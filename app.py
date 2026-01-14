@@ -10,6 +10,7 @@ import logging
 import sys
 from flask import Flask, render_template, request, jsonify
 from flask_login import login_required, current_user
+from werkzeug.middleware.proxy_fix import ProxyFix
 from config import Config
 from assistant import get_assistant
 from auth import init_auth
@@ -46,6 +47,9 @@ def log_user_action(action, details=""):
 
 app = Flask(__name__)
 app.secret_key = Config.SECRET_KEY
+
+# Trust proxy headers (Railway terminates SSL)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 # Initialize authentication
 init_auth(app)
