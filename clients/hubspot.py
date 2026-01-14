@@ -4,8 +4,11 @@ HubSpot Client
 Client for HubSpot CRM and Marketing APIs.
 """
 
+import logging
 import requests
 from config import Config
+
+logger = logging.getLogger(__name__)
 
 
 class HubSpotClient:
@@ -22,33 +25,45 @@ class HubSpotClient:
     def _get(self, endpoint: str, params: dict = None) -> dict:
         """Make a GET request to HubSpot API"""
         if not self.access_token:
+            logger.error("HubSpot access token not configured")
             return {"error": "HubSpot access token not configured"}
+        
+        url = f"{self.base_url}/{endpoint}"
+        logger.info(f"HubSpot GET: {endpoint} | params: {params}")
         
         try:
             response = requests.get(
-                f"{self.base_url}/{endpoint}",
+                url,
                 headers=self.headers,
                 params=params,
                 timeout=30
             )
+            logger.info(f"HubSpot Response: {response.status_code}")
             return response.json()
         except requests.exceptions.RequestException as e:
+            logger.error(f"HubSpot Error: {str(e)}")
             return {"error": str(e)}
     
     def _post(self, endpoint: str, data: dict = None) -> dict:
         """Make a POST request to HubSpot API"""
         if not self.access_token:
+            logger.error("HubSpot access token not configured")
             return {"error": "HubSpot access token not configured"}
+        
+        url = f"{self.base_url}/{endpoint}"
+        logger.info(f"HubSpot POST: {endpoint}")
         
         try:
             response = requests.post(
-                f"{self.base_url}/{endpoint}",
+                url,
                 headers=self.headers,
                 json=data,
                 timeout=30
             )
+            logger.info(f"HubSpot Response: {response.status_code}")
             return response.json()
         except requests.exceptions.RequestException as e:
+            logger.error(f"HubSpot Error: {str(e)}")
             return {"error": str(e)}
     
     # =========================================================================
@@ -93,6 +108,10 @@ class HubSpotClient:
     def get_marketing_events(self, limit: int = 10) -> dict:
         """Get marketing events"""
         return self._get("marketing/v3/marketing-events", {"limit": limit})
+    
+    def create_marketing_event(self, event_data: dict) -> dict:
+        """Create a marketing event"""
+        return self._post("marketing/v3/marketing-events", event_data)
     
     # =========================================================================
     # SOCIAL MEDIA

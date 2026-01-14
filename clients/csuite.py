@@ -4,8 +4,11 @@ CSuite Client
 Client for CSuite Fund Accounting API.
 """
 
+import logging
 import requests
 from config import Config
+
+logger = logging.getLogger(__name__)
 
 
 class CSuiteClient:
@@ -24,17 +27,23 @@ class CSuiteClient:
     def _get(self, endpoint: str, params: dict = None) -> dict:
         """Make a GET request to CSuite API"""
         if not self.api_key or not self.api_secret:
+            logger.error("CSuite API credentials not configured")
             return {"error": "CSuite API credentials not configured"}
+        
+        url = f"{self.base_url}/{endpoint}"
+        logger.info(f"CSuite GET: {endpoint} | params: {params}")
         
         try:
             response = requests.get(
-                f"{self.base_url}/{endpoint}",
+                url,
                 headers=self.headers,
                 params=params,
                 timeout=30
             )
+            logger.info(f"CSuite Response: {response.status_code}")
             return response.json()
         except requests.exceptions.RequestException as e:
+            logger.error(f"CSuite Error: {str(e)}")
             return {"error": str(e)}
     
     # =========================================================================
@@ -88,3 +97,19 @@ class CSuiteClient:
     def get_vouchers(self, limit: int = 100) -> dict:
         """Get vouchers list"""
         return self._get("voucher/list", {"view_limit": limit})
+    
+    # =========================================================================
+    # EVENTS
+    # =========================================================================
+    
+    def get_events(self, limit: int = 100) -> dict:
+        """Get events list"""
+        return self._get("event/list", {"view_limit": limit})
+    
+    def get_event(self, event_id: int) -> dict:
+        """Get specific event details"""
+        return self._get("event/display", {"event_id": event_id})
+    
+    def get_event_dates(self, limit: int = 100) -> dict:
+        """Get event dates"""
+        return self._get("event_date/list", {"view_limit": limit})
