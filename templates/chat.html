@@ -5,6 +5,76 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Jidhr | AMCF Operations Assistant</title>
     <link rel="stylesheet" href="/static/style.css">
+    <style>
+        /* User menu styles */
+        .header-actions {
+            margin-left: auto;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        
+        .user-info {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 20px;
+            font-size: 0.85rem;
+        }
+        
+        .user-avatar {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background: rgba(255,255,255,0.3);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            overflow: hidden;
+        }
+        
+        .user-avatar img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        
+        .user-name {
+            max-width: 120px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        
+        .logout-btn {
+            background: rgba(255,255,255,0.2);
+            border: none;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: background 0.2s;
+            text-decoration: none;
+        }
+        
+        .logout-btn:hover {
+            background: rgba(255,255,255,0.3);
+        }
+        
+        @media (max-width: 600px) {
+            .user-name {
+                display: none;
+            }
+            
+            .header-actions {
+                gap: 8px;
+            }
+        }
+    </style>
 </head>
 <body>
     <div class="container">
@@ -14,14 +84,27 @@
                 <h1>Jidhr <span class="arabic">جذر</span></h1>
                 <p>AMCF Operations Assistant • HubSpot + CSuite</p>
             </div>
-            <button class="clear-btn" onclick="clearChat()">Clear Chat</button>
+            <div class="header-actions">
+                <div class="user-info">
+                    <div class="user-avatar">
+                        {% if user.picture %}
+                        <img src="{{ user.picture }}" alt="{{ user.name }}" referrerpolicy="no-referrer">
+                        {% else %}
+                        👤
+                        {% endif %}
+                    </div>
+                    <span class="user-name">{{ user.name }}</span>
+                </div>
+                <button class="clear-btn" onclick="clearChat()">Clear</button>
+                <a href="{{ url_for('auth.logout') }}" class="logout-btn">Sign Out</a>
+            </div>
         </div>
         
         <div class="chat-area" id="chat-area">
             <div class="message assistant">
                 <div class="message-avatar">🌳</div>
                 <div class="message-content">
-                    Assalamu Alaikum! 👋 I'm <strong>Jidhr</strong> (جذر - "The Root"), your AMCF Operations Assistant.
+                    Assalamu Alaikum, <strong>{{ user.name.split(' ')[0] }}</strong>! 👋 I'm <strong>Jidhr</strong> (جذر - "The Root"), your AMCF Operations Assistant.
                     <br><br>
                     I can help you with:
                     <br><br>
@@ -43,8 +126,8 @@
             </div>
             <div class="input-container">
                 <div class="input-wrapper">
-                    <textarea 
-                        id="message-input" 
+                    <textarea
+                        id="message-input"
                         placeholder="Ask about funds, contacts, donations, events..."
                         rows="1"
                         onkeydown="handleKeyDown(event)"

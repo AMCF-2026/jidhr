@@ -22,7 +22,7 @@ class Config:
     # OpenRouter (Claude)
     OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
     OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-    CLAUDE_MODEL = "anthropic/claude-sonnet-4-20250514"
+    CLAUDE_MODEL = "anthropic/claude-3.5-sonnet"
     
     # HubSpot
     HUBSPOT_ACCESS_TOKEN = os.environ.get('HUBSPOT_ACCESS_TOKEN', '')
@@ -32,6 +32,11 @@ class Config:
     CSUITE_API_KEY = os.environ.get('CSUITE_API_KEY', '')
     CSUITE_API_SECRET = os.environ.get('CSUITE_API_SECRET', '')
     CSUITE_BASE_URL = os.environ.get('CSUITE_BASE_URL', 'https://amuslimcf.fcsuite.com/erp/api')
+    
+    # Google OAuth
+    GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', '')
+    GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET', '')
+    ALLOWED_DOMAIN = os.environ.get('ALLOWED_DOMAIN', 'amuslimcf.org')
     
     @classmethod
     def validate(cls):
@@ -45,6 +50,10 @@ class Config:
             missing.append("CSUITE_API_KEY")
         if not cls.CSUITE_API_SECRET:
             missing.append("CSUITE_API_SECRET")
+        if not cls.GOOGLE_CLIENT_ID:
+            missing.append("GOOGLE_CLIENT_ID")
+        if not cls.GOOGLE_CLIENT_SECRET:
+            missing.append("GOOGLE_CLIENT_SECRET")
         return missing
 
 
