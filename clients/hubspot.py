@@ -2,10 +2,16 @@
 HubSpot Client
 ==============
 Client for HubSpot CRM and Marketing APIs.
+
+Jidhr v1.2 - Added:
+- Marketing Email Drafts
+- Social Media Posts (create/schedule)
+- Tasks (list)
 """
 
 import logging
 import requests
+from datetime import datetime
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -14,6 +20,29 @@ logger = logging.getLogger(__name__)
 class HubSpotClient:
     """Client for HubSpot API"""
     
+    # =========================================================================
+    # TEMPLATE & CHANNEL MAPPINGS
+    # =========================================================================
+    
+    # Email templates discovered via API
+    EMAIL_TEMPLATES = {
+        "amcf": "EMAIL_DND_TEMPLATE/AMFC Emails.html",
+        "amfc": "EMAIL_DND_TEMPLATE/AMFC Emails.html",  # alias
+        "newsletter": "EMAIL_DND_TEMPLATE/AMFC Emails.html",  # alias
+        "giving circle": "EMAIL_DND_TEMPLATE/Giving Circle Email.html",
+        "giving_circle": "EMAIL_DND_TEMPLATE/Giving Circle Email.html",  # alias
+    }
+    
+    # Social channel mapping (friendly name -> channel key pattern)
+    # Actual channel keys will be fetched dynamically
+    SOCIAL_PLATFORMS = {
+        "twitter": "TwitterChannel",
+        "x": "TwitterChannel",
+        "facebook": "FacebookPage",
+        "linkedin": "LinkedInCompanyPage",
+        "instagram": "InstagramBusinessProfile",
+    }
+    
     def __init__(self):
         self.access_token = Config.HUBSPOT_ACCESS_TOKEN
         self.base_url = Config.HUBSPOT_BASE_URL
@@ -21,6 +50,12 @@ class HubSpotClient:
             "Authorization": f"Bearer {self.access_token}",
             "Content-Type": "application/json"
         }
+        # Cache for social channels (populated on first use)
+        self._social_channels_cache = None
+    
+    # =========================================================================
+    # HTTP METHODS
+    # =========================================================================
     
     def _get(self, endpoint: str, params: dict = None) -> dict:
         """Make a GET request to HubSpot API"""
@@ -204,6 +239,90 @@ class HubSpotClient:
         return self._get(f"marketing/v3/marketing-events/external/{external_id}")
     
     # =========================================================================
+    # MARKETING EMAILS (NEW - Jidhr v1.2)
+    # =========================================================================
+    
+    def get_marketing_emails(self, limit: int = 20) -> dict:
+        """Get list of marketing emails
+        
+        Args:
+            limit: Number of emails to return (default 20)
+            
+        Returns:
+            dict with 'results' containing email objects
+        """
+        return self._get("marketing/v3/emails", {"limit": limit})
+    
+    def get_marketing_email(self, email_id: str) -> dict:
+        """Get a specific marketing email by ID"""
+        return self._get(f"marketing/v3/emails/{email_id}")
+    
+    def create_marketing_email_draft(
+        self,
+        name: str,
+        subject: str,
+        body_html: str,
+        template: str = "amcf"
+    ) -> dict:
+        """Create a marketing email draft
+        
+        Args:
+            name: Internal name for the email (e.g., "DAF Portal Launch - Jan 2026")
+            subject: Email subject line
+            body_html: HTML content for the email body
+            template: Template key - "amcf", "newsletter", or "giving circle"
+            
+        Returns:
+            dict with created email details including 'id' for editing URL
+        
+        Example:
+            result = client.create_marketing_email_draft(
+                name="Ramadan Campaign Draft",
+                subject="Prepare for Ramadan Giving",
+                body_html="<p>Ramadan is approaching...</p>",
+                template="amcf"
+            )
+            # Edit URL: https://app-na2.hubspot.com/email/243832852/edit/{result['id']}/content
+        """
+        # Resolve template path
+        template_key = template.lower().strip()
+        template_path = self.EMAIL_TEMPLATES.get(template_key)
+        
+        if not template_path:
+            available = ", ".join(self.EMAIL_TEMPLATES.keys())
+            return {"error": f"Unknown template '{template}'. Available: {available}"}
+        
+        # Build the email payload
+        # Using the v3 API content.widgets structure discovered from community
+        payload = {
+            "name": name,
+            "subject": subject,
+            "templatePath": template_path,
+            "content": {
+                "widgets": {
+                    "hs_email_body": {
+                        "body": {
+                            "html": body_html
+                        },
+                        "id": "hs_email_body",
+                        "label": "Main body",
+                        "name": "hs_email_body",
+                        "type": "rich_text"
+                    }
+                }
+            }
+        }
+        
+        logger.info(f"Creating email draft: {name} with template: {template_path}")
+        result = self._post("marketing/v3/emails", payload)
+        
+        # Add helpful edit URL if successful
+        if "id" in result:
+            result["edit_url"] = f"https://app-na2.hubspot.com/email/243832852/edit/{result['id']}/content"
+        
+        return result
+    
+    # =========================================================================
     # SUBSCRIPTIONS (Email/Newsletter)
     # =========================================================================
     
@@ -234,20 +353,159 @@ class HubSpotClient:
         })
     
     # =========================================================================
-    # SOCIAL MEDIA
+    # SOCIAL MEDIA (ENHANCED - Jidhr v1.2)
     # =========================================================================
     
     def get_social_channels(self) -> dict:
-        """Get connected social media channels"""
+        """Get connected social media channels
+        
+        Returns list of channels with channelId, channelType, name, etc.
+        """
         return self._get("broadcast/v1/channels/setting/publish/current")
+    
+    def _get_channel_key(self, platform: str) -> str:
+        """Get the channel key for a platform
+        
+        Args:
+            platform: Friendly name like "facebook", "twitter", "linkedin", "instagram"
+            
+        Returns:
+            Channel key like "FacebookPage:1159312454102818" or None if not found
+        """
+        # Fetch channels if not cached
+        if self._social_channels_cache is None:
+            channels_response = self.get_social_channels()
+            if isinstance(channels_response, list):
+                self._social_channels_cache = channels_response
+            else:
+                self._social_channels_cache = []
+        
+        # Find matching channel
+        platform_lower = platform.lower().strip()
+        channel_type = self.SOCIAL_PLATFORMS.get(platform_lower)
+        
+        if not channel_type:
+            return None
+        
+        for channel in self._social_channels_cache:
+            if channel.get("channelType") == channel_type:
+                channel_id = channel.get("channelId")
+                return f"{channel_type}:{channel_id}"
+        
+        return None
     
     def get_social_broadcasts(self, limit: int = 10) -> dict:
         """Get social media broadcasts"""
         return self._get("broadcast/v1/broadcasts", {"limit": limit})
     
     def create_social_broadcast(self, data: dict) -> dict:
-        """Create a social media broadcast"""
+        """Create a social media broadcast (raw API)"""
         return self._post("broadcast/v1/broadcasts", data)
+    
+    def create_social_post(
+        self,
+        platform: str,
+        content: str,
+        link_url: str = None,
+        photo_url: str = None,
+        schedule_time: datetime = None,
+        campaign_guid: str = None
+    ) -> dict:
+        """Create a social media post (draft, scheduled, or publish now)
+        
+        Args:
+            platform: "facebook", "twitter", "linkedin", or "instagram"
+            content: The post text/message
+            link_url: Optional URL to include in the post
+            photo_url: Optional image URL (must be publicly accessible)
+            schedule_time: Optional datetime to schedule (None = draft, "now" for immediate)
+            campaign_guid: Optional HubSpot campaign GUID
+            
+        Returns:
+            dict with broadcast details
+            
+        Example - Create draft:
+            result = client.create_social_post(
+                platform="facebook",
+                content="Check out our new DAF portal!",
+                link_url="https://amuslimcf.org/daf"
+            )
+            
+        Example - Schedule post:
+            from datetime import datetime, timedelta
+            schedule = datetime.now() + timedelta(days=1)
+            result = client.create_social_post(
+                platform="linkedin",
+                content="Year-end giving strategies...",
+                schedule_time=schedule
+            )
+        """
+        # Get channel key
+        channel_key = self._get_channel_key(platform)
+        if not channel_key:
+            available = ", ".join(self.SOCIAL_PLATFORMS.keys())
+            return {"error": f"Channel not found for '{platform}'. Available: {available}"}
+        
+        # Build broadcast payload
+        payload = {
+            "channelKeys": [channel_key],
+            "content": {
+                "body": content
+            }
+        }
+        
+        # Add optional fields
+        if link_url:
+            payload["content"]["linkUrl"] = link_url
+        
+        if photo_url:
+            payload["content"]["photoUrl"] = photo_url
+        
+        if campaign_guid:
+            payload["campaignGuid"] = campaign_guid
+        
+        # Handle scheduling
+        if schedule_time:
+            if isinstance(schedule_time, datetime):
+                # Convert to milliseconds timestamp
+                timestamp_ms = int(schedule_time.timestamp() * 1000)
+                payload["triggerAt"] = timestamp_ms
+            elif schedule_time == "now":
+                # Publish immediately (triggerAt in the past or very soon)
+                payload["triggerAt"] = int(datetime.now().timestamp() * 1000)
+        # If no schedule_time, it creates a draft
+        
+        logger.info(f"Creating social post for {platform}: {content[:50]}...")
+        return self._post("broadcast/v1/broadcasts", payload)
+    
+    def get_available_social_platforms(self) -> list:
+        """Get list of connected social platforms
+        
+        Returns:
+            List of platform names that are connected (e.g., ["facebook", "twitter", "linkedin", "instagram"])
+        """
+        channels_response = self.get_social_channels()
+        
+        if not isinstance(channels_response, list):
+            return []
+        
+        # Map channel types back to friendly names
+        type_to_name = {v: k for k, v in self.SOCIAL_PLATFORMS.items()}
+        
+        connected = []
+        seen_types = set()
+        
+        for channel in channels_response:
+            channel_type = channel.get("channelType")
+            if channel_type and channel_type not in seen_types:
+                seen_types.add(channel_type)
+                name = type_to_name.get(channel_type, channel_type)
+                # Prefer standard names
+                if name == "x":
+                    name = "twitter"
+                connected.append(name)
+        
+        return connected
     
     # =========================================================================
     # CAMPAIGNS
@@ -258,12 +516,98 @@ class HubSpotClient:
         return self._get("marketing/v3/campaigns", {"limit": limit})
     
     # =========================================================================
-    # TASKS
+    # TASKS (ENHANCED - Jidhr v1.2)
     # =========================================================================
     
+    def get_tasks(self, limit: int = 20, owner_id: str = None) -> dict:
+        """Get tasks list
+        
+        Args:
+            limit: Number of tasks to return
+            owner_id: Optional owner ID to filter by
+            
+        Returns:
+            dict with 'results' containing task objects
+        """
+        params = {
+            "limit": limit,
+            "properties": "hs_task_subject,hs_task_body,hs_task_status,hs_task_priority,hs_timestamp,hubspot_owner_id"
+        }
+        
+        if owner_id:
+            # Use search endpoint for filtering
+            return self._post("crm/v3/objects/tasks/search", {
+                "filterGroups": [{
+                    "filters": [{
+                        "propertyName": "hubspot_owner_id",
+                        "operator": "EQ",
+                        "value": owner_id
+                    }]
+                }],
+                "properties": params["properties"].split(","),
+                "limit": limit
+            })
+        
+        return self._get("crm/v3/objects/tasks", params)
+    
     def create_task(self, properties: dict) -> dict:
-        """Create a task"""
+        """Create a task
+        
+        Args:
+            properties: Task properties dict. Common properties:
+                - hs_task_subject: Task title (required)
+                - hs_task_body: Task description
+                - hs_task_status: "NOT_STARTED", "IN_PROGRESS", "COMPLETED"
+                - hs_task_priority: "LOW", "MEDIUM", "HIGH"
+                - hs_timestamp: Due date (Unix timestamp in milliseconds)
+                - hubspot_owner_id: Assigned owner ID
+                
+        Example:
+            client.create_task({
+                "hs_task_subject": "Follow up with donor",
+                "hs_task_body": "Discuss DAF contribution",
+                "hs_task_priority": "HIGH",
+                "hs_task_status": "NOT_STARTED"
+            })
+        """
         return self._post("crm/v3/objects/tasks", {"properties": properties})
+    
+    def create_task_simple(
+        self,
+        subject: str,
+        body: str = None,
+        priority: str = "MEDIUM",
+        due_date: datetime = None,
+        owner_id: str = None
+    ) -> dict:
+        """Create a task with simple parameters
+        
+        Args:
+            subject: Task title
+            body: Optional task description
+            priority: "LOW", "MEDIUM", or "HIGH"
+            due_date: Optional due date
+            owner_id: Optional owner to assign to
+            
+        Returns:
+            Created task object
+        """
+        properties = {
+            "hs_task_subject": subject,
+            "hs_task_status": "NOT_STARTED",
+            "hs_task_priority": priority.upper()
+        }
+        
+        if body:
+            properties["hs_task_body"] = body
+        
+        if due_date:
+            properties["hs_timestamp"] = int(due_date.timestamp() * 1000)
+        
+        if owner_id:
+            properties["hubspot_owner_id"] = owner_id
+        
+        return self.create_task(properties)
     
     # =========================================================================
     # TICKETS
