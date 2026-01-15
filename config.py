@@ -28,15 +28,19 @@ class Config:
     HUBSPOT_ACCESS_TOKEN = os.environ.get('HUBSPOT_ACCESS_TOKEN', '')
     HUBSPOT_BASE_URL = "https://api.hubapi.com"
     
-    # CSuite
+    # CSuite - NOTE: Using API v2 with HMAC authentication
     CSUITE_API_KEY = os.environ.get('CSUITE_API_KEY', '')
     CSUITE_API_SECRET = os.environ.get('CSUITE_API_SECRET', '')
-    CSUITE_BASE_URL = os.environ.get('CSUITE_BASE_URL', 'https://amuslimcf.fcsuite.com/erp/api')
+    CSUITE_BASE_URL = os.environ.get('CSUITE_BASE_URL', 'https://amuslimcf.fcsuite.com/api/v2')
     
     # Google OAuth
     GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', '')
     GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET', '')
     ALLOWED_DOMAIN = os.environ.get('ALLOWED_DOMAIN', 'amuslimcf.org')
+    
+    # Sync Configuration
+    DEFAULT_EVENT_OWNER_ID = "159996166"  # carl@amuslimcf.org
+    HUBSPOT_MARKETING_SUBSCRIPTION_ID = "1265988358"  # Marketing Information subscription
     
     @classmethod
     def validate(cls):
@@ -73,6 +77,12 @@ You have access to TWO systems:
 - Schedule social media posts (with confirmation)
 - Check marketing events and registrations
 - Search across both systems
+- **Sync data** from CSuite to HubSpot (donations, events, newsletter opt-ins)
+
+## Sync Commands:
+- "sync donations" - Update HubSpot contacts with donation aggregates from CSuite
+- "sync events" - Create HubSpot Marketing Events from CSuite events
+- "sync newsletter" - Update HubSpot subscriptions from CSuite opt-ins
 
 ## Important Context:
 - AMCF manages Donor Advised Funds (DAFs), endowments, and fiscal sponsorships

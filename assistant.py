@@ -8,6 +8,7 @@ import logging
 from datetime import datetime
 from config import SYSTEM_PROMPT
 from clients import OpenRouterClient, HubSpotClient, CSuiteClient
+from sync import run_donation_sync, run_event_sync, run_newsletter_sync
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,14 @@ class JidhrAssistant:
             Jidhr's response
         """
         logger.info(f"Processing query: {user_message[:50]}...")
+        
+        # Check for sync commands FIRST (before adding to history)
+        sync_response = self._handle_sync_commands(user_message)
+        if sync_response:
+            # Add to history for context
+            self.conversation_history.append({"role": "user", "content": user_message})
+            self.conversation_history.append({"role": "assistant", "content": sync_response})
+            return sync_response
         
         # Add user message to history
         self.conversation_history.append({
@@ -75,6 +84,148 @@ class JidhrAssistant:
         
         return response
     
+    def _handle_sync_commands(self, query: str) -> str:
+        """
+        Handle sync commands directly without going to Claude.
+        
+        Returns:
+            Response string if sync command detected, None otherwise
+        """
+        query_lower = query.lower().strip()
+        
+        # Sync donations command
+        if any(phrase in query_lower for phrase in ['sync donations', 'sync donation', 'update donations']):
+            logger.info("Running donation sync...")
+            
+            # Check for dry run
+            dry_run = 'dry run' in query_lower or 'test' in query_lower
+            
+            try:
+                results = run_donation_sync(dry_run=dry_run)
+                return self._format_donation_sync_results(results, dry_run)
+            except Exception as e:
+                logger.error(f"Donation sync error: {str(e)}")
+                return f"❌ Donation sync failed: {str(e)}"
+        
+        # Sync events command
+        if any(phrase in query_lower for phrase in ['sync events', 'sync event', 'update events']):
+            logger.info("Running event sync...")
+            
+            dry_run = 'dry run' in query_lower or 'test' in query_lower
+            
+            try:
+                results = run_event_sync(dry_run=dry_run)
+                return self._format_event_sync_results(results, dry_run)
+            except Exception as e:
+                logger.error(f"Event sync error: {str(e)}")
+                return f"❌ Event sync failed: {str(e)}"
+        
+        # Sync newsletter command
+        if any(phrase in query_lower for phrase in ['sync newsletter', 'sync newsletters', 'update newsletter', 'sync subscriptions']):
+            logger.info("Running newsletter sync...")
+            
+            dry_run = 'dry run' in query_lower or 'test' in query_lower
+            
+            try:
+                results = run_newsletter_sync(dry_run=dry_run)
+                return self._format_newsletter_sync_results(results, dry_run)
+            except Exception as e:
+                logger.error(f"Newsletter sync error: {str(e)}")
+                return f"❌ Newsletter sync failed: {str(e)}"
+        
+        # Sync all command
+        if query_lower in ['sync all', 'sync everything', 'run all syncs']:
+            logger.info("Running all syncs...")
+            return self._run_all_syncs()
+        
+        return None
+    
+    def _format_donation_sync_results(self, results: dict, dry_run: bool) -> str:
+        """Format donation sync results for display"""
+        prefix = "🧪 **DRY RUN** - " if dry_run else ""
+        
+        response = f"""{prefix}✅ **Donation Sync Complete**
+
+📊 **Results:**
+• **{results['updated']}** contacts updated with donation data
+• **{results['skipped_no_email']}** profiles skipped (no email in CSuite)
+• **{results['skipped_not_found']}** profiles skipped (not found in HubSpot)
+• **{results['errors']}** errors
+
+💡 Updated fields: `lifetime_giving`, `last_donation_date`, `last_donation_amount`, `donation_count`, `csuite_profile_id`"""
+        
+        if dry_run:
+            response += "\n\n*Run without 'dry run' to apply changes.*"
+        
+        return response
+    
+    def _format_event_sync_results(self, results: dict, dry_run: bool) -> str:
+        """Format event sync results for display"""
+        prefix = "🧪 **DRY RUN** - " if dry_run else ""
+        
+        response = f"""{prefix}✅ **Event Sync Complete**
+
+📊 **Results:**
+• **{results['created']}** events created in HubSpot
+• **{results['skipped_exists']}** events skipped (already exist)
+• **{results['skipped_past']}** events skipped (past events)
+• **{results['skipped_archived']}** events skipped (archived)
+• **{results['errors']}** errors"""
+        
+        if results.get('details'):
+            response += "\n\n📝 **Details:**\n"
+            for detail in results['details'][:10]:  # Limit to 10
+                response += f"• {detail}\n"
+        
+        if dry_run:
+            response += "\n*Run without 'dry run' to apply changes.*"
+        
+        return response
+    
+    def _format_newsletter_sync_results(self, results: dict, dry_run: bool) -> str:
+        """Format newsletter sync results for display"""
+        prefix = "🧪 **DRY RUN** - " if dry_run else ""
+        
+        response = f"""{prefix}✅ **Newsletter Sync Complete**
+
+📊 **Results:**
+• **{results['subscribed']}** contacts subscribed to marketing emails
+• **{results['already_subscribed']}** contacts already subscribed
+• **{results['not_found']}** contacts not found in HubSpot
+• **{results['errors']}** errors"""
+        
+        if dry_run:
+            response += "\n\n*Run without 'dry run' to apply changes.*"
+        
+        return response
+    
+    def _run_all_syncs(self) -> str:
+        """Run all sync operations"""
+        responses = []
+        
+        # Donations
+        try:
+            donation_results = run_donation_sync(dry_run=False)
+            responses.append(f"**Donations:** {donation_results['updated']} updated, {donation_results['errors']} errors")
+        except Exception as e:
+            responses.append(f"**Donations:** ❌ Failed - {str(e)}")
+        
+        # Events
+        try:
+            event_results = run_event_sync(dry_run=False)
+            responses.append(f"**Events:** {event_results['created']} created, {event_results['errors']} errors")
+        except Exception as e:
+            responses.append(f"**Events:** ❌ Failed - {str(e)}")
+        
+        # Newsletter
+        try:
+            newsletter_results = run_newsletter_sync(dry_run=False)
+            responses.append(f"**Newsletter:** {newsletter_results['subscribed']} subscribed, {newsletter_results['errors']} errors")
+        except Exception as e:
+            responses.append(f"**Newsletter:** ❌ Failed - {str(e)}")
+        
+        return "✅ **All Syncs Complete**\n\n" + "\n".join(responses)
+    
     def _gather_context(self, query: str) -> str:
         """
         Gather relevant context from HubSpot/CSuite based on query.
@@ -91,10 +242,11 @@ class JidhrAssistant:
         if any(word in query_lower for word in ['fund', 'balance', 'daf', 'endowment', 'grant']):
             logger.info("Fetching CSuite funds...")
             funds_data = self.csuite.get_funds(limit=20)
-            if 'results' in funds_data:
+            if funds_data.get('success') and funds_data.get('data'):
+                results = funds_data['data'].get('results', [])
                 fund_list = [
-                    f"{f.get('fund_name', 'Unknown')} (ID: {f.get('funit_id', 'N/A')})" 
-                    for f in funds_data['results'][:10]
+                    f"{f.get('fund_name', 'Unknown')} (ID: {f.get('funit_id', 'N/A')})"
+                    for f in results[:10]
                 ]
                 context_parts.append(f"CSuite Funds:\n" + "\n".join(fund_list))
                 logger.info(f"Found {len(fund_list)} funds")
@@ -139,11 +291,12 @@ class JidhrAssistant:
         if any(word in query_lower for word in ['event', 'symposium', 'webinar', 'registration', 'gala', 'dinner']):
             # CSuite Events
             logger.info("Fetching CSuite events...")
-            csuite_events = self.csuite.get_events(limit=10)
-            if 'results' in csuite_events:
+            csuite_events = self.csuite.get_event_dates(limit=10)
+            if csuite_events.get('success') and csuite_events.get('data'):
+                results = csuite_events['data'].get('results', [])
                 event_list = [
-                    f"{e.get('event_name', 'Unknown')} ({e.get('event_date', 'No date')})"
-                    for e in csuite_events['results'][:5]
+                    f"{e.get('event_description') or e.get('event_name', 'Unknown')} ({e.get('event_date', 'No date')})"
+                    for e in results[:5]
                 ]
                 context_parts.append(f"CSuite Events:\n" + "\n".join(event_list))
                 logger.info(f"Found {len(event_list)} CSuite events")
@@ -163,10 +316,11 @@ class JidhrAssistant:
         if any(word in query_lower for word in ['donation', 'gift', 'gave', 'contributed', 'recent donations']):
             logger.info("Fetching CSuite donations...")
             donations_data = self.csuite.get_donations(limit=10)
-            if 'results' in donations_data:
+            if donations_data.get('success') and donations_data.get('data'):
+                results = donations_data['data'].get('results', [])
                 donation_list = [
                     f"{d.get('name', 'Unknown')}: ${d.get('donation_amount', '0')} to {d.get('fund_name', 'Unknown')} ({d.get('donation_date', 'No date')})"
-                    for d in donations_data['results'][:5]
+                    for d in results[:5]
                 ]
                 context_parts.append(f"CSuite Donations:\n" + "\n".join(donation_list))
                 logger.info(f"Found {len(donation_list)} donations")
