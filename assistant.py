@@ -101,7 +101,8 @@ class JidhrAssistant:
             dry_run = 'dry run' in query_lower or 'test' in query_lower
             
             try:
-                results = run_donation_sync(dry_run=dry_run)
+                # Use quick mode for dry runs to avoid timeout
+                results = run_donation_sync(dry_run=dry_run, quick=dry_run)
                 return self._format_donation_sync_results(results, dry_run)
             except Exception as e:
                 logger.error(f"Donation sync error: {str(e)}")
@@ -142,20 +143,20 @@ class JidhrAssistant:
     
     def _format_donation_sync_results(self, results: dict, dry_run: bool) -> str:
         """Format donation sync results for display"""
-        prefix = "🧪 **DRY RUN** - " if dry_run else ""
+        prefix = "🧪 **DRY RUN (Sample)** - " if dry_run else ""
         
         response = f"""{prefix}✅ **Donation Sync Complete**
 
 📊 **Results:**
-• **{results['updated']}** contacts updated with donation data
+• **{results['updated']}** contacts {"would be updated" if dry_run else "updated"} with donation data
 • **{results['skipped_no_email']}** profiles skipped (no email in CSuite)
 • **{results['skipped_not_found']}** profiles skipped (not found in HubSpot)
 • **{results['errors']}** errors
 
-💡 Updated fields: `lifetime_giving`, `last_donation_date`, `last_donation_amount`, `donation_count`, `csuite_profile_id`"""
+💡 Fields: `lifetime_giving`, `last_donation_date`, `last_donation_amount`, `donation_count`, `csuite_profile_id`"""
         
         if dry_run:
-            response += "\n\n*Run without 'dry run' to apply changes.*"
+            response += "\n\n⚡ *This dry run used sample data (500 profiles, 500 donations). Run `sync donations` without 'dry run' for full sync.*"
         
         return response
     
