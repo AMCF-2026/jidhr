@@ -103,11 +103,11 @@ class CSuiteClient:
     # PROFILES
     # =========================================================================
     
-    def get_profiles(self, limit: int = 100, page: int = 1) -> dict:
+    def get_profiles(self, limit: int = 100, offset: int = 0) -> dict:
         """Get profiles (donors, vendors, etc.)"""
         return self._request("profile/list", {
             "view_limit": limit,
-            "cur_page": page
+            "view_offset": offset
         })
     
     def get_profile(self, profile_id: int) -> dict:
@@ -118,15 +118,45 @@ class CSuiteClient:
         """Search profiles by name"""
         return self._request("profile/list/search", {"q": query})
     
+    def get_all_profiles(self, max_iterations: int = 200) -> list:
+        """Get all profiles across all pages using offset pagination"""
+        all_profiles = []
+        offset = 0
+        limit = 100
+        
+        for _ in range(max_iterations):
+            result = self.get_profiles(limit=limit, offset=offset)
+            
+            if not result.get("success"):
+                logger.error(f"Failed to get profiles at offset {offset}")
+                break
+            
+            data = result.get("data", {})
+            profiles = data.get("results", [])
+            
+            if not profiles:
+                break
+            
+            all_profiles.extend(profiles)
+            
+            # Check if we got fewer than limit (last page)
+            if len(profiles) < limit:
+                break
+            
+            offset += limit
+        
+        logger.info(f"Retrieved {len(all_profiles)} total profiles")
+        return all_profiles
+    
     # =========================================================================
     # FUNDS
     # =========================================================================
     
-    def get_funds(self, limit: int = 100, page: int = 1) -> dict:
+    def get_funds(self, limit: int = 100, offset: int = 0) -> dict:
         """Get list of funds"""
         return self._request("funit/list", {
             "view_limit": limit,
-            "cur_page": page
+            "view_offset": offset
         })
     
     def get_fund(self, fund_id: int) -> dict:
@@ -145,27 +175,28 @@ class CSuiteClient:
     # DONATIONS
     # =========================================================================
     
-    def get_donations(self, limit: int = 100, page: int = 1) -> dict:
+    def get_donations(self, limit: int = 100, offset: int = 0) -> dict:
         """Get donations list"""
         return self._request("donation/list", {
             "view_limit": limit,
-            "cur_page": page
+            "view_offset": offset
         })
     
     def get_donations_by_profile(self, profile_id: int) -> dict:
         """Get donations for a specific profile"""
         return self._request("donation/list", {"profile_id": profile_id})
     
-    def get_all_donations(self, max_pages: int = 100) -> list:
-        """Get all donations across all pages"""
+    def get_all_donations(self, max_iterations: int = 100) -> list:
+        """Get all donations across all pages using offset pagination"""
         all_donations = []
-        page = 1
+        offset = 0
+        limit = 100
         
-        while page <= max_pages:
-            result = self.get_donations(limit=100, page=page)
+        for _ in range(max_iterations):
+            result = self.get_donations(limit=limit, offset=offset)
             
             if not result.get("success"):
-                logger.error(f"Failed to get donations page {page}")
+                logger.error(f"Failed to get donations at offset {offset}")
                 break
             
             data = result.get("data", {})
@@ -176,12 +207,11 @@ class CSuiteClient:
             
             all_donations.extend(donations)
             
-            # Check if more pages
-            total_pages = data.get("pages", 1)
-            if page >= total_pages:
+            # Check if we got fewer than limit (last page)
+            if len(donations) < limit:
                 break
             
-            page += 1
+            offset += limit
         
         logger.info(f"Retrieved {len(all_donations)} total donations")
         return all_donations
@@ -190,11 +220,11 @@ class CSuiteClient:
     # GRANTS
     # =========================================================================
     
-    def get_grants(self, limit: int = 100, page: int = 1) -> dict:
+    def get_grants(self, limit: int = 100, offset: int = 0) -> dict:
         """Get grants list"""
         return self._request("grant/list", {
             "view_limit": limit,
-            "cur_page": page
+            "view_offset": offset
         })
     
     # =========================================================================
@@ -213,11 +243,11 @@ class CSuiteClient:
     # VOUCHERS
     # =========================================================================
     
-    def get_vouchers(self, limit: int = 100, page: int = 1) -> dict:
+    def get_vouchers(self, limit: int = 100, offset: int = 0) -> dict:
         """Get vouchers list"""
         return self._request("voucher/list", {
             "view_limit": limit,
-            "cur_page": page
+            "view_offset": offset
         })
     
     # =========================================================================

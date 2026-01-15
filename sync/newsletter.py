@@ -33,39 +33,21 @@ class NewsletterSync:
             list: Profiles with email and newsletter=1
         """
         opted_in = []
-        page = 1
-        max_pages = 200
         
-        while page <= max_pages:
-            result = self.csuite.get_profiles(limit=100, page=page)
+        # Use built-in method that handles pagination
+        profiles = self.csuite.get_all_profiles()
+        
+        for profile in profiles:
+            email = profile.get("primary_email")
+            newsletter = profile.get("newsletter", 0)
             
-            if not result.get("success"):
-                logger.error(f"Failed to get profiles page {page}")
-                break
-            
-            data = result.get("data", {})
-            profiles = data.get("results", [])
-            
-            if not profiles:
-                break
-            
-            for profile in profiles:
-                email = profile.get("primary_email")
-                newsletter = profile.get("newsletter", 0)
-                
-                # Only include profiles with email and newsletter opt-in
-                if email and newsletter == 1:
-                    opted_in.append({
-                        'profile_id': profile.get("profile_id"),
-                        'email': email.lower().strip(),
-                        'name': profile.get("name", "")
-                    })
-            
-            total_pages = data.get("pages", 1)
-            if page >= total_pages:
-                break
-            
-            page += 1
+            # Only include profiles with email and newsletter opt-in
+            if email and newsletter == 1:
+                opted_in.append({
+                    'profile_id': profile.get("profile_id"),
+                    'email': email.lower().strip(),
+                    'name': profile.get("name", "")
+                })
         
         logger.info(f"Found {len(opted_in)} profiles opted in to newsletter")
         return opted_in

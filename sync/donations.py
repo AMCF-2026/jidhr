@@ -32,33 +32,15 @@ class DonationSync:
     def get_profile_emails(self) -> dict:
         """Get mapping of profile_id → email from CSuite"""
         profile_emails = {}
-        page = 1
-        max_pages = 200  # Safety limit
         
-        while page <= max_pages:
-            result = self.csuite.get_profiles(limit=100, page=page)
-            
-            if not result.get("success"):
-                logger.error(f"Failed to get profiles page {page}")
-                break
-            
-            data = result.get("data", {})
-            profiles = data.get("results", [])
-            
-            if not profiles:
-                break
-            
-            for profile in profiles:
-                profile_id = profile.get("profile_id")
-                email = profile.get("primary_email")
-                if profile_id and email:
-                    profile_emails[profile_id] = email.lower().strip()
-            
-            total_pages = data.get("pages", 1)
-            if page >= total_pages:
-                break
-            
-            page += 1
+        # Use the built-in method that handles pagination
+        profiles = self.csuite.get_all_profiles()
+        
+        for profile in profiles:
+            profile_id = profile.get("profile_id")
+            email = profile.get("primary_email")
+            if profile_id and email:
+                profile_emails[profile_id] = email.lower().strip()
         
         logger.info(f"Found {len(profile_emails)} profiles with emails")
         return profile_emails
