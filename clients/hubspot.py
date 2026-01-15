@@ -266,6 +266,40 @@ class HubSpotClient:
         return self._post("crm/v3/objects/tasks", {"properties": properties})
     
     # =========================================================================
+    # TICKETS
+    # =========================================================================
+    
+    def get_tickets(self, limit: int = 10, properties: list = None) -> dict:
+        """Get tickets list
+        
+        Args:
+            limit: Number of tickets to return
+            properties: List of properties to include (default: basic props)
+        """
+        if properties is None:
+            properties = ['subject', 'content', 'hs_pipeline', 'hs_pipeline_stage',
+                         'hs_ticket_priority', 'createdate', 'hs_lastmodifieddate']
+        
+        return self._get("crm/v3/objects/tickets", {
+            "limit": limit,
+            "properties": ",".join(properties)
+        })
+    
+    def get_open_tickets(self, limit: int = 10) -> dict:
+        """Get open tickets only"""
+        return self._post("crm/v3/objects/tickets/search", {
+            "filterGroups": [{
+                "filters": [{
+                    "propertyName": "hs_pipeline_stage",
+                    "operator": "EQ",
+                    "value": "1"  # Stage 1 is typically "New/Open"
+                }]
+            }],
+            "properties": ['subject', 'content', 'hs_pipeline_stage', 'hs_ticket_priority', 'createdate'],
+            "limit": limit
+        })
+    
+    # =========================================================================
     # OWNERS
     # =========================================================================
     

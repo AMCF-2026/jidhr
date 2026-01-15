@@ -26,37 +26,66 @@ class NewsletterSync:
         self.hubspot = HubSpotClient()
         self.subscription_id = Config.HUBSPOT_MARKETING_SUBSCRIPTION_ID
     
-    def get_opted_in_profiles(self) -> list:
-        """Get all CSuite profiles with newsletter opt-in
+    def get_opted_in_profiles(self, limit: int = None) -> list:
+        """Get CSuite profiles with newsletter opt-in
+        
+        Args:
+            limit: Max profiles to check (None = all)
         
         Returns:
             list: Profiles with email and newsletter=1
         """
         opted_in = []
+        offset = 0
+        batch_size = 100
+        profiles_checked = 0
         
-        # Use built-in method that handles pagination
-        profiles = self.csuite.get_all_profiles()
-        
-        for profile in profiles:
-            email = profile.get("primary_email")
-            newsletter = profile.get("newsletter", 0)
+        while True:
+            result = self.csuite.get_profiles(limit=batch_size, offset=offset)
             
-            # Only include profiles with email and newsletter opt-in
-            if email and newsletter == 1:
-                opted_in.append({
-                    'profile_id': profile.get("profile_id"),
-                    'email': email.lower().strip(),
-                    'name': profile.get("name", "")
-                })
+            if not result.get("success"):
+                logger.error(f"Failed to get profiles at offset {offset}")
+                break
+            
+            data = result.get("data", {})
+            profiles = data.get("results", [])
+            
+            if not profiles:
+                break
+            
+            for profile in profiles:
+                email = profile.get("primary_email")
+                newsletter = profile.get("newsletter", 0)
+                
+                # Only include profiles with email and newsletter opt-in
+                if email and newsletter == 1:
+                    opted_in.append({
+                        'profile_id': profile.get("profile_id"),
+                        'email': email.lower().strip(),
+                        'name': profile.get("name", "")
+                    })
+            
+            profiles_checked += len(profiles)
+            
+            # Check if we've hit the limit
+            if limit and profiles_checked >= limit:
+                break
+            
+            # Check if we got fewer than batch_size (last page)
+            if len(profiles) < batch_size:
+                break
+            
+            offset += batch_size
         
-        logger.info(f"Found {len(opted_in)} profiles opted in to newsletter")
+        logger.info(f"Checked {profiles_checked} profiles, found {len(opted_in)} opted in to newsletter")
         return opted_in
     
-    def sync(self, dry_run: bool = False) -> dict:
+    def sync(self, dry_run: bool = False, quick: bool = False) -> dict:
         """Run the newsletter sync
         
         Args:
             dry_run: If True, don't actually update HubSpot
+            quick: If True, only check sample profiles (faster for testing)
         
         Returns:
             dict: Sync results with stats
@@ -69,11 +98,14 @@ class NewsletterSync:
             'details': []
         }
         
-        logger.info("Starting newsletter sync...")
+        # Use limit for dry run or quick mode
+        profile_limit = 500 if (dry_run or quick) else None
+        
+        logger.info(f"Starting newsletter sync... (dry_run={dry_run}, quick={quick})")
         
         # Step 1: Get opted-in profiles from CSuite
         logger.info("Step 1: Getting newsletter opt-ins from CSuite...")
-        opted_in = self.get_opted_in_profiles()
+        opted_in = self.get_opted_in_profiles(limit=profile_limit)
         
         if not opted_in:
             logger.warning("No newsletter opt-ins found in CSuite")
@@ -132,7 +164,12 @@ class NewsletterSync:
         return results
 
 
-def run_newsletter_sync(dry_run: bool = False) -> dict:
-    """Convenience function to run newsletter sync"""
+def run_newsletter_sync(dry_run: bool = False, quick: bool = False) -> dict:
+    """Convenience function to run newsletter sync
+    
+    Args:
+        dry_run: Preview changes without applying them
+        quick: Use sample data for faster testing (500 profiles)
+    """
     sync = NewsletterSync()
-    return sync.sync(dry_run=dry_run)
+    return sync.sync(dry_run=dry_run, quick=quick)

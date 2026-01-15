@@ -128,7 +128,8 @@ class JidhrAssistant:
             dry_run = 'dry run' in query_lower or 'test' in query_lower
             
             try:
-                results = run_newsletter_sync(dry_run=dry_run)
+                # Use quick mode for dry runs to avoid timeout
+                results = run_newsletter_sync(dry_run=dry_run, quick=dry_run)
                 return self._format_newsletter_sync_results(results, dry_run)
             except Exception as e:
                 logger.error(f"Newsletter sync error: {str(e)}")
@@ -185,18 +186,18 @@ class JidhrAssistant:
     
     def _format_newsletter_sync_results(self, results: dict, dry_run: bool) -> str:
         """Format newsletter sync results for display"""
-        prefix = "🧪 **DRY RUN** - " if dry_run else ""
+        prefix = "🧪 **DRY RUN (Sample)** - " if dry_run else ""
         
         response = f"""{prefix}✅ **Newsletter Sync Complete**
 
 📊 **Results:**
-• **{results['subscribed']}** contacts subscribed to marketing emails
+• **{results['subscribed']}** contacts {"would be subscribed" if dry_run else "subscribed"} to marketing emails
 • **{results['already_subscribed']}** contacts already subscribed
 • **{results['not_found']}** contacts not found in HubSpot
 • **{results['errors']}** errors"""
         
         if dry_run:
-            response += "\n\n*Run without 'dry run' to apply changes.*"
+            response += "\n\n⚡ *This dry run used sample data (500 profiles). Run `sync newsletter` without 'dry run' for full sync.*"
         
         return response
     
@@ -325,6 +326,40 @@ class JidhrAssistant:
                 ]
                 context_parts.append(f"CSuite Donations:\n" + "\n".join(donation_list))
                 logger.info(f"Found {len(donation_list)} donations")
+        
+        # Ticket-related queries → HubSpot
+        if any(word in query_lower for word in ['ticket', 'support', 'issue', 'help desk', 'open tickets']):
+            logger.info("Fetching HubSpot tickets...")
+            try:
+                tickets_data = self.hubspot.get_tickets(limit=10)
+                if 'results' in tickets_data:
+                    ticket_list = []
+                    for t in tickets_data['results'][:10]:
+                        props = t.get('properties', {})
+                        subject = props.get('subject', 'No subject')
+                        status = props.get('hs_pipeline_stage', 'Unknown')
+                        ticket_list.append(f"{subject} (Status: {status})")
+                    if ticket_list:
+                        context_parts.append(f"HubSpot Tickets:\n" + "\n".join(ticket_list))
+                        logger.info(f"Found {len(ticket_list)} tickets")
+            except Exception as e:
+                logger.error(f"Error fetching tickets: {str(e)}")
+        
+        # Campaign-related queries → HubSpot
+        if any(word in query_lower for word in ['campaign', 'marketing campaign']):
+            logger.info("Fetching HubSpot campaigns...")
+            try:
+                campaigns_data = self.hubspot.get_campaigns(limit=10)
+                if 'results' in campaigns_data:
+                    campaign_list = [
+                        f"Campaign ID: {c.get('id', 'Unknown')}"
+                        for c in campaigns_data['results'][:5]
+                    ]
+                    if campaign_list:
+                        context_parts.append(f"HubSpot Campaigns:\n" + "\n".join(campaign_list))
+                        logger.info(f"Found {len(campaign_list)} campaigns")
+            except Exception as e:
+                logger.error(f"Error fetching campaigns: {str(e)}")
         
         result = "\n\n".join(context_parts) if context_parts else ""
         logger.info(f"Total context gathered: {len(result)} chars")
