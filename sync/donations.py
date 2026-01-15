@@ -38,6 +38,7 @@ class DonationSync:
         profile_emails = {}
         offset = 0
         batch_size = 100
+        total_fetched = 0
         
         while True:
             result = self.csuite.get_profiles(limit=batch_size, offset=offset)
@@ -52,14 +53,16 @@ class DonationSync:
             if not profiles:
                 break
             
+            total_fetched += len(profiles)
+            
             for profile in profiles:
                 profile_id = profile.get("profile_id")
                 email = profile.get("primary_email")
                 if profile_id and email:
                     profile_emails[profile_id] = email.lower().strip()
             
-            # Check if we've hit the limit
-            if limit and len(profile_emails) >= limit:
+            # Check if we've hit the limit on TOTAL profiles fetched
+            if limit and total_fetched >= limit:
                 break
             
             # Check if we got fewer than batch_size (last page)
@@ -67,12 +70,8 @@ class DonationSync:
                 break
             
             offset += batch_size
-            
-            # Log progress every 500 profiles
-            if offset % 500 == 0:
-                logger.info(f"Fetched {offset} profiles so far...")
         
-        logger.info(f"Found {len(profile_emails)} profiles with emails")
+        logger.info(f"Fetched {total_fetched} profiles, {len(profile_emails)} have emails")
         return profile_emails
     
     def aggregate_donations(self, donations: list) -> dict:

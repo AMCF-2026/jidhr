@@ -243,89 +243,110 @@ class JidhrAssistant:
         # Fund-related queries → CSuite
         if any(word in query_lower for word in ['fund', 'balance', 'daf', 'endowment', 'grant']):
             logger.info("Fetching CSuite funds...")
-            funds_data = self.csuite.get_funds(limit=20)
-            if funds_data.get('success') and funds_data.get('data'):
-                results = funds_data['data'].get('results', [])
-                fund_list = [
-                    f"{f.get('fund_name', 'Unknown')} (ID: {f.get('funit_id', 'N/A')})"
-                    for f in results[:10]
-                ]
-                context_parts.append(f"CSuite Funds:\n" + "\n".join(fund_list))
-                logger.info(f"Found {len(fund_list)} funds")
+            try:
+                funds_data = self.csuite.get_funds(limit=20)
+                if funds_data.get('success') and funds_data.get('data'):
+                    results = funds_data['data'].get('results', [])
+                    fund_list = [
+                        f"{f.get('fund_name', 'Unknown')} (ID: {f.get('funit_id', 'N/A')})"
+                        for f in results[:10]
+                    ]
+                    context_parts.append(f"CSuite Funds:\n" + "\n".join(fund_list))
+                    logger.info(f"Found {len(fund_list)} funds")
+            except Exception as e:
+                logger.error(f"Error fetching funds: {str(e)}")
         
         # Contact-related queries → HubSpot
         if any(word in query_lower for word in ['contact', 'donor', 'email', 'person', 'who']):
             logger.info("Fetching HubSpot contacts...")
-            contacts_data = self.hubspot.get_contacts(limit=10)
-            if 'results' in contacts_data:
-                contact_list = [
-                    f"{c.get('properties', {}).get('firstname', '')} {c.get('properties', {}).get('lastname', '')} ({c.get('properties', {}).get('email', 'No email')})"
-                    for c in contacts_data['results'][:5]
-                ]
-                context_parts.append(f"HubSpot Contacts:\n" + "\n".join(contact_list))
-                logger.info(f"Found {len(contact_list)} contacts")
+            try:
+                contacts_data = self.hubspot.get_contacts(limit=10)
+                if 'results' in contacts_data:
+                    contact_list = [
+                        f"{c.get('properties', {}).get('firstname', '')} {c.get('properties', {}).get('lastname', '')} ({c.get('properties', {}).get('email', 'No email')})"
+                        for c in contacts_data['results'][:5]
+                    ]
+                    context_parts.append(f"HubSpot Contacts:\n" + "\n".join(contact_list))
+                    logger.info(f"Found {len(contact_list)} contacts")
+            except Exception as e:
+                logger.error(f"Error fetching contacts: {str(e)}")
         
         # Form-related queries → HubSpot
         if any(word in query_lower for word in ['form', 'submission', 'inquiry', 'submitted']):
             logger.info("Fetching HubSpot forms...")
-            forms_data = self.hubspot.get_forms(limit=10)
-            if 'results' in forms_data:
-                form_list = [
-                    f"{f.get('name', 'Unknown')} (ID: {f.get('id', 'N/A')})"
-                    for f in forms_data['results'][:5]
-                ]
-                context_parts.append(f"HubSpot Forms:\n" + "\n".join(form_list))
-                logger.info(f"Found {len(form_list)} forms")
+            try:
+                forms_data = self.hubspot.get_forms(limit=10)
+                if 'results' in forms_data:
+                    form_list = [
+                        f"{f.get('name', 'Unknown')} (ID: {f.get('id', 'N/A')})"
+                        for f in forms_data['results'][:5]
+                    ]
+                    context_parts.append(f"HubSpot Forms:\n" + "\n".join(form_list))
+                    logger.info(f"Found {len(form_list)} forms")
+            except Exception as e:
+                logger.error(f"Error fetching forms: {str(e)}")
         
         # Social media queries → HubSpot
         if any(word in query_lower for word in ['social', 'post', 'facebook', 'linkedin', 'schedule', 'channel']):
             logger.info("Fetching HubSpot social channels...")
-            channels_data = self.hubspot.get_social_channels()
-            if isinstance(channels_data, list):
-                channel_list = [
-                    f"{c.get('name', 'Unknown')} ({c.get('channelType', 'Unknown')})"
-                    for c in channels_data[:5]
-                ]
-                context_parts.append(f"Social Channels:\n" + "\n".join(channel_list))
-                logger.info(f"Found {len(channel_list)} channels")
+            try:
+                channels_data = self.hubspot.get_social_channels()
+                if isinstance(channels_data, list):
+                    channel_list = [
+                        f"{c.get('name', 'Unknown')} ({c.get('channelType', 'Unknown')})"
+                        for c in channels_data[:5]
+                    ]
+                    context_parts.append(f"Social Channels:\n" + "\n".join(channel_list))
+                    logger.info(f"Found {len(channel_list)} channels")
+            except Exception as e:
+                logger.error(f"Error fetching social channels: {str(e)}")
         
         # Event-related queries → BOTH CSuite AND HubSpot
         if any(word in query_lower for word in ['event', 'symposium', 'webinar', 'registration', 'gala', 'dinner']):
             # CSuite Events
             logger.info("Fetching CSuite events...")
-            csuite_events = self.csuite.get_event_dates(limit=10)
-            if csuite_events.get('success') and csuite_events.get('data'):
-                results = csuite_events['data'].get('results', [])
-                event_list = [
-                    f"{e.get('event_description') or e.get('event_name', 'Unknown')} ({e.get('event_date', 'No date')})"
-                    for e in results[:5]
-                ]
-                context_parts.append(f"CSuite Events:\n" + "\n".join(event_list))
-                logger.info(f"Found {len(event_list)} CSuite events")
+            try:
+                csuite_events = self.csuite.get_event_dates(limit=10)
+                if csuite_events.get('success') and csuite_events.get('data'):
+                    results = csuite_events['data'].get('results', [])
+                    event_list = [
+                        f"{e.get('event_description') or e.get('event_name', 'Unknown')} ({e.get('event_date', 'No date')})"
+                        for e in results[:5]
+                    ]
+                    context_parts.append(f"CSuite Events:\n" + "\n".join(event_list))
+                    logger.info(f"Found {len(event_list)} CSuite events")
+            except Exception as e:
+                logger.error(f"Error fetching CSuite events: {str(e)}")
             
             # HubSpot Events
             logger.info("Fetching HubSpot marketing events...")
-            hubspot_events = self.hubspot.get_marketing_events(limit=5)
-            if 'results' in hubspot_events:
-                event_list = [
-                    f"{e.get('eventName', 'Unknown')} ({e.get('startDateTime', 'No date')})"
-                    for e in hubspot_events['results'][:5]
-                ]
-                context_parts.append(f"HubSpot Marketing Events:\n" + "\n".join(event_list))
-                logger.info(f"Found {len(event_list)} HubSpot events")
+            try:
+                hubspot_events = self.hubspot.get_marketing_events(limit=5)
+                if 'results' in hubspot_events:
+                    event_list = [
+                        f"{e.get('eventName', 'Unknown')} ({e.get('startDateTime', 'No date')})"
+                        for e in hubspot_events['results'][:5]
+                    ]
+                    context_parts.append(f"HubSpot Marketing Events:\n" + "\n".join(event_list))
+                    logger.info(f"Found {len(event_list)} HubSpot events")
+            except Exception as e:
+                logger.error(f"Error fetching HubSpot events: {str(e)}")
         
         # Donation-related queries → CSuite
         if any(word in query_lower for word in ['donation', 'gift', 'gave', 'contributed', 'recent donations']):
             logger.info("Fetching CSuite donations...")
-            donations_data = self.csuite.get_donations(limit=10)
-            if donations_data.get('success') and donations_data.get('data'):
-                results = donations_data['data'].get('results', [])
-                donation_list = [
-                    f"{d.get('name', 'Unknown')}: ${d.get('donation_amount', '0')} to {d.get('fund_name', 'Unknown')} ({d.get('donation_date', 'No date')})"
-                    for d in results[:5]
-                ]
-                context_parts.append(f"CSuite Donations:\n" + "\n".join(donation_list))
-                logger.info(f"Found {len(donation_list)} donations")
+            try:
+                donations_data = self.csuite.get_donations(limit=10)
+                if donations_data.get('success') and donations_data.get('data'):
+                    results = donations_data['data'].get('results', [])
+                    donation_list = [
+                        f"{d.get('name', 'Unknown')}: ${d.get('donation_amount', '0')} to {d.get('fund_name', 'Unknown')} ({d.get('donation_date', 'No date')})"
+                        for d in results[:5]
+                    ]
+                    context_parts.append(f"CSuite Donations:\n" + "\n".join(donation_list))
+                    logger.info(f"Found {len(donation_list)} donations")
+            except Exception as e:
+                logger.error(f"Error fetching donations: {str(e)}")
         
         # Ticket-related queries → HubSpot
         if any(word in query_lower for word in ['ticket', 'support', 'issue', 'help desk', 'open tickets']):
