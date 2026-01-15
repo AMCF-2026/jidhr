@@ -277,7 +277,7 @@ class HubSpotClient:
             properties: List of properties to include (default: basic props)
         """
         if properties is None:
-            properties = ['subject', 'content', 'hs_pipeline', 'hs_pipeline_stage',
+            properties = ['subject', 'content', 'hs_pipeline', 'hs_pipeline_stage', 
                          'hs_ticket_priority', 'createdate', 'hs_lastmodifieddate']
         
         return self._get("crm/v3/objects/tickets", {
