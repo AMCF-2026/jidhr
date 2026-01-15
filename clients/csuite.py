@@ -232,8 +232,12 @@ class CSuiteClient:
     # =========================================================================
     
     def get_event_dates(self, limit: int = 100) -> dict:
-        """Get event dates list"""
-        return self._request("event_date/list", {"view_limit": limit})
+        """Get event dates list (campaigns)"""
+        return self._request("event/list/dates", {"view_limit": limit})
+    
+    def get_event_date(self, event_date_id: int) -> dict:
+        """Get specific event date details including attendees"""
+        return self._request("event/display/eventdate", {"event_date_id": event_date_id})
     
     def get_event(self, event_id: int) -> dict:
         """Get specific event details"""
