@@ -523,23 +523,43 @@ class CSuiteClient:
         """Get all checks across all pages (5,324+ records)"""
         return self._get_all_pages("check/list", max_iterations=max_iterations)
     
-    def get_uncashed_checks(self, limit: int = 200) -> list:
+    def get_uncashed_checks(self, max_pages: int = 5) -> list:
         """Get checks that haven't been cleared (not cashed yet).
-        
+
         Used by: Muhi's "which charities have cashed their checks" query
-        
+
+        Capped at max_pages (default 5 = 500 checks) to avoid tying up
+        gunicorn workers. Full check list is 5750+ records.
+
         Returns:
             list of check dicts where cleared == 0 and voided == 0
         """
-        all_checks = self._get_all_pages("check/list", batch_size=200)
-        
+        all_checks = []
+        offset = 0
+        batch_size = 100
+
+        for _ in range(max_pages):
+            result = self._request("check/list", {
+                "view_limit": batch_size,
+                "view_offset": offset
+            })
+            if not result.get("success") or not result.get("data"):
+                break
+            page = result["data"].get("results", [])
+            if not page:
+                break
+            all_checks.extend(page)
+            if len(page) < batch_size:
+                break
+            offset += batch_size
+
         uncashed = [
             c for c in all_checks
             if c.get("cleared") == 0 and c.get("voided") == 0
             and not c.get("unused", 0)
         ]
-        
-        logger.info(f"Found {len(uncashed)} uncashed checks out of {len(all_checks)} total")
+
+        logger.info(f"Found {len(uncashed)} uncashed checks out of {len(all_checks)} fetched (capped at {max_pages} pages)")
         return uncashed
     
     # =========================================================================

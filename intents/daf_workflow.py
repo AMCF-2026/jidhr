@@ -24,10 +24,18 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 TRIGGER_PHRASES = [
-    'daf inquiry', 'new daf', 'process daf', 'create daf',
-    'endowment inquiry', 'new endowment', 'process endowment',
+    'new daf', 'process daf', 'create daf', 'open a daf',
+    'new endowment', 'process endowment', 'create endowment',
     'new fund inquiry', 'process inquiry', 'latest inquiry',
     'create profile from', 'create csuite profile',
+    'daf inquiry form', 'endowment inquiry form',
+    'process daf inquiry', 'process endowment inquiry',
+]
+
+# Phrases that should NOT trigger daf_workflow even if they contain trigger words
+_EXCLUDE_PHRASES = [
+    'summary', 'summarize', 'monthly', 'report', 'how many',
+    'this month', 'last month', 'inquiries this', 'inquiry summary',
 ]
 
 
@@ -63,6 +71,9 @@ def can_handle(query: str, workflow_state: dict = None, **kwargs) -> bool:
     if workflow_state and workflow_state.get("active"):
         return workflow_state.get("workflow_type") == "daf"
     q = query.lower().strip()
+    # Don't match summary/report queries that happen to contain "daf inquiry"
+    if any(ex in q for ex in _EXCLUDE_PHRASES):
+        return False
     return any(p in q for p in TRIGGER_PHRASES)
 
 

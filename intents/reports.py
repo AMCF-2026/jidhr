@@ -594,47 +594,54 @@ def _report_uncashed_checks(csuite) -> str:
     if not checks:
         return "✅ **No uncashed checks outstanding!**"
 
-    # Group by vendor
-    by_vendor = {}
+    # Group by account
+    by_account = {}
     total = 0
     for c in checks:
-        vendor = c.get('vendor_name', 'Unknown')
+        account = c.get('account_name', 'Unknown Account')
         amount = float(c.get('amount', 0) or 0)
         total += amount
-        by_vendor.setdefault(vendor, []).append({
-            "number": c.get('check_number', '?'),
+        by_account.setdefault(account, []).append({
+            "number": c.get('check_num') or c.get('check_id', '?'),
             "amount": amount,
             "date": c.get('check_date', 'N/A'),
+            "electronic": c.get('is_electronic', 0),
         })
 
-    # Sort vendors by total outstanding
-    sorted_vendors = sorted(
-        by_vendor.items(),
+    # Sort accounts by total outstanding
+    sorted_accounts = sorted(
+        by_account.items(),
         key=lambda x: sum(ch["amount"] for ch in x[1]),
         reverse=True,
     )
+
+    capped_note = ""
+    if len(checks) >= 500:
+        capped_note = "\n*Showing oldest 500 uncashed checks — contact Finance for full export.*\n"
 
     lines = [
         f"📊 **Uncashed Checks Report**",
         "",
         f"**{len(checks)}** checks outstanding totalling **${total:,.2f}**",
-        "",
-        "**By Recipient:**",
+        capped_note,
+        "**By Account:**",
     ]
 
-    for vendor, vendor_checks in sorted_vendors[:15]:
-        vendor_total = sum(ch["amount"] for ch in vendor_checks)
-        lines.append(f"• **{vendor}** — {len(vendor_checks)} check(s), ${vendor_total:,.2f}")
-        for ch in vendor_checks[:3]:
-            lines.append(f"  #{ch['number']}: ${ch['amount']:,.2f} ({ch['date']})")
-        if len(vendor_checks) > 3:
-            lines.append(f"  ... and {len(vendor_checks) - 3} more")
+    for account, account_checks in sorted_accounts[:15]:
+        account_total = sum(ch["amount"] for ch in account_checks)
+        e_count = sum(1 for ch in account_checks if ch["electronic"])
+        type_note = f" ({e_count} electronic)" if e_count else ""
+        lines.append(f"• **{account}** — {len(account_checks)} check(s), ${account_total:,.2f}{type_note}")
+        for ch in account_checks[:3]:
+            lines.append(f"  Check {ch['number']}: ${ch['amount']:,.2f} ({ch['date']})")
+        if len(account_checks) > 3:
+            lines.append(f"  ... and {len(account_checks) - 3} more")
 
-    if len(sorted_vendors) > 15:
-        lines.append(f"• ... and {len(sorted_vendors) - 15} more recipients")
+    if len(sorted_accounts) > 15:
+        lines.append(f"• ... and {len(sorted_accounts) - 15} more accounts")
 
     lines.append("")
-    lines.append("💡 *Consider following up with recipients on older uncashed checks.*")
+    lines.append("💡 *Consider following up on older uncashed checks.*")
 
     return "\n".join(lines)
 

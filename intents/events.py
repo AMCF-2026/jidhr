@@ -119,12 +119,15 @@ def _list_upcoming(csuite) -> str:
 
     events = result["data"].get("results", [])
     today = datetime.now().strftime("%Y-%m-%d")
-    upcoming = [e for e in events if e.get("event_date", "") >= today and not e.get("archived")]
+    upcoming = [
+        e for e in events
+        if e.get("event_date") and e["event_date"] >= today and not e.get("archived")
+    ]
 
     if not upcoming:
         return "No upcoming events found in CSuite."
 
-    upcoming.sort(key=lambda e: e.get("event_date", ""))
+    upcoming.sort(key=lambda e: e.get("event_date") or "9999")
 
     lines = [f"**Upcoming Events** ({len(upcoming)} found)\n"]
     for e in upcoming[:20]:
@@ -425,7 +428,7 @@ def _compare_events(query: str, query_lower: str, csuite) -> str:
     if not name:
         # Fall back to showing recent events for the user to pick
         non_archived = [e for e in events if not e.get("archived")]
-        non_archived.sort(key=lambda e: e.get("event_date", ""), reverse=True)
+        non_archived.sort(key=lambda e: e.get("event_date") or "0000", reverse=True)
         lines = [
             "I need to know which event to compare. Here are recent events:\n"
         ]
@@ -456,7 +459,7 @@ def _compare_events(query: str, query_lower: str, csuite) -> str:
         return f"No events found matching '{name}'."
 
     # Sort by date — most recent first
-    matches.sort(key=lambda e: e.get("event_date", ""), reverse=True)
+    matches.sort(key=lambda e: e.get("event_date") or "0000", reverse=True)
     current_event = matches[0]
     prior_event = matches[1]
 
@@ -544,7 +547,7 @@ def _find_event(query: str, query_lower: str, csuite) -> dict | str:
     else:
         # No name extracted — show recent events for user to pick
         non_archived = [e for e in events if not e.get("archived")]
-        non_archived.sort(key=lambda e: e.get("event_date", ""), reverse=True)
+        non_archived.sort(key=lambda e: e.get("event_date") or "0000", reverse=True)
         recent = non_archived[:5]
         lines = ["I couldn't determine which event. Here are the most recent:\n"]
         for i, e in enumerate(recent, 1):
