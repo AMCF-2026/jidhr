@@ -9,6 +9,10 @@ from functools import wraps
 from flask import Blueprint, redirect, url_for, session, flash, request, render_template
 from flask_login import LoginManager, UserMixin, login_user, logout_user, current_user
 from authlib.integrations.flask_client import OAuth
+from authlib.integrations.base_client.errors import (
+    MismatchingStateError,
+    OAuthError,
+)
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -57,8 +61,18 @@ def get_or_create_user(email, name=None, picture=None):
 
 @login_manager.user_loader
 def load_user(user_id):
-    """Load user by ID (email) for Flask-Login"""
-    return _users.get(user_id)
+    """Load user by ID (email) for Flask-Login.
+
+    If the user isn't in this worker's memory (e.g. request routed
+    to a different gunicorn worker), reconstruct from the session
+    cookie — the email is the user_id, which is all we need.
+    """
+    user = _users.get(user_id)
+    if user is None and user_id:
+        # Reconstruct on this worker — the session cookie proves auth
+        user = get_or_create_user(user_id)
+        logger.info(f"Reconstructed user on this worker: {user_id}")
+    return user
 
 
 @login_manager.unauthorized_handler
@@ -114,35 +128,47 @@ def callback():
     try:
         # Get token from Google
         token = oauth.google.authorize_access_token()
-        
+
+    except MismatchingStateError:
+        # Google fired a second callback — user is already logged in
+        # from the first one.  Redirect silently without touching the
+        # session so we don't corrupt the valid login.
+        logger.info("Duplicate OAuth callback (MismatchingStateError) — redirecting silently")
+        return redirect(url_for('home'))
+
+    except OAuthError as e:
+        logger.error(f"OAuth error: {e}", exc_info=True)
+        return redirect(url_for('auth.login', error='Authentication failed. Please try again.'))
+
+    try:
         # Get user info
         user_info = token.get('userinfo')
         if not user_info:
             user_info = oauth.google.userinfo()
-        
+
         email = user_info.get('email', '').lower()
         name = user_info.get('name')
         picture = user_info.get('picture')
-        
+
         logger.info(f"OAuth callback for: {email}")
-        
+
         # Validate domain
         if not email.endswith(f'@{Config.ALLOWED_DOMAIN}'):
             logger.warning(f"Access denied - invalid domain: {email}")
             return redirect(url_for('auth.login', error=f'Access restricted to @{Config.ALLOWED_DOMAIN} accounts'))
-        
+
         # Create/get user and log them in
         user = get_or_create_user(email, name, picture)
         login_user(user, remember=True)
-        
+
         logger.info(f"Login successful: {email}")
-        
+
         # Redirect to originally requested page or home
         next_page = session.pop('next', None)
         return redirect(next_page or url_for('home'))
-    
+
     except Exception as e:
-        logger.error(f"OAuth callback error: {str(e)}", exc_info=True)
+        logger.exception(f"OAuth callback error: {e}")
         return redirect(url_for('auth.login', error='Authentication failed. Please try again.'))
 
 
