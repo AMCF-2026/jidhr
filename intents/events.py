@@ -574,13 +574,26 @@ def _find_event(query: str, query_lower: str, csuite) -> dict | str:
     if not events:
         return "No events found in CSuite."
 
-    # Search by name/description match
+    # Search by name/description match — try substring first, then word-level
     if name:
+        name_lower = name.lower()
         matches = [
             e for e in events
-            if name.lower() in (e.get("event_description") or "").lower()
-            or name.lower() in (e.get("event_name") or "").lower()
+            if name_lower in (e.get("event_description") or "").lower()
+            or name_lower in (e.get("event_name") or "").lower()
         ]
+        # If no substring match, try matching individual words (3+ chars)
+        if not matches:
+            search_words = [w for w in name_lower.split() if len(w) >= 3]
+            if search_words:
+                matches = [
+                    e for e in events
+                    if any(
+                        w in (e.get("event_description") or "").lower()
+                        or w in (e.get("event_name") or "").lower()
+                        for w in search_words
+                    )
+                ]
     else:
         # No name extracted — show recent events for user to pick
         non_archived = [
@@ -616,14 +629,15 @@ def _find_event(query: str, query_lower: str, csuite) -> dict | str:
 def _extract_event_name(query: str, query_lower: str) -> str:
     """Extract the event name from a query string."""
     # Remove trigger phrases to isolate the event name
-    all_triggers = _LIST_TRIGGERS + _ATTENDEE_TRIGGERS + _SYNC_TRIGGERS + _FOLLOWUP_TRIGGERS
+    all_triggers = _LIST_TRIGGERS + _ATTENDEE_TRIGGERS + _SYNC_TRIGGERS + _FOLLOWUP_TRIGGERS + _COMPARE_TRIGGERS
     remaining = query_lower
     for phrase in sorted(all_triggers, key=len, reverse=True):
         remaining = remaining.replace(phrase, "")
 
-    # Clean up common filler words
-    for word in ["the", "for", "about", "our", "my", "a", "an"]:
+    # Clean up common filler words and punctuation
+    for word in ["the", "for", "about", "our", "my", "a", "an", "event", "events"]:
         remaining = re.sub(rf"\b{word}\b", "", remaining)
+    remaining = re.sub(r"[?!.,;:]", "", remaining)
 
     name = remaining.strip().strip('"\'')
     return name if len(name) > 2 else ""

@@ -30,7 +30,8 @@ logger = logging.getLogger(__name__)
 _GRANT_TRIGGERS = [
     'how many grants', 'grants last quarter', 'grants this year',
     'grant report', 'grants processed', 'quarterly grants',
-    'grants this quarter', 'grant summary',
+    'grants this quarter', 'grant summary', 'open grants',
+    'show grants', 'list grants', 'recent grants', 'show me grants',
 ]
 
 _LAPSED_TRIGGERS = [
@@ -215,7 +216,7 @@ def _report_grants(query: str, csuite) -> str:
     try:
         all_grants = _fetch_all_grants(csuite)
     except Exception as e:
-        logger.error(f"Error fetching grants: {e}")
+        logger.exception(f"Error fetching grants: {e}")
         return f"❌ Failed to fetch grants: {e}"
 
     # Filter by date range
@@ -945,38 +946,56 @@ def _report_endowment_distributions(csuite) -> str:
     """List endowment funds with their distribution schedule and dates."""
     logger.info("Running endowment distribution report...")
 
-    MAX_DETAIL_CALLS = 20
+    ENDOWMENT_FGROUP_ID = 1008
+    MAX_DETAIL_CALLS = 50  # Budget for detail calls (24 endowments expected)
 
-    # Step 1: Search for endowment funds by name (avoids iterating all 379 funds)
+    # Step 1: Get all fund IDs from the paginated fund list.
+    # The list endpoint doesn't include fgroup_id, so we must fetch
+    # details to filter. We iterate all funds but stop detail calls
+    # at MAX_DETAIL_CALLS to protect workers.
+    all_fund_ids = []
     try:
-        search_result = csuite.search_funds("Endowments")
+        result = csuite.get_funds(limit=100, offset=0)
+        if result.get("success") and result.get("data"):
+            fund_list = result["data"].get("results", [])
+            all_fund_ids = [f.get("funit_id") for f in fund_list if f.get("funit_id")]
+            total_pages = result["data"].get("pages", 1)
+
+            for page in range(1, min(total_pages, 4)):
+                more = csuite.get_funds(limit=100, offset=page * 100)
+                if more.get("success") and more.get("data"):
+                    for f in more["data"].get("results", []):
+                        if f.get("funit_id"):
+                            all_fund_ids.append(f["funit_id"])
     except Exception as e:
-        return f"Failed to search endowment funds: {e}"
+        logger.exception(f"Error fetching fund list: {e}")
+        return f"Failed to fetch funds: {e}"
 
-    results = search_result.get("data", {}).get("results", []) if search_result.get("success") else []
+    if not all_fund_ids:
+        return "No funds found in CSuite."
 
-    # Filter to actual endowment funds (fullname contains ":: Endowments")
-    endowment_ids = [
-        r.get("id") for r in results
-        if "endowment" in (r.get("fullname") or r.get("name") or "").lower()
-        and r.get("id")
-    ]
+    logger.info(f"Found {len(all_fund_ids)} total funds, checking for endowments...")
 
-    if not endowment_ids:
-        return "No endowment funds found in CSuite."
-
-    # Step 2: Fetch details for up to MAX_DETAIL_CALLS funds
+    # Step 2: Fetch details and filter to endowments (fgroup_id=1008).
     endowments = []
-    for fid in endowment_ids[:MAX_DETAIL_CALLS]:
+    calls_made = 0
+    for fid in all_fund_ids:
+        if calls_made >= MAX_DETAIL_CALLS:
+            logger.warning(f"Hit detail call cap ({MAX_DETAIL_CALLS}) — found {len(endowments)} endowments so far")
+            break
         try:
             detail = csuite.get_fund(fid)
+            calls_made += 1
         except Exception:
+            calls_made += 1
             continue
 
         if not detail.get("success") or not detail.get("data"):
             continue
 
         fund_data = detail["data"]
+        if fund_data.get("fgroup_id") != ENDOWMENT_FGROUP_ID:
+            continue
         if fund_data.get("fund_closed"):
             continue
 
@@ -1013,9 +1032,10 @@ def _report_endowment_distributions(csuite) -> str:
             "\n*Note: No endowment funds currently have distribution schedules configured in CSuite.*"
         )
 
-    if len(endowment_ids) > MAX_DETAIL_CALLS:
+    if calls_made >= MAX_DETAIL_CALLS:
         lines.append(
-            f"\n*Showing first {MAX_DETAIL_CALLS} of {len(endowment_ids)} endowment funds.*"
+            f"\n*Note: Checked {calls_made} of {len(all_fund_ids)} funds. "
+            f"Some endowments may not be shown.*"
         )
 
     return "\n".join(lines)
