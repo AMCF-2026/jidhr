@@ -47,6 +47,9 @@ FOLLOWUP_PATTERNS = [
     'schedule it', 'schedule for', 'make it shorter', 'make it longer',
     'save draft', 'post it', 'publish it', 'looks good', 'that works',
     'send it', 'send now', 'done with it',
+    'save to template', 'save this to', 'save to amcf', 'save to giving circle',
+    'add link', 'include link', 'switch to', 'change to',
+    'more professional', 'add emojis', 'less formal', 'more formal',
 ]
 
 
@@ -112,11 +115,13 @@ def handle(query: str, assistant) -> str:
     # Follow-up command with no active draft — tell user clearly
     if _is_followup_command(q):
         return (
-            "I don't have a recent draft to act on. "
-            "What would you like me to create? For example:\n"
+            "I don't have a recent draft to act on — my draft context "
+            "may have been lost between requests. Please start fresh:\n\n"
             "- \"Draft a LinkedIn post about our upcoming event\"\n"
             "- \"Write an email to thank Ramadan donors\"\n"
-            "- \"Create a social post about EverWaqf\""
+            "- \"Create a social post about EverWaqf\"\n\n"
+            "Once I generate a draft, you can use commands like "
+            "\"Post now\", \"Create as draft\", \"Save to AMCF template\", etc."
         )
 
     return "❌ Content command not recognised."
