@@ -18,6 +18,7 @@ Jidhr v1.3 - Complete client covering:
 - Owners
 """
 
+import json
 import logging
 import requests
 from datetime import datetime
@@ -65,75 +66,93 @@ class HubSpotClient:
     # HTTP METHODS
     # =========================================================================
     
+    def _parse_response(self, response, method: str, endpoint: str) -> dict:
+        """Parse a HubSpot API response safely.
+
+        Handles empty bodies, non-JSON responses, and error status codes
+        without crashing the worker.
+        """
+        status = response.status_code
+        logger.info(f"HubSpot {method} {endpoint}: {status}")
+
+        if status >= 400:
+            body = response.text[:300] if response.text else "(empty)"
+            logger.warning(f"HubSpot {method} {endpoint} failed: {status} | {body}")
+
+        if not response.text or not response.text.strip():
+            if 200 <= status < 300:
+                return {"status_code": status}
+            return {"error": f"HubSpot returned {status} with empty body", "status_code": status}
+
+        try:
+            return response.json()
+        except (ValueError, json.JSONDecodeError):
+            snippet = response.text[:200]
+            logger.error(f"HubSpot {method} {endpoint}: non-JSON response ({status}): {snippet}")
+            return {"error": f"Non-JSON response ({status}): {snippet}", "status_code": status}
+
     def _get(self, endpoint: str, params: dict = None) -> dict:
         """Make a GET request to HubSpot API"""
         if not self.access_token:
             logger.error("HubSpot access token not configured")
             return {"error": "HubSpot access token not configured"}
-        
+
         url = f"{self.base_url}/{endpoint}"
         logger.info(f"HubSpot GET: {endpoint} | params: {params}")
-        
+
         try:
-            response = requests.get(
-                url,
-                headers=self.headers,
-                params=params,
-                timeout=30
-            )
-            logger.info(f"HubSpot Response: {response.status_code}")
-            return response.json()
+            response = requests.get(url, headers=self.headers, params=params, timeout=30)
+            return self._parse_response(response, "GET", endpoint)
         except requests.exceptions.RequestException as e:
-            logger.error(f"HubSpot Error: {str(e)}")
+            logger.error(f"HubSpot GET {endpoint} error: {e}")
             return {"error": str(e)}
-    
+
     def _post(self, endpoint: str, data: dict = None) -> dict:
         """Make a POST request to HubSpot API"""
         if not self.access_token:
             logger.error("HubSpot access token not configured")
             return {"error": "HubSpot access token not configured"}
-        
+
         url = f"{self.base_url}/{endpoint}"
         logger.info(f"HubSpot POST: {endpoint}")
-        
+
         try:
-            response = requests.post(
-                url,
-                headers=self.headers,
-                json=data,
-                timeout=30
-            )
-            logger.info(f"HubSpot Response: {response.status_code}")
-            return response.json()
+            response = requests.post(url, headers=self.headers, json=data, timeout=30)
+            return self._parse_response(response, "POST", endpoint)
         except requests.exceptions.RequestException as e:
-            logger.error(f"HubSpot Error: {str(e)}")
+            logger.error(f"HubSpot POST {endpoint} error: {e}")
             return {"error": str(e)}
-    
+
+    def _put(self, endpoint: str, data: dict = None) -> dict:
+        """Make a PUT request to HubSpot API"""
+        if not self.access_token:
+            logger.error("HubSpot access token not configured")
+            return {"error": "HubSpot access token not configured"}
+
+        url = f"{self.base_url}/{endpoint}"
+        logger.info(f"HubSpot PUT: {endpoint}")
+
+        try:
+            response = requests.put(url, headers=self.headers, json=data, timeout=30)
+            return self._parse_response(response, "PUT", endpoint)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"HubSpot PUT {endpoint} error: {e}")
+            return {"error": str(e)}
+
     def _patch(self, endpoint: str, data: dict = None) -> dict:
         """Make a PATCH request to HubSpot API"""
         if not self.access_token:
             logger.error("HubSpot access token not configured")
             return {"error": "HubSpot access token not configured"}
-        
+
         url = f"{self.base_url}/{endpoint}"
         logger.info(f"HubSpot PATCH: {endpoint}")
-        
+
         try:
-            response = requests.patch(
-                url,
-                headers=self.headers,
-                json=data,
-                timeout=30
-            )
-            logger.info(f"HubSpot Response: {response.status_code}")
-            
-            # PATCH may return 204 No Content on success
-            if response.status_code == 204:
-                return {"success": True}
-            
-            return response.json()
+            response = requests.patch(url, headers=self.headers, json=data, timeout=30)
+            return self._parse_response(response, "PATCH", endpoint)
         except requests.exceptions.RequestException as e:
-            logger.error(f"HubSpot Error: {str(e)}")
+            logger.error(f"HubSpot PATCH {endpoint} error: {e}")
             return {"error": str(e)}
     
     def _delete(self, endpoint: str) -> dict:
@@ -141,24 +160,15 @@ class HubSpotClient:
         if not self.access_token:
             logger.error("HubSpot access token not configured")
             return {"error": "HubSpot access token not configured"}
-        
+
         url = f"{self.base_url}/{endpoint}"
         logger.info(f"HubSpot DELETE: {endpoint}")
-        
+
         try:
-            response = requests.delete(
-                url,
-                headers=self.headers,
-                timeout=30
-            )
-            logger.info(f"HubSpot Response: {response.status_code}")
-            
-            if response.status_code == 204:
-                return {"success": True}
-            
-            return response.json()
+            response = requests.delete(url, headers=self.headers, timeout=30)
+            return self._parse_response(response, "DELETE", endpoint)
         except requests.exceptions.RequestException as e:
-            logger.error(f"HubSpot Error: {str(e)}")
+            logger.error(f"HubSpot DELETE {endpoint} error: {e}")
             return {"error": str(e)}
     
     # =========================================================================
@@ -571,19 +581,32 @@ class HubSpotClient:
         return self._get(f"marketing/v3/marketing-events/{event_id}")
     
     def create_marketing_event(self, event_data: dict) -> dict:
-        """Create a marketing event.
-        
-        Required fields:
+        """Create or update a marketing event via PUT.
+
+        HubSpot Marketing Events API requires PUT with externalAccountId
+        and externalEventId in the URL path. POST does not work.
+
+        Required in event_data:
         - eventName: str
-        - eventOrganizer: str (HubSpot owner ID)
         - externalEventId: str (unique ID for deduplication)
-        
-        Optional fields:
+
+        Optional:
         - eventDescription, eventUrl, eventType
         - startDateTime, endDateTime (ISO 8601)
+        - eventOrganizer: str
         - customProperties: list of {name, value}
         """
-        return self._post("marketing/v3/marketing-events", event_data)
+        external_account_id = "jidhr-amcf"
+        external_event_id = event_data.get("externalEventId")
+        if not external_event_id:
+            return {"error": "externalEventId is required"}
+
+        # PUT requires externalEventId in both URL and body
+        endpoint = f"marketing/v3/marketing-events/events/{external_event_id}"
+        event_data["externalAccountId"] = external_account_id
+        event_data["externalEventId"] = external_event_id
+
+        return self._put(endpoint, event_data)
     
     def search_marketing_event_by_external_id(self, external_id: str) -> dict:
         """Search for marketing event by external ID"""
@@ -608,52 +631,93 @@ class HubSpotClient:
         body_html: str,
         template: str = "amcf"
     ) -> dict:
-        """Create a marketing email draft.
-        
+        """Create a marketing email draft in HubSpot.
+
+        Uses a two-step approach for DnD templates:
+        1. Create the email with the template (initializes layout)
+        2. PATCH the email to inject the body content into the main widget
+
+        If no template is found, falls back to a regular (non-template) email
+        with the body content set directly.
+
         Args:
             name: Internal name (e.g., "DAF Portal Launch - Jan 2026")
             subject: Email subject line
             body_html: HTML content for the email body
             template: Template key - "amcf", "newsletter", or "giving circle"
-            
+
         Returns:
             dict with created email details including 'id' and 'edit_url'
         """
         template_key = template.lower().strip()
         template_path = self.EMAIL_TEMPLATES.get(template_key)
-        
-        if not template_path:
-            available = ", ".join(self.EMAIL_TEMPLATES.keys())
-            return {"error": f"Unknown template '{template}'. Available: {available}"}
-        
-        payload = {
-            "name": name,
-            "subject": subject,
-            "templatePath": template_path,
-            "content": {
-                "widgets": {
-                    "hs_email_body": {
-                        "body": {
-                            "html": body_html
-                        },
-                        "id": "hs_email_body",
-                        "label": "Main body",
-                        "name": "hs_email_body",
-                        "type": "rich_text"
+
+        # Step 1: Create the email
+        if template_path:
+            # DnD template — create with template, patch body after
+            create_payload = {
+                "name": name,
+                "subject": subject,
+                "templatePath": template_path,
+            }
+            logger.info(f"Creating email draft: {name} with template: {template_path}")
+        else:
+            # No template — create a regular email with body inline
+            create_payload = {
+                "name": name,
+                "subject": subject,
+                "subcategory": "regular_email",
+                "content": {
+                    "body": body_html,
+                },
+            }
+            logger.info(f"Creating email draft: {name} (no template)")
+
+        logger.info(f"Email create payload keys: {list(create_payload.keys())}")
+        result = self._post("marketing/v3/emails", create_payload)
+
+        if "error" in result or "id" not in result:
+            logger.error(f"Email create failed: {result}")
+            return result
+
+        email_id = result["id"]
+
+        # Step 2: For DnD templates, PATCH the body content into the main widget
+        if template_path:
+            patch_payload = {
+                "content": {
+                    "widgets": {
+                        "hs_email_body": {
+                            "body": {
+                                "html": body_html
+                            },
+                            "id": "hs_email_body",
+                            "label": "Main body",
+                            "name": "hs_email_body",
+                            "type": "rich_text"
+                        }
                     }
                 }
             }
-        }
-        
-        logger.info(f"Creating email draft: {name} with template: {template_path}")
-        result = self._post("marketing/v3/emails", payload)
-        
-        if "id" in result:
-            result["edit_url"] = (
-                f"https://app-na2.hubspot.com/email/"
-                f"{Config.HUBSPOT_PORTAL_ID}/edit/{result['id']}/content"
-            )
-        
+            logger.info(f"Patching email {email_id} with body content ({len(body_html)} chars)")
+            patch_result = self._patch(f"marketing/v3/emails/{email_id}", patch_payload)
+            if patch_result and "error" not in patch_result:
+                logger.info(f"Email {email_id} body content patched successfully")
+            else:
+                # Patch failed — try setting body directly as fallback
+                logger.warning(f"Widget patch failed for {email_id}, trying direct body: {patch_result}")
+                fallback_payload = {
+                    "content": {
+                        "body": body_html
+                    }
+                }
+                self._patch(f"marketing/v3/emails/{email_id}", fallback_payload)
+
+        result["edit_url"] = (
+            f"https://app-na2.hubspot.com/email/"
+            f"{Config.HUBSPOT_PORTAL_ID}/edit/{email_id}/content"
+        )
+
         return result
     
     # =========================================================================
