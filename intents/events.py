@@ -159,43 +159,52 @@ def _list_upcoming(csuite) -> str:
 
 def _show_attendees(query: str, query_lower: str, csuite) -> str:
     """Show attendees for a specific event."""
-    event_data = _find_event(query, query_lower, csuite)
-    if isinstance(event_data, str):
-        return event_data  # Error message
+    try:
+        event_data = _find_event(query, query_lower, csuite)
+        if isinstance(event_data, str):
+            return event_data  # Error message
 
-    event_detail = _fetch_event_detail(event_data["event_date_id"], csuite)
-    if isinstance(event_detail, str):
-        return event_detail  # Error message
+        event_date_id = event_data.get("event_date_id")
+        if not event_date_id:
+            return "Could not determine the event ID. Please try specifying the event name more precisely."
 
-    profiles = event_detail.get("profiles", [])
-    desc = event_detail.get("event_description", event_detail.get("event_name", "Event"))
-    date = event_detail.get("event_date", "")
+        event_detail = _fetch_event_detail(event_date_id, csuite)
+        if isinstance(event_detail, str):
+            return event_detail  # Error message
 
-    rsvp_count = sum(1 for p in profiles if p.get("rsvp"))
-    guest_count = sum(len(p.get("guests", [])) for p in profiles)
+        profiles = event_detail.get("profiles") or []
+        desc = event_detail.get("event_description", event_detail.get("event_name", "Event"))
+        date = event_detail.get("event_date", "")
 
-    lines = [
-        f"**{desc}** — {date}",
-        f"Registered: {len(profiles)} | RSVP'd: {rsvp_count} | Guests: {guest_count}\n",
-    ]
+        rsvp_count = sum(1 for p in profiles if p.get("rsvp"))
+        guest_count = sum(len(p.get("guests", [])) for p in profiles)
 
-    for p in profiles[:50]:
-        name = p.get("event_profile_name", "Unknown")
-        email = p.get("event_profile_email", "no email")
-        rsvp = "RSVP" if p.get("rsvp") else ""
-        attended = "Attended" if p.get("attended") else ""
-        status = " | ".join(filter(None, [rsvp, attended]))
-        status_str = f" [{status}]" if status else ""
-        lines.append(f"- {name} ({email}){status_str}")
-        for g in p.get("guests", []):
-            g_name = g.get("contact_name", "Guest")
-            g_email = g.get("contact_email", "")
-            lines.append(f"  - Guest: {g_name} ({g_email})")
+        lines = [
+            f"**{desc}** — {date}",
+            f"Registered: {len(profiles)} | RSVP'd: {rsvp_count} | Guests: {guest_count}\n",
+        ]
 
-    if len(profiles) > 50:
-        lines.append(f"\n...and {len(profiles) - 50} more attendees")
+        for p in profiles[:50]:
+            name = p.get("event_profile_name", "Unknown")
+            email = p.get("event_profile_email", "no email")
+            rsvp = "RSVP" if p.get("rsvp") else ""
+            attended = "Attended" if p.get("attended") else ""
+            status = " | ".join(filter(None, [rsvp, attended]))
+            status_str = f" [{status}]" if status else ""
+            lines.append(f"- {name} ({email}){status_str}")
+            for g in p.get("guests", []):
+                g_name = g.get("contact_name", "Guest")
+                g_email = g.get("contact_email", "")
+                lines.append(f"  - Guest: {g_name} ({g_email})")
 
-    return "\n".join(lines)
+        if len(profiles) > 50:
+            lines.append(f"\n...and {len(profiles) - 50} more attendees")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.exception(f"Attendee lookup crashed: {e}")
+        return f"Something went wrong fetching attendees. Error: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -204,12 +213,26 @@ def _show_attendees(query: str, query_lower: str, csuite) -> str:
 
 def _start_sync_workflow(query: str, query_lower: str, state: dict, csuite) -> str:
     """Step 1: Search for the event and ask for confirmation."""
-    event_data = _find_event(query, query_lower, csuite)
+    try:
+        event_data = _find_event(query, query_lower, csuite)
+    except Exception as e:
+        logger.exception(f"Event search crashed: {e}")
+        return f"Something went wrong searching for the event. Error: {e}"
+
     if isinstance(event_data, str):
         return event_data  # Error message
 
+    event_date_id = event_data.get("event_date_id")
+    if not event_date_id:
+        return "Could not determine the event ID. Please try specifying the event name more precisely."
+
     # Fetch full details to show attendee count
-    event_detail = _fetch_event_detail(event_data["event_date_id"], csuite)
+    try:
+        event_detail = _fetch_event_detail(event_date_id, csuite)
+    except Exception as e:
+        logger.exception(f"Event detail fetch crashed: {e}")
+        return f"Something went wrong fetching event details. Error: {e}"
+
     if isinstance(event_detail, str):
         return event_detail
 
@@ -460,19 +483,31 @@ def _compare_events(query: str, query_lower: str, csuite) -> str:
             )
         return f"No events found matching '{name}'."
 
-    # Sort by date — most recent first
+    # Filter out events without dates, then sort — most recent first
+    matches = [m for m in matches if m.get("event_date") is not None]
+    if len(matches) < 2:
+        return f"Not enough dated events matching '{name}' to compare."
     matches.sort(key=lambda e: e.get("event_date") or "0000", reverse=True)
     current_event = matches[0]
     prior_event = matches[1]
 
-    # Fetch attendees for both
-    current_detail = _fetch_event_detail(current_event["event_date_id"], csuite)
-    if isinstance(current_detail, str):
-        return current_detail
+    current_eid = current_event.get("event_date_id")
+    prior_eid = prior_event.get("event_date_id")
+    if not current_eid or not prior_eid:
+        return "Could not determine event IDs for comparison."
 
-    prior_detail = _fetch_event_detail(prior_event["event_date_id"], csuite)
-    if isinstance(prior_detail, str):
-        return prior_detail
+    # Fetch attendees for both
+    try:
+        current_detail = _fetch_event_detail(current_eid, csuite)
+        if isinstance(current_detail, str):
+            return current_detail
+
+        prior_detail = _fetch_event_detail(prior_eid, csuite)
+        if isinstance(prior_detail, str):
+            return prior_detail
+    except Exception as e:
+        logger.exception(f"Event comparison fetch crashed: {e}")
+        return f"Something went wrong fetching event details for comparison. Error: {e}"
 
     # Build email sets
     current_emails = {
@@ -548,7 +583,10 @@ def _find_event(query: str, query_lower: str, csuite) -> dict | str:
         ]
     else:
         # No name extracted — show recent events for user to pick
-        non_archived = [e for e in events if not e.get("archived")]
+        non_archived = [
+            e for e in events
+            if not e.get("archived") and e.get("event_date") is not None
+        ]
         non_archived.sort(key=lambda e: e.get("event_date") or "0000", reverse=True)
         recent = non_archived[:5]
         lines = ["I couldn't determine which event. Here are the most recent:\n"]
