@@ -38,13 +38,13 @@ class HubSpotClient:
     # correct AMCF/GC template applied.  We clone these and update the content
     # because HubSpot v3 API does not apply user templates via templateId.
     EMAIL_CLONE_SOURCES = {
-        "amcf": "325698324178",             # Eid Mubarak draft (AMCF template)
-        "amfc": "325698324178",             # alias
-        "master": "325698324178",           # alias
-        "newsletter": "325698324178",       # alias
-        "giving circle": "325698324178",    # TODO: replace with a GC-templated email ID
-        "giving_circle": "325698324178",    # alias
-        "gc": "325698324178",               # alias
+        "amcf": "323772982006",             # Last sent AMCF newsletter (confirmed AMCF branded template)
+        "amfc": "323772982006",             # alias
+        "master": "323772982006",           # alias
+        "newsletter": "323772982006",       # alias
+        "giving circle": "325004407544",    # Last sent GC email (confirmed GC template)
+        "giving_circle": "325004407544",    # alias
+        "gc": "325004407544",               # alias
     }
     
     # Social channel mapping (friendly name -> channel key pattern)
@@ -738,12 +738,19 @@ class HubSpotClient:
         if not body_set:
             logger.error(f"EMAIL {email_id} — ALL body injection approaches failed")
 
-        result["edit_url"] = (
+        # --- Step 4: Verify the template is correct (not plain_text.html) ---
+        final_check = self._get(patch_endpoint)
+        final_template = (final_check.get("content") or {}).get("templatePath", "unknown")
+        logger.info(f"EMAIL {email_id} — final templatePath: {final_template}")
+        if "plain_text" in final_template:
+            logger.warning(f"EMAIL {email_id} — WRONG TEMPLATE: {final_template} (expected AMCF/GC branded template)")
+
+        clone_result["edit_url"] = (
             f"https://app-na2.hubspot.com/email/"
             f"{Config.HUBSPOT_PORTAL_ID}/edit/{email_id}/content"
         )
 
-        return result
+        return clone_result
     
     # =========================================================================
     # SUBSCRIPTIONS (Email/Newsletter)
