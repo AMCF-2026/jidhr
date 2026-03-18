@@ -682,36 +682,66 @@ class HubSpotClient:
 
         email_id = result["id"]
 
-        # Step 2: For DnD templates, PATCH the body content into the main widget
+        # Step 2: PATCH the body content into the email.
+        # For DnD templates, we first GET the email to discover the actual
+        # widget IDs, then patch the correct widget. If that fails, we try
+        # direct body fields as fallback.
+        patch_endpoint = f"marketing/v3/emails/{email_id}"
+        body_set = False
+
         if template_path:
-            patch_payload = {
-                "content": {
-                    "widgets": {
-                        "hs_email_body": {
-                            "body": {
-                                "html": body_html
-                            },
-                            "id": "hs_email_body",
-                            "label": "Main body",
-                            "name": "hs_email_body",
-                            "type": "rich_text"
+            # Try to discover widget IDs from the created email
+            try:
+                email_detail = self._get(patch_endpoint)
+                widgets = (email_detail.get("content") or {}).get("widgets") or {}
+                logger.info(f"Email {email_id} widget IDs: {list(widgets.keys())}")
+
+                if widgets:
+                    # Find the first rich_text widget (that's the body)
+                    target_widget_id = None
+                    for wid, wdata in widgets.items():
+                        if isinstance(wdata, dict) and wdata.get("type") == "rich_text":
+                            target_widget_id = wid
+                            break
+                    # Fall back to hs_email_body or first widget
+                    if not target_widget_id:
+                        target_widget_id = "hs_email_body" if "hs_email_body" in widgets else list(widgets.keys())[0]
+
+                    patch_payload = {
+                        "content": {
+                            "widgets": {
+                                target_widget_id: {
+                                    "body": {"html": body_html},
+                                    "type": "rich_text",
+                                }
+                            }
                         }
                     }
-                }
-            }
-            logger.info(f"Patching email {email_id} with body content ({len(body_html)} chars)")
-            patch_result = self._patch(f"marketing/v3/emails/{email_id}", patch_payload)
-            if patch_result and "error" not in patch_result:
-                logger.info(f"Email {email_id} body content patched successfully")
-            else:
-                # Patch failed — try setting body directly as fallback
-                logger.warning(f"Widget patch failed for {email_id}, trying direct body: {patch_result}")
-                fallback_payload = {
-                    "content": {
-                        "body": body_html
-                    }
-                }
-                self._patch(f"marketing/v3/emails/{email_id}", fallback_payload)
+                    logger.info(f"Patching widget '{target_widget_id}' with {len(body_html)} chars")
+                    patch_result = self._patch(patch_endpoint, patch_payload)
+                    body_set = patch_result and "error" not in patch_result
+                    if body_set:
+                        logger.info(f"Email {email_id} body patched via widget '{target_widget_id}'")
+                    else:
+                        logger.warning(f"Widget patch failed: {patch_result}")
+            except Exception as e:
+                logger.warning(f"Widget discovery failed for {email_id}: {e}")
+
+        # Fallback approaches if widget patch didn't work
+        if not body_set:
+            for field_name in ["body", "htmlBody"]:
+                fallback_payload = {"content": {field_name: body_html}}
+                logger.info(f"Trying fallback: content.{field_name} ({len(body_html)} chars)")
+                patch_result = self._patch(patch_endpoint, fallback_payload)
+                if patch_result and "error" not in patch_result:
+                    logger.info(f"Email {email_id} body set via content.{field_name}")
+                    body_set = True
+                    break
+                else:
+                    logger.warning(f"Fallback content.{field_name} failed: {patch_result}")
+
+        if not body_set:
+            logger.error(f"Could not set body content for email {email_id} — all approaches failed")
 
         result["edit_url"] = (
             f"https://app-na2.hubspot.com/email/"

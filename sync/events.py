@@ -12,6 +12,7 @@ Mapping:
 """
 
 import logging
+import re
 from datetime import datetime, timedelta
 from clients.csuite import CSuiteClient
 from clients.hubspot import HubSpotClient
@@ -29,29 +30,70 @@ class EventSync:
         self.default_owner_id = Config.DEFAULT_EVENT_OWNER_ID
     
     def format_datetime(self, date_str: str, time_str: str = None) -> str:
-        """Convert CSuite date/time to ISO 8601 format
-        
+        """Convert CSuite date/time to ISO 8601 format.
+
+        Handles messy CSuite time formats:
+        - "7:30 pm PST", "10:00 am", "2 pm EST | 11 am PST"
+        - "September 3rd" (plaintext in time field)
+        - None or empty
+
+        Always returns a valid ISO 8601 string — never None.
+        Falls back to midnight of the event date.
+
         Args:
             date_str: Date in YYYY-MM-DD format
-            time_str: Optional time in HH:MM format
-        
+            time_str: Optional time in various CSuite formats
+
         Returns:
-            ISO 8601 datetime string
+            ISO 8601 datetime string (always valid)
         """
         if not date_str:
-            return None
-        
+            return datetime.now().strftime("%Y-%m-%dT10:00:00.000Z")
+
+        # Parse the date portion
         try:
-            if time_str:
-                dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-            else:
-                # Default to 10:00 AM if no time specified
-                dt = datetime.strptime(f"{date_str} 10:00", "%Y-%m-%d %H:%M")
-            
+            base_date = datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            logger.warning(f"Invalid date format: {date_str}")
+            return datetime.now().strftime("%Y-%m-%dT10:00:00.000Z")
+
+        if not time_str or not time_str.strip():
+            # No time — default to 10:00 AM
+            dt = base_date.replace(hour=10, minute=0)
             return dt.strftime("%Y-%m-%dT%H:%M:00.000Z")
-        except ValueError as e:
-            logger.warning(f"Invalid date/time: {date_str} {time_str} - {e}")
-            return None
+
+        # Clean up the time string
+        time_clean = time_str.strip()
+
+        # Handle compound formats: "2 pm EST | 11 am PST" → take the first part
+        if "|" in time_clean:
+            time_clean = time_clean.split("|")[0].strip()
+
+        # Strip timezone suffixes (PST, EST, UTC, CST, MST, etc.)
+        time_clean = re.sub(r'\b[A-Z]{2,4}\b$', '', time_clean).strip()
+        time_clean = re.sub(r'\b(pst|est|cst|mst|utc|edt|pdt|cdt|mdt)\b', '', time_clean, flags=re.IGNORECASE).strip()
+
+        # Try common 12-hour formats
+        for fmt in ["%I:%M %p", "%I:%M%p", "%I %p", "%I%p"]:
+            try:
+                parsed_time = datetime.strptime(time_clean, fmt)
+                dt = base_date.replace(hour=parsed_time.hour, minute=parsed_time.minute)
+                return dt.strftime("%Y-%m-%dT%H:%M:00.000Z")
+            except ValueError:
+                continue
+
+        # Try 24-hour format
+        for fmt in ["%H:%M", "%H:%M:%S"]:
+            try:
+                parsed_time = datetime.strptime(time_clean, fmt)
+                dt = base_date.replace(hour=parsed_time.hour, minute=parsed_time.minute)
+                return dt.strftime("%Y-%m-%dT%H:%M:00.000Z")
+            except ValueError:
+                continue
+
+        # If time_str is plaintext (e.g. "September 3rd") — use midnight
+        logger.info(f"Could not parse time '{time_str}' — using midnight for {date_str}")
+        return base_date.strftime("%Y-%m-%dT00:00:00.000Z")
     
     def calculate_end_time(self, start_datetime: str, duration_hours: int = 2) -> str:
         """Calculate end time by adding duration to start time"""
@@ -98,11 +140,9 @@ class EventSync:
             "eventOrganizer": self.default_owner_id,
             "externalEventId": external_id,
             "eventType": self.map_event_type(csuite_event.get("event_type_code", "")),
+            "startDateTime": start_datetime,  # Always set (format_datetime never returns None)
         }
-        
-        # Add optional fields
-        if start_datetime:
-            hubspot_event["startDateTime"] = start_datetime
+
         if end_datetime:
             hubspot_event["endDateTime"] = end_datetime
         
