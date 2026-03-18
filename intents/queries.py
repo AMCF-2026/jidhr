@@ -25,9 +25,32 @@ def _extract_name(query: str) -> str | None:
     """
     Try to pull a proper name out of a query.
 
-    Looks for capitalised words that aren't common keywords.
+    First strips common command prefixes, then looks for capitalised words.
     Returns the name string or None.
     """
+    # Strip command prefixes to isolate the name
+    _COMMAND_PREFIXES = [
+        'pull up donor profile for', 'pull up profile for',
+        'pull up donor for', 'pull up contact for',
+        'donor profile for', 'contact profile for',
+        'look up donor', 'look up contact', 'look up profile',
+        'look up', 'pull up', 'search for', 'search up',
+        'find donor', 'find contact', 'find profile', 'find',
+        'show me donor', 'show me contact', 'show me profile',
+        'show me', 'show donor', 'show contact', 'show profile',
+        'get donor', 'get contact', 'get profile', 'get info on',
+        'prep for my call with', 'prep for call with',
+        'talking points for', 'call prep for',
+        'who is', "who's",
+    ]
+
+    cleaned = query.strip()
+    cleaned_lower = cleaned.lower()
+    for prefix in sorted(_COMMAND_PREFIXES, key=len, reverse=True):
+        if cleaned_lower.startswith(prefix):
+            cleaned = cleaned[len(prefix):].strip()
+            break
+
     STOP_WORDS = {
         'fund', 'balance', 'daf', 'endowment', 'grant', 'grants',
         'contact', 'donor', 'donors', 'email', 'person', 'who',
@@ -36,10 +59,11 @@ def _extract_name(query: str) -> str | None:
         'look', 'up', 'search', 'check', 'csuite', 'hubspot',
         'donation', 'donations', 'profile', 'ticket', 'task',
         'recent', 'latest', 'last', 'all', 'any', 'many',
+        'pull', 'me', 'my', 'a', 'an',
     }
 
     # Find sequences of capitalised words (2+ chars) that aren't stop words
-    words = query.split()
+    words = cleaned.split()
     name_parts = []
     for word in words:
         clean = re.sub(r'[^\w]', '', word)
@@ -47,6 +71,12 @@ def _extract_name(query: str) -> str | None:
             name_parts.append(clean)
         elif name_parts:
             break  # end of name sequence
+
+    # Fallback: if prefix stripping left us with a clean name, use it
+    if not name_parts and cleaned and len(cleaned) > 1:
+        remaining = cleaned.strip().strip('"\'')
+        if remaining and remaining[0].isupper():
+            return remaining
 
     return ' '.join(name_parts) if name_parts else None
 
@@ -385,9 +415,9 @@ def _gather_form_context(query_lower: str, hubspot) -> list:
 
 
 def _gather_social_context(hubspot) -> list:
-    """Social channels from HubSpot."""
+    """Social channels and recent broadcasts from HubSpot."""
     parts = []
-    logger.info("Fetching HubSpot social channels...")
+    logger.info("Fetching HubSpot social context...")
     try:
         channels_data = hubspot.get_social_channels()
         if isinstance(channels_data, list):
@@ -399,6 +429,36 @@ def _gather_social_context(hubspot) -> list:
             logger.info(f"Found {len(channel_list)} channels")
     except Exception as e:
         logger.error(f"Error fetching social channels: {e}")
+
+    # Fetch recent broadcasts for context
+    try:
+        broadcasts = hubspot.get_social_broadcasts(limit=5)
+        if isinstance(broadcasts, list) and broadcasts:
+            broadcast_list = []
+            for b in broadcasts[:5]:
+                status = b.get("status", "Unknown")
+                created = b.get("createdAt", "")
+                channel = b.get("channelKey", "")
+                clicks = b.get("clicks", 0)
+                interactions = b.get("interactions", 0)
+                broadcast_list.append(
+                    f"  - {channel} | Status: {status} | "
+                    f"Clicks: {clicks} | Interactions: {interactions}"
+                )
+            parts.append("Recent Social Posts:\n" + "\n".join(broadcast_list))
+        elif not broadcasts:
+            parts.append(
+                "Social Analytics Note: HubSpot does not provide a dedicated "
+                "social performance metrics API via personal access tokens. "
+                "For detailed social analytics, use the HubSpot Social dashboard directly."
+            )
+    except Exception as e:
+        logger.error(f"Error fetching social broadcasts: {e}")
+        parts.append(
+            "Social Analytics Note: Could not fetch social data. "
+            "For performance metrics, use the HubSpot Social dashboard directly."
+        )
+
     return parts
 
 

@@ -945,39 +945,29 @@ def _report_endowment_distributions(csuite) -> str:
     """List endowment funds with their distribution schedule and dates."""
     logger.info("Running endowment distribution report...")
 
-    ENDOWMENT_FGROUP_ID = 1008
+    MAX_DETAIL_CALLS = 20
 
-    # Fetch all funds (paginated) and filter for endowments
-    endowment_funds = []
-    offset = 0
-    limit = 100
+    # Step 1: Search for endowment funds by name (avoids iterating all 379 funds)
+    try:
+        search_result = csuite.search_funds("Endowments")
+    except Exception as e:
+        return f"Failed to search endowment funds: {e}"
 
-    for _ in range(5):  # Max 5 pages
-        try:
-            result = csuite.get_funds(limit=limit, offset=offset)
-        except Exception as e:
-            return f"Failed to fetch funds: {e}"
+    results = search_result.get("data", {}).get("results", []) if search_result.get("success") else []
 
-        if not result.get("success") or not result.get("data"):
-            break
+    # Filter to actual endowment funds (fullname contains ":: Endowments")
+    endowment_ids = [
+        r.get("id") for r in results
+        if "endowment" in (r.get("fullname") or r.get("name") or "").lower()
+        and r.get("id")
+    ]
 
-        fund_list = result["data"].get("results", [])
-        if not fund_list:
-            break
+    if not endowment_ids:
+        return "No endowment funds found in CSuite."
 
-        # We need fund details to check fgroup_id — collect fund IDs first
-        for f in fund_list:
-            endowment_funds.append(f.get("funit_id"))
-
-        if len(fund_list) < limit:
-            break
-        offset += limit
-
-    # Now fetch details for each fund and filter to endowments
+    # Step 2: Fetch details for up to MAX_DETAIL_CALLS funds
     endowments = []
-    for fid in endowment_funds:
-        if not fid:
-            continue
+    for fid in endowment_ids[:MAX_DETAIL_CALLS]:
         try:
             detail = csuite.get_fund(fid)
         except Exception:
@@ -987,16 +977,10 @@ def _report_endowment_distributions(csuite) -> str:
             continue
 
         fund_data = detail["data"]
-        if fund_data.get("fgroup_id") != ENDOWMENT_FGROUP_ID:
-            continue
         if fund_data.get("fund_closed"):
             continue
 
         endowments.append(fund_data)
-
-        # Stop early if we've found enough — don't fetch all 379 funds
-        if len(endowments) >= 50:
-            break
 
     if not endowments:
         return "No open endowment funds found in CSuite."
@@ -1029,6 +1013,9 @@ def _report_endowment_distributions(csuite) -> str:
             "\n*Note: No endowment funds currently have distribution schedules configured in CSuite.*"
         )
 
-    return "\n".join(lines)
+    if len(endowment_ids) > MAX_DETAIL_CALLS:
+        lines.append(
+            f"\n*Showing first {MAX_DETAIL_CALLS} of {len(endowment_ids)} endowment funds.*"
+        )
 
     return "\n".join(lines)

@@ -32,8 +32,10 @@ _LIST_TRIGGERS = [
 
 _ATTENDEE_TRIGGERS = [
     "who's registered", "who is registered", "who registered",
+    "who is attending", "who's attending", "who attended",
     "attendees for", "registrations for", "event attendees",
-    "who signed up",
+    "who signed up", "rsvp list for", "registered for",
+    "attendance for", "attendance list",
 ]
 
 _SYNC_TRIGGERS = [
