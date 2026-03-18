@@ -34,15 +34,17 @@ class HubSpotClient:
     # TEMPLATE & CHANNEL MAPPINGS
     # =========================================================================
     
-    # Email template IDs (confirmed from HubSpot UI)
-    EMAIL_TEMPLATES = {
-        "amcf": 247058757328,
-        "amfc": 247058757328,               # alias
-        "master": 247058757328,             # alias
-        "newsletter": 247058757328,         # alias
-        "giving circle": 245705415357,
-        "giving_circle": 245705415357,      # alias
-        "gc": 245705415357,                 # alias
+    # Clone source email IDs — existing HubSpot emails that already have the
+    # correct AMCF/GC template applied.  We clone these and update the content
+    # because HubSpot v3 API does not apply user templates via templateId.
+    EMAIL_CLONE_SOURCES = {
+        "amcf": "325698324178",             # Eid Mubarak draft (AMCF template)
+        "amfc": "325698324178",             # alias
+        "master": "325698324178",           # alias
+        "newsletter": "325698324178",       # alias
+        "giving circle": "325698324178",    # TODO: replace with a GC-templated email ID
+        "giving_circle": "325698324178",    # alias
+        "gc": "325698324178",               # alias
     }
     
     # Social channel mapping (friendly name -> channel key pattern)
@@ -635,12 +637,12 @@ class HubSpotClient:
     ) -> dict:
         """Create a marketing email draft in HubSpot.
 
-        Two-step process:
-        1. Create email from template ID
-        2. GET the email to discover widget structure, then PATCH body content
-           into the correct widget. Tries multiple field names as fallback.
+        Uses clone-and-patch approach because HubSpot v3 API does not apply
+        user-created templates via templateId.
 
-        Full request/response logging is enabled to diagnose body injection issues.
+        Process:
+        1. Clone a known AMCF-templated email (preserves template + branding)
+        2. PATCH the clone with new name, subject, and body content
 
         Args:
             name: Internal name (e.g., "DAF Portal Launch - Jan 2026")
@@ -652,99 +654,84 @@ class HubSpotClient:
             dict with created email details including 'id' and 'edit_url'
         """
         template_key = template.lower().strip()
-        template_id = self.EMAIL_TEMPLATES.get(template_key)
+        clone_source_id = self.EMAIL_CLONE_SOURCES.get(template_key)
 
-        # --- Step 1: Create the email ---
-        if template_id:
-            create_payload = {
-                "name": name,
-                "subject": subject,
-                "content": {
-                    "templateId": template_id,
-                },
-            }
-        else:
-            # No template match — create a regular email with body inline
-            create_payload = {
-                "name": name,
-                "subject": subject,
-                "subcategory": "regular_email",
-                "content": {
-                    "body": body_html,
-                },
-            }
+        if not clone_source_id:
+            available = ", ".join(self.EMAIL_CLONE_SOURCES.keys())
+            return {"error": f"Unknown template '{template}'. Available: {available}"}
 
-        logger.info(f"EMAIL CREATE — payload: {json.dumps(create_payload, default=str)[:500]}")
-        result = self._post("marketing/v3/emails", create_payload)
-        logger.info(f"EMAIL CREATE — response: {json.dumps(result, default=str)[:500]}")
+        # --- Step 1: Clone the source email ---
+        clone_endpoint = f"marketing/v3/emails/{clone_source_id}/clone"
+        clone_payload = {"name": name}
 
-        if "error" in result or "id" not in result:
-            logger.error(f"Email create failed: {result}")
-            return result
+        logger.info(f"EMAIL CLONE — source: {clone_source_id}, name: {name}")
+        clone_result = self._post(clone_endpoint, clone_payload)
+        logger.info(f"EMAIL CLONE — response: {json.dumps(clone_result, default=str)[:500]}")
 
-        email_id = result["id"]
+        if "error" in clone_result or "id" not in clone_result:
+            logger.error(f"Email clone failed: {clone_result}")
+            return clone_result
+
+        email_id = clone_result["id"]
         patch_endpoint = f"marketing/v3/emails/{email_id}"
 
-        # --- Step 2: Inject body content ---
-        # First GET the email to see its content structure
+        # --- Step 2: GET the cloned email to discover widget structure ---
         email_detail = self._get(patch_endpoint)
         content_obj = email_detail.get("content") or {}
         widgets = content_obj.get("widgets") or {}
         logger.info(f"EMAIL GET — content keys: {list(content_obj.keys())}")
         logger.info(f"EMAIL GET — widget IDs: {list(widgets.keys())}")
 
-        # Log each widget's type and structure
         for wid, wdata in widgets.items():
             wtype = wdata.get("type", "?") if isinstance(wdata, dict) else "?"
-            logger.info(f"  widget '{wid}': type={wtype}, keys={list(wdata.keys()) if isinstance(wdata, dict) else '?'}")
+            logger.info(f"  widget '{wid}': type={wtype}")
 
+        # --- Step 3: PATCH subject + body content ---
+        # Find the body widget (rich_text type)
+        target_widget_id = None
+        for wid, wdata in widgets.items():
+            if isinstance(wdata, dict) and wdata.get("type") == "rich_text":
+                target_widget_id = wid
+                break
+        if not target_widget_id:
+            for candidate in ["hs_email_body", "body", "main_body"]:
+                if candidate in widgets:
+                    target_widget_id = candidate
+                    break
+        if not target_widget_id and widgets:
+            target_widget_id = list(widgets.keys())[0]
+
+        patch_payload = {"subject": subject}
         body_set = False
 
-        # Approach 1: Patch into discovered rich_text widget
-        if widgets:
-            target_widget_id = None
-            for wid, wdata in widgets.items():
-                if isinstance(wdata, dict) and wdata.get("type") == "rich_text":
-                    target_widget_id = wid
-                    break
-            if not target_widget_id:
-                # Try known widget IDs
-                for candidate in ["hs_email_body", "body", "main_body"]:
-                    if candidate in widgets:
-                        target_widget_id = candidate
-                        break
-            if not target_widget_id and widgets:
-                target_widget_id = list(widgets.keys())[0]
-
-            if target_widget_id:
-                patch_payload = {
-                    "content": {
-                        "widgets": {
-                            target_widget_id: {
-                                "body": {"html": body_html},
-                                "type": "rich_text",
-                            }
-                        }
+        if target_widget_id:
+            patch_payload["content"] = {
+                "widgets": {
+                    target_widget_id: {
+                        "body": {"html": body_html},
+                        "type": "rich_text",
                     }
                 }
-                logger.info(f"EMAIL PATCH attempt 1 — widget '{target_widget_id}', payload: {json.dumps(patch_payload, default=str)[:300]}")
-                patch_result = self._patch(patch_endpoint, patch_payload)
-                logger.info(f"EMAIL PATCH attempt 1 — response: {json.dumps(patch_result, default=str)[:300]}")
-                body_set = patch_result and "error" not in patch_result and patch_result.get("status_code", 200) < 400
+            }
+            logger.info(f"EMAIL PATCH — subject + widget '{target_widget_id}' ({len(body_html)} chars)")
+            patch_result = self._patch(patch_endpoint, patch_payload)
+            logger.info(f"EMAIL PATCH — response: {json.dumps(patch_result, default=str)[:300]}")
+            body_set = patch_result and "error" not in patch_result and patch_result.get("status_code", 200) < 400
+            if body_set:
+                logger.info(f"EMAIL {email_id} — body set via widget '{target_widget_id}'")
 
-        # Approach 2-4: Try direct content fields
+        # Fallback: try direct content fields if widget patch failed
         if not body_set:
-            approaches = [
-                ("content.body", {"content": {"body": body_html}}),
-                ("content.htmlBody", {"content": {"htmlBody": body_html}}),
-                ("content.simple_html_body", {"content": {"simple_html_body": body_html}}),
-            ]
-            for label, payload in approaches:
-                logger.info(f"EMAIL PATCH attempt '{label}' — {len(body_html)} chars")
-                patch_result = self._patch(patch_endpoint, payload)
-                logger.info(f"EMAIL PATCH '{label}' — response: {json.dumps(patch_result, default=str)[:300]}")
+            # Still update the subject even if body approaches fail
+            self._patch(patch_endpoint, {"subject": subject})
+
+            for field_name in ["body", "htmlBody", "simple_html_body"]:
+                fallback = {"content": {field_name: body_html}}
+                logger.info(f"EMAIL PATCH fallback '{field_name}' ({len(body_html)} chars)")
+                patch_result = self._patch(patch_endpoint, fallback)
+                logger.info(f"EMAIL PATCH '{field_name}' — response: {json.dumps(patch_result, default=str)[:300]}")
                 if patch_result and "error" not in patch_result and patch_result.get("status_code", 200) < 400:
-                    logger.info(f"EMAIL BODY SET via {label}")
+                    logger.info(f"EMAIL {email_id} — body set via content.{field_name}")
                     body_set = True
                     break
 
