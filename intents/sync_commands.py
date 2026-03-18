@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DONATION_SYNC_PHRASES = ['sync donations', 'sync donation', 'update donations']
-EVENT_SYNC_PHRASES = ['sync events', 'sync event', 'update events']
+EVENT_SYNC_PHRASES = ['sync events', 'update events']  # "sync event [name]" → events.py attendee sync
 NEWSLETTER_SYNC_PHRASES = ['sync newsletter', 'sync newsletters', 'update newsletter', 'sync subscriptions']
 ALL_SYNC_PHRASES = ['sync all', 'sync everything', 'run all syncs']
 

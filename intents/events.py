@@ -245,7 +245,7 @@ def _start_sync_workflow(query: str, query_lower: str, state: dict, csuite) -> s
         "active": True,
         "workflow_type": "events",
         "step": "confirm_sync",
-        "event_date_id": event_data["event_date_id"],
+        "event_date_id": event_date_id,
         "event_description": desc,
         "event_date": date,
         "attendee_count": len(profiles),
