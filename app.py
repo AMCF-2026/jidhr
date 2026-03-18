@@ -8,7 +8,7 @@ This is the entry point - all the logic lives in assistant.py and clients/
 
 import logging
 import sys
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, session
 from flask_login import login_required, current_user
 from werkzeug.middleware.proxy_fix import ProxyFix
 from config import Config
@@ -93,7 +93,7 @@ def chat():
             return jsonify({"error": "Failed to initialize assistant. Please try again."}), 500
 
         try:
-            response = assistant.process_query(message)
+            response = assistant.process_query(message, flask_session=session)
         except Exception as e:
             logger.exception(f"process_query crashed for user {current_user.id}: {e}")
             return jsonify({"error": f"Something went wrong processing your request: {e}"}), 500
@@ -114,7 +114,7 @@ def clear():
     try:
         log_user_action("Cleared conversation")
         assistant = get_assistant(current_user.id)
-        assistant.clear_history()
+        assistant.clear_history(flask_session=session)
         return jsonify({"status": "cleared"})
     except Exception as e:
         logger.exception(f"Clear error: {e}")
