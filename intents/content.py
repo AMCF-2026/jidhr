@@ -28,6 +28,10 @@ EMAIL_PATTERNS = [
     'draft an email', 'draft email', 'write an email', 'write email',
     'create an email', 'create email', 'compose an email', 'compose email',
     'email draft', 'marketing email', 'newsletter about',
+    'write a newsletter', 'write the newsletter', 'draft a newsletter',
+    'draft the newsletter', 'create a newsletter', 'write newsletter',
+    'draft newsletter', 'newsletter draft', 'newsletter blurb',
+    'weekly newsletter', 'monthly newsletter', 'amcf newsletter',
 ]
 
 SOCIAL_PATTERNS = [
@@ -35,6 +39,14 @@ SOCIAL_PATTERNS = [
     'facebook post', 'linkedin post', 'twitter post', 'instagram post',
     'social media post', 'social post', 'draft a facebook', 'draft a linkedin',
     'draft a twitter', 'draft an instagram', 'write a facebook', 'write a linkedin',
+]
+
+# Follow-up commands that should resolve against pending content, not start new intents
+FOLLOWUP_PATTERNS = [
+    'create as draft', 'save as draft', 'post now', 'publish now',
+    'schedule it', 'schedule for', 'make it shorter', 'make it longer',
+    'save draft', 'post it', 'publish it', 'looks good', 'that works',
+    'send it', 'send now', 'done with it',
 ]
 
 
@@ -58,6 +70,10 @@ def can_handle(query: str, draft_state: dict = None, **kwargs) -> bool:
 
     # Active draft conversation (refinement, save, cancel, etc.)
     if draft_state and draft_state.get("active"):
+        return True
+
+    # Follow-up commands — only match if there's a pending draft
+    if _is_followup_command(q):
         return True
 
     return False
@@ -93,6 +109,16 @@ def handle(query: str, assistant) -> str:
     if assistant.draft_state.get("active"):
         return _handle_draft_conversation(query, assistant)
 
+    # Follow-up command with no active draft — tell user clearly
+    if _is_followup_command(q):
+        return (
+            "I don't have a recent draft to act on. "
+            "What would you like me to create? For example:\n"
+            "- \"Draft a LinkedIn post about our upcoming event\"\n"
+            "- \"Write an email to thank Ramadan donors\"\n"
+            "- \"Create a social post about EverWaqf\""
+        )
+
     return "❌ Content command not recognised."
 
 
@@ -110,6 +136,10 @@ def _is_email_draft_request(query: str) -> bool:
 
 def _is_social_post_request(query: str) -> bool:
     return any(p in query for p in SOCIAL_PATTERNS)
+
+
+def _is_followup_command(query: str) -> bool:
+    return any(p in query for p in FOLLOWUP_PATTERNS)
 
 
 # ---------------------------------------------------------------------------

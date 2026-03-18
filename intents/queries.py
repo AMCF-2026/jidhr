@@ -799,51 +799,70 @@ def _gather_fund_contacts_context(query: str, query_lower: str, hubspot, csuite)
 # ---------------------------------------------------------------------------
 
 def _gather_giving_circle_context(query_lower: str, hubspot) -> list:
-    """Fetch Giving Circle members from HubSpot list 126, grouped by constituent_codes."""
+    """Fetch Giving Circle data from BOTH HubSpot lists. Returns raw data only — no analysis."""
     parts = []
 
+    # --- List 126: AMCF Women's Giving Circle (Static, 130 members) ---
     try:
-        contacts = hubspot.get_giving_circle_member_details(limit=130)
-        if not contacts:
-            parts.append("Giving Circle: No members found in list 126.")
-            return parts
-
-        # Group by constituent_codes value
-        by_code = {}
-        for c in contacts:
-            props = c.get("properties", {})
-            name = f"{props.get('firstname', '')} {props.get('lastname', '')}".strip()
-            email = props.get("email", "no email")
-            code = props.get("constituent_codes", "") or "No code set"
-
-            entry = f"{name} ({email})"
-            by_code.setdefault(code, []).append(entry)
-
-        summary = [f"Giving Circle Members (List 126): {len(contacts)} total"]
-
-        # Show groups with the GC-specific code first
-        gc_code = "American Muslim Women's Giving Circle"
-        if gc_code in by_code:
-            summary.append(f"\n{gc_code} ({len(by_code[gc_code])}):")
-            for m in by_code[gc_code][:20]:
-                summary.append(f"  - {m}")
-            if len(by_code[gc_code]) > 20:
-                summary.append(f"  ...and {len(by_code[gc_code]) - 20} more")
-
-        # Show other codes
-        for code, members in sorted(by_code.items()):
-            if code == gc_code:
-                continue
-            summary.append(f"\n{code} ({len(members)}):")
-            for m in members[:10]:
-                summary.append(f"  - {m}")
-            if len(members) > 10:
-                summary.append(f"  ...and {len(members) - 10} more")
-
-        parts.append("\n".join(summary))
-        logger.info(f"Found {len(contacts)} Giving Circle members")
-
+        members_126 = hubspot.get_giving_circle_member_details(limit=130)
+        if members_126:
+            lines = [
+                f"**AMCF Women's Giving Circle** (List 126 — Static)",
+                f"Members: {len(members_126)}",
+                "",
+            ]
+            for c in members_126[:10]:
+                props = c.get("properties", {})
+                name = f"{props.get('firstname', '')} {props.get('lastname', '')}".strip()
+                email = props.get("email", "no email")
+                lines.append(f"  - {name} ({email})")
+            if len(members_126) > 10:
+                lines.append(f"  ...and {len(members_126) - 10} more")
+            parts.append("\n".join(lines))
+            logger.info(f"List 126: {len(members_126)} GC members")
+        else:
+            parts.append("List 126 (AMCF Women's Giving Circle): No members found.")
     except Exception as e:
-        logger.error(f"Error fetching Giving Circle members: {e}")
+        logger.exception(f"Error fetching List 126 (GC members): {e}")
+
+    # --- List 31: Giving Circle Email List (Active, ~450 contacts) ---
+    try:
+        memberships_31 = hubspot._get(
+            f"crm/v3/lists/{Config.GIVING_CIRCLE_EMAIL_LIST_ID}/memberships",
+            {"limit": 250}
+        )
+        count_31 = len(memberships_31.get("results", [])) if memberships_31 else 0
+
+        if count_31 > 0:
+            # Fetch first 10 contact details for display
+            record_ids = [str(m.get("recordId")) for m in memberships_31.get("results", [])[:10]]
+            contacts_31 = []
+            if record_ids:
+                batch_result = hubspot._post("crm/v3/objects/contacts/batch/read", {
+                    "inputs": [{"id": rid} for rid in record_ids],
+                    "properties": ["firstname", "lastname", "email"]
+                })
+                if batch_result and "results" in batch_result:
+                    contacts_31 = batch_result["results"]
+
+            lines = [
+                f"\n**Giving Circle Email List** (List 31 — Active)",
+                f"Contacts: {count_31}+",
+                f"Filter: GC Email form submission OR constituent code contains 'American Muslim Women's Giving Circle'",
+                "",
+            ]
+            for c in contacts_31[:10]:
+                props = c.get("properties", {})
+                name = f"{props.get('firstname', '')} {props.get('lastname', '')}".strip()
+                email = props.get("email", "no email")
+                lines.append(f"  - {name} ({email})")
+            if count_31 > 10:
+                lines.append(f"  ...and {count_31 - 10} more")
+            parts.append("\n".join(lines))
+            logger.info(f"List 31: {count_31} GC email contacts")
+        else:
+            parts.append("\nList 31 (Giving Circle Email List): No contacts found.")
+    except Exception as e:
+        logger.exception(f"Error fetching List 31 (GC email list): {e}")
 
     return parts
