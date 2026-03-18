@@ -135,8 +135,16 @@ class EventSync:
         # External ID for deduplication
         external_id = f"csuite-{csuite_event.get('event_date_id', csuite_event.get('event_id', 'unknown'))}"
         
+        # Fold location into the event description (HubSpot Marketing Events
+        # don't support a "location" property by default)
+        location = csuite_event.get("location")
+        description = event_name
+        if location:
+            description = f"{event_name} | {location}"
+
         hubspot_event = {
             "eventName": event_name,
+            "eventDescription": description,
             "eventOrganizer": self.default_owner_id,
             "externalEventId": external_id,
             "eventType": self.map_event_type(csuite_event.get("event_type_code", "")),
@@ -145,14 +153,7 @@ class EventSync:
 
         if end_datetime:
             hubspot_event["endDateTime"] = end_datetime
-        
-        # Add location as custom property if available
-        location = csuite_event.get("location")
-        if location:
-            hubspot_event["customProperties"] = [
-                {"name": "location", "value": location}
-            ]
-        
+
         return hubspot_event
     
     def event_exists(self, external_id: str) -> bool:
@@ -241,11 +242,25 @@ class EventSync:
             
             # Create in HubSpot
             create_result = self.hubspot.create_marketing_event(hubspot_event)
-            
-            if "error" in create_result:
+
+            # Check for failure: "error" key from our client, "message" key
+            # from HubSpot validation errors, or status_code >= 400
+            status_code = create_result.get("status_code", 200)
+            has_error = (
+                "error" in create_result
+                or create_result.get("status") == "error"
+                or (isinstance(status_code, int) and status_code >= 400)
+            )
+
+            if has_error:
+                error_msg = (
+                    create_result.get("error")
+                    or create_result.get("message")
+                    or str(create_result)
+                )
                 results['errors'] += 1
-                logger.error(f"Failed to create event {event_name}: {create_result['error']}")
-                results['details'].append(f"Error creating {event_name}: {create_result['error']}")
+                logger.error(f"Failed to create event {event_name} (HTTP {status_code}): {error_msg}")
+                results['details'].append(f"Error creating {event_name}: {error_msg}")
             else:
                 results['created'] += 1
                 logger.info(f"Created event: {event_name}")
