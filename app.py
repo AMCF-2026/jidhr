@@ -73,35 +73,52 @@ def chat():
     """Process a chat message"""
     try:
         data = request.get_json()
+        if not data:
+            logger.warning("No JSON body received")
+            return jsonify({"error": "Invalid request"}), 400
+
         message = data.get('message', '').strip()
-        
+
         if not message:
             logger.warning("Empty message received")
             return jsonify({"error": "No message provided"}), 400
-        
+
         log_user_action("Chat request", message[:100] + "..." if len(message) > 100 else message)
-        
-        # Get assistant and process query
-        assistant = get_assistant()
-        response = assistant.process_query(message)
-        
+
+        # Get per-user assistant (reconstructed if this worker doesn't have it)
+        try:
+            assistant = get_assistant(current_user.id)
+        except Exception as e:
+            logger.exception(f"Failed to initialize assistant for user {current_user.id}: {e}")
+            return jsonify({"error": "Failed to initialize assistant. Please try again."}), 500
+
+        try:
+            response = assistant.process_query(message)
+        except Exception as e:
+            logger.exception(f"process_query crashed for user {current_user.id}: {e}")
+            return jsonify({"error": f"Something went wrong processing your request: {e}"}), 500
+
         log_user_action("Chat response", response[:100] + "..." if len(response) > 100 else response)
-        
+
         return jsonify({"response": response})
-    
+
     except Exception as e:
-        logger.error(f"Chat error: {str(e)}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+        logger.exception(f"Unhandled chat error for user {current_user.id if current_user.is_authenticated else 'unknown'}: {e}")
+        return jsonify({"error": "An unexpected error occurred. Please try again."}), 500
 
 
 @app.route('/clear', methods=['POST'])
 @login_required
 def clear():
     """Clear conversation history"""
-    log_user_action("Cleared conversation")
-    assistant = get_assistant()
-    assistant.clear_history()
-    return jsonify({"status": "cleared"})
+    try:
+        log_user_action("Cleared conversation")
+        assistant = get_assistant(current_user.id)
+        assistant.clear_history()
+        return jsonify({"status": "cleared"})
+    except Exception as e:
+        logger.exception(f"Clear error: {e}")
+        return jsonify({"error": "Failed to clear history"}), 500
 
 
 @app.route('/health')

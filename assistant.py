@@ -130,15 +130,22 @@ class JidhrAssistant:
 
 
 # ---------------------------------------------------------------------------
-# Singleton
+# Per-user assistant instances (per-worker; reconstructed if missing)
 # ---------------------------------------------------------------------------
 
-_assistant = None
+_assistants: dict[str, JidhrAssistant] = {}
 
 
-def get_assistant() -> JidhrAssistant:
-    """Get or create the assistant instance."""
-    global _assistant
-    if _assistant is None:
-        _assistant = JidhrAssistant()
-    return _assistant
+def get_assistant(user_id: str = "default") -> JidhrAssistant:
+    """Get or create an assistant instance for the given user.
+
+    Each gunicorn worker maintains its own dict.  If a user's assistant
+    doesn't exist on this worker (e.g. request routed to a different
+    worker than last time), a fresh instance is created transparently.
+    Conversation history is lost across workers — this is acceptable
+    for a small team and avoids external session stores.
+    """
+    if user_id not in _assistants:
+        logger.info(f"Creating new assistant instance for user: {user_id}")
+        _assistants[user_id] = JidhrAssistant()
+    return _assistants[user_id]
