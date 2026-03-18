@@ -659,7 +659,9 @@ class HubSpotClient:
             create_payload = {
                 "name": name,
                 "subject": subject,
-                "templateId": template_id,
+                "content": {
+                    "templateId": template_id,
+                },
             }
         else:
             # No template match — create a regular email with body inline
