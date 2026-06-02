@@ -20,8 +20,9 @@ Jidhr v1.3 - Complete client covering:
 
 import json
 import logging
+import re
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -627,7 +628,82 @@ class HubSpotClient:
     def get_marketing_email(self, email_id: str) -> dict:
         """Get a specific marketing email by ID"""
         return self._get(f"marketing/v3/emails/{email_id}")
-    
+
+    def get_sent_emails_with_content(self, days_back: int = 90):
+        """Fetch PUBLISHED marketing emails from the last N days with body content.
+
+        Uses GET /marketing/v3/emails?state=PUBLISHED — content.widgets is
+        returned inline, so no separate detail call is needed.
+
+        Returns:
+            list[dict] on success, each item containing:
+                id, name, subject, plain_body, sent_at, template_path,
+                from_name, reply_to.
+            If HubSpot returns an error, returns the {"error": ...} dict
+            instead of a list — callers should check the return type.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
+        results = []
+        after = None
+
+        while True:
+            params = {"state": "PUBLISHED", "limit": 100}
+            if after:
+                params["after"] = after
+
+            page = self._get("marketing/v3/emails", params)
+            if isinstance(page, dict) and "error" in page:
+                return page
+
+            for email in page.get("results", []):
+                published_at = email.get("publishedAt")
+                if not published_at:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+                except (ValueError, AttributeError):
+                    continue
+                if dt < cutoff:
+                    continue
+
+                content_obj = email.get("content") or {}
+                widgets = content_obj.get("widgets") or {}
+
+                html_parts = []
+                for wdata in widgets.values():
+                    if not isinstance(wdata, dict):
+                        continue
+                    body = wdata.get("body") or {}
+                    html = body.get("html")
+                    if html:
+                        html_parts.append(html)
+                html = "\n".join(html_parts)
+
+                plain = re.sub(r'<[^>]+>', ' ', html)
+                plain = re.sub(r'\s+', ' ', plain).strip()
+
+                from_obj = email.get("from") or {}
+                reply_to = from_obj.get("replyTo") or from_obj.get("customReplyTo") or ""
+
+                results.append({
+                    "id": email.get("id"),
+                    "name": email.get("name", ""),
+                    "subject": email.get("subject", ""),
+                    "plain_body": plain,
+                    "sent_at": published_at,
+                    "template_path": content_obj.get("templatePath", ""),
+                    "from_name": from_obj.get("fromName", ""),
+                    "reply_to": reply_to,
+                })
+
+            paging = page.get("paging") or {}
+            next_link = paging.get("next") or {}
+            after = next_link.get("after")
+            if not after:
+                break
+
+        return results
+
     def create_marketing_email_draft(
         self,
         name: str,
