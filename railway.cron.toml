@@ -1,0 +1,9 @@
+# Railway config for the cron-weekly-sync service.
+# The web service continues to use railway.toml (untouched).
+# This file is referenced by the cron service via its
+# Service Settings → Config Path = /railway.cron.toml
+
+[deploy]
+startCommand = "/opt/venv/bin/python scripts/backfill_emails.py"
+cronSchedule = "0 7 * * 0"
+restartPolicyType = "never"
