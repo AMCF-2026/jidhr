@@ -6,10 +6,13 @@ content_history table. Idempotent — re-running skips emails already
 logged (matched by external_id).
 
 # Run from Railway shell (web service):
-#   /opt/venv/bin/python scripts/backfill_emails.py --limit 3
+#   /opt/venv/bin/python scripts/backfill_emails.py                       # 90 days (default)
+#   /opt/venv/bin/python scripts/backfill_emails.py --days-back 365       # 12 months
+#   /opt/venv/bin/python scripts/backfill_emails.py --limit 3             # quick test
+#   /opt/venv/bin/python scripts/backfill_emails.py --limit 3 --days-back 365
 # If that Python path isn't right, find it with: which gunicorn
 # Test with --limit 3 first. Inspect rows in TablePlus.
-# Then re-run without --limit for full 90 days.
+# Then re-run without --limit for the full window.
 """
 
 import argparse
@@ -60,10 +63,16 @@ def main():
         default=None,
         help="Cap the number of emails processed (after dedup ordering). Default: no limit.",
     )
+    parser.add_argument(
+        "--days-back",
+        type=int,
+        default=90,
+        help="How many days of history to fetch from HubSpot. Default: 90.",
+    )
     args = parser.parse_args()
 
     limit_label = args.limit if args.limit is not None else "no limit"
-    print(f"Starting email backfill — last 90 days (limit: {limit_label})...")
+    print(f"Starting email backfill — last {args.days_back} days (limit: {limit_label})...")
 
     # 1. Existing external_ids
     try:
@@ -82,7 +91,7 @@ def main():
 
     # 2. Fetch from HubSpot
     hubspot = HubSpotClient()
-    emails = hubspot.get_sent_emails_with_content(days_back=90)
+    emails = hubspot.get_sent_emails_with_content(days_back=args.days_back)
 
     if isinstance(emails, dict) and "error" in emails:
         print(f"HubSpot error: {emails['error']}")
