@@ -174,6 +174,137 @@ def log_content(content_type, channel, external_id, title, full_body,
 # DB read
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Email backfill (shared by CLI script and /internal/sync/emails route)
+# ---------------------------------------------------------------------------
+
+def _classify_email_channel(email: dict) -> str:
+    from_name = (email.get("from_name") or "").lower()
+    reply_to = (email.get("reply_to") or "").lower()
+    if "giving circle" in from_name or "givingcircles" in reply_to:
+        return "giving_circle"
+    return "amcf_newsletter"
+
+
+def _topics_for_row(row_id):
+    try:
+        rows = execute_query(
+            "SELECT topics FROM content_history WHERE id = %s",
+            params=(row_id,),
+            fetch=True,
+        )
+    except Exception:
+        return []
+    if not rows:
+        return []
+    topics = rows[0].get("topics") or []
+    return topics[:3] if isinstance(topics, list) else []
+
+
+def run_email_backfill(days_back: int = 90, limit=None,
+                       logged_by: str = "system_backfill") -> dict:
+    """Backfill sent HubSpot emails into content_history.
+
+    Idempotent (dedup by external_id). Used by both the CLI script and
+    the /internal/sync/emails HTTP route. Per-email failures are
+    captured in the errors list but do not halt the run.
+
+    Returns:
+        {
+          "processed": int,  # rows successfully inserted
+          "skipped":   int,  # already-logged duplicates
+          "failed":    int,  # per-email failures + setup failures
+          "errors":    [{"id", "subject", "error"}, ...],
+        }
+    """
+    # Imported here to avoid any chance of circular import at module load.
+    from clients.hubspot import HubSpotClient
+
+    result = {"processed": 0, "skipped": 0, "failed": 0, "errors": []}
+
+    logger.info(f"Email backfill starting — days_back={days_back}, limit={limit}")
+
+    try:
+        rows = execute_query(
+            "SELECT external_id FROM content_history "
+            "WHERE content_type = %s AND external_id IS NOT NULL",
+            params=("email",),
+            fetch=True,
+        )
+    except Exception as e:
+        logger.error(f"Backfill: failed to query existing rows: {e}", exc_info=True)
+        result["failed"] = 1
+        result["errors"].append({"id": None, "subject": None, "error": f"db_init: {e}"})
+        return result
+
+    existing = {r["external_id"] for r in rows}
+    logger.info(f"Backfill: {len(existing)} email(s) already logged.")
+
+    hubspot = HubSpotClient()
+    emails = hubspot.get_sent_emails_with_content(days_back=days_back)
+
+    if isinstance(emails, dict) and "error" in emails:
+        logger.error(f"Backfill: HubSpot error: {emails['error']}")
+        result["failed"] = 1
+        result["errors"].append(
+            {"id": None, "subject": None, "error": f"hubspot: {emails['error']}"}
+        )
+        return result
+
+    logger.info(f"Backfill: fetched {len(emails)} email(s) from HubSpot.")
+
+    if limit is not None:
+        emails = emails[:limit]
+        logger.info(f"Backfill: limited to {len(emails)} after --limit.")
+
+    for email in emails:
+        ext_id = email.get("id")
+        subject = email.get("subject") or "(no subject)"
+
+        if ext_id in existing:
+            logger.info(f"Backfill: skipped (dup): {subject}")
+            result["skipped"] += 1
+            continue
+
+        channel = _classify_email_channel(email)
+
+        try:
+            new_id = log_content(
+                content_type="email",
+                channel=channel,
+                external_id=ext_id,
+                title=subject,
+                full_body=email.get("plain_body", ""),
+                sent_at=email.get("sent_at"),
+                logged_by=logged_by,
+            )
+        except Exception as e:
+            logger.warning(f"Backfill: failed {subject!r}: {e}", exc_info=True)
+            result["failed"] += 1
+            result["errors"].append({"id": ext_id, "subject": subject, "error": str(e)})
+            continue
+
+        if new_id is None:
+            logger.warning(f"Backfill: failed {subject!r}: log_content returned None")
+            result["failed"] += 1
+            result["errors"].append(
+                {"id": ext_id, "subject": subject, "error": "log_content returned None"}
+            )
+            continue
+
+        topics = _topics_for_row(new_id)
+        result["processed"] += 1
+        logger.info(
+            f"Backfill: logged id={new_id} channel={channel} subject={subject!r} topics={topics}"
+        )
+
+    logger.info(
+        f"Backfill complete: processed={result['processed']} "
+        f"skipped={result['skipped']} failed={result['failed']}"
+    )
+    return result
+
+
 def get_recent_content(content_type, channel=None, days=90):
     """Return recent content_history rows (no full_body, to keep payload small).
 

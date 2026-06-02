@@ -6,7 +6,9 @@ Main Flask application.
 This is the entry point - all the logic lives in assistant.py and clients/
 """
 
+import hmac
 import logging
+import os
 import sys
 from flask import Flask, render_template, request, jsonify, session
 from flask_login import login_required, current_user
@@ -15,6 +17,7 @@ from config import Config
 from assistant import get_assistant
 from auth import init_auth
 from clients.database import health_check as db_health_check
+from intents.content_memory import run_email_backfill
 
 # =============================================================================
 # LOGGING SETUP
@@ -149,6 +152,26 @@ def health():
         "env_vars": env_status,
         "database": db_status,
     })
+
+
+@app.route('/internal/sync/emails', methods=['POST'])
+def sync_emails():
+    """Trigger an email backfill via HTTP (used by the cron service).
+
+    Requires header X-Sync-Token matching SYNC_SECRET_TOKEN env var.
+    Always returns 200 on auth success — per-email failures are normal
+    and reported in the result body.
+    """
+    token = request.headers.get('X-Sync-Token', '')
+    expected = os.environ.get('SYNC_SECRET_TOKEN', '')
+
+    if not expected or not hmac.compare_digest(token, expected):
+        logger.warning('Unauthorized /internal/sync/emails attempt')
+        return jsonify({'error': 'unauthorized'}), 403
+
+    result = run_email_backfill(days_back=90)
+    logger.info(f'Sync completed: {result}')
+    return jsonify(result), 200
 
 
 # =============================================================================

@@ -1,0 +1,28 @@
+name: Weekly Email Sync
+
+on:
+  schedule:
+    # Every Sunday at 7am UTC. Cron syntax uses UTC regardless of repo settings.
+    - cron: '0 7 * * 0'
+  workflow_dispatch:  # allows manual triggering from GitHub UI
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger email backfill on Jidhr
+        run: |
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "X-Sync-Token: ${{ secrets.SYNC_SECRET_TOKEN }}" \
+            https://web-production-e0593.up.railway.app/internal/sync/emails)
+
+          body=$(echo "$response" | head -n -1)
+          status=$(echo "$response" | tail -n 1)
+
+          echo "Status: $status"
+          echo "Body: $body"
+
+          if [ "$status" != "200" ]; then
+            echo "::error::Sync failed with status $status"
+            exit 1
+          fi
