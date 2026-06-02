@@ -35,7 +35,7 @@ class Config:
     # =========================================================================
     OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
     OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-    CLAUDE_MODEL = "anthropic/claude-3.5-sonnet"
+    CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', 'anthropic/claude-sonnet-4.6')
     
     # =========================================================================
     # HUBSPOT
