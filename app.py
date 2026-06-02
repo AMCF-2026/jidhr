@@ -14,6 +14,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from config import Config
 from assistant import get_assistant
 from auth import init_auth
+from clients.database import health_check as db_health_check
 
 # =============================================================================
 # LOGGING SETUP
@@ -123,18 +124,31 @@ def clear():
 
 @app.route('/health')
 def health():
-    """Health check endpoint for Railway (no auth required)"""
-    # Check for required config
+    """Health check endpoint for Railway (no auth required).
+
+    Always returns 200 so monitoring can read the JSON body;
+    degraded != broken. A non-200 status would mask the diagnosis.
+    """
     missing = Config.validate()
-    if missing:
-        logger.warning(f"Health check failed - missing: {missing}")
-        return jsonify({
-            "status": "unhealthy",
-            "missing_config": missing
-        }), 500
-    
-    logger.debug("Health check passed")
-    return jsonify({"status": "healthy", "service": "jidhr"})
+    env_status = "ok" if not missing else f"missing: [{', '.join(missing)}]"
+
+    try:
+        db_status = "ok" if db_health_check() else "unreachable"
+    except Exception as e:
+        db_status = f"unreachable: {type(e).__name__}"
+
+    overall = "ok" if env_status == "ok" and db_status == "ok" else "degraded"
+
+    if overall == "degraded":
+        logger.warning(f"Health degraded — env_vars={env_status}, database={db_status}")
+    else:
+        logger.debug("Health check passed")
+
+    return jsonify({
+        "status": overall,
+        "env_vars": env_status,
+        "database": db_status,
+    })
 
 
 # =============================================================================
