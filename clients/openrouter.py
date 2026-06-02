@@ -19,14 +19,16 @@ class OpenRouterClient:
         self.base_url = Config.OPENROUTER_BASE_URL
         self.model = Config.CLAUDE_MODEL
     
-    def chat(self, messages: list, system_prompt: str = None) -> str:
+    def chat(self, messages: list, system_prompt: str = None, temperature: float = None) -> str:
         """
         Send a chat request to Claude.
-        
+
         Args:
             messages: List of message dicts with 'role' and 'content'
             system_prompt: Optional system prompt to prepend
-            
+            temperature: Optional sampling temperature. If None, omitted
+                from the request so OpenRouter's default applies.
+
         Returns:
             Claude's response as a string
         """
@@ -51,6 +53,8 @@ class OpenRouterClient:
             "model": self.model,
             "messages": all_messages
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
         
         logger.info(f"OpenRouter request: model={self.model}, messages={len(all_messages)}")
         

@@ -88,6 +88,7 @@ def extract_topics(content_type: str, full_body: str) -> dict:
         raw = client.chat(
             messages=[{"role": "user", "content": user_prompt}],
             system_prompt=_EXTRACT_SYSTEM_PROMPT,
+            temperature=0.2,
         )
     except Exception as e:
         logger.warning(f"extract_topics: Claude call raised: {e}")
