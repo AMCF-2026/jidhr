@@ -896,9 +896,120 @@ class HubSpotClient:
         
         return None
     
-    def get_social_broadcasts(self, limit: int = 10) -> dict:
+    def get_social_broadcasts(self, limit: int = 10, offset: int = 0) -> dict:
         """Get social media broadcasts"""
-        return self._get("broadcast/v1/broadcasts", {"limit": limit})
+        params = {"limit": limit}
+        if offset:
+            params["offset"] = offset
+        return self._get("broadcast/v1/broadcasts", params)
+
+    def get_published_social_broadcasts_with_content(
+        self, limit_per_page: int = 100, max_pages: int = 50
+    ) -> list[dict]:
+        """Page through ALL published social broadcasts and return them
+        normalized for content_history insertion.
+
+        Published = status in ('SUCCESS', 'SUCCESS_ARCHIVE'). Other
+        statuses (DRAFT / SCHEDULED / FAILED / etc.) are scanned but
+        not returned.
+
+        Each returned dict has keys: external_id, channel, full_body,
+        sent_at (naive UTC datetime), source_url.
+
+        Returns:
+            list[dict] of normalized broadcasts ordered as fetched.
+            Returns an empty list if the API errors on the first page
+            or has no published broadcasts.
+        """
+        channel_map = {
+            "FacebookPage": "facebook",
+            "Instagram": "instagram",
+            "LinkedInCompanyPage": "linkedin",
+            "YouTube": "youtube",
+        }
+        published_statuses = ("SUCCESS", "SUCCESS_ARCHIVE")
+
+        results: list[dict] = []
+        seen: set = set()
+        total_scanned = 0
+        skipped_no_ts = 0
+        offset = 0
+
+        for _page_idx in range(max_pages):
+            page = self.get_social_broadcasts(
+                limit=limit_per_page, offset=offset
+            )
+            if page is None or not isinstance(page, list) or len(page) == 0:
+                break
+
+            new_in_page = 0
+            for b in page:
+                if not isinstance(b, dict):
+                    continue
+                guid = b.get("broadcastGuid")
+                if guid is None:
+                    continue
+                if guid not in seen:
+                    new_in_page += 1
+                seen.add(guid)
+                total_scanned += 1
+
+                if b.get("status") not in published_statuses:
+                    continue
+
+                ts_ms = b.get("finishedAt") or b.get("triggerAt")
+                if ts_ms is None:
+                    logger.info(
+                        f"skipping published broadcast {guid}: no timestamp"
+                    )
+                    skipped_no_ts += 1
+                    continue
+
+                channel_key = b.get("channelKey") or ""
+                prefix = channel_key.split(":", 1)[0] if channel_key else ""
+                channel = channel_map.get(prefix)
+                if not channel:
+                    channel = (b.get("channelType") or "").lower()
+                if not channel:
+                    channel = "unknown"
+
+                full_body = b.get("messageText") or (
+                    b.get("content") or {}
+                ).get("body")
+
+                sent_at = datetime.fromtimestamp(
+                    ts_ms / 1000, tz=timezone.utc
+                ).replace(tzinfo=None)
+
+                results.append({
+                    "external_id": guid,
+                    "channel": channel,
+                    "full_body": full_body,
+                    "sent_at": sent_at,
+                    "source_url": b.get("messageUrl"),
+                })
+
+            if new_in_page == 0:
+                logger.warning(
+                    f"social broadcast pagination did not advance at "
+                    f"offset={offset}; stopping"
+                )
+                break
+
+            if len(page) < limit_per_page:
+                break
+
+            offset += limit_per_page
+        else:
+            logger.warning(
+                f"social broadcast pagination hit max_pages={max_pages}; stopping"
+            )
+
+        logger.info(
+            f"social broadcasts scanned: total={total_scanned} "
+            f"kept={len(results)} skipped_no_ts={skipped_no_ts}"
+        )
+        return results
     
     def create_social_broadcast(self, data: dict) -> dict:
         """Create a social media broadcast (raw API)"""
