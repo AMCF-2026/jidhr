@@ -124,6 +124,7 @@ _INSERT_SQL = """
         (content_type, channel, external_id, title, topics, summary,
          cta, full_body, sent_at, logged_by)
     VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s)
+    ON CONFLICT (content_type, external_id) DO NOTHING
     RETURNING id;
 """
 
@@ -160,7 +161,10 @@ def log_content(content_type, channel, external_id, title, full_body,
         return None
 
     if not rows:
-        logger.error("log_content: INSERT...RETURNING produced no rows")
+        logger.info(
+            "log_content: skipped duplicate (content_type=%s, external_id=%s)",
+            content_type, external_id,
+        )
         return None
 
     new_id = rows[0].get("id")
@@ -285,11 +289,11 @@ def run_email_backfill(days_back: int = 90, limit=None,
             continue
 
         if new_id is None:
-            logger.warning(f"Backfill: failed {subject!r}: log_content returned None")
-            result["failed"] += 1
-            result["errors"].append(
-                {"id": ext_id, "subject": subject, "error": "log_content returned None"}
-            )
+            # log_content returned None means ON CONFLICT DO NOTHING fired —
+            # a row with this (content_type, external_id) already exists.
+            # Genuine DB errors are raised by execute_query and caught above.
+            logger.info(f"Backfill: skipped (dup via ON CONFLICT): {subject}")
+            result["skipped"] += 1
             continue
 
         topics = _topics_for_row(new_id)
