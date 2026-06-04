@@ -13,6 +13,7 @@ import json
 from datetime import datetime, timedelta
 
 from config import ORG_FACTS_PROMPT
+from content.content_analysis import find_topic_matches
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +206,69 @@ View in HubSpot: https://app-na2.hubspot.com/tasks/243832852/view/all"""
 
 
 # ---------------------------------------------------------------------------
+# Repetition heads-up (pre-draft check via content.content_analysis)
+# ---------------------------------------------------------------------------
+
+# Channel abbreviations mirror content_report's style so the pre-draft
+# heads-up reads consistently with the broader content report view.
+_REPETITION_CHANNEL_ABBR = {
+    "facebook":        "FB",
+    "instagram":       "IG",
+    "linkedin":        "LI",
+    "youtube":         "YT",
+    "twitter":         "TW",
+    "giving_circle":   "GC",
+    "amcf_newsletter": "NL",
+    "email":           "EM",
+    "unknown":         "?",
+}
+
+
+def _abbr_channel_for_note(c) -> str:
+    if not isinstance(c, str) or not c:
+        return "?"
+    return _REPETITION_CHANNEL_ABBR.get(c.lower(), c[:2].upper())
+
+
+def _repetition_note(topic) -> str | None:
+    """Build a one-line heads-up if the topic was covered in the last 6 weeks.
+
+    Returns None on no matches, empty/invalid topic, or any exception —
+    drafting must NEVER fail because of this informational helper.
+    """
+    try:
+        if not isinstance(topic, str) or not topic.strip():
+            return None
+        matches = find_topic_matches(topic, days=42)
+        if not matches:
+            return None
+
+        per_channel: dict[str, int] = {}
+        for m in matches:
+            ch = m.get("channel") or "unknown"
+            per_channel[ch] = per_channel.get(ch, 0) + 1
+        channel_pairs = sorted(per_channel.items(), key=lambda kv: (-kv[1], kv[0]))
+        channel_str = ", ".join(
+            f"{_abbr_channel_for_note(c)} {n}" for c, n in channel_pairs
+        )
+
+        timestamps = [m.get("sent_at") for m in matches if m.get("sent_at") is not None]
+        if timestamps:
+            days_ago = (datetime.utcnow() - max(timestamps)).days
+            recency = f"most recent {days_ago}d ago"
+        else:
+            recency = "recent"
+
+        return (
+            f"ℹ️ Heads-up: this topic appeared {len(matches)}× in the last "
+            f"6 weeks ({channel_str} — {recency})."
+        )
+    except Exception as e:
+        logger.warning(f"_repetition_note failed for topic={topic!r}: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Email draft lifecycle
 # ---------------------------------------------------------------------------
 
@@ -247,7 +311,7 @@ BODY:
             "photo_url": None,
         })
 
-        return f"""📧 **Email Draft**
+        response = f"""📧 **Email Draft**
 
 **Subject:** {subject}
 
@@ -259,6 +323,9 @@ BODY:
 • Request changes: *"Make it shorter"*, *"Add more urgency"*, *"Include a call to action"*
 • Save to HubSpot: *"Save this to the AMCF template"* or *"Save to Giving Circle template"*
 • Start over: *"Start over"* or *"Cancel"*"""
+
+        note = _repetition_note(topic)
+        return f"{note}\n\n{response}" if note else response
 
     except Exception as e:
         logger.error(f"Email draft error: {e}")
@@ -370,7 +437,7 @@ Write just the post content, nothing else."""
         platform_list = ", ".join(available) if available else "facebook, twitter, linkedin, instagram"
         platform_display = platform.title() if platform else "Social Media"
 
-        return f"""📱 **{platform_display} Post Draft**
+        response = f"""📱 **{platform_display} Post Draft**
 
 {content}
 
@@ -384,6 +451,9 @@ Write just the post content, nothing else."""
 • Schedule: *"Schedule for tomorrow at 5pm"*
 • Post now: *"Post this now"* or *"Create as draft"*
 • Start over: *"Start over"* or *"Cancel"*"""
+
+        note = _repetition_note(topic)
+        return f"{note}\n\n{response}" if note else response
 
     except Exception as e:
         logger.error(f"Social post draft error: {e}")
