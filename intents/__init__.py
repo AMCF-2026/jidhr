@@ -17,6 +17,7 @@ assistant.py calls it directly as the fallback path.
 import logging
 
 from intents import sync_commands
+from intents import social_sync
 from intents import content
 from intents import daf_workflow
 from intents import events
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 # Each entry: (name, module)
 HANDLER_CHAIN = [
     ("sync_commands", sync_commands),
+    ("social_sync",   social_sync),
     ("content",       content),
     ("daf_workflow",  daf_workflow),
     ("events",        events),
