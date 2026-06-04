@@ -82,9 +82,26 @@ def _ms_to_utc(ms):
 
 
 def _text_similarity(a, b) -> float:
-    """Jaccard similarity (|A ∩ B| / |A ∪ B|) over word sets, post-
-    _normalize_text. Returns a float in [0, 1]. Rule 1 uses the
-    _TEXT_SIMILARITY_THRESHOLD (0.5) above for "same topic" detection.
+    """Overlap coefficient: |A ∩ B| / min(|A|, |B|) over word sets,
+    post-_normalize_text. Returns a float in [0, 1].
+
+    Why overlap, not Jaccard: rule 1 compares a SHORT proposed draft
+    against potentially LONGER stored queue bodies. Jaccard
+    (|A ∩ B| / |A ∪ B|) is dominated by the larger set's size — a
+    13-word campaign phrase fully contained in a 50-word stored post
+    scored 0.19–0.39 in production, below the 0.5 threshold, so rule 1
+    never fired. Overlap-over-smaller-set correctly registers near 1.0
+    in that case because the smaller set's words are mostly present in
+    the larger one.
+
+    Safeguards:
+      - either normalized set has fewer than 4 words → 0.0, since
+        otherwise any two 2-word snippets sharing one word would hit
+        0.5+ and over-fire rule 1;
+      - min(|A|, |B|) == 0 → 0.0 (defensive; unreachable given the
+        4-word check above, but documents intent).
+
+    Rule 1's threshold (_TEXT_SIMILARITY_THRESHOLD = 0.5) is unchanged.
     """
     na = _normalize_text(a)
     nb = _normalize_text(b)
@@ -92,10 +109,12 @@ def _text_similarity(a, b) -> float:
         return 0.0
     sa = set(na.split())
     sb = set(nb.split())
-    union = sa | sb
-    if not union:
+    if len(sa) < 4 or len(sb) < 4:
         return 0.0
-    return len(sa & sb) / len(union)
+    smaller = min(len(sa), len(sb))
+    if smaller == 0:
+        return 0.0
+    return len(sa & sb) / smaller
 
 
 # ---------------------------------------------------------------------------
