@@ -1088,7 +1088,48 @@ class HubSpotClient:
             f"kept={len(results)} skipped_no_ts={skipped_no_ts}"
         )
         return results
-    
+
+    def get_waiting_broadcasts(self) -> list[dict]:
+        """Fetch ALL broadcasts with status=WAITING via server-side filter.
+
+        Uses limit=100/offset pagination matching V4.5
+        get_published_social_broadcasts_with_content. The V5.4 read probe
+        verified `status=WAITING` filters server-side (no client-side
+        post-filtering needed).
+
+        Returns:
+            list[dict] of raw broadcast dicts as returned by HubSpot,
+            concatenated across pages. No payload reshaping.
+
+            If self._get returns an error dict at any page, returns that
+            error dict (matches V4.5 convention; callers should
+            isinstance-check before iterating).
+        """
+        PAGE_SIZE = 100
+        MAX_PAGES = 100  # safety cap; queue should never approach this
+        results: list[dict] = []
+        offset = 0
+
+        for _ in range(MAX_PAGES):
+            params = {"limit": PAGE_SIZE, "status": "WAITING"}
+            if offset:
+                params["offset"] = offset
+
+            page = self._get("broadcast/v1/broadcasts", params)
+
+            if isinstance(page, dict) and "error" in page:
+                return page
+            if not isinstance(page, list) or len(page) == 0:
+                break
+
+            results.extend(page)
+
+            if len(page) < PAGE_SIZE:
+                break
+            offset += PAGE_SIZE
+
+        return results
+
     def create_social_broadcast(self, data: dict) -> dict:
         """Create a social media broadcast (raw API)"""
         return self._post("broadcast/v1/broadcasts", data)
