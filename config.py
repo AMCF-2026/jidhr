@@ -364,3 +364,23 @@ You have access to TWO systems:
 
 Current date: {current_date}
 """
+
+
+# =============================================================================
+# ORG FACTS (injected into drafting system prompts in intents/content.py;
+# wiring lands in the next commit)
+# =============================================================================
+
+ORG_FACTS_PROMPT = """
+CANONICAL ORG FACTS — use these exactly as written:
+- Organization: American Muslim Community Foundation (AMCF)
+- Website: https://amuslimcf.org/
+- Facebook: https://www.facebook.com/amuslimcf
+- Instagram: https://www.instagram.com/amuslimcf/
+- LinkedIn: https://www.linkedin.com/company/amuslimcf/
+
+STRICT RULE: Use ONLY the URLs and handles listed above. Never invent, guess,
+or abbreviate any URL, domain, social handle, or email address. The domain is
+amuslimcf.org — never amcf.org. If you need a specific page link that is not
+listed above, write [LINK] as a placeholder instead of guessing.
+"""
