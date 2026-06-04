@@ -12,6 +12,8 @@ import re
 import json
 from datetime import datetime, timedelta
 
+from config import ORG_FACTS_PROMPT
+
 logger = logging.getLogger(__name__)
 
 
@@ -229,7 +231,7 @@ BODY:
     try:
         draft = assistant.claude.chat(
             messages=[{"role": "user", "content": draft_prompt}],
-            system_prompt="You are a nonprofit marketing copywriter. Write warm, engaging emails.",
+            system_prompt="You are a nonprofit marketing copywriter. Write warm, engaging emails." + ORG_FACTS_PROMPT,
         )
 
         subject, body = _parse_email_draft(draft)
@@ -348,7 +350,7 @@ Write just the post content, nothing else."""
     try:
         draft = assistant.claude.chat(
             messages=[{"role": "user", "content": draft_prompt}],
-            system_prompt="You are a social media manager for a nonprofit. Write engaging posts.",
+            system_prompt="You are a social media manager for a nonprofit. Write engaging posts." + ORG_FACTS_PROMPT,
         )
 
         content = draft.strip()
@@ -565,7 +567,7 @@ Return only the revised post content, nothing else."""
     try:
         revised = assistant.claude.chat(
             messages=[{"role": "user", "content": refine_prompt}],
-            system_prompt="You are a marketing copywriter. Make the requested changes.",
+            system_prompt="You are a marketing copywriter. Make the requested changes." + ORG_FACTS_PROMPT,
         )
 
         if draft_type == "email":
