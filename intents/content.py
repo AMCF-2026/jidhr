@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 
 from config import ORG_FACTS_PROMPT
 from content.content_analysis import find_topic_matches
+from content.queue_check import check_schedule, get_queue, suggest_slot
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +269,61 @@ def _repetition_note(topic) -> str | None:
         return None
 
 
+def _queue_note(topic) -> str | None:
+    """One-line heads-up if a queued (WAITING) post mentions the topic.
+
+    Substring containment AFTER lowercasing+stripping punctuation —
+    deliberately NOT queue_check._text_similarity, which guards against
+    inputs with < 4 words. Topics are often 2–3 words ("EverWaqf launch",
+    "Ramadan giving"); we want those to fire.
+
+    Same contract as _repetition_note: returns None on no matches,
+    empty/invalid topic, or any exception. Drafting must NEVER fail
+    because of this informational helper.
+    """
+    try:
+        if not isinstance(topic, str) or not topic.strip():
+            return None
+        norm_topic = re.sub(r"[^a-z0-9\s]", " ", topic.lower())
+        norm_topic = re.sub(r"\s+", " ", norm_topic).strip()
+        if not norm_topic:
+            return None
+
+        queue = get_queue()
+        if not queue:
+            return None
+
+        matches = []
+        for item in queue:
+            body = item.get("body")
+            if not isinstance(body, str):
+                continue
+            norm_body = re.sub(r"[^a-z0-9\s]", " ", body.lower())
+            norm_body = re.sub(r"\s+", " ", norm_body).strip()
+            if norm_topic in norm_body:
+                matches.append(item)
+
+        if not matches:
+            return None
+
+        matches.sort(key=lambda m: m.get("trigger_at_et") or datetime.max)
+        parts = []
+        for m in matches:
+            dt = m.get("trigger_at_et")
+            if dt is None:
+                continue
+            parts.append(
+                f"{_abbr_channel_for_note(m.get('channel'))} {dt.month}/{dt.day}"
+            )
+        if not parts:
+            return None
+
+        return f"📅 Already in the queue: {topic} — {', '.join(parts)}."
+    except Exception as e:
+        logger.warning(f"_queue_note failed for topic={topic!r}: {e}")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Email draft lifecycle
 # ---------------------------------------------------------------------------
@@ -324,8 +380,15 @@ BODY:
 • Save to HubSpot: *"Save this to the AMCF template"* or *"Save to Giving Circle template"*
 • Start over: *"Start over"* or *"Cancel"*"""
 
-        note = _repetition_note(topic)
-        return f"{note}\n\n{response}" if note else response
+        parts = []
+        rep_note = _repetition_note(topic)
+        if rep_note:
+            parts.append(rep_note)
+        q_note = _queue_note(topic)
+        if q_note:
+            parts.append(q_note)
+        parts.append(response)
+        return "\n\n".join(parts)
 
     except Exception as e:
         logger.error(f"Email draft error: {e}")
@@ -452,12 +515,100 @@ Write just the post content, nothing else."""
 • Post now: *"Post this now"* or *"Create as draft"*
 • Start over: *"Start over"* or *"Cancel"*"""
 
-        note = _repetition_note(topic)
-        return f"{note}\n\n{response}" if note else response
+        parts = []
+        rep_note = _repetition_note(topic)
+        if rep_note:
+            parts.append(rep_note)
+        q_note = _queue_note(topic)
+        if q_note:
+            parts.append(q_note)
+        parts.append(response)
+        return "\n\n".join(parts)
 
     except Exception as e:
         logger.error(f"Social post draft error: {e}")
         return f"❌ Failed to generate social post draft: {e}"
+
+
+_RULE_LABEL = {
+    "slot_collision":         "Slot collision",
+    "same_day_cross_network": "Same-day cross-network",
+}
+
+
+def _format_cadence_violations(violations, platform, requested_dt) -> str:
+    """Render the blocking cadence-violation message."""
+    lines = [
+        "🚧 **Cadence check flagged conflicts — post not sent yet.**",
+        "",
+    ]
+    for v in violations:
+        label = _RULE_LABEL.get(v.get("rule"), v.get("rule") or "?")
+        ch = v.get("channel") or "?"
+        et = v.get("trigger_at_et") or "?"
+        matched = v.get("matched_on") or "?"
+        excerpt = (v.get("excerpt") or "").strip()
+        lines.append(f"• **{label}** ({matched}): {_abbr_channel_for_note(ch)} @ {et}")
+        if excerpt:
+            lines.append(f"  > {excerpt}")
+
+    sug = None
+    if isinstance(requested_dt, datetime):
+        try:
+            sug = suggest_slot(platform, requested_dt)
+        except Exception as e:
+            logger.warning(f"suggest_slot failed (display only): {e}")
+            sug = None
+    if sug is not None:
+        lines.append("")
+        lines.append(f"💡 Suggested clean slot: **{sug.strftime('%B %d at %I:%M %p')} ET**")
+
+    lines.append("")
+    lines.append('Reply **"schedule anyway"** to override, or give a new time.')
+    return "\n".join(lines)
+
+
+def _execute_override(assistant) -> str:
+    """Bypass the cadence gate using the stashed pending_schedule.
+
+    Called from _handle_draft_conversation when the user types
+    "schedule anyway" / "override and schedule" after a violation
+    message. Always pops pending_schedule (success or failure).
+    """
+    pending = assistant.draft_state.get("pending_schedule") or {}
+    platform = pending.get("platform", "facebook")
+    body = pending.get("content", "")
+    link_url = pending.get("link_url")
+    photo_url = pending.get("photo_url")
+    schedule_iso = pending.get("schedule_time_iso")
+
+    try:
+        result = assistant.hubspot.create_social_post(
+            platform=platform,
+            content=body,
+            link_url=link_url,
+            photo_url=photo_url,
+            schedule_time=schedule_iso,  # V5.6 _coerce_trigger_at_ms parses ISO
+        )
+    except Exception as e:
+        logger.error(f"Override save error: {e}")
+        assistant.draft_state.pop("pending_schedule", None)
+        return f"❌ Failed to create post: {e}"
+
+    assistant.draft_state.pop("pending_schedule", None)
+
+    if "error" in result:
+        return f"❌ Failed to create post: {result['error']}"
+
+    _clear_draft_state(assistant)
+    excerpt = body[:100] + ("..." if len(body) > 100 else "")
+    return f"""✅ **Post Scheduled (cadence override)!**
+
+📱 **{platform.title()}**
+
+{excerpt}
+
+*Rule-1/rule-2 conflicts were bypassed at your request. View in HubSpot Social.*"""
 
 
 def _save_social_post(query: str, assistant) -> str:
@@ -475,6 +626,39 @@ def _save_social_post(query: str, assistant) -> str:
     elif 'post now' in query_lower or 'publish now' in query_lower:
         schedule_time = datetime.now()
     # else: creates as draft (no schedule_time)
+
+    # Cadence gate — runs only when there's an effective trigger time.
+    # Drafts (no schedule_time) skip the gate by design.
+    # Fail-open: any check error logs + proceeds. The rules are advisory.
+    if schedule_time is not None:
+        try:
+            violations = check_schedule(
+                body=content,
+                link=link_url,
+                channel=platform,
+                trigger_at=schedule_time,
+            )
+        except Exception as e:
+            logger.error(f"check_schedule failed (fail-open): {e}", exc_info=True)
+            violations = []
+
+        if violations:
+            schedule_iso = (
+                schedule_time.isoformat()
+                if isinstance(schedule_time, datetime)
+                else str(schedule_time)
+            )
+            assistant.draft_state["pending_schedule"] = {
+                "platform":          platform,
+                "content":           content,
+                "link_url":          link_url,
+                "photo_url":         photo_url,
+                "schedule_time_iso": schedule_iso,
+            }
+            return _format_cadence_violations(violations, platform, schedule_time)
+
+    # Clean: clear any stale pending_schedule from a previous gate hit.
+    assistant.draft_state.pop("pending_schedule", None)
 
     try:
         result = assistant.hubspot.create_social_post(
@@ -580,6 +764,16 @@ def _handle_draft_conversation(query: str, assistant) -> str:
         w in query_lower for w in ['save', 'create', 'done', 'looks good', 'that works']
     ):
         return _save_email_draft(query, assistant)
+
+    # Cadence override — must run BEFORE the generic "schedule" matcher
+    # below, since "schedule anyway" contains "schedule".
+    if assistant.draft_state.get("type") == "social" and (
+        "schedule anyway" in query_lower
+        or "override and schedule" in query_lower
+    ):
+        if assistant.draft_state.get("pending_schedule"):
+            return _execute_override(assistant)
+        # No stashed pending → fall through to normal handling.
 
     # Post/schedule social
     if assistant.draft_state["type"] == "social":
@@ -786,3 +980,6 @@ def _clear_draft_state(assistant):
         "link_url": None,
         "photo_url": None,
     })
+    # pending_schedule isn't a fixed key on the default draft_state dict —
+    # remove it entirely so it doesn't haunt the next draft session.
+    assistant.draft_state.pop("pending_schedule", None)
