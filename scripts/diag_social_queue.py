@@ -26,9 +26,11 @@ Auth is reused from clients.hubspot.HubSpotClient (no token duplication).
 import argparse
 import json
 import os
+import re
 import sys
 import traceback
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 # Make the repo root importable when run as `python scripts/...`.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -81,6 +83,60 @@ def _dump_json(body):
     except Exception as e:
         print(f"(could not pretty-print: {e})")
         print(body)
+
+
+# Drive-share rewrite + image-extension sanity check, both used by the
+# write probe when --photo-url is supplied.
+
+_DRIVE_FILE_RE = re.compile(r"^/file/d/([^/]+)")
+_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+
+
+def _rewrite_drive_url(url):
+    """If drive.google.com /file/d/<ID>/..., rewrite to direct-download.
+    Returns (final_url, was_rewritten)."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return (url, False)
+    if (parsed.netloc or "").lower() != "drive.google.com":
+        return (url, False)
+    m = _DRIVE_FILE_RE.match(parsed.path or "")
+    if not m:
+        return (url, False)
+    return (
+        f"https://drive.google.com/uc?export=download&id={m.group(1)}",
+        True,
+    )
+
+
+def _looks_like_image_url(url):
+    try:
+        path = (urlparse(url).path or "").lower()
+    except Exception:
+        return False
+    return path.endswith(_IMAGE_EXTS)
+
+
+def _print_media_fields(body):
+    """Print broadcastMediaType, content.photoUrl, content.link, and
+    extraData.files (count + first file's url/mediaType/fileStatus)
+    on their own labeled lines."""
+    if not isinstance(body, dict):
+        print("  (no parseable body for media-field readout)")
+        return
+    print(f"  broadcastMediaType: {body.get('broadcastMediaType')!r}")
+    content = body.get("content") if isinstance(body.get("content"), dict) else {}
+    print(f"  content.photoUrl:   {content.get('photoUrl')!r}")
+    print(f"  content.link:       {content.get('link')!r}")
+    extra = body.get("extraData") if isinstance(body.get("extraData"), dict) else {}
+    files = extra.get("files") if isinstance(extra.get("files"), list) else []
+    print(f"  extraData.files:    count={len(files)}")
+    if files and isinstance(files[0], dict):
+        f0 = files[0]
+        print(f"    [0].url:        {f0.get('url')!r}")
+        print(f"    [0].mediaType:  {f0.get('mediaType')!r}")
+        print(f"    [0].fileStatus: {f0.get('fileStatus')!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -240,17 +296,43 @@ def read_probe(hubspot):
 # MODE 2 — WRITE PROBE
 # ---------------------------------------------------------------------------
 
-def write_probe(hubspot, channel_guid):
+def write_probe(hubspot, channel_guid, photo_url=None, link=None):
     print(SEP); print("WRITE PROBE"); print(SEP)
     print(f"channelKey:           {channel_guid}")
     print(f"triggerAt UTC:        {PROBE_TRIGGER_AT_UTC.isoformat()}")
     print(f"triggerAt epoch-ms:   {_ms_from_utc(PROBE_TRIGGER_AT_UTC)}")
+
+    final_photo_url = None
+    if photo_url:
+        rewritten, was_rewritten = _rewrite_drive_url(photo_url)
+        if was_rewritten:
+            print(f"photoUrl original:    {photo_url}")
+            print(f"photoUrl rewritten:   {rewritten}")
+            print( "                      (drive.google.com /file/d/ → direct-download)")
+        else:
+            print(f"photoUrl:             {photo_url}")
+        final_photo_url = rewritten
+        if not _looks_like_image_url(final_photo_url):
+            print()
+            print("⚠️  WARNING: photoUrl does not end in .jpg/.jpeg/.png/.gif/.webp")
+            print("    HubSpot may reject non-image media submitted as PHOTO")
+            print("    (known failure: .mp4 → ERROR_ARCHIVE). Sending anyway —")
+            print("    collecting the rejection is valid probe data.")
+
+    if link:
+        print(f"link:                 {link}")
     print()
+
+    content_block = {"body": PROBE_MESSAGE}
+    if final_photo_url:
+        content_block["photoUrl"] = final_photo_url
+    if link:
+        content_block["link"] = link
 
     payload = {
         "channelGuid": channel_guid,
         "triggerAt": _ms_from_utc(PROBE_TRIGGER_AT_UTC),
-        "content": {"body": PROBE_MESSAGE},
+        "content": content_block,
     }
     create_url = f"{hubspot.base_url}/broadcast/v1/broadcasts"
     print(f"POST {create_url}")
@@ -261,8 +343,13 @@ def write_probe(hubspot, channel_guid):
     )
     print(f"\n→ status: {create_resp.status_code}")
     print("→ body:")
-    try: _dump_json(create_resp.json())
-    except Exception: print(create_resp.text or "(empty)")
+    try:
+        create_body = create_resp.json()
+        _dump_json(create_body)
+        print("→ media fields:")
+        _print_media_fields(create_body)
+    except Exception:
+        print(create_resp.text or "(empty)")
 
     if create_resp.status_code >= 400:
         print("\nCreate failed; nothing to clean up.")
@@ -290,6 +377,8 @@ def write_probe(hubspot, channel_guid):
         detail = detail_resp.json()
         print(f"→ status field: {detail.get('status')}")
         _dump_json(detail)
+        print("→ media fields:")
+        _print_media_fields(detail)
     except Exception:
         print(detail_resp.text or "(empty)")
 
@@ -335,6 +424,12 @@ def main():
                    help="Create + cancel one far-future test broadcast.")
     p.add_argument("--channel-guid",
                    help="Required with --write-probe. The channelKey / channelGuid.")
+    p.add_argument("--photo-url",
+                   help="Write-probe only: add photoUrl to payload content. "
+                        "drive.google.com /file/d/<ID>/... is rewritten to "
+                        "the uc?export=download form before sending.")
+    p.add_argument("--link",
+                   help="Write-probe only: add link to payload content.")
     args = p.parse_args()
 
     hubspot = HubSpotClient()
@@ -348,7 +443,12 @@ def main():
             print("       Run with no args for the read-only probe.")
             return 2
         try:
-            write_probe(hubspot, args.channel_guid)
+            write_probe(
+                hubspot,
+                args.channel_guid,
+                photo_url=args.photo_url,
+                link=args.link,
+            )
         except Exception:
             print("\nWRITE PROBE RAISED:")
             traceback.print_exc()
