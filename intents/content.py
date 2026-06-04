@@ -11,6 +11,9 @@ import logging
 import re
 import json
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from dateutil import parser as dateutil_parser
 
 from config import ORG_FACTS_PROMPT
 from content.content_analysis import find_topic_matches
@@ -602,9 +605,19 @@ def _execute_override(assistant) -> str:
 
     _clear_draft_state(assistant)
     excerpt = body[:100] + ("..." if len(body) > 100 else "")
+
+    # Echo the stashed schedule so the operator sees what they're confirming.
+    schedule_echo = ""
+    if isinstance(schedule_iso, str):
+        try:
+            schedule_echo = _format_et_schedule(datetime.fromisoformat(schedule_iso))
+        except (ValueError, TypeError):
+            schedule_echo = ""
+    schedule_line = f"\n📅 Scheduled for: **{schedule_echo}**" if schedule_echo else ""
+
     return f"""✅ **Post Scheduled (cadence override)!**
 
-📱 **{platform.title()}**
+📱 **{platform.title()}**{schedule_line}
 
 {excerpt}
 
@@ -621,11 +634,28 @@ def _save_social_post(query: str, assistant) -> str:
 
     # Determine schedule time
     schedule_time = None
+    parse_failed = False
     if 'schedule' in query_lower:
-        schedule_time = _parse_schedule_time(query)
+        parsed = _parse_schedule_time(query)
+        if parsed is None:
+            parse_failed = True
+        else:
+            schedule_time = parsed
     elif 'post now' in query_lower or 'publish now' in query_lower:
-        schedule_time = datetime.now()
+        # ET-aware now so the echo + V5.6 _coerce_trigger_at_ms agree on tz.
+        schedule_time = datetime.now(_ET_TZ).replace(tzinfo=None)
     # else: creates as draft (no schedule_time)
+
+    if parse_failed:
+        # Keep draft + pending_schedule intact; ask the user to restate.
+        return (
+            "⏰ I couldn't parse the time from that. Try formats like:\n"
+            '• *"Schedule for tomorrow at 5pm"*\n'
+            '• *"Schedule for June 21 at 10am"*\n'
+            '• *"Schedule for Monday 10am"*\n'
+            '• *"Schedule for 2026-06-21 10:00"*\n\n'
+            "Your draft is still here — say a new time when ready."
+        )
 
     # Cadence gate — runs only when there's an effective trigger time.
     # Drafts (no schedule_time) skip the gate by design.
@@ -674,21 +704,28 @@ def _save_social_post(query: str, assistant) -> str:
 
         _clear_draft_state(assistant)
 
-        if schedule_time and schedule_time > datetime.now():
-            time_str = schedule_time.strftime("%B %d at %I:%M %p")
+        # Compare schedule_time (naive ET) against a naive-ET "now".
+        # Mixing naive-ET with datetime.now() (naive UTC on Railway) would
+        # miscategorise a 5pm-ET post as "already past" by 4–5 hours.
+        now_et_naive = datetime.now(_ET_TZ).replace(tzinfo=None)
+
+        if schedule_time and schedule_time > now_et_naive:
+            schedule_echo = _format_et_schedule(schedule_time)
             return f"""✅ **Post Scheduled!**
 
 📱 **{platform.title()}**
-📅 Scheduled for: {time_str}
+📅 Scheduled for: **{schedule_echo}**
 
 {content[:100]}{'...' if len(content) > 100 else ''}
 
 *View and manage in HubSpot Social.*"""
 
         elif schedule_time:
+            schedule_echo = _format_et_schedule(schedule_time)
             return f"""✅ **Post Published!**
 
 📱 **{platform.title()}**
+🕒 At: **{schedule_echo}**
 
 {content[:100]}{'...' if len(content) > 100 else ''}"""
 
@@ -871,32 +908,85 @@ Return only the revised post content, nothing else."""
 # Utilities (used only by this module)
 # ---------------------------------------------------------------------------
 
-def _parse_schedule_time(query: str) -> datetime:
-    """Parse a schedule time from natural language."""
-    query_lower = query.lower()
-    now = datetime.now()
+_ET_TZ = ZoneInfo("America/New_York")
 
-    if 'tomorrow' in query_lower:
-        target = now + timedelta(days=1)
-    elif 'next week' in query_lower:
-        target = now + timedelta(weeks=1)
+_WEEKDAY_WORDS = (
+    "monday", "tuesday", "wednesday", "thursday",
+    "friday", "saturday", "sunday",
+)
+
+
+def _parse_schedule_time(query: str):
+    """Parse a schedule time from natural language to a naive ET datetime.
+
+    Uses dateutil.parser.parse(fuzzy=True) so command words like
+    "schedule for facebook" don't poison the parse. The default anchor
+    is "now in America/New_York" (HubSpot portal default); date-only
+    inputs inherit the anchor's time, time-only inputs inherit the
+    anchor's date. Anchor shifts to tomorrow/next-week when those words
+    appear (dateutil can't interpret those natively).
+
+    Roll-forward heuristics for past results:
+      - any weekday name in input  → +7 days (next occurrence of weekday)
+      - otherwise                  → +1 day  (bare time, assume tomorrow)
+
+    Returns:
+        naive datetime in ET wall-clock time on success;
+        None on parse failure, OR if still in the past after roll-forward
+        (caller must NOT guess — ask the user to restate).
+    """
+    q = query.lower()
+    now_et = datetime.now(_ET_TZ)
+
+    anchor = now_et
+    if "tomorrow" in q:
+        anchor = now_et + timedelta(days=1)
+    elif "next week" in q:
+        anchor = now_et + timedelta(weeks=1)
+
+    # Zero-anchor: drop tz and snap to noon so bare "10am" means 10:00 (not
+    # inheriting the current minute), and date-only inputs default to noon.
+    default_naive = anchor.replace(
+        tzinfo=None, hour=12, minute=0, second=0, microsecond=0,
+    )
+    try:
+        parsed = dateutil_parser.parse(query, fuzzy=True, default=default_naive)
+    except (ValueError, OverflowError, TypeError):
+        return None
+
+    # If the input carried an explicit tz (e.g. "2026-06-21T10:00:00Z"),
+    # convert to ET; otherwise treat the naive result as ET wall time.
+    if parsed.tzinfo is not None:
+        parsed_et = parsed.astimezone(_ET_TZ)
     else:
-        target = now + timedelta(hours=1)
+        parsed_et = parsed.replace(tzinfo=_ET_TZ)
 
-    time_match = re.search(r'(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', query_lower)
-    if time_match:
-        hour = int(time_match.group(1))
-        minute = int(time_match.group(2) or 0)
-        period = time_match.group(3)
+    grace = timedelta(seconds=60)
+    if parsed_et < now_et - grace:
+        if any(w in q for w in _WEEKDAY_WORDS):
+            parsed_et = parsed_et + timedelta(days=7)
+        else:
+            parsed_et = parsed_et + timedelta(days=1)
 
-        if period == 'pm' and hour < 12:
-            hour += 12
-        elif period == 'am' and hour == 12:
-            hour = 0
+    if parsed_et < now_et - grace:
+        return None
 
-        target = target.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return parsed_et.replace(tzinfo=None)
 
-    return target
+
+def _format_et_schedule(dt) -> str:
+    """Format a naive ET datetime as 'Weekday, Month Day at H:MM AM/PM ET'.
+
+    The echo is what catches parse bugs — operator sees exactly what
+    will be scheduled before HubSpot acts.
+    """
+    if not isinstance(dt, datetime):
+        return "(unknown time)"
+    weekday = dt.strftime("%A")
+    month = dt.strftime("%B")
+    hour_12 = (dt.hour % 12) or 12
+    period = "AM" if dt.hour < 12 else "PM"
+    return f"{weekday}, {month} {dt.day} at {hour_12}:{dt.minute:02d} {period} ET"
 
 
 def _extract_topic(query: str, context: str) -> str:
