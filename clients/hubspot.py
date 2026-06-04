@@ -23,9 +23,16 @@ import logging
 import re
 import requests
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from config import Config
 
 logger = logging.getLogger(__name__)
+
+# HubSpot portal time zone. Naive datetimes (or naive ISO strings)
+# passed to create_social_post are interpreted in this zone before
+# converting to UTC epoch-ms — that's what HubSpot users see in the UI
+# when they pick a schedule time.
+_HUBSPOT_PORTAL_TZ = ZoneInfo("America/New_York")
 
 
 class HubSpotClient:
@@ -893,9 +900,80 @@ class HubSpotClient:
             if channel.get("channelType") == channel_type:
                 channel_id = channel.get("channelId")
                 return f"{channel_type}:{channel_id}"
-        
+
         return None
-    
+
+    def _get_channel_guid(self, platform: str) -> str:
+        """Get the channelGuid for a platform.
+
+        Mirrors _get_channel_key but returns the singular `channelGuid`
+        field from the channels list response instead of the composite
+        `channelType:channelId` key form.
+
+        2026-06-04 write probe vs POST /broadcast/v1/broadcasts confirmed
+        the API rejects "channelKeys": [...] with HTTP 400 ("Broadcast
+        arguments must have a channelkey or channelguid field present")
+        and accepts "channelGuid": "<guid>" with 201.
+
+        Args:
+            platform: Friendly name like "facebook", "twitter",
+                      "linkedin", "instagram"
+
+        Returns:
+            channelGuid string, or None if no connected channel of that
+            type exists.
+        """
+        if self._social_channels_cache is None:
+            channels_response = self.get_social_channels()
+            if isinstance(channels_response, list):
+                self._social_channels_cache = channels_response
+            else:
+                self._social_channels_cache = []
+
+        platform_lower = platform.lower().strip()
+        channel_type = self.SOCIAL_PLATFORMS.get(platform_lower)
+
+        if not channel_type:
+            return None
+
+        for channel in self._social_channels_cache:
+            if channel.get("channelType") == channel_type:
+                return channel.get("channelGuid")
+
+        return None
+
+    @staticmethod
+    def _coerce_trigger_at_ms(value):
+        """Convert an input to triggerAt as epoch MILLISECONDS.
+
+        - "now"           → current UTC time in ms
+        - aware datetime  → converted to UTC ms
+        - naive datetime  → interpreted as America/New_York wall time
+                            (HubSpot portal default), then UTC ms
+        - ISO 8601 string → parsed via fromisoformat; aware/naive
+                            handled like datetime above
+        - anything else (None, unparseable string, number, …) → None;
+          caller omits triggerAt (= draft, current behavior preserved)
+
+        Verified by 2026-06-04 probe: triggerAt=1800007200000 (epoch-ms)
+        creates a broadcast scheduled for 2027-01-15 10:00 UTC.
+        """
+        if value == "now":
+            return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+        if isinstance(value, str):
+            try:
+                value = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=_HUBSPOT_PORTAL_TZ)
+            return int(value.astimezone(timezone.utc).timestamp() * 1000)
+
+        return None
+
     def get_social_broadcasts(self, limit: int = 10, offset: int = 0) -> dict:
         """Get social media broadcasts"""
         params = {"limit": limit}
@@ -1034,32 +1112,31 @@ class HubSpotClient:
             schedule_time: datetime to schedule (None = draft, "now" = immediate)
             campaign_guid: Optional HubSpot campaign GUID
         """
-        channel_key = self._get_channel_key(platform)
-        if not channel_key:
+        channel_guid = self._get_channel_guid(platform)
+        if not channel_guid:
             available = ", ".join(self.SOCIAL_PLATFORMS.keys())
             return {"error": f"Channel not found for '{platform}'. Available: {available}"}
-        
+
         payload = {
-            "channelKeys": [channel_key],
+            "channelGuid": channel_guid,
+            "clientTag": "jidhr",
             "content": {
                 "body": content
             }
         }
-        
+
         if link_url:
             payload["content"]["linkUrl"] = link_url
         if photo_url:
             payload["content"]["photoUrl"] = photo_url
         if campaign_guid:
             payload["campaignGuid"] = campaign_guid
-        
+
         if schedule_time:
-            if isinstance(schedule_time, datetime):
-                timestamp_ms = int(schedule_time.timestamp() * 1000)
-                payload["triggerAt"] = timestamp_ms
-            elif schedule_time == "now":
-                payload["triggerAt"] = int(datetime.now().timestamp() * 1000)
-        
+            trigger_ms = self._coerce_trigger_at_ms(schedule_time)
+            if trigger_ms is not None:
+                payload["triggerAt"] = trigger_ms
+
         logger.info(f"Creating social post for {platform}: {content[:50]}...")
         return self._post("broadcast/v1/broadcasts", payload)
     
