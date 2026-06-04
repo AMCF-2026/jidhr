@@ -50,27 +50,61 @@ def backfill_social_content() -> dict:
         {
           "fetched": <total returned by HubSpot>,
           "inserted": <new rows written>,
-          "skipped_duplicate": <ON CONFLICT no-ops>,
+          "skipped_duplicate": <pre-filter hits + ON CONFLICT no-ops>,
           "topic_extraction_failures": <extract_topics raised>,
+          "error": <None on success, str on early-return DB-init failure>,
         }
     """
+    summary = {
+        "fetched": 0,
+        "inserted": 0,
+        "skipped_duplicate": 0,
+        "topic_extraction_failures": 0,
+        "error": None,
+    }
+
+    # Pre-filter: pull already-logged external_ids so we can skip them
+    # BEFORE the (expensive) extract_topics LLM call. Mirrors the pattern
+    # in intents.content_memory.run_email_backfill. Failure here is fatal:
+    # a failed DB read predicts failed inserts, no point burning LLM spend.
+    try:
+        rows = execute_query(
+            "SELECT external_id FROM content_history "
+            "WHERE content_type = %s AND external_id IS NOT NULL",
+            params=("social_post",),
+            fetch=True,
+        )
+    except Exception as e:
+        logger.error(
+            f"Social backfill: failed to query existing rows: {e}",
+            exc_info=True,
+        )
+        summary["error"] = str(e)
+        return summary
+
+    existing = {r["external_id"] for r in rows}
+    logger.info(f"Social backfill: {len(existing)} post(s) already logged.")
+
     # Lazy import — mirrors the pattern in intents.content_memory.run_email_backfill.
     from clients.hubspot import HubSpotClient
 
     hubspot = HubSpotClient()
     records = hubspot.get_published_social_broadcasts_with_content()
 
-    summary = {
-        "fetched": len(records),
-        "inserted": 0,
-        "skipped_duplicate": 0,
-        "topic_extraction_failures": 0,
-    }
+    summary["fetched"] = len(records)
     logger.info(f"backfill_social_content: fetched={summary['fetched']}")
 
     for rec in records:
         external_id = rec["external_id"]
         full_body = rec["full_body"]
+
+        if external_id in existing:
+            logger.info(
+                f"Social backfill: skipped (dup): {external_id} "
+                f"[{rec.get('channel')}]"
+            )
+            summary["skipped_duplicate"] += 1
+            continue
 
         # Topic extraction — guarded even though extract_topics is documented
         # never-raises. Template .format() can still raise KeyError if
@@ -123,6 +157,13 @@ def backfill_social_content() -> dict:
         if rowcount == 1:
             summary["inserted"] += 1
         else:
+            # Canary: after the pre-filter, this path should only fire if
+            # something slipped past the existing-ids set (race condition,
+            # NULL external_id row, schema drift). Worth a distinct log
+            # so log-greps can spot it.
+            logger.info(
+                f"Social backfill: skipped (dup via ON CONFLICT): {external_id}"
+            )
             summary["skipped_duplicate"] += 1
 
     logger.info(f"backfill_social_content: summary={summary}")

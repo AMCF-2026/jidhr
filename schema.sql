@@ -15,8 +15,12 @@ CREATE TABLE IF NOT EXISTS content_history (
     full_body       TEXT,
     sent_at         TIMESTAMP NOT NULL,
     logged_by       TEXT,
-    created_at      TIMESTAMP DEFAULT NOW()
+    created_at      TIMESTAMP DEFAULT NOW(),
+    source_url      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_content_lookup
     ON content_history (content_type, channel, sent_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_content_external
+    ON content_history (content_type, external_id);
