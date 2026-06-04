@@ -248,7 +248,7 @@ def write_probe(hubspot, channel_guid):
     print()
 
     payload = {
-        "channelKeys": [channel_guid],
+        "channelGuid": channel_guid,
         "triggerAt": _ms_from_utc(PROBE_TRIGGER_AT_UTC),
         "content": {"body": PROBE_MESSAGE},
     }
