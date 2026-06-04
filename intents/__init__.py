@@ -18,6 +18,7 @@ import logging
 
 from intents import sync_commands
 from intents import social_sync
+from intents import content_report
 from intents import content
 from intents import daf_workflow
 from intents import events
@@ -30,14 +31,18 @@ logger = logging.getLogger(__name__)
 # Priority order: most specific first, broadest last.
 # Each entry: (name, module)
 HANDLER_CHAIN = [
-    ("sync_commands", sync_commands),
-    ("social_sync",   social_sync),
-    ("content",       content),
-    ("daf_workflow",  daf_workflow),
-    ("events",        events),
-    ("notes",         notes),
-    ("donor_prep",    donor_prep),
-    ("reports",       reports),
+    ("sync_commands",  sync_commands),
+    ("social_sync",    social_sync),
+    # content_report must win before content — its phrases (e.g. "what
+    # have we been posting") would otherwise risk being shadowed if the
+    # broader content handler ever expands its triggers.
+    ("content_report", content_report),
+    ("content",        content),
+    ("daf_workflow",   daf_workflow),
+    ("events",         events),
+    ("notes",          notes),
+    ("donor_prep",     donor_prep),
+    ("reports",        reports),
 ]
 
 
