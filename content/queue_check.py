@@ -126,6 +126,11 @@ _STOPWORDS = frozenset({
     "this", "that", "with", "from", "have", "your", "their",
     "what", "when", "will", "been", "also",
     "amcf", "http", "https", "amuslimcf",
+    # Domain-ubiquitous in AMCF copy — present in nearly every post,
+    # so they collide on rule 1 without indicating same-topic.
+    # Live probe (V5.12): a Retain Quran draft vs an AGL Fellows LI post
+    # scored kw=2 exactly on {muslim, support} — unrelated topics.
+    "muslim", "support",
 })
 
 
