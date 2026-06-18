@@ -744,8 +744,8 @@ class HubSpotClient:
             return {"error": f"Unknown template '{template}'. Available: {available}"}
 
         # --- Step 1: Clone the source email ---
-        clone_endpoint = f"marketing/v3/emails/{clone_source_id}/clone"
-        clone_payload = {"name": name}
+        clone_endpoint = "marketing/v3/emails/clone"
+        clone_payload = {"id": clone_source_id, "cloneName": name}
 
         logger.info(f"EMAIL CLONE — source: {clone_source_id}, name: {name}")
         clone_result = self._post(clone_endpoint, clone_payload)
