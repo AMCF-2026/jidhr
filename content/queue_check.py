@@ -18,6 +18,7 @@ raises to callers.
 """
 
 import logging
+import re
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -115,6 +116,36 @@ def _text_similarity(a, b) -> float:
     if smaller == 0:
         return 0.0
     return len(sa & sb) / smaller
+
+
+# Stopwords for the keyword-intersection second pass in rule 1. Common
+# English glue words plus "amcf"/"amuslimcf" (always present in AMCF
+# copy and don't indicate same-topic) and the http(s) protocol tokens
+# (link URLs would otherwise contribute trivial overlaps).
+_STOPWORDS = frozenset({
+    "this", "that", "with", "from", "have", "your", "their",
+    "what", "when", "will", "been", "also",
+    "amcf", "http", "https", "amuslimcf",
+})
+
+
+def _significant_tokens(text: str) -> set:
+    """Extract keywords for the rule-1 second-pass intersection check.
+
+    Tokenization: re.findall(r'[a-z0-9]+', text.lower()) — alphanumeric
+    runs, case-folded. Filters to tokens length >= 4 then removes the
+    stopword set above.
+
+    Used by rule 1 as an OR-fallback to _text_similarity for cases where
+    one post is prose and the other is hashtag/bullet formatted — the
+    overlap coefficient can dip below 0.5 when the formatted side
+    inflates the word count with hashtags, while the underlying
+    keywords still overlap. No < 4-word guard applies here.
+    """
+    if not isinstance(text, str):
+        return set()
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    return {t for t in tokens if len(t) >= 4 and t not in _STOPWORDS}
 
 
 # ---------------------------------------------------------------------------
@@ -254,8 +285,10 @@ def check_schedule(body, link, channel, trigger_at, queue=None) -> list[dict]:
                 if (target_link_norm and item_link_norm
                         and target_link_norm == item_link_norm):
                     matched_on = "link"
-                elif (body and item_body
-                      and _text_similarity(body, item_body) >= _TEXT_SIMILARITY_THRESHOLD):
+                elif body and item_body and (
+                    _text_similarity(body, item_body) >= _TEXT_SIMILARITY_THRESHOLD
+                    or len(_significant_tokens(body) & _significant_tokens(item_body)) >= 2
+                ):
                     matched_on = "text"
 
                 if matched_on:
