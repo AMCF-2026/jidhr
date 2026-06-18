@@ -131,8 +131,12 @@ _STOPWORDS = frozenset({
     # Live probes:
     #   V5.12 → Retain Quran draft vs AGL Fellows LI = {muslim, support}
     #   V5.13 → Women's Giving Circle LI vs endowment draft = {year, more}
+    #   V5.14 → endowment draft vs WGC LI = {muslimphilanthropy, funding}
+    #          (#MuslimPhilanthropy is AMCF's universal hashtag, normalized
+    #          to a single joined token after re.findall split)
     "muslim", "support",
     "year",   "more",
+    "muslimphilanthropy",
 })
 
 
