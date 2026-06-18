@@ -771,18 +771,26 @@ class HubSpotClient:
 
         # --- Step 3: PATCH subject + body content ---
         # Find the body widget (rich_text type)
-        target_widget_id = None
-        for wid, wdata in widgets.items():
-            if isinstance(wdata, dict) and wdata.get("type") == "rich_text":
-                target_widget_id = wid
-                break
-        if not target_widget_id:
-            for candidate in ["hs_email_body", "body", "main_body"]:
-                if candidate in widgets:
-                    target_widget_id = candidate
-                    break
+        # Body widget IDs are fixed per clone source template.
+        # Confirmed by inspecting widget HTML content live.
+        BODY_WIDGET_BY_TEMPLATE = {
+            "amcf":         "module-3-0-0",   # newsletter clone 323772982006
+            "amfc":         "module-3-0-0",
+            "master":       "module-3-0-0",
+            "newsletter":   "module-3-0-0",
+            "giving circle": "module-3-1-0",  # GC clone 325004407544
+            "giving_circle": "module-3-1-0",
+            "gc":           "module-3-1-0",
+        }
+        target_widget_id = BODY_WIDGET_BY_TEMPLATE.get(template_key)
         if not target_widget_id and widgets:
-            target_widget_id = list(widgets.keys())[0]
+            # Fallback: longest HTML widget (excludes empty and footer)
+            target_widget_id = max(
+                (wid for wid, w in widgets.items()
+                 if isinstance(w, dict) and len(str(w.get("body", {}).get("html", ""))) > 50),
+                key=lambda wid: len(str(widgets[wid].get("body", {}).get("html", ""))),
+                default=list(widgets.keys())[0]
+            )
 
         patch_payload = {"subject": subject}
         body_set = False
