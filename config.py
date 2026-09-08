@@ -28,7 +28,10 @@ class Config:
     # =========================================================================
     SECRET_KEY = os.environ.get('SECRET_KEY', 'jidhr-dev-key-change-in-production')
     DEBUG = os.environ.get('DEBUG', 'False').lower() == 'true'
-    PORT = int(os.environ.get('PORT', 5000))
+    # `or` rather than a default argument: an env var that is present but
+    # blank (Railway does this when a variable is cleared rather than removed)
+    # returns '' from os.environ.get, and int('') raises at import time.
+    PORT = int(os.environ.get('PORT') or 5000)
     
     # =========================================================================
     # OPENROUTER (Claude)

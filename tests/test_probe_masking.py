@@ -201,3 +201,242 @@ def test_dotted_field_paths_are_masked_by_their_leaf_segment():
     assert mask_value("properties.email", "z@x.org") == "z*@x.org"
     assert mask_value("properties.firstname", "Zaid") == REDACTED
     assert mask_value("properties.lifetime_giving", 5000) == "$1k-10k"
+
+
+# ---------------------------------------------------------------------------
+# Nested record shapes introduced by probe extension #2
+#
+# event/display/eventdate returns registrants as nested arrays (profiles[],
+# guests[]). Those rows are flattened to dotted paths before masking, so the
+# leaf-segment rules have to hold at depth.
+# ---------------------------------------------------------------------------
+
+def test_registrant_row_is_masked_leaf_by_leaf():
+    registrant = {
+        "profile_id": 19879,
+        "name": "Someone Real",
+        "email": "someone@example.org",
+        "rsvp": 1,
+        "attended": 0,
+        "guest_count": 2,
+        "amount_paid": "150.00",
+    }
+    assert mask_value("profiles", registrant) == {
+        "profile_id": 19879,
+        "name": REDACTED,
+        "email": "s*@example.org",
+        "rsvp": 1,
+        "attended": 0,
+        "guest_count": 2,
+        "amount_paid": "$100-1k",
+    }
+
+
+def test_guest_rows_in_a_list_are_each_masked():
+    guests = [
+        {"guest_name": "A Person", "guest_email": "a@x.org", "attended": 1},
+        {"guest_name": "B Person", "guest_email": None, "attended": 0},
+    ]
+    assert mask_value("guests", guests) == [
+        {"guest_name": REDACTED, "guest_email": "a*@x.org", "attended": 1},
+        {"guest_name": REDACTED, "guest_email": None, "attended": 0},
+    ]
+
+
+@pytest.mark.parametrize("path,value,expected", [
+    ("guests.guest_name", "A Person", REDACTED),
+    ("profiles.rsvp", 1, 1),
+    ("profiles.attended", 0, 0),
+    ("profiles.registration_date", "2026-03-20", "2026-03-20"),
+    ("profiles.profile_id", 19879, 19879),
+    ("guests.amount_paid", "150.00", "$100-1k"),
+])
+def test_nested_registrant_paths_mask_by_leaf(path, value, expected):
+    assert mask_value(path, value) == expected
+
+
+def test_rsvp_and_attended_flags_survive_masking_so_they_can_be_counted():
+    # C3 reports the distinct values of these; masking must not flatten them.
+    for flag in ("rsvp", "attended", "checked_in", "no_show"):
+        for value in (0, 1):
+            assert mask_value(flag, value) == value
+
+
+def test_deeply_nested_dicts_still_mask_their_leaves():
+    payload = {"event": {"registrants": {"name": "X", "email": "x@y.org"}}}
+    assert mask_value("data", payload) == {
+        "event": {"registrants": {"name": REDACTED, "email": "x*@y.org"}}
+    }
+
+
+# ---------------------------------------------------------------------------
+# F3: Config must import when an env var is present but blank.
+#
+# These live here rather than in their own file because this change set is
+# scoped to tests/test_probe_masking.py.
+# ---------------------------------------------------------------------------
+
+# Every env var config.py casts to int() or float(). Add to this list when a
+# new numeric setting is introduced.
+NUMERIC_CONFIG_ENV_VARS = ["PORT"]
+
+
+@pytest.mark.parametrize("var", NUMERIC_CONFIG_ENV_VARS)
+def test_config_imports_when_a_numeric_env_var_is_blank(monkeypatch, var):
+    """A cleared-but-present env var returns '', and int('') raises."""
+    import importlib
+
+    monkeypatch.setenv(var, "")
+    import config
+    reloaded = importlib.reload(config)
+    assert reloaded.Config is not None
+
+
+@pytest.mark.parametrize("var", NUMERIC_CONFIG_ENV_VARS)
+def test_blank_numeric_env_var_falls_back_to_the_documented_default(
+        monkeypatch, var):
+    import importlib
+
+    monkeypatch.setenv(var, "")
+    import config
+    reloaded = importlib.reload(config)
+    assert getattr(reloaded.Config, var) == 5000
+
+
+def test_numeric_env_var_is_still_honoured_when_set(monkeypatch):
+    import importlib
+
+    monkeypatch.setenv("PORT", "8080")
+    import config
+    reloaded = importlib.reload(config)
+    assert reloaded.Config.PORT == 8080
+
+
+def test_config_source_has_no_bare_int_cast_of_an_env_var():
+    """Guards the fix itself: int(os.environ.get('X', default)) is the bug."""
+    import os as _os
+    import re as _re
+
+    repo_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    with open(_os.path.join(repo_root, "config.py"), encoding="utf-8") as handle:
+        source = handle.read()
+
+    bad = _re.findall(
+        r"(?:int|float)\(\s*os\.environ\.get\(\s*['\"][^'\"]+['\"]\s*,",
+        source,
+    )
+    assert bad == [], (
+        "config.py casts an env var with a default argument; a blank value "
+        "still reaches int()/float(). Use os.environ.get('X') or 'default'."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Label suffixes: a money word in the name does not always mean an amount
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("field", [
+    "first_gift_fund", "latest_gift_fund", "payment_method_name",
+    "donation_type", "grant_status",
+])
+def test_label_fields_are_not_reported_as_non_numeric_amounts(field):
+    # These contain a money word but hold a label. Masking them through
+    # mask_amount produced "<non-numeric>", which hid what the field was.
+    assert mask_value(field, "AMCF General Fund") != "<non-numeric>"
+
+
+def test_status_enums_survive_so_their_distinct_values_can_be_reported():
+    # C2/C6 report the distinct values of these; they must not be mangled.
+    assert mask_value("donation_status", "closed") == "closed"
+    assert mask_value("grant_status", "new") == "new"
+    assert mask_value("payment_method_id", 1003) == 1003
+
+
+def test_fund_named_fields_are_redacted_because_fund_names_carry_surnames():
+    # "Ali Family Fund" identifies a household as surely as a name field.
+    assert mask_value("fund_name", "Ali Family Fund") == REDACTED
+    assert mask_value("first_gift_fund", "Ali Family Fund") == REDACTED
+    assert mask_value("fund.fund_name", "Ali Family Fund") == REDACTED
+
+
+def test_real_amounts_are_still_reduced_despite_the_label_guard():
+    assert mask_value("donation_amount", "2500.00") == "$1k-10k"
+    assert mask_value("grant_amount", "25000.00") == "$10k-100k"
+    assert mask_value("current_fundbalance", "312000.00") == "$100k-1M"
+    assert mask_value("ticket_price", "0.00") == "$0"
+
+
+# ---------------------------------------------------------------------------
+# Record discovery (F2): the envelope is not a record
+# ---------------------------------------------------------------------------
+
+from scripts.probe_apis import find_records  # noqa: E402
+
+
+def test_hubspot_lists_envelope_is_read_from_the_lists_key():
+    payload = {"lists": [{"listId": "126", "name": "Giving Circle"}], "total": 1}
+    records, container = find_records(payload)
+    assert container == "lists"
+    assert len(records) == 1
+
+
+def test_subscription_definitions_envelope_is_recognised():
+    payload = {"subscriptionDefinitions": [{"id": "1265988358"}]}
+    records, container = find_records(payload)
+    assert container == "subscriptionDefinitions"
+    assert len(records) == 1
+
+
+def test_unknown_envelope_key_falls_back_to_the_first_object_list():
+    payload = {"someNewKey": [{"a": 1}, {"a": 2}], "total": 2}
+    records, container = find_records(payload)
+    assert len(records) == 2
+    assert "someNewKey" in container
+
+
+def test_empty_csuite_search_reports_zero_records_not_one_envelope():
+    # A search with no matches used to come back as "1 record" whose only
+    # field was `results`, which read as a hit.
+    payload = {"success": 1, "data": {"results": [], "count": 0}}
+    records, container = find_records(payload)
+    assert records == []
+    assert "empty" in container
+
+
+def test_csuite_display_envelope_is_still_a_single_record():
+    payload = {"success": 1, "data": {"funit_id": 1299, "fund_name": "X"}}
+    records, _ = find_records(payload)
+    assert len(records) == 1
+    assert records[0]["funit_id"] == 1299
+
+
+# ---------------------------------------------------------------------------
+# A "number" is not an identifier
+#
+# Regression: CSuite returns `primary_phone_number`, which ends in _number.
+# The id rule matched first and wrote a real phone number into the receipt.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("field", [
+    "primary_phone_number", "phone_number", "mobile_number", "fax_number",
+    "work_phone_number",
+])
+def test_phone_fields_are_redacted_even_when_they_end_in_number(field):
+    assert mask_value(field, "415-980-9091") == REDACTED
+
+
+def test_check_number_is_still_treated_as_an_identifier():
+    # The _number suffix still means "id" for the fields it was added for.
+    assert mask_value("check_number", "10432") == "10432"
+    assert mask_value("check_num", "10432") == "10432"
+
+
+@pytest.mark.parametrize("field", ["fedid", "ssn", "tax_id", "account_number"])
+def test_government_and_bank_identifiers_are_redacted(field):
+    assert mask_value(field, "52-1234567") == REDACTED
+
+
+def test_no_phone_shaped_value_survives_masking_under_any_phone_field():
+    for field in ("primary_phone_number", "phone", "mobile", "fax"):
+        masked = mask_value(field, "415-980-9091")
+        assert "415" not in str(masked)
