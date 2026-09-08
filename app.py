@@ -16,8 +16,11 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from config import Config
 from assistant import get_assistant
 from auth import init_auth
-from clients.database import health_check as db_health_check
-from intents.content_memory import run_email_backfill
+from clients.database import (
+    health_check as db_health_check,
+    is_configured as db_is_configured,
+)
+from content.content_memory import run_email_backfill
 
 # =============================================================================
 # LOGGING SETUP
@@ -135,6 +138,9 @@ def health():
     missing = Config.validate()
     env_status = "ok" if not missing else f"missing: [{', '.join(missing)}]"
 
+    # Config-only check: reads the environment, never opens a connection.
+    db_config_status = "configured" if db_is_configured() else "missing"
+
     try:
         db_status = "ok" if db_health_check() else "unreachable"
     except Exception as e:
@@ -143,7 +149,10 @@ def health():
     overall = "ok" if env_status == "ok" and db_status == "ok" else "degraded"
 
     if overall == "degraded":
-        logger.warning(f"Health degraded — env_vars={env_status}, database={db_status}")
+        logger.warning(
+            f"Health degraded — env_vars={env_status}, "
+            f"database={db_status}, database_config={db_config_status}"
+        )
     else:
         logger.debug("Health check passed")
 
@@ -151,6 +160,7 @@ def health():
         "status": overall,
         "env_vars": env_status,
         "database": db_status,
+        "database_config": db_config_status,
     })
 
 

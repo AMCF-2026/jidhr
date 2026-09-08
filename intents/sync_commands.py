@@ -3,7 +3,8 @@ Jidhr Sync Commands
 ===================
 Handles sync operations: donations, events, newsletter, and sync-all.
 
-Extracted from assistant.py lines 727-863 — logic unchanged.
+Chat-surface trigger for the sync/ package: matches the sync phrases,
+invokes the requested sync, and formats the result for the user.
 """
 
 import logging

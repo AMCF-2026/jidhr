@@ -1,0 +1,603 @@
+{
+  "generated_at": "2026-09-08T12:41:03",
+  "args": {
+    "system": "all",
+    "limit": 5,
+    "out": "/Users/b.c.dodge/Documents/GitHub/JIDHR/scripts/probe_output"
+  },
+  "masking": {
+    "emails": "first char + '*@' + domain",
+    "names_addresses_phones": "<redacted>",
+    "money_fields": "order of magnitude only",
+    "money_field_tokens": [
+      "amount",
+      "balance",
+      "total",
+      "fee",
+      "value",
+      "giving",
+      "gift",
+      "contribution",
+      "donation_amt",
+      "revenue",
+      "payment",
+      "paid",
+      "price",
+      "cost",
+      "principal",
+      "deposit",
+      "disbursement",
+      "payout",
+      "salary",
+      "income"
+    ],
+    "ids": "kept verbatim",
+    "dates": "kept verbatim",
+    "free_text": "replaced with '<text len=N>'"
+  },
+  "endpoints": [
+    {
+      "system": "csuite",
+      "endpoint": "profile/list",
+      "request": {
+        "view_limit": 5,
+        "view_offset": 0
+      },
+      "post_transport": true,
+      "note": "CSuite v2 signs the JSON body, so every read is an HTTP POST.",
+      "http_status": null,
+      "elapsed_ms": 0.1,
+      "ok": false,
+      "error": "CSuite API credentials not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    },
+    {
+      "system": "csuite",
+      "endpoint": "profile/list/search",
+      "request": {},
+      "post_transport": true,
+      "note": "SKIPPED \u2014 requires a person name as the query and config.py defines no known profile name. Probing it would have meant inventing a name or reusing live donor data.",
+      "http_status": null,
+      "elapsed_ms": null,
+      "ok": false,
+      "error": "skipped (no known name in config)",
+      "top_level_keys": [],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": [],
+      "skipped": true
+    },
+    {
+      "system": "csuite",
+      "endpoint": "donation/list",
+      "request": {
+        "view_limit": 5,
+        "view_offset": 0
+      },
+      "post_transport": true,
+      "note": "CSuite v2 signs the JSON body, so every read is an HTTP POST.",
+      "http_status": null,
+      "elapsed_ms": 0.0,
+      "ok": false,
+      "error": "CSuite API credentials not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    },
+    {
+      "system": "csuite",
+      "endpoint": "grant/list",
+      "request": {
+        "view_limit": 5,
+        "view_offset": 0
+      },
+      "post_transport": true,
+      "note": "CSuite v2 signs the JSON body, so every read is an HTTP POST.",
+      "http_status": null,
+      "elapsed_ms": 0.0,
+      "ok": false,
+      "error": "CSuite API credentials not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    },
+    {
+      "system": "csuite",
+      "endpoint": "funit/list",
+      "request": {
+        "view_limit": 5,
+        "view_offset": 0
+      },
+      "post_transport": true,
+      "note": "CSuite v2 signs the JSON body, so every read is an HTTP POST.",
+      "http_status": null,
+      "elapsed_ms": 0.0,
+      "ok": false,
+      "error": "CSuite API credentials not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    },
+    {
+      "system": "csuite",
+      "endpoint": "funit/list/search",
+      "request": {
+        "q": "fund"
+      },
+      "post_transport": true,
+      "note": "CSuite v2 signs the JSON body, so every read is an HTTP POST. Query is a fixed generic word, not a real name.",
+      "http_status": null,
+      "elapsed_ms": 0.0,
+      "ok": false,
+      "error": "CSuite API credentials not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    },
+    {
+      "system": "csuite",
+      "endpoint": "funit/display",
+      "request": {},
+      "post_transport": true,
+      "note": "SKIPPED \u2014 no fund id available \u2014 funit/list returned no records",
+      "http_status": null,
+      "elapsed_ms": null,
+      "ok": false,
+      "error": "skipped (no fund id available \u2014 funit/list returned no records)",
+      "top_level_keys": [],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": [],
+      "skipped": true
+    },
+    {
+      "system": "csuite",
+      "endpoint": "funit/feetype",
+      "request": {},
+      "post_transport": true,
+      "note": "CSuite v2 signs the JSON body, so every read is an HTTP POST. Client sends no fund id for this endpoint.",
+      "http_status": null,
+      "elapsed_ms": 0.0,
+      "ok": false,
+      "error": "CSuite API credentials not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    },
+    {
+      "system": "csuite",
+      "endpoint": "event/list/dates",
+      "request": {
+        "view_limit": 5
+      },
+      "post_transport": true,
+      "note": "CSuite v2 signs the JSON body, so every read is an HTTP POST.",
+      "http_status": null,
+      "elapsed_ms": 0.0,
+      "ok": false,
+      "error": "CSuite API credentials not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    },
+    {
+      "system": "csuite",
+      "endpoint": "event/display/eventdate",
+      "request": {},
+      "post_transport": true,
+      "note": "SKIPPED \u2014 no event date id available \u2014 event/list/dates returned no records",
+      "http_status": null,
+      "elapsed_ms": null,
+      "ok": false,
+      "error": "skipped (no event date id available \u2014 event/list/dates returned no records)",
+      "top_level_keys": [],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": [],
+      "skipped": true
+    },
+    {
+      "system": "csuite",
+      "endpoint": "check/list",
+      "request": {
+        "view_limit": 5,
+        "view_offset": 0
+      },
+      "post_transport": true,
+      "note": "CSuite v2 signs the JSON body, so every read is an HTTP POST.",
+      "http_status": null,
+      "elapsed_ms": 0.0,
+      "ok": false,
+      "error": "CSuite API credentials not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    },
+    {
+      "system": "csuite",
+      "endpoint": "profile/list (full page)",
+      "request": {
+        "view_limit": 100,
+        "view_offset": 0
+      },
+      "post_transport": true,
+      "note": "Single 100-record page. Field statistics only \u2014 no records are stored. Used to read the reported total and the newsletter field.",
+      "http_status": null,
+      "elapsed_ms": 0.0,
+      "ok": false,
+      "error": "CSuite API credentials not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    },
+    {
+      "system": "hubspot",
+      "endpoint": "crm/v3/properties/contacts",
+      "request": {},
+      "post_transport": false,
+      "note": "Full contact property schema.",
+      "http_status": null,
+      "elapsed_ms": 0.0,
+      "ok": false,
+      "error": "HubSpot access token not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    },
+    {
+      "system": "hubspot",
+      "endpoint": "crm/v3/properties/companies",
+      "request": {},
+      "post_transport": false,
+      "note": "Full company property schema.",
+      "http_status": null,
+      "elapsed_ms": 0.0,
+      "ok": false,
+      "error": "HubSpot access token not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    },
+    {
+      "system": "hubspot",
+      "endpoint": "crm/v3/objects/contacts",
+      "request": {
+        "limit": 5
+      },
+      "post_transport": false,
+      "note": "HubSpot returns only default properties unless `properties=` is passed, so absent fields here do not mean absent in the schema.",
+      "http_status": null,
+      "elapsed_ms": 0.0,
+      "ok": false,
+      "error": "HubSpot access token not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    },
+    {
+      "system": "hubspot",
+      "endpoint": "crm/v3/lists",
+      "request": {
+        "count": 100
+      },
+      "post_transport": false,
+      "note": "Plain GET listing.",
+      "http_status": null,
+      "elapsed_ms": 0.0,
+      "ok": false,
+      "error": "HubSpot access token not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    },
+    {
+      "system": "hubspot",
+      "endpoint": "crm/v3/lists/search",
+      "request": {
+        "count": 100
+      },
+      "post_transport": true,
+      "note": "Fallback. HubSpot offers no GET that enumerates lists; lists/search is POST-only and read-only.",
+      "http_status": null,
+      "elapsed_ms": 0.0,
+      "ok": false,
+      "error": "HubSpot access token not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    },
+    {
+      "system": "hubspot",
+      "endpoint": "marketing/v3/marketing-events",
+      "request": {
+        "limit": 5
+      },
+      "post_transport": false,
+      "note": "Client method get_marketing_events (GET).",
+      "http_status": null,
+      "elapsed_ms": 0.0,
+      "ok": false,
+      "error": "HubSpot access token not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    },
+    {
+      "system": "hubspot",
+      "endpoint": "communication-preferences/v3/definitions",
+      "request": {},
+      "post_transport": false,
+      "note": "Subscription types available for newsletter sync.",
+      "http_status": null,
+      "elapsed_ms": 0.0,
+      "ok": false,
+      "error": "HubSpot access token not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    },
+    {
+      "system": "hubspot",
+      "endpoint": "marketing/v3/forms",
+      "request": {
+        "limit": 100
+      },
+      "post_transport": false,
+      "note": "Names and ids only.",
+      "http_status": null,
+      "elapsed_ms": 0.0,
+      "ok": false,
+      "error": "HubSpot access token not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    },
+    {
+      "system": "hubspot",
+      "endpoint": "marketing/v3/emails",
+      "request": {
+        "limit": 5
+      },
+      "post_transport": false,
+      "note": "Ids, names and state only.",
+      "http_status": null,
+      "elapsed_ms": 0.0,
+      "ok": false,
+      "error": "HubSpot access token not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    },
+    {
+      "system": "hubspot",
+      "endpoint": "marketing/v3/emails/323772982006",
+      "request": {
+        "email_id": "323772982006"
+      },
+      "post_transport": false,
+      "note": "EMAIL_CLONE_SOURCES resolution check.",
+      "http_status": null,
+      "elapsed_ms": 0.0,
+      "ok": false,
+      "error": "HubSpot access token not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    },
+    {
+      "system": "hubspot",
+      "endpoint": "marketing/v3/emails/325004407544",
+      "request": {
+        "email_id": "325004407544"
+      },
+      "post_transport": false,
+      "note": "EMAIL_CLONE_SOURCES resolution check.",
+      "http_status": null,
+      "elapsed_ms": 0.0,
+      "ok": false,
+      "error": "HubSpot access token not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    },
+    {
+      "system": "hubspot",
+      "endpoint": "broadcast/v1/channels/setting/publish/current",
+      "request": {},
+      "post_transport": false,
+      "note": "Channel names and guids.",
+      "http_status": null,
+      "elapsed_ms": 0.0,
+      "ok": false,
+      "error": "HubSpot access token not configured",
+      "top_level_keys": [
+        "error"
+      ],
+      "reported_totals": {},
+      "record_count": 0,
+      "records_container": null,
+      "field_count": 0,
+      "fields": []
+    }
+  ],
+  "csuite_extras": {
+    "profile_total": {},
+    "profile_full_page_count": 0,
+    "newsletter": {
+      "exists": null,
+      "reason": "no profile records returned"
+    },
+    "first_fund_id": null,
+    "first_event_date_id": null
+  },
+  "hubspot_extras": {
+    "contact_properties": [],
+    "mapped_property_check": {
+      "lifetime_giving": {
+        "exists": false,
+        "detail": null
+      },
+      "donation_count": {
+        "exists": false,
+        "detail": null
+      },
+      "last_donation_amount": {
+        "exists": false,
+        "detail": null
+      },
+      "last_donation_date": {
+        "exists": false,
+        "detail": null
+      },
+      "csuite_profile_id": {
+        "exists": false,
+        "detail": null
+      },
+      "csuite_fund_id": {
+        "exists": false,
+        "detail": null
+      }
+    },
+    "company_properties": [],
+    "lists": [],
+    "subscription_definitions": [],
+    "forms": [],
+    "marketing_emails": [],
+    "email_clone_sources": {
+      "323772982006": {
+        "aliases": [
+          "amcf",
+          "amfc",
+          "master",
+          "newsletter"
+        ],
+        "http_status": null,
+        "resolved": false,
+        "name": null,
+        "state": null,
+        "error": "HubSpot access token not configured"
+      },
+      "325004407544": {
+        "aliases": [
+          "gc",
+          "giving circle",
+          "giving_circle"
+        ],
+        "http_status": null,
+        "resolved": false,
+        "name": null,
+        "state": null,
+        "error": "HubSpot access token not configured"
+      }
+    },
+    "social_channels": []
+  }
+}

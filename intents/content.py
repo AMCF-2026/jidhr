@@ -4,7 +4,8 @@ Jidhr Content Creation
 Handles email drafting, social media posts, and task creation.
 Owns the draft_state lifecycle (email/social conversational flow).
 
-Extracted from assistant.py lines 120-721 — logic unchanged.
+Owns draft generation, refinement, scheduling and the HubSpot save
+path for both marketing emails and social broadcasts.
 """
 
 import logging

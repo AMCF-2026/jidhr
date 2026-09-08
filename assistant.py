@@ -4,7 +4,9 @@ Jidhr Assistant
 Slim orchestrator that routes queries to intent handlers
 and falls back to context-enhanced Claude conversations.
 
-Jidhr v1.3 — Refactored from 1,061-line monolith into modular intents.
+Per-request orchestration in ~190 lines: loads draft/workflow state
+from the Flask session, routes the query through the intent registry,
+falls back to context + Claude, then saves state back to the session.
 """
 
 import logging

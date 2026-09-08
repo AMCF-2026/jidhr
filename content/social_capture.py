@@ -26,12 +26,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from clients.database import execute_query
-from intents.content_memory import extract_topics
+from content.content_memory import extract_topics
 
 logger = logging.getLogger(__name__)
 
 
-# JSONB cast on topics matches the pattern in intents/content_memory.py's
+# JSONB cast on topics matches the pattern in content/content_memory.py's
 # log_content INSERT. ON CONFLICT relies on uq_content_external
 # (content_type, external_id) — the unique index in production.
 _INSERT_SQL = """
@@ -65,7 +65,7 @@ def backfill_social_content() -> dict:
 
     # Pre-filter: pull already-logged external_ids so we can skip them
     # BEFORE the (expensive) extract_topics LLM call. Mirrors the pattern
-    # in intents.content_memory.run_email_backfill. Failure here is fatal:
+    # in content.content_memory.run_email_backfill. Failure here is fatal:
     # a failed DB read predicts failed inserts, no point burning LLM spend.
     try:
         rows = execute_query(
@@ -85,7 +85,7 @@ def backfill_social_content() -> dict:
     existing = {r["external_id"] for r in rows}
     logger.info(f"Social backfill: {len(existing)} post(s) already logged.")
 
-    # Lazy import — mirrors the pattern in intents.content_memory.run_email_backfill.
+    # Lazy import — mirrors the pattern in content.content_memory.run_email_backfill.
     from clients.hubspot import HubSpotClient
 
     hubspot = HubSpotClient()

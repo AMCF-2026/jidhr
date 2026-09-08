@@ -1,7 +1,7 @@
 """
 Email Backfill Script
 =====================
-Thin CLI wrapper around intents.content_memory.run_email_backfill.
+Thin CLI wrapper around content.content_memory.run_email_backfill.
 
 # Run from Railway shell (web service):
 #   /opt/venv/bin/python scripts/backfill_emails.py                       # 90 days (default)
@@ -20,7 +20,7 @@ import sys
 # Make the repo root importable when run as `python scripts/backfill_emails.py`
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from intents.content_memory import run_email_backfill
+from content.content_memory import run_email_backfill
 
 
 def main():

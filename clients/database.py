@@ -7,13 +7,21 @@ This module only handles connection management — pool lifecycle,
 context-managed checkout, and a one-shot query helper. Business
 queries live in intents/; schema/migrations live elsewhere.
 
-Each gunicorn worker imports this module on fork and gets its own
-ThreadedConnectionPool. With 8 workers × maxconn=2, peak usage is
-16 connections — well under the Railway Postgres hobby tier cap.
+The pool is built lazily on first use rather than at import time, so
+this module (and everything that imports it) can be imported without
+DATABASE_URL set — tests, tooling, and `python -c "import intents"`.
+A missing DATABASE_URL now fails at first query, not at import.
+
+Each gunicorn worker builds its own ThreadedConnectionPool. With
+8 workers × maxconn=2, peak usage is 16 connections — well under the
+Railway Postgres hobby tier cap.
+Note: gunicorn also runs --threads 4, so 4 threads within a worker
+contend for those 2 connections; getconn() blocks when both are out.
 """
 
 import logging
 import os
+import threading
 from contextlib import contextmanager
 
 import psycopg2
@@ -23,24 +31,65 @@ from psycopg2.pool import ThreadedConnectionPool
 logger = logging.getLogger(__name__)
 
 
+_MISSING_DATABASE_URL_MESSAGE = (
+    "DATABASE_URL environment variable is not set. "
+    "Railway should inject this automatically when a Postgres "
+    "plugin is attached; check the service's Variables tab."
+)
+
+
 # ---------------------------------------------------------------------------
-# Pool initialization (module load — one pool per gunicorn worker)
+# Lazy pool initialization (first use — one pool per gunicorn worker)
 # ---------------------------------------------------------------------------
 
-DATABASE_URL = os.environ.get('DATABASE_URL')
-if not DATABASE_URL:
-    raise RuntimeError(
-        "DATABASE_URL environment variable is not set. "
-        "Railway should inject this automatically when a Postgres "
-        "plugin is attached; check the service's Variables tab."
-    )
+_pool = None
+_pool_lock = threading.Lock()
 
-try:
-    _pool = ThreadedConnectionPool(minconn=1, maxconn=2, dsn=DATABASE_URL)
-    logger.info("Database pool initialized (minconn=1, maxconn=2)")
-except psycopg2.Error as e:
-    logger.error(f"Failed to initialize database pool: {e}")
-    raise
+
+def is_configured() -> bool:
+    """Return True if DATABASE_URL is set.
+
+    Cheap and side-effect free: reads the environment only. Does not
+    build the pool and does not open a connection.
+    """
+    return bool(os.environ.get('DATABASE_URL'))
+
+
+def get_pool():
+    """Return the process-wide connection pool, building it on first call.
+
+    Thread-safe via double-checked locking: once the pool exists the
+    common path is a single read with no lock acquired.
+
+    Raises:
+        RuntimeError: DATABASE_URL is unset at the time of the call.
+        psycopg2.Error: the pool could not be created.
+    """
+    global _pool
+
+    if _pool is not None:
+        return _pool
+
+    with _pool_lock:
+        # Re-check under the lock: another thread may have built it
+        # while this one waited.
+        if _pool is not None:
+            return _pool
+
+        database_url = os.environ.get('DATABASE_URL')
+        if not database_url:
+            raise RuntimeError(_MISSING_DATABASE_URL_MESSAGE)
+
+        try:
+            _pool = ThreadedConnectionPool(
+                minconn=1, maxconn=2, dsn=database_url
+            )
+            logger.info("Database pool initialized (minconn=1, maxconn=2)")
+        except psycopg2.Error as e:
+            logger.error(f"Failed to initialize database pool: {e}")
+            raise
+
+    return _pool
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +105,8 @@ def get_connection():
             with conn.cursor() as cur:
                 cur.execute("...")
     """
-    conn = _pool.getconn()
+    pool = get_pool()
+    conn = pool.getconn()
     try:
         yield conn
         conn.commit()
@@ -64,7 +114,7 @@ def get_connection():
         conn.rollback()
         raise
     finally:
-        _pool.putconn(conn)
+        pool.putconn(conn)
 
 
 def execute_query(sql: str, params=None, fetch: bool = True):

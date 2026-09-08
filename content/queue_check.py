@@ -169,7 +169,7 @@ def get_queue(hubspot=None) -> list[dict]:
     Args:
         hubspot: Optional pre-instantiated HubSpotClient. If None, one is
                  created via the same lazy-import pattern used by
-                 content/social_capture.py and intents/content_memory.py.
+                 content/social_capture.py and content/content_memory.py.
 
     Returns:
         list[dict], each with:
@@ -186,7 +186,7 @@ def get_queue(hubspot=None) -> list[dict]:
     try:
         if hubspot is None:
             # Lazy import — matches content.social_capture.backfill_social_content
-            # and intents.content_memory.run_email_backfill.
+            # and content.content_memory.run_email_backfill.
             from clients.hubspot import HubSpotClient
             hubspot = HubSpotClient()
 

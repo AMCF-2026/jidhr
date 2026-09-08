@@ -8,8 +8,8 @@ Thin wrapper around content.social_capture.backfill_social_content().
 The heavy lifting (pre-filter, extraction, INSERT, ON CONFLICT) lives
 there; this module is just the chat-surface trigger.
 
-Not registered in intents/__init__.py yet — HANDLER_CHAIN registration
-is a deliberate separate step.
+Registered in intents/__init__.py as the "social_sync" entry in
+HANDLER_CHAIN.
 """
 
 import logging

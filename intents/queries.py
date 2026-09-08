@@ -6,8 +6,8 @@ Gathers relevant data from HubSpot and CSuite based on query keywords.
 NOT a handler — does not produce final responses. Returns a context string
 that gets injected into the Claude prompt so it can answer with real data.
 
-Extracted from assistant.py lines 869-1043, with new triggers (v1.3)
-and smarter lookups for existing triggers.
+Keyword-dispatched read-only gatherers, one per data domain
+(funds, contacts, forms, social, events, donations, tickets, ...).
 """
 
 import logging
