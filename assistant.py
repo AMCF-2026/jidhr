@@ -148,7 +148,11 @@ class JidhrAssistant:
                     response = handler(user_message, ctx)
                 except Exception as e:
                     logger.exception(f"Intent handler '{name}' error: {e}")
-                    response = f"⚠️ {name} hit an error: {e}. Nothing was changed."
+                    response = (
+                        f"⚠️ {name} hit an error: {e}. "
+                        "This action may not have completed — check before "
+                        "retrying."
+                    )
                 self._add_to_history(user_message, response)
                 return response
 

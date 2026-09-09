@@ -694,6 +694,28 @@ def take_pending_fund_pick(query: str, workflow_state: dict):
     return None
 
 
+def _fund_pick_directive(query: str, picked: dict, fund_id) -> str:
+    """The line that tells the model a bare digit was already resolved."""
+    names = _fund_row_names(picked)
+    name = names[0] if names else "Unknown"
+    code = _fund_row_code(picked)
+    identifier = code or f"id {fund_id}"
+    return (
+        f"[User replied '{(query or '').strip()}' to a numbered fund list and "
+        f"selected: {name} ({identifier}). Present the fund details below "
+        f"directly. Do not ask what they meant.]"
+    )
+
+
+def _contact_ambiguity_directive(name: str, count: int) -> str:
+    """Tell the model that several contacts matched, so it must not choose."""
+    return (
+        f"[{count} HubSpot contacts match '{name}'. Ask the user which one "
+        f"they mean and list the options below. Do not pick one, and do not "
+        f"state facts about any single contact as if it were the right one.]"
+    )
+
+
 def _fund_detail_context(csuite, fund_id) -> str:
     """Labelled detail lines for one fund, or the literal CSuite error."""
     try:
@@ -765,6 +787,10 @@ def _gather_fund_context(query: str, query_lower: str, csuite,
         if picked is not None:
             fund_id = _fund_row_id(picked)
             logger.info(f"Fund pick resolved to id {fund_id}")
+            # The model sees a bare digit as the user's message. Without being
+            # told what that digit resolved to, it asks "which fund did you
+            # mean?" — the question the list already answered.
+            parts.append(_fund_pick_directive(query, picked, fund_id))
             parts.append(_fund_detail_context(csuite, fund_id))
             return parts
 
@@ -835,13 +861,17 @@ def _gather_contact_context(query: str, query_lower: str, hubspot, csuite) -> li
         try:
             search_data = hubspot.search_contacts(name)
             if 'results' in search_data and search_data['results']:
+                matches = search_data['results']
                 contact_list = [
                     f"{c.get('properties', {}).get('firstname', '')} "
                     f"{c.get('properties', {}).get('lastname', '')} "
                     f"({c.get('properties', {}).get('email', 'No email')}) "
                     f"[ID: {c.get('id', 'N/A')}]"
-                    for c in search_data['results'][:5]
+                    for c in matches[:9]
                 ]
+                if len(matches) > 1:
+                    parts.append(
+                        _contact_ambiguity_directive(name, len(matches)))
                 parts.append(f"HubSpot Contact Search '{name}':\n" + "\n".join(contact_list))
                 logger.info(f"Found {len(contact_list)} matching contacts")
         except Exception as e:

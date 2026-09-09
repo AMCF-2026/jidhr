@@ -124,11 +124,11 @@ def _guarded(name: str, handle):
     route_intent's callable gets the same behaviour, and the message says
     plainly that nothing changed instead of leaking a traceback.
 
-    A handler that raises part-way through may already have written to
-    HubSpot or CSuite. "Nothing was changed" is about this turn's outcome
-    being unusable, so the message stays deliberately about the failure —
-    anything a handler completed before raising is reported by the handler
-    itself when it succeeds, never here.
+    The message does NOT claim nothing happened. A handler that raises
+    part-way through may already have created a CSuite profile or written a
+    HubSpot note, and telling someone their action was rolled back when it
+    was not is its own kind of hidden failure — they retry, and the write
+    lands twice.
     """
 
     def guarded_handle(query, ctx):
@@ -140,7 +140,8 @@ def _guarded(name: str, handle):
                 exc_info=True,
             )
             return (
-                f"⚠️ {name} hit an error: {e}. Nothing was changed."
+                f"⚠️ {name} hit an error: {e}. "
+                "This action may not have completed — check before retrying."
             )
 
     guarded_handle.__name__ = getattr(handle, "__name__", "handle")

@@ -717,7 +717,7 @@ class TestHandlerGuard:
 
         assert "boomer hit an error" in out
         assert "hubspot exploded" in out
-        assert "Nothing was changed" in out
+        assert "may not have completed" in out
         assert any(r.levelno == logging.WARNING for r in caplog.records)
 
     def test_a_working_handler_is_untouched(self, monkeypatch):
@@ -757,4 +757,6 @@ class TestHandlerGuard:
         out = a.process_query("anything", ACTOR)
 
         assert "boomer hit an error" in out
-        assert "Nothing was changed" in out
+        # assistant.py's own backstop still says "Nothing was changed"; it is
+        # only reached for a handler route_intent did not wrap.
+        assert "hit an error" in out

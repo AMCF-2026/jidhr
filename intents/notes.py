@@ -34,6 +34,72 @@ TRIGGER_PHRASES = [
     'upgrade gc', 'upgrade giving circle',
 ]
 
+# Giving Circle status commands, matched with the contact name in the middle.
+# Substring matching could not see "upgrade Sara to voting member": the
+# literal 'upgrade to voting member' never appears, so can_handle returned
+# False and the query — the example in _handle_gc_upgrade's own docstring —
+# fell through to the Claude fallback instead of reaching this module.
+#
+# The verb forms are anchored to the start of the message on purpose. Without
+# that, "log a call with Sara — we discussed her upgrade to voting member"
+# would route to the status writer instead of the note logger.
+_GC_TRIGGER_RE = re.compile(
+    r"""
+      ^\s*upgrade\s+[\w .'\-]{0,40}?\bto\s+(?:voting\s+)?member\b
+    | ^\s*make\s+[\w .'\-]{0,40}?\b(?:a\s+)?voting\s+member\b
+    | ^\s*set\s+gc\s+status\b
+    | ^\s*upgrade\s+gc\b
+    | ^\s*upgrade\s+giving\s+circle\b
+    | \bgiving\s+circle\s+status\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def is_gc_status_command(query: str) -> bool:
+    """True if this message asks to change someone's Giving Circle status."""
+    return bool(_GC_TRIGGER_RE.search(query or ""))
+
+
+# Trailing punctuation an extracted name should never keep: "Khan." is the
+# same contact as "Khan", but HubSpot's search treats them as different.
+_NAME_EDGE_CHARS = " \t.,!?;:'\"-–—"
+
+# Connectives left over once the trigger phrase is consumed. "log a note
+# about Sara" leaves "about Sara", and HubSpot finds nobody by that name.
+_NAME_LEAD_RE = re.compile(
+    r"^(?:about|for|on|with|re)\b[:\s]+", re.IGNORECASE)
+
+
+def _strip_name_lead(name: str) -> str:
+    """Drop leading connectives from an extracted name.
+
+    Looped because a trigger can leave more than one ("note about with Sara"),
+    and bounded so a pathological input cannot spin.
+    """
+    text = name or ""
+    for _ in range(3):
+        stripped = _NAME_LEAD_RE.sub("", text, count=1)
+        if stripped == text:
+            break
+        text = stripped
+    return text
+
+
+def _clean_name(name) -> str:
+    """Normalise an extracted contact name.
+
+    Collapses whitespace, drops a leading connective, and trims edge
+    punctuation. Internal punctuation is preserved — real names contain
+    apostrophes, hyphens and full stops.
+    """
+    if not name:
+        return ""
+    text = " ".join(str(name).split())
+    text = _strip_name_lead(text)
+    return text.strip(_NAME_EDGE_CHARS).strip()
+
+
 # Used to determine engagement type
 _CALL_WORDS = ['call', 'spoke', 'phone', 'rang', 'dialed']
 _MEETING_WORDS = ['meeting', 'met', 'visited', 'visit', 'sat down']
@@ -159,6 +225,9 @@ def can_handle(query: str, workflow_state: dict = None, **kwargs) -> bool:
         if _CONTACT_PICK_RE.match(query or ""):
             return True
 
+    if is_gc_status_command(q):
+        return True
+
     return any(p in q for p in TRIGGER_PHRASES)
 
 
@@ -180,9 +249,7 @@ def handle(query: str, ctx) -> str:
             return _log_note(hubspot, pending["payload"], contact)
 
     # Route GC upgrades separately
-    if any(w in q for w in ['upgrade to voting', 'make voting member',
-                             'set gc status', 'giving circle status',
-                             'upgrade gc', 'upgrade giving circle']):
+    if is_gc_status_command(q):
         return _handle_gc_upgrade(query, q, hubspot, state)
 
     parsed = _parse_note_query(query)
@@ -293,8 +360,11 @@ def _parse_note_query(query: str) -> dict:
     elif any(w in q_lower for w in _MEETING_WORDS):
         result["type"] = "meeting"
 
-    # Strip trigger phrase
-    remainder = _TRIGGER_RE.sub('', query).strip()
+    # Strip trigger phrase, then any connective it left behind. This has to
+    # happen BEFORE the separator split: "log a note re: Sara" leaves
+    # "re: Sara", and the colon would otherwise be read as the name/body
+    # separator, making the contact "re".
+    remainder = _strip_name_lead(_TRIGGER_RE.sub('', query).strip()).strip()
 
     if not remainder:
         return result
@@ -314,9 +384,10 @@ def _parse_note_query(query: str) -> dict:
             # Last resort: entire remainder is the contact name, no body
             result["contact_name"] = remainder.strip()
 
-    # Clean up contact name (remove "with" prefix if leftover)
+    # Clean up the contact name: drop a leading connective ("with", "about",
+    # ...) and trailing punctuation, so "about Sara!" and "Sara" search alike.
     if result["contact_name"]:
-        result["contact_name"] = re.sub(r'^with\s+', '', result["contact_name"], flags=re.IGNORECASE).strip()
+        result["contact_name"] = _clean_name(result["contact_name"])
 
     return result
 
@@ -349,7 +420,7 @@ def _extract_gc_name(query_lower: str) -> str:
     """Pull the contact name out of a Giving Circle status command."""
     name = _GC_STRIP_RE.sub(" ", query_lower or "")
     name = re.sub(r"\s+", " ", name)
-    return name.strip().strip('-:,').strip()
+    return _clean_name(name)
 
 
 def _handle_gc_upgrade(query: str, query_lower: str, hubspot,
