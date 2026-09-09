@@ -62,6 +62,14 @@ FOLLOWUP_PATTERNS = [
 
 
 # ---------------------------------------------------------------------------
+# Access control
+# ---------------------------------------------------------------------------
+
+# Nothing is donor-facing yet; every handler is staff-and-above.
+ALLOWED_ROLES = frozenset({"admin", "staff"})
+
+
+# ---------------------------------------------------------------------------
 # Registry interface
 # ---------------------------------------------------------------------------
 
@@ -90,14 +98,14 @@ def can_handle(query: str, draft_state: dict = None, **kwargs) -> bool:
     return False
 
 
-def handle(query: str, assistant) -> str:
+def handle(query: str, ctx) -> str:
     """
     Route to the appropriate content handler.
 
     Args:
         query: The user's message
-        assistant: JidhrAssistant instance (provides .claude, .hubspot,
-                   .draft_state and helper access)
+        ctx: RequestContext (provides .services.claude, .services.hubspot
+             and .draft_state)
 
     Returns:
         Response string
@@ -106,19 +114,19 @@ def handle(query: str, assistant) -> str:
 
     # Task creation (immediate, no draft flow)
     if _is_task_creation(q):
-        return _handle_task_creation(query, assistant)
+        return _handle_task_creation(query, ctx)
 
     # Email draft initiation
     if _is_email_draft_request(q):
-        return _initiate_email_draft(query, assistant)
+        return _initiate_email_draft(query, ctx)
 
     # Social post initiation
     if _is_social_post_request(q):
-        return _initiate_social_post(query, assistant)
+        return _initiate_social_post(query, ctx)
 
     # Active draft — route to conversational handler
-    if assistant.draft_state.get("active"):
-        return _handle_draft_conversation(query, assistant)
+    if ctx.draft_state.get("active"):
+        return _handle_draft_conversation(query, ctx)
 
     # Follow-up command with no active draft — tell user clearly
     if _is_followup_command(q):
@@ -159,7 +167,7 @@ def _is_followup_command(query: str) -> bool:
 # Task creation (immediate)
 # ---------------------------------------------------------------------------
 
-def _handle_task_creation(query: str, assistant) -> str:
+def _handle_task_creation(query: str, ctx) -> str:
     """Create a task from natural language."""
     logger.info("Creating task from query...")
 
@@ -173,7 +181,7 @@ Request: "{query}"
 JSON:"""
 
     try:
-        extraction = assistant.claude.chat(
+        extraction = ctx.services.claude.chat(
             messages=[{"role": "user", "content": extraction_prompt}],
             system_prompt="You are a JSON extractor. Return only valid JSON, no markdown.",
         )
@@ -188,7 +196,7 @@ JSON:"""
 
         task_data = json.loads(extraction)
 
-        result = assistant.hubspot.create_task_simple(
+        result = ctx.services.hubspot.create_task_simple(
             subject=task_data.get("subject", "New Task"),
             body=task_data.get("body"),
             priority=task_data.get("priority", "MEDIUM"),
@@ -332,7 +340,7 @@ def _queue_note(topic) -> str | None:
 # Email draft lifecycle
 # ---------------------------------------------------------------------------
 
-def _initiate_email_draft(query: str, assistant) -> str:
+def _initiate_email_draft(query: str, ctx) -> str:
     """Start the email drafting conversation."""
     logger.info("Initiating email draft...")
 
@@ -353,14 +361,14 @@ BODY:
 [email body - can include basic HTML like <p>, <strong>, <a>]"""
 
     try:
-        draft = assistant.claude.chat(
+        draft = ctx.services.claude.chat(
             messages=[{"role": "user", "content": draft_prompt}],
             system_prompt="You are a nonprofit marketing copywriter. Write warm, engaging emails." + ORG_FACTS_PROMPT,
         )
 
         subject, body = _parse_email_draft(draft)
 
-        assistant.draft_state.update({
+        ctx.draft_state.update({
             "active": True,
             "type": "email",
             "subject": subject,
@@ -399,14 +407,14 @@ BODY:
         return f"❌ Failed to generate email draft: {e}"
 
 
-def _save_email_draft(query: str, assistant) -> str:
+def _save_email_draft(query: str, ctx) -> str:
     """Save the email draft to HubSpot."""
     template = "amcf"
     if 'giving circle' in query.lower():
         template = "giving circle"
 
-    subject = assistant.draft_state["subject"]
-    body = assistant.draft_state["body"]
+    subject = ctx.draft_state["subject"]
+    body = ctx.draft_state["body"]
 
     # Convert plain text body to HTML if needed
     if not body.startswith("<"):
@@ -415,7 +423,7 @@ def _save_email_draft(query: str, assistant) -> str:
     name = f"{subject[:50]} - {datetime.now().strftime('%Y-%m-%d')}"
 
     try:
-        result = assistant.hubspot.create_marketing_email_draft(
+        result = ctx.services.hubspot.create_marketing_email_draft(
             name=name,
             subject=subject,
             body_html=body,
@@ -431,7 +439,7 @@ def _save_email_draft(query: str, assistant) -> str:
             f"https://app-na2.hubspot.com/email/243832852/edit/{email_id}/content",
         )
 
-        _clear_draft_state(assistant)
+        _clear_draft_state(ctx)
 
         template_display = "AMCF Emails" if template == "amcf" else "Giving Circle Email"
 
@@ -454,7 +462,7 @@ def _save_email_draft(query: str, assistant) -> str:
 # Social post lifecycle
 # ---------------------------------------------------------------------------
 
-def _initiate_social_post(query: str, assistant) -> str:
+def _initiate_social_post(query: str, ctx) -> str:
     """Start the social post drafting conversation."""
     logger.info("Initiating social post draft...")
 
@@ -482,14 +490,14 @@ Requirements:
 Write just the post content, nothing else."""
 
     try:
-        draft = assistant.claude.chat(
+        draft = ctx.services.claude.chat(
             messages=[{"role": "user", "content": draft_prompt}],
             system_prompt="You are a social media manager for a nonprofit. Write engaging posts." + ORG_FACTS_PROMPT,
         )
 
         content = draft.strip()
 
-        assistant.draft_state.update({
+        ctx.draft_state.update({
             "active": True,
             "type": "social",
             "subject": None,
@@ -500,7 +508,7 @@ Write just the post content, nothing else."""
             "photo_url": None,
         })
 
-        available = assistant.hubspot.get_available_social_platforms()
+        available = ctx.services.hubspot.get_available_social_platforms()
         platform_list = ", ".join(available) if available else "facebook, twitter, linkedin, instagram"
         platform_display = platform.title() if platform else "Social Media"
 
@@ -572,14 +580,14 @@ def _format_cadence_violations(violations, platform, requested_dt) -> str:
     return "\n".join(lines)
 
 
-def _execute_override(assistant) -> str:
+def _execute_override(ctx) -> str:
     """Bypass the cadence gate using the stashed pending_schedule.
 
     Called from _handle_draft_conversation when the user types
     "schedule anyway" / "override and schedule" after a violation
     message. Always pops pending_schedule (success or failure).
     """
-    pending = assistant.draft_state.get("pending_schedule") or {}
+    pending = ctx.draft_state.get("pending_schedule") or {}
     platform = pending.get("platform", "facebook")
     body = pending.get("content", "")
     link_url = pending.get("link_url")
@@ -587,7 +595,7 @@ def _execute_override(assistant) -> str:
     schedule_iso = pending.get("schedule_time_iso")
 
     try:
-        result = assistant.hubspot.create_social_post(
+        result = ctx.services.hubspot.create_social_post(
             platform=platform,
             content=body,
             link_url=link_url,
@@ -596,15 +604,15 @@ def _execute_override(assistant) -> str:
         )
     except Exception as e:
         logger.error(f"Override save error: {e}")
-        assistant.draft_state.pop("pending_schedule", None)
+        ctx.draft_state.pop("pending_schedule", None)
         return f"❌ Failed to create post: {e}"
 
-    assistant.draft_state.pop("pending_schedule", None)
+    ctx.draft_state.pop("pending_schedule", None)
 
     if "error" in result:
         return f"❌ Failed to create post: {result['error']}"
 
-    _clear_draft_state(assistant)
+    _clear_draft_state(ctx)
     excerpt = body[:100] + ("..." if len(body) > 100 else "")
 
     # Echo the stashed schedule so the operator sees what they're confirming.
@@ -625,13 +633,13 @@ def _execute_override(assistant) -> str:
 *Rule-1/rule-2 conflicts were bypassed at your request. View in HubSpot Social.*"""
 
 
-def _save_social_post(query: str, assistant) -> str:
+def _save_social_post(query: str, ctx) -> str:
     """Save/schedule the social post to HubSpot."""
     query_lower = query.lower()
-    platform = assistant.draft_state.get("platform", "facebook")
-    content = assistant.draft_state["body"]
-    link_url = assistant.draft_state.get("link_url")
-    photo_url = assistant.draft_state.get("photo_url")
+    platform = ctx.draft_state.get("platform", "facebook")
+    content = ctx.draft_state["body"]
+    link_url = ctx.draft_state.get("link_url")
+    photo_url = ctx.draft_state.get("photo_url")
 
     # Determine schedule time
     schedule_time = None
@@ -679,7 +687,7 @@ def _save_social_post(query: str, assistant) -> str:
                 if isinstance(schedule_time, datetime)
                 else str(schedule_time)
             )
-            assistant.draft_state["pending_schedule"] = {
+            ctx.draft_state["pending_schedule"] = {
                 "platform":          platform,
                 "content":           content,
                 "link_url":          link_url,
@@ -689,10 +697,10 @@ def _save_social_post(query: str, assistant) -> str:
             return _format_cadence_violations(violations, platform, schedule_time)
 
     # Clean: clear any stale pending_schedule from a previous gate hit.
-    assistant.draft_state.pop("pending_schedule", None)
+    ctx.draft_state.pop("pending_schedule", None)
 
     try:
-        result = assistant.hubspot.create_social_post(
+        result = ctx.services.hubspot.create_social_post(
             platform=platform,
             content=content,
             link_url=link_url,
@@ -703,7 +711,7 @@ def _save_social_post(query: str, assistant) -> str:
         if "error" in result:
             return f"❌ Failed to create post: {result['error']}"
 
-        _clear_draft_state(assistant)
+        _clear_draft_state(ctx)
 
         # Compare schedule_time (naive ET) against a naive-ET "now".
         # Mixing naive-ET with datetime.now() (naive UTC on Railway) would
@@ -744,17 +752,17 @@ def _save_social_post(query: str, assistant) -> str:
         return f"❌ Failed to create post: {e}"
 
 
-def _add_link_to_draft(query: str, assistant) -> str:
+def _add_link_to_draft(query: str, ctx) -> str:
     """Add a link to the current social post draft."""
     url_match = re.search(r'https?://[^\s]+', query)
     if url_match:
         url = url_match.group(0)
-        assistant.draft_state["link_url"] = url
+        ctx.draft_state["link_url"] = url
         return f"""✅ Link added: {url}
 
 📱 **Current Draft:**
 
-{assistant.draft_state['body']}
+{ctx.draft_state['body']}
 
 🔗 Link: {url}
 
@@ -764,23 +772,23 @@ def _add_link_to_draft(query: str, assistant) -> str:
         return '❓ I didn\'t see a URL in your message. Try: *"Add link https://amuslimcf.org/..."*'
 
 
-def _change_platform(query: str, assistant) -> str:
+def _change_platform(query: str, ctx) -> str:
     """Change the target platform for the social post."""
     new_platform = _detect_platform(query)
     if new_platform:
-        assistant.draft_state["platform"] = new_platform
+        ctx.draft_state["platform"] = new_platform
         return f"""✅ Switched to **{new_platform.title()}**
 
 📱 **Current Draft:**
 
-{assistant.draft_state['body']}
+{ctx.draft_state['body']}
 
-📊 Character count: {len(assistant.draft_state['body'])}
+📊 Character count: {len(ctx.draft_state['body'])}
 
 ---
 💬 Ready? Say *"Post now"*, *"Schedule for [time]"*, or request changes."""
     else:
-        available = assistant.hubspot.get_available_social_platforms()
+        available = ctx.services.hubspot.get_available_social_platforms()
         return f"❓ Which platform? Available: {', '.join(available)}"
 
 
@@ -788,58 +796,58 @@ def _change_platform(query: str, assistant) -> str:
 # Draft conversation router
 # ---------------------------------------------------------------------------
 
-def _handle_draft_conversation(query: str, assistant) -> str:
+def _handle_draft_conversation(query: str, ctx) -> str:
     """Handle ongoing draft refinement conversation."""
     query_lower = query.lower().strip()
 
     # Cancel / start over
     if any(w in query_lower for w in ['cancel', 'start over', 'nevermind', 'forget it']):
-        _clear_draft_state(assistant)
+        _clear_draft_state(ctx)
         return "👍 Draft cancelled. Let me know if you'd like to start something new!"
 
     # Save email to HubSpot
-    if assistant.draft_state["type"] == "email" and any(
+    if ctx.draft_state["type"] == "email" and any(
         w in query_lower for w in ['save', 'create', 'done', 'looks good', 'that works']
     ):
-        return _save_email_draft(query, assistant)
+        return _save_email_draft(query, ctx)
 
     # Cadence override — must run BEFORE the generic "schedule" matcher
     # below, since "schedule anyway" contains "schedule".
-    if assistant.draft_state.get("type") == "social" and (
+    if ctx.draft_state.get("type") == "social" and (
         "schedule anyway" in query_lower
         or "override and schedule" in query_lower
     ):
-        if assistant.draft_state.get("pending_schedule"):
-            return _execute_override(assistant)
+        if ctx.draft_state.get("pending_schedule"):
+            return _execute_override(ctx)
         # No stashed pending → fall through to normal handling.
 
     # Post/schedule social
-    if assistant.draft_state["type"] == "social":
+    if ctx.draft_state["type"] == "social":
         if any(w in query_lower for w in [
             'post now', 'publish', 'schedule', 'create as draft',
             'save as draft', 'done', 'looks good',
         ]):
-            return _save_social_post(query, assistant)
+            return _save_social_post(query, ctx)
 
         if 'add link' in query_lower or 'include link' in query_lower:
-            return _add_link_to_draft(query, assistant)
+            return _add_link_to_draft(query, ctx)
 
         if 'switch to' in query_lower or 'change to' in query_lower:
-            return _change_platform(query, assistant)
+            return _change_platform(query, ctx)
 
     # Refinement request — use Claude to revise
-    return _refine_draft(query, assistant)
+    return _refine_draft(query, ctx)
 
 
 # ---------------------------------------------------------------------------
 # Draft refinement
 # ---------------------------------------------------------------------------
 
-def _refine_draft(feedback: str, assistant) -> str:
+def _refine_draft(feedback: str, ctx) -> str:
     """Refine the current draft based on user feedback."""
-    draft_type = assistant.draft_state["type"]
-    current_content = assistant.draft_state["body"]
-    current_subject = assistant.draft_state.get("subject", "")
+    draft_type = ctx.draft_state["type"]
+    current_content = ctx.draft_state["body"]
+    current_subject = ctx.draft_state.get("subject", "")
 
     if draft_type == "email":
         refine_prompt = f"""Revise this marketing email based on the feedback.
@@ -856,7 +864,7 @@ SUBJECT: [revised subject line]
 BODY:
 [revised body]"""
     else:
-        platform = assistant.draft_state.get("platform", "social media")
+        platform = ctx.draft_state.get("platform", "social media")
         refine_prompt = f"""Revise this {platform} post based on the feedback.
 
 Current Post:
@@ -867,15 +875,15 @@ Feedback: {feedback}
 Return only the revised post content, nothing else."""
 
     try:
-        revised = assistant.claude.chat(
+        revised = ctx.services.claude.chat(
             messages=[{"role": "user", "content": refine_prompt}],
             system_prompt="You are a marketing copywriter. Make the requested changes." + ORG_FACTS_PROMPT,
         )
 
         if draft_type == "email":
             subject, body = _parse_email_draft(revised)
-            assistant.draft_state["subject"] = subject
-            assistant.draft_state["body"] = body
+            ctx.draft_state["subject"] = subject
+            ctx.draft_state["body"] = body
 
             return f"""📧 **Revised Email Draft**
 
@@ -889,7 +897,7 @@ Return only the revised post content, nothing else."""
 
         else:
             content = revised.strip()
-            assistant.draft_state["body"] = content
+            ctx.draft_state["body"] = content
 
             return f"""📱 **Revised Post**
 
@@ -1059,9 +1067,9 @@ def _html_to_display(html: str) -> str:
     return text.strip()
 
 
-def _clear_draft_state(assistant):
+def _clear_draft_state(ctx):
     """Reset the draft state to inactive."""
-    assistant.draft_state.update({
+    ctx.draft_state.update({
         "active": False,
         "type": None,
         "subject": None,
@@ -1073,4 +1081,4 @@ def _clear_draft_state(assistant):
     })
     # pending_schedule isn't a fixed key on the default draft_state dict —
     # remove it entirely so it doesn't haunt the next draft session.
-    assistant.draft_state.pop("pending_schedule", None)
+    ctx.draft_state.pop("pending_schedule", None)

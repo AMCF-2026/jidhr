@@ -14,6 +14,7 @@ from datetime import datetime
 from config import SYSTEM_PROMPT
 from clients import OpenRouterClient, HubSpotClient, CSuiteClient
 from intents import route_intent
+from intents.context import Actor, RequestContext, Services
 from intents.queries import gather_context
 from intents.daf_workflow import default_workflow_state
 
@@ -50,9 +51,49 @@ class JidhrAssistant:
         self.csuite = CSuiteClient()
         self.conversation_history = []
 
+        # One Services instance for the life of the assistant. The clients are
+        # stateless HTTP wrappers, so rebuilding them per request would only
+        # throw away connection reuse.
+        self.services = Services(
+            hubspot=self.hubspot,
+            csuite=self.csuite,
+            claude=self.claude,
+        )
+
         # In-memory defaults — overwritten by session on each request
         self.draft_state = dict(self._DEFAULT_DRAFT)
         self.workflow_state = default_workflow_state()
+
+    def build_context(self, user_row) -> RequestContext:
+        """Assemble the RequestContext for one request.
+
+        `user_row` is either an Actor or a mapping shaped like a `users` row
+        (what clients.users returns). The state fields are passed by
+        reference, not copied: handlers mutate them in place and
+        _save_state_to_session writes the result back afterwards, which is
+        exactly how it behaved when handlers held the assistant itself.
+        """
+        if isinstance(user_row, Actor):
+            actor = user_row
+        else:
+            actor = Actor(
+                user_id=int(user_row["user_id" if "user_id" in user_row else "id"]),
+                email=user_row["email"],
+                role=user_row.get("role") or "staff",
+                csuite_profile_id=(
+                    str(user_row["csuite_profile_id"])
+                    if user_row.get("csuite_profile_id") is not None
+                    else None
+                ),
+            )
+
+        return RequestContext(
+            actor=actor,
+            services=self.services,
+            draft_state=self.draft_state,
+            workflow_state=self.workflow_state,
+            conversation_history=self.conversation_history,
+        )
 
     def _load_state_from_session(self, flask_session):
         """Load draft and workflow state from Flask session cookie."""
@@ -78,7 +119,7 @@ class JidhrAssistant:
             current_date=datetime.now().strftime("%B %d, %Y")
         )
 
-    def process_query(self, user_message: str, flask_session=None) -> str:
+    def process_query(self, user_message: str, actor, flask_session=None) -> str:
         """
         Process a user query and return response.
 
@@ -88,24 +129,31 @@ class JidhrAssistant:
 
         Args:
             user_message: The user's raw message
+            actor: Actor (or a users-row mapping) identifying who is asking.
+                   Handlers receive it via ctx.actor, and the router uses its
+                   role to decide which handlers are eligible at all.
             flask_session: Flask session object for cross-worker state persistence.
                           If provided, draft_state and workflow_state are loaded
                           from it at the start and saved back at the end.
         """
-        # Load state from session cookie (survives across workers)
+        # Load state from session cookie (survives across workers) BEFORE the
+        # context is built, so ctx points at the restored dicts rather than
+        # the empty defaults.
         if flask_session is not None:
             self._load_state_from_session(flask_session)
+
+        ctx = self.build_context(actor)
 
         logger.info(f"Processing query: {user_message[:50]}...")
 
         try:
             # --- 1. Check intent handlers ---
-            match = route_intent(user_message, self.draft_state, self.workflow_state)
+            match = route_intent(user_message, ctx)
             if match:
                 name, handler = match
                 logger.info(f"Routing to intent: {name}")
                 try:
-                    response = handler(user_message, self)
+                    response = handler(user_message, ctx)
                 except Exception as e:
                     logger.error(f"Intent handler '{name}' error: {e}")
                     response = f"❌ Something went wrong with {name}: {e}"
@@ -118,13 +166,14 @@ class JidhrAssistant:
                 "content": user_message,
             })
 
-            context = gather_context(user_message, self.hubspot, self.csuite)
+            context = gather_context(
+                user_message, ctx.services.hubspot, ctx.services.csuite)
             if context:
                 enhanced = f"{user_message}\n\n[System Context - Real Data]\n{context}"
                 self.conversation_history[-1]["content"] = enhanced
                 logger.info(f"Added context: {len(context)} chars")
 
-            response = self.claude.chat(
+            response = ctx.services.claude.chat(
                 messages=self.conversation_history,
                 system_prompt=self.get_system_prompt(),
             )

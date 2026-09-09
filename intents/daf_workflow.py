@@ -19,6 +19,14 @@ from config import Config
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Access control
+# ---------------------------------------------------------------------------
+
+# Nothing is donor-facing yet; every handler is staff-and-above.
+ALLOWED_ROLES = frozenset({"admin", "staff"})
+
 # ---------------------------------------------------------------------------
 # Trigger keywords
 # ---------------------------------------------------------------------------
@@ -77,16 +85,16 @@ def can_handle(query: str, workflow_state: dict = None, **kwargs) -> bool:
     return any(p in q for p in TRIGGER_PHRASES)
 
 
-def handle(query: str, assistant) -> str:
+def handle(query: str, ctx) -> str:
     """
     Route to the appropriate workflow step.
 
     If workflow is not active, initiate it (show latest submission).
     If workflow is active, handle the current conversational step.
     """
-    state = assistant.workflow_state
-    hubspot = assistant.hubspot
-    csuite = assistant.csuite
+    state = ctx.workflow_state
+    hubspot = ctx.services.hubspot
+    csuite = ctx.services.csuite
 
     # --- Active workflow: handle conversation ---
     if state.get("active"):

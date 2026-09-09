@@ -25,6 +25,13 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Access control
+# ---------------------------------------------------------------------------
+
+# Nothing is donor-facing yet; every handler is staff-and-above.
+ALLOWED_ROLES = frozenset({"admin", "staff"})
+
+# ---------------------------------------------------------------------------
 # Trigger phrases (exact substring matches)
 # ---------------------------------------------------------------------------
 
@@ -71,14 +78,14 @@ def can_handle(query: str, **kwargs) -> bool:
     return any(p in q for p in CONTENT_REPORT_PHRASES)
 
 
-def handle(query: str, assistant) -> str:
+def handle(query: str, ctx) -> str:
     """
     Build a content report for a recent window.
 
     Args:
         query: The user's message (parsed for an optional N day(s)/week(s))
-        assistant: JidhrAssistant instance (not used directly, but keeps
-                   the interface consistent across all intent modules)
+        ctx: RequestContext (not used directly, but keeps the interface
+             consistent across all intent modules)
 
     Returns:
         Formatted markdown summary string

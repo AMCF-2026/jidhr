@@ -43,23 +43,32 @@ _MEETING_WORDS = ['meeting', 'met', 'visited', 'visit', 'sat down']
 # Registry interface
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# Access control
+# ---------------------------------------------------------------------------
+
+# Nothing is donor-facing yet; every handler is staff-and-above.
+ALLOWED_ROLES = frozenset({"admin", "staff"})
+
 def can_handle(query: str, **kwargs) -> bool:
     q = query.lower().strip()
     return any(p in q for p in TRIGGER_PHRASES)
 
 
-def handle(query: str, assistant) -> str:
+def handle(query: str, ctx) -> str:
     """
     Parse the query, find the contact, and log the note.
     Also handles Giving Circle status upgrades.
     """
+    hubspot = ctx.services.hubspot
     q = query.lower().strip()
 
     # Route GC upgrades separately
     if any(w in q for w in ['upgrade to voting', 'make voting member',
                              'set gc status', 'giving circle status',
                              'upgrade gc', 'upgrade giving circle']):
-        return _handle_gc_upgrade(query, q, assistant.hubspot)
+        return _handle_gc_upgrade(query, q, hubspot)
 
     parsed = _parse_note_query(query)
 
@@ -85,7 +94,7 @@ def handle(query: str, assistant) -> str:
     contact_id = None
     hubspot_link = None
     try:
-        search = assistant.hubspot.search_contacts(name)
+        search = hubspot.search_contacts(name)
         results = search.get('results', [])
         if results:
             contact_id = results[0].get('id')
@@ -102,14 +111,14 @@ def handle(query: str, assistant) -> str:
     # --- Create the engagement ---
     try:
         if note_type == "call":
-            result = assistant.hubspot.create_call_note(body=body, contact_id=contact_id)
+            result = hubspot.create_call_note(body=body, contact_id=contact_id)
         elif note_type == "meeting":
             title = f"Meeting with {name}"
-            result = assistant.hubspot.create_meeting_note(
+            result = hubspot.create_meeting_note(
                 title=title, body=body, contact_id=contact_id,
             )
         else:
-            result = assistant.hubspot.create_note(body=body, contact_id=contact_id)
+            result = hubspot.create_note(body=body, contact_id=contact_id)
 
         if result and "error" in result:
             return f"❌ Failed to log note: {result['error']}"

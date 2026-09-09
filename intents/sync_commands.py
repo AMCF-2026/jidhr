@@ -12,6 +12,14 @@ from sync import run_donation_sync, run_event_sync, run_newsletter_sync
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Access control
+# ---------------------------------------------------------------------------
+
+# Nothing is donor-facing yet; every handler is staff-and-above.
+ALLOWED_ROLES = frozenset({"admin", "staff"})
+
 # ---------------------------------------------------------------------------
 # Trigger phrases (exact substring matches)
 # ---------------------------------------------------------------------------
@@ -37,14 +45,14 @@ def can_handle(query: str, **kwargs) -> bool:
     )
 
 
-def handle(query: str, assistant) -> str:
+def handle(query: str, ctx) -> str:
     """
     Route to the appropriate sync operation.
 
     Args:
         query: The user's message
-        assistant: JidhrAssistant instance (not used directly, but keeps
-                   the interface consistent across all intent modules)
+        ctx: RequestContext (not used directly, but keeps the interface
+             consistent across all intent modules)
 
     Returns:
         Formatted result string

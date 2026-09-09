@@ -40,11 +40,16 @@ class User(UserMixin):
     """
 
     def __init__(self, id, email, display_name=None, role="staff",
-                 is_active=True, picture=None):
+                 is_active=True, picture=None, csuite_profile_id=None):
         self.id = int(id)
         self.email = email
         self.display_name = display_name or (email or "").split("@")[0]
         self.role = role
+        # Carried so app.py can build an Actor without a second query. Stored
+        # as a string: it is an opaque identifier, never arithmetic.
+        self.csuite_profile_id = (
+            str(csuite_profile_id) if csuite_profile_id is not None else None
+        )
         self.picture = picture
         self._is_active = bool(is_active)
 
@@ -58,6 +63,7 @@ class User(UserMixin):
             role=row.get("role") or "staff",
             is_active=row.get("is_active", True),
             picture=picture,
+            csuite_profile_id=row.get("csuite_profile_id"),
         )
 
     @property
@@ -222,6 +228,11 @@ def callback():
         # remember=False: no long-lived "remember me" cookie. Access lasts as
         # long as the session cookie and no longer.
         login_user(user, remember=False)
+
+        # PERMANENT_SESSION_LIFETIME only applies to permanent sessions.
+        # Without this the cookie is a browser-session cookie with no expiry
+        # at all, and the configured 12-hour limit never fires.
+        session.permanent = True
 
         logger.info(f"Login successful: {email} (id={user.id}, role={user.role})")
 

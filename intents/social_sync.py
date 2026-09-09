@@ -17,6 +17,14 @@ from content.social_capture import backfill_social_content
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Access control
+# ---------------------------------------------------------------------------
+
+# Nothing is donor-facing yet; every handler is staff-and-above.
+ALLOWED_ROLES = frozenset({"admin", "staff"})
+
 # ---------------------------------------------------------------------------
 # Trigger phrases (exact substring matches)
 # ---------------------------------------------------------------------------
@@ -39,14 +47,14 @@ def can_handle(query: str, **kwargs) -> bool:
     return any(p in q for p in SOCIAL_SYNC_PHRASES)
 
 
-def handle(query: str, assistant) -> str:
+def handle(query: str, ctx) -> str:
     """
     Run the social broadcast backfill on demand.
 
     Args:
         query: The user's message
-        assistant: JidhrAssistant instance (not used directly, but keeps
-                   the interface consistent across all intent modules)
+        ctx: RequestContext (not used directly, but keeps the interface
+             consistent across all intent modules)
 
     Returns:
         Formatted result string

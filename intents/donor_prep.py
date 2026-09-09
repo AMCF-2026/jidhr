@@ -30,12 +30,20 @@ TRIGGER_PHRASES = [
 # Registry interface
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# Access control
+# ---------------------------------------------------------------------------
+
+# Nothing is donor-facing yet; every handler is staff-and-above.
+ALLOWED_ROLES = frozenset({"admin", "staff"})
+
 def can_handle(query: str, **kwargs) -> bool:
     q = query.lower().strip()
     return any(p in q for p in TRIGGER_PHRASES)
 
 
-def handle(query: str, assistant) -> str:
+def handle(query: str, ctx) -> str:
     """
     Build a donor call-prep brief.
 
@@ -56,8 +64,8 @@ def handle(query: str, assistant) -> str:
     logger.info(f"Preparing call prep for: {name}")
 
     # ----- Gather data from both systems -----
-    hs_data = _gather_hubspot_data(name, assistant.hubspot)
-    cs_data = _gather_csuite_data(name, assistant.csuite)
+    hs_data = _gather_hubspot_data(name, ctx.services.hubspot)
+    cs_data = _gather_csuite_data(name, ctx.services.csuite)
 
     if not hs_data["found"] and not cs_data["found"]:
         return (
@@ -69,7 +77,7 @@ def handle(query: str, assistant) -> str:
     context = _build_context_block(name, hs_data, cs_data)
 
     # ----- Generate talking points via Claude -----
-    talking_points = _generate_talking_points(name, context, assistant.claude)
+    talking_points = _generate_talking_points(name, context, ctx.services.claude)
 
     # ----- Format final output -----
     return _format_brief(name, hs_data, cs_data, talking_points)

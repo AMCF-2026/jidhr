@@ -45,7 +45,10 @@ _UPSERT_SQL = """
     VALUES (%s, %s, NOW())
     ON CONFLICT (email) DO UPDATE
         SET last_login_at = NOW(),
-            display_name  = EXCLUDED.display_name,
+            -- COALESCE, not a bare assignment: Google occasionally returns a
+            -- profile with no name, and EXCLUDED.display_name would then
+            -- overwrite a good stored name with NULL.
+            display_name  = COALESCE(EXCLUDED.display_name, users.display_name),
             updated_at    = NOW()
     RETURNING *
 """

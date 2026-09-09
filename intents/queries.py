@@ -18,6 +18,17 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Access control
+# ---------------------------------------------------------------------------
+
+# queries.py is not in HANDLER_CHAIN — it is the fallback context gatherer,
+# reached only after every handler declines. It still declares who may reach
+# it, because the fallback path returns real donor data and a donor-role actor
+# must not be handed it by default.
+ALLOWED_ROLES = frozenset({"admin", "staff"})
+
+
+# ---------------------------------------------------------------------------
 # Helper: extract a name-like phrase from a query
 # ---------------------------------------------------------------------------
 

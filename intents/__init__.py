@@ -5,10 +5,14 @@ Central router that checks handlers in priority order (most specific first).
 
 Usage from assistant.py:
     from intents import route_intent
-    handler = route_intent(query, draft_state, workflow_state)
+    handler = route_intent(query, ctx)
     if handler:
-        module, func = handler
-        response = func(query, assistant)
+        name, func = handler
+        response = func(query, ctx)
+
+Handlers are skipped outright when the actor's role is not in the module's
+ALLOWED_ROLES, before can_handle is consulted — a handler must not get a say
+in whether it applies to someone who may not use it at all.
 
 queries.py is NOT in this registry — it's a context gatherer, not a handler.
 assistant.py calls it directly as the fallback path.
@@ -46,26 +50,45 @@ HANDLER_CHAIN = [
 ]
 
 
-def route_intent(query: str, draft_state: dict, workflow_state: dict):
+def route_intent(query: str, ctx):
     """
     Check handlers in priority order and return the first match.
 
     Args:
         query: The user's raw message
-        draft_state: Current email/social draft state dict
-        workflow_state: Current DAF/endowment workflow state dict
+        ctx: RequestContext — supplies the actor whose role gates each
+             handler, plus the draft/workflow state can_handle inspects.
 
     Returns:
         Tuple of (module_name: str, handle: callable) if matched, else None.
-        The caller invokes handle(query, assistant) to get the response.
+        The caller invokes handle(query, ctx) to get the response.
     """
     for name, module in HANDLER_CHAIN:
+        allowed = getattr(module, "ALLOWED_ROLES", frozenset())
+        if not ctx.is_allowed(allowed):
+            logger.debug(
+                f"Skipping handler '{name}': role '{ctx.actor.role}' not in "
+                f"{sorted(allowed)}"
+            )
+            continue
+
         try:
-            if module.can_handle(query, draft_state=draft_state, workflow_state=workflow_state):
+            if module.can_handle(
+                query,
+                draft_state=ctx.draft_state,
+                workflow_state=ctx.workflow_state,
+            ):
                 logger.info(f"Intent matched: {name}")
                 return (name, module.handle)
         except Exception as e:
-            logger.error(f"Error checking handler '{name}': {e}")
+            # Still swallowed so one broken matcher cannot take down routing,
+            # but no longer silently: a handler that raises here never matches
+            # anything, and that used to be invisible.
+            logger.warning(
+                f"Handler '{name}' can_handle() raised {type(e).__name__}: {e} "
+                f"— skipping it for this query",
+                exc_info=True,
+            )
 
     logger.info("No specific intent matched — falling back to context + Claude")
     return None

@@ -97,6 +97,14 @@ _ENDOWMENT_DIST_TRIGGERS = [
 # Registry interface
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# Access control
+# ---------------------------------------------------------------------------
+
+# Nothing is donor-facing yet; every handler is staff-and-above.
+ALLOWED_ROLES = frozenset({"admin", "staff"})
+
 def can_handle(query: str, **kwargs) -> bool:
     q = query.lower().strip()
     all_triggers = (
@@ -108,11 +116,11 @@ def can_handle(query: str, **kwargs) -> bool:
     return any(t in q for t in all_triggers)
 
 
-def handle(query: str, assistant) -> str:
+def handle(query: str, ctx) -> str:
     """Route to the appropriate report sub-handler."""
     q = query.lower().strip()
-    hubspot = assistant.hubspot
-    csuite = assistant.csuite
+    hubspot = ctx.services.hubspot
+    csuite = ctx.services.csuite
 
     if any(t in q for t in _GRANT_TRIGGERS):
         return _report_grants(q, csuite)

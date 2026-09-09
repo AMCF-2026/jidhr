@@ -93,8 +93,8 @@ def test_get_or_create_user_uses_the_on_conflict_upsert():
     assert "insert into users" in sql
     assert "on conflict (email) do update" in sql
     assert "last_login_at = now()" in sql
-    assert "display_name  = excluded.display_name".replace("  ", " ") in \
-        sql.replace("  ", " ")
+    # COALESCE so a nameless Google profile cannot blank a stored display_name.
+    assert "coalesce(excluded.display_name, users.display_name)" in sql
     assert "returning *" in sql
 
 

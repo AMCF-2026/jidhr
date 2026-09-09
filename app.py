@@ -17,6 +17,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from config import Config
 from assistant import get_assistant
 from auth import init_auth
+from intents.context import Actor
 from clients.database import (
     health_check as db_health_check,
     is_configured as db_is_configured,
@@ -128,8 +129,16 @@ def chat():
                 f"{current_user.id} ({current_user.email}): {e}")
             return jsonify({"error": "Failed to initialize assistant. Please try again."}), 500
 
+        actor = Actor(
+            user_id=current_user.id,
+            email=current_user.email,
+            role=current_user.role,
+            csuite_profile_id=current_user.csuite_profile_id,
+        )
+
         try:
-            response = assistant.process_query(message, flask_session=session)
+            response = assistant.process_query(
+                message, actor, flask_session=session)
         except Exception as e:
             logger.exception(
                 f"process_query crashed for user "

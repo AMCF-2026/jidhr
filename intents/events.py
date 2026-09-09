@@ -67,6 +67,14 @@ ALL_TRIGGERS = (_LIST_TRIGGERS + _ATTENDEE_TRIGGERS + _SYNC_TRIGGERS +
 # Public API: can_handle / handle
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# Access control
+# ---------------------------------------------------------------------------
+
+# Nothing is donor-facing yet; every handler is staff-and-above.
+ALLOWED_ROLES = frozenset({"admin", "staff"})
+
 def can_handle(query: str, workflow_state: dict = None, **kwargs) -> bool:
     """Match if trigger phrase detected OR events workflow is active."""
     if workflow_state and workflow_state.get("active"):
@@ -75,11 +83,11 @@ def can_handle(query: str, workflow_state: dict = None, **kwargs) -> bool:
     return any(p in q for p in ALL_TRIGGERS)
 
 
-def handle(query: str, assistant) -> str:
+def handle(query: str, ctx) -> str:
     """Route to the appropriate sub-handler."""
-    state = assistant.workflow_state
-    hubspot = assistant.hubspot
-    csuite = assistant.csuite
+    state = ctx.workflow_state
+    hubspot = ctx.services.hubspot
+    csuite = ctx.services.csuite
     q = query.lower().strip()
 
     # Active workflow — handle conversation
