@@ -106,14 +106,69 @@ def _extract_name(query: str, stop_words: set | None = None) -> str | None:
     return ' '.join(name_parts) if name_parts else None
 
 
-def _extract_id(query: str) -> str | None:
-    """Extract a numeric ID from the query (e.g. 'donations for profile 1234').
+# ---------------------------------------------------------------------------
+# Numeric reference extraction (shared by the fund and profile paths)
+# ---------------------------------------------------------------------------
 
-    Deliberately loose, and only used for profile/donation lookups. Fund
-    lookups must use extract_fund_ref() instead — see the note there.
+_PUNCT_STRIP = "#.,;:!?()[]{}<>\"'"
+
+_DIGITS_RE = re.compile(r'\d+')
+
+
+def _extract_bare_number(query: str, keywords: set) -> int | None:
+    r"""Read a numeric id out of a query, or None.
+
+    A token counts only when BOTH hold:
+
+      1. the whole token is digits — never a number spliced out of the
+         middle of something longer, and
+      2. the preceding word introduces an id (one of `keywords`, or a
+         leading '#'), or the number is the last word of the query.
+
+    Rule 1 alone is not enough: "200 Muslim Women Who Care" is a fund NAME
+    that begins with a number, and the old \b(\d{2,})\b search pulled 200
+    out of it and looked up an unrelated record. As a further guard, a
+    number immediately followed by a Capitalised word is read as the start
+    of a name rather than an id.
     """
-    match = re.search(r'\b(\d{2,})\b', query)
-    return match.group(1) if match else None
+    if not query:
+        return None
+
+    tokens = query.split()
+    cleaned = [t.strip(_PUNCT_STRIP) for t in tokens]
+
+    for index, token in enumerate(cleaned):
+        if not token or not _DIGITS_RE.fullmatch(token):
+            continue
+
+        previous = cleaned[index - 1].lower().lstrip('#') if index else ""
+        introduced = previous in keywords or tokens[index].startswith('#')
+        is_last = index == len(cleaned) - 1
+        if not (introduced or is_last):
+            continue
+
+        following = cleaned[index + 1] if index + 1 < len(cleaned) else ""
+        if following[:1].isupper():
+            # "profile 200 Muslim Women Who Care" — a name, not an id.
+            continue
+
+        return int(token)
+
+    return None
+
+
+# Words that introduce a profile/contact id.
+_PROFILE_ID_KEYWORDS = {"id", "profile", "profile_id", "donor", "contact", "#"}
+
+
+def _extract_id(query: str) -> str | None:
+    """Extract a profile/contact id from the query (e.g. 'profile 19879').
+
+    Same rule as extract_fund_ref, shared via _extract_bare_number. Returns
+    a string because the CSuite client takes ids as strings here.
+    """
+    number = _extract_bare_number(query, _PROFILE_ID_KEYWORDS)
+    return str(number) if number is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +184,6 @@ _FUND_CODE_RE = re.compile(r'^[A-Za-z]{2,4}\d{3,}$')
 # unrelated fund.
 _FUND_ID_KEYWORDS = {"fund", "funit", "fund_id", "funit_id", "id", "#"}
 
-_PUNCT_STRIP = "#.,;:!?()[]{}<>\"'"
-
 
 def extract_fund_ref(query: str) -> dict | None:
     """Pull a fund reference out of a query.
@@ -140,60 +193,29 @@ def extract_fund_ref(query: str) -> dict | None:
         {"id": 1046}         — a numeric fund id
         None                 — no fund reference; treat the query as a name
 
-    A token is only read as a numeric id when BOTH hold:
-
-      1. the whole token is digits (never a number spliced out of the middle
-         of something longer), and
-      2. the preceding word introduces an id — "fund 1046", "funit 1046",
-         "fund id 1046", "#1046" — or the number is the last word of the
-         query.
-
-    Rule 2 is what the brief's own examples require: "fund 1046" is an id but
-    "fund balance for 200 Muslim Women Who Care" is not, and rule 1 alone
-    cannot tell those apart. As a further guard, a number immediately
-    followed by a Capitalised word is treated as the start of a name.
-
-    Codes need no such guard: the shape is distinctive enough on its own.
+    The numeric half follows _extract_bare_number's rule: a bare number is
+    an id only when introduced by a fund keyword or final, and not followed
+    by a Capitalised word. Codes need no such guard — the shape is
+    distinctive enough on its own — so they are matched anywhere.
     """
     if not query:
         return None
 
-    tokens = query.split()
-    cleaned = [t.strip(_PUNCT_STRIP) for t in tokens]
-
     # Codes win: they are unambiguous wherever they appear.
-    for token in cleaned:
+    for token in (t.strip(_PUNCT_STRIP) for t in query.split()):
         if token and _FUND_CODE_RE.fullmatch(token):
             return {"code": token.upper()}
 
-    for index, token in enumerate(cleaned):
-        if not token or not re.fullmatch(r'\d+', token):
-            continue
-
-        previous = cleaned[index - 1].lower().lstrip('#') if index else ""
-        introduced = (
-            previous in _FUND_ID_KEYWORDS
-            or tokens[index].startswith('#')
-        )
-        is_last = index == len(cleaned) - 1
-        if not (introduced or is_last):
-            continue
-
-        following = cleaned[index + 1] if index + 1 < len(cleaned) else ""
-        if following[:1].isupper():
-            # "fund 200 Muslim Women Who Care" — a name, not an id.
-            continue
-
-        return {"id": int(token)}
-
-    return None
+    number = _extract_bare_number(query, _FUND_ID_KEYWORDS)
+    return {"id": number} if number is not None else None
 
 
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def gather_context(query: str, hubspot, csuite) -> str:
+def gather_context(query: str, hubspot, csuite,
+                   workflow_state: dict | None = None) -> str:
     """
     Analyse the query for keywords and fetch relevant data.
 
@@ -201,6 +223,9 @@ def gather_context(query: str, hubspot, csuite) -> str:
         query: The user's raw message
         hubspot: HubSpotClient instance
         csuite: CSuiteClient instance
+        workflow_state: The request's workflow state. Optional so existing
+            callers keep working, but WITHOUT it a numbered fund pick cannot
+            be remembered between messages — see take_pending_fund_pick.
 
     Returns:
         Context string (may be empty if no keywords matched)
@@ -210,11 +235,21 @@ def gather_context(query: str, hubspot, csuite) -> str:
 
     logger.info(f"Gathering context for: {query_lower[:50]}...")
 
+    # A bare digit answering a fund list has no keywords of its own, so it
+    # has to be checked before keyword dispatch or it would match nothing.
+    if workflow_state is not None and workflow_state.get("pending_fund_pick"):
+        if _FUND_PICK_RE.match(query.strip()):
+            return "\n\n".join(
+                _gather_fund_context(query, query_lower, csuite, workflow_state))
+        # Any other message means the user moved on.
+        workflow_state.pop("pending_fund_pick", None)
+
     # ------------------------------------------------------------------
     # FUND / BALANCE / DAF / ENDOWMENT / GRANT → CSuite
     # ------------------------------------------------------------------
     if any(w in query_lower for w in ['fund', 'balance', 'daf', 'endowment', 'grant']):
-        context_parts += _gather_fund_context(query, query_lower, csuite)
+        context_parts += _gather_fund_context(
+            query, query_lower, csuite, workflow_state)
 
     # ------------------------------------------------------------------
     # CONTACT / DONOR → HubSpot (+ CSuite cross-reference)
@@ -348,12 +383,70 @@ def _fund_row_id(row: dict):
     return None
 
 
-def _fund_row_names(row: dict) -> list:
-    """Every name-ish string a search row carries, for exact matching."""
+# CSuite carries the fund code inside the name, not in a field of its own:
+#   "200 Muslim Women Who Care Endowment Fund-(END0026)"
+# Seen also as " (END0026)" and trailing "-END0026".
+_FUND_NAME_CODE_RE = re.compile(
+    r"""(?:
+            \s*-?\s*\(\s*([A-Za-z]{2,4}\d{3,})\s*\)   # -(END0026) / (END0026)
+          | \s*-\s*([A-Za-z]{2,4}\d{3,})                 # -END0026
+        )\s*$""",
+    re.VERBOSE,
+)
+
+
+def split_fund_name(raw) -> tuple:
+    """Split a CSuite fund name into (clean_name, code).
+
+    >>> split_fund_name("200 Muslim Women Who Care Endowment Fund-(END0026)")
+    ('200 Muslim Women Who Care Endowment Fund', 'END0026')
+
+    Returns (clean_name, None) when there is no code suffix. Whitespace is
+    collapsed so a name that differs only in spacing still compares equal.
+    """
+    if not raw:
+        return "", None
+
+    text = " ".join(str(raw).split())
+    match = _FUND_NAME_CODE_RE.search(text)
+    if not match:
+        return text, None
+
+    code = (match.group(1) or match.group(2) or "").upper()
+    clean = " ".join(text[:match.start()].split()).rstrip(" -")
+    return clean, (code or None)
+
+
+def _norm_for_match(text) -> str:
+    """Case-insensitive, whitespace-collapsed form used for name equality."""
+    return " ".join(str(text or "").split()).strip().lower()
+
+
+def _fund_row_raw_names(row: dict) -> list:
+    """Every name-ish string a row carries, exactly as CSuite sent it."""
     return [
         str(row[key]) for key in ("fund_name", "name", "fullname", "public_name")
         if row.get(key)
     ]
+
+
+def _fund_row_names(row: dict) -> list:
+    """Display names for a row, with any code suffix stripped."""
+    names = []
+    for raw in _fund_row_raw_names(row):
+        clean, _ = split_fund_name(raw)
+        names.append(clean or raw)
+    return names
+
+
+def _fund_row_code(row: dict) -> str | None:
+    """The fund code, parsed out of the name or read from short_name."""
+    for raw in _fund_row_raw_names(row):
+        _, code = split_fund_name(raw)
+        if code:
+            return code
+    short = row.get("short_name")
+    return str(short).strip().upper() if short else None
 
 
 def _format_currency(value) -> str:
@@ -362,6 +455,76 @@ def _format_currency(value) -> str:
         return f"${float(str(value).replace(',', '').strip()):,.2f}"
     except (TypeError, ValueError):
         return str(value)
+
+
+# Lead-ins a fund question opens with. Stripping these leaves the fund name
+# whole, which _extract_name cannot do: it stops at the first stop word, so
+# "200 Muslim Women Who Care Endowment Fund" was truncated to "Muslim Women"
+# — it drops the leading number and halts on "Who".
+_FUND_LEAD_IN_RE = re.compile(
+    r"""^\s*(?:
+          what(?:'s|\s+is)\s+(?:the\s+)?(?:current\s+)?(?:fund\s+)?
+              balance\s+(?:of|for|in)\s+
+        | how\s+much\s+is\s+(?:in|left\s+in)\s+
+        | (?:fund\s+)?balance\s+(?:of|for|in)\s+
+        | (?:show|tell|give)\s+me\s+(?:the\s+)?(?:balance\s+(?:of|for|in)\s+)?
+        | (?:calculate\s+)?fees?\s+for\s+
+        | look\s+up\s+
+        | pull\s+up\s+
+        )\s*(?:the\s+)?""",
+    re.VERBOSE | re.IGNORECASE,
+)
+
+
+def extract_fund_name_phrase(query: str) -> str | None:
+    """The fund name a query is asking about, as a whole phrase.
+
+    Strips a leading question form and returns the rest verbatim. Falls back
+    to the capitalised-words heuristic when nothing recognisable leads.
+    """
+    if not query:
+        return None
+
+    text = " ".join(str(query).split())
+    stripped = _FUND_LEAD_IN_RE.sub("", text, count=1).strip()
+    stripped = stripped.strip('"\'').rstrip("?.!,;:").strip()
+
+    if stripped and stripped.lower() != text.lower():
+        return stripped
+
+    return _extract_name(query, stop_words=_FUND_NAME_STOP_WORDS)
+
+
+def resolve_fund_id(csuite, query: str):
+    """Resolve a query to one fund id.
+
+    Returns (fund_id, rows, message):
+        fund_id  — the id to display, or None
+        rows     — the search rows, when a choice is needed
+        message  — an error string, when the search itself failed
+
+    A caller that gets no id and no message is looking at an ambiguous
+    result and should offer `rows` as a choice rather than guess.
+    """
+    ref = extract_fund_ref(query)
+    if ref and "id" in ref:
+        return ref["id"], [], None
+
+    term = ref["code"] if ref else extract_fund_name_phrase(query)
+    if not term:
+        return None, [], None
+
+    rows, error = _search_funds(csuite, term)
+    if error:
+        return None, [], error
+    if not rows:
+        return None, [], f"CSuite fund search '{term}' returned no funds."
+
+    chosen = _choose_fund(rows, term)
+    if chosen is not None:
+        return _fund_row_id(chosen), rows, None
+
+    return None, rows, None
 
 
 def _search_funds(csuite, term: str):
@@ -385,16 +548,26 @@ def _choose_fund(rows: list, term: str):
     Order: exact name match, then exact code match, then a lone result.
     Anything else is ambiguous on purpose — guessing between two funds and
     reporting one balance as fact is worse than asking.
+
+    The name comparison runs against both the code-stripped name and the raw
+    one, so "200 Muslim Women Who Care Endowment Fund" matches a row whose
+    name is "200 Muslim Women Who Care Endowment Fund-(END0026)", and a user
+    pasting the full raw string still matches too.
     """
-    term_lower = (term or "").strip().lower()
+    wanted = _norm_for_match(term)
+    if not wanted:
+        return rows[0] if len(rows) == 1 else None
 
     for row in rows:
-        if any(n.strip().lower() == term_lower for n in _fund_row_names(row)):
-            return row
+        for raw in _fund_row_raw_names(row):
+            clean, _ = split_fund_name(raw)
+            if wanted in (_norm_for_match(clean), _norm_for_match(raw)):
+                return row
 
+    wanted_code = wanted.upper()
     for row in rows:
-        code = row.get("short_name")
-        if code and str(code).strip().lower() == term_lower:
+        code = _fund_row_code(row)
+        if code and code.upper() == wanted_code:
             return row
 
     if len(rows) == 1:
@@ -403,21 +576,73 @@ def _choose_fund(rows: list, term: str):
     return None
 
 
-def _format_fund_candidates(term: str, rows: list) -> str:
-    """List the candidates and stop. No display call, no guessing."""
+# Picks are single digits, matching the event pick.
+_MAX_FUND_CHOICES = 9
+
+_FUND_PICK_RE = re.compile(r"^\s*([1-9])\s*$")
+
+
+def _fund_choice_line(index: int, row: dict) -> str:
+    names = _fund_row_names(row)
+    name = names[0] if names else "Unknown"
+    code = _fund_row_code(row)
+    suffix = f", code: {code}" if code else ""
+    return f"{index}. {name} (id: {_fund_row_id(row)}{suffix})"
+
+
+def _format_fund_candidates(term: str, rows: list,
+                            workflow_state: dict | None = None) -> str:
+    """List the candidates and stop. No display call, no guessing.
+
+    2–9 candidates are numbered and remembered, so the next message can be
+    just "1". More than that is not a list worth printing.
+    """
+    if len(rows) > _MAX_FUND_CHOICES:
+        return (
+            f"CSuite fund search '{term}' matched {len(rows)} funds — too many "
+            "to list. Ask the user for more of the fund's name, or its code "
+            "(for example END0026)."
+        )
+
     lines = [
         f"CSuite fund search '{term}' matched {len(rows)} funds. "
         f"Ask the user which one is meant — do not guess:"
     ]
-    for row in rows[:10]:
-        names = _fund_row_names(row)
-        name = names[0] if names else "Unknown"
-        code = row.get("short_name")
-        suffix = f", code: {code}" if code else ""
-        lines.append(f"- {name} (id: {_fund_row_id(row)}{suffix})")
-    if len(rows) > 10:
-        lines.append(f"- ...and {len(rows) - 10} more")
+    for index, row in enumerate(rows, 1):
+        lines.append(_fund_choice_line(index, row))
+    lines.append(
+        "The user can reply with just the number to pick one.")
+
+    if workflow_state is not None:
+        workflow_state["pending_fund_pick"] = {
+            "term": term,
+            "funds": rows,
+        }
     return "\n".join(lines)
+
+
+def take_pending_fund_pick(query: str, workflow_state: dict):
+    """Resolve a bare 1-9 against a stored fund list.
+
+    Returns the chosen row, or None. The pending list is cleared either way:
+    a pick consumes it, and any other message means the user moved on.
+    """
+    pending = (workflow_state or {}).get("pending_fund_pick")
+    if not pending:
+        return None
+
+    match = _FUND_PICK_RE.match(query or "")
+    if not match:
+        workflow_state.pop("pending_fund_pick", None)
+        return None
+
+    index = int(match.group(1)) - 1
+    rows = pending.get("funds") or []
+    workflow_state.pop("pending_fund_pick", None)
+
+    if 0 <= index < len(rows):
+        return rows[index]
+    return None
 
 
 def _fund_detail_context(csuite, fund_id) -> str:
@@ -438,12 +663,17 @@ def _fund_detail_context(csuite, fund_id) -> str:
     if not fund:
         return f"CSuite returned no detail for fund id {fund_id}."
 
+    clean_name, code = split_fund_name(fund.get("fund_name"))
+
     lines = ["CSuite Fund Detail:"]
-    lines.append(f"Fund name: {fund.get('fund_name', 'Unknown')}")
+    lines.append(f"Fund name: {clean_name or 'Unknown'}")
     lines.append(f"Fund id: {fund.get('funit_id', fund_id)}")
 
-    if fund.get("short_name"):
-        lines.append(f"Fund code: {fund['short_name']}")
+    # The code lives inside the name; short_name is the fallback.
+    if not code and fund.get("short_name"):
+        code = str(fund["short_name"]).strip().upper()
+    if code:
+        lines.append(f"Fund code: {code}")
 
     group_id = fund.get("fgroup_id")
     if group_id is not None:
@@ -466,36 +696,38 @@ def _fund_detail_context(csuite, fund_id) -> str:
     return "\n".join(lines)
 
 
-def _gather_fund_context(query: str, query_lower: str, csuite) -> list:
+def _gather_fund_context(query: str, query_lower: str, csuite,
+                         workflow_state: dict | None = None) -> list:
     """Fund-related: resolve one fund and report it, or list the candidates.
 
-    Sequence: a fund code searches by code; a numeric id goes straight to
-    funit/display; anything else searches on the extracted name phrase.
+    Sequence: a pending numbered pick wins; then a fund code searches by
+    code, a numeric id goes straight to funit/display, and anything else
+    searches on the extracted name phrase.
     """
     parts = []
-    ref = extract_fund_ref(query)
-    fund_id = None
 
-    if ref and "id" in ref:
-        fund_id = ref["id"]
-    else:
-        term = ref["code"] if ref else _extract_name(
-            query, stop_words=_FUND_NAME_STOP_WORDS)
-        if term:
-            rows, error = _search_funds(csuite, term)
-            if error:
-                parts.append(error)
-                return parts
+    # A bare "1" answering a previous list of candidates.
+    if workflow_state is not None and workflow_state.get("pending_fund_pick"):
+        picked = take_pending_fund_pick(query, workflow_state)
+        if picked is not None:
+            fund_id = _fund_row_id(picked)
+            logger.info(f"Fund pick resolved to id {fund_id}")
+            parts.append(_fund_detail_context(csuite, fund_id))
+            return parts
 
-            if not rows:
-                parts.append(f"CSuite fund search '{term}' returned no funds.")
-            else:
-                chosen = _choose_fund(rows, term)
-                if chosen is None:
-                    # Ambiguous: report the candidates and stop here.
-                    parts.append(_format_fund_candidates(term, rows))
-                    return parts
-                fund_id = _fund_row_id(chosen)
+    fund_id, rows, error = resolve_fund_id(csuite, query)
+
+    if error:
+        parts.append(error)
+        return parts
+
+    if fund_id is None and rows:
+        # Ambiguous: report the candidates and stop here.
+        term = extract_fund_ref(query)
+        term = term.get("code") if term else None
+        term = term or extract_fund_name_phrase(query) or query.strip()
+        parts.append(_format_fund_candidates(term, rows, workflow_state))
+        return parts
 
     if fund_id is not None:
         logger.info(f"Fetching CSuite fund details for id {fund_id}")
@@ -509,7 +741,8 @@ def _gather_fund_context(query: str, query_lower: str, csuite) -> list:
             if funds_data.get('success') and funds_data.get('data'):
                 results = funds_data['data'].get('results', [])
                 fund_list = [
-                    f"{f.get('fund_name', 'Unknown')} (ID: {f.get('funit_id', 'N/A')})"
+                    f"{(_fund_row_names(f) or ['Unknown'])[0]} "
+                    f"(ID: {_fund_row_id(f) or 'N/A'})"
                     for f in results[:10]
                 ]
                 parts.append(f"CSuite Funds:\n" + "\n".join(fund_list))

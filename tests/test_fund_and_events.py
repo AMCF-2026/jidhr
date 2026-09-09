@@ -319,10 +319,11 @@ def test_a_bare_number_selects_the_matching_event():
         "events": [event("First"), event("Second")],
     }}
 
-    action, picked = take_pending_event_pick("2", state)
+    action, picked, extra = take_pending_event_pick("2", state)
 
     assert action == "attendees"
     assert picked["event_name"] == "Second"
+    assert extra == {}
     assert "pending_event_pick" not in state, "a pick consumes the list"
 
 
@@ -330,7 +331,7 @@ def test_a_non_numeric_message_clears_the_pending_pick():
     state = {"pending_event_pick": {"action": "attendees",
                                     "events": [event("First")]}}
 
-    action, picked = take_pending_event_pick("show me donations", state)
+    action, picked, _ = take_pending_event_pick("show me donations", state)
 
     assert (action, picked) == (None, None)
     assert "pending_event_pick" not in state
@@ -340,7 +341,7 @@ def test_an_out_of_range_number_clears_without_picking():
     state = {"pending_event_pick": {"action": "attendees",
                                     "events": [event("Only")]}}
 
-    action, picked = take_pending_event_pick("7", state)
+    action, picked, _ = take_pending_event_pick("7", state)
 
     assert (action, picked) == (None, None)
     assert "pending_event_pick" not in state
@@ -348,7 +349,7 @@ def test_an_out_of_range_number_clears_without_picking():
 
 def test_pick_is_a_no_op_when_nothing_is_pending():
     state = {}
-    assert take_pending_event_pick("2", state) == (None, None)
+    assert take_pending_event_pick("2", state) == (None, None, {})
 
 
 def test_more_than_nine_matches_reports_a_count_and_lists_nothing():
@@ -415,3 +416,246 @@ def test_can_handle_ignores_unrelated_text_while_a_pick_is_pending():
 
     state = {"pending_event_pick": {"action": "attendees", "events": []}}
     assert not events_module.can_handle("sync donations", workflow_state=state)
+
+
+# ---------------------------------------------------------------------------
+# Step 1e: profile id extraction shares the fund rule
+# ---------------------------------------------------------------------------
+
+from intents.queries import _extract_id, _gather_donation_context  # noqa: E402
+
+
+def test_a_donation_query_naming_a_numeric_fund_extracts_no_id():
+    """"200 Muslim Women Who Care" is a name, not profile 200."""
+    assert _extract_id("donations for 200 Muslim Women Who Care") is None
+
+
+def test_profile_keyword_introduces_an_id():
+    assert _extract_id("donations for profile 19879") == "19879"
+
+
+@pytest.mark.parametrize("query,expected", [
+    ("donations for 19879", "19879"),          # trailing number
+    ("profile #19879", "19879"),               # hash prefix
+    ("donor 19879 giving history", "19879"),   # keyword-introduced
+    ("show me recent donations", None),        # no number at all
+    ("donations for 200 Cedar Street Fund", None),
+])
+def test_profile_id_rule_matches_the_fund_rule(query, expected):
+    assert _extract_id(query) == expected
+
+
+def test_profile_id_and_fund_ref_agree_on_the_same_query():
+    """Both paths share _extract_bare_number, so they cannot drift."""
+    for query in ("donations for 200 Muslim Women Who Care",
+                  "totals for 1046"):
+        fund = extract_fund_ref(query)
+        profile = _extract_id(query)
+        fund_id = fund.get("id") if fund else None
+        assert (fund_id is None) == (profile is None)
+
+
+def test_donation_gatherer_does_not_look_up_a_name_as_a_profile_id():
+    """The whole point: no get_donations_by_profile(200) for a fund name."""
+    class DonationStub:
+        def __init__(self):
+            self.by_profile = []
+
+        def get_donations_by_profile(self, profile_id, limit=10):
+            self.by_profile.append(profile_id)
+            return {"success": True, "data": {"results": []}}
+
+        def get_donations(self, limit=10, offset=0):
+            return {"success": True, "data": {"results": []}}
+
+    csuite = DonationStub()
+    _gather_donation_context(
+        "donations for 200 Muslim Women Who Care",
+        "donations for 200 muslim women who care", csuite)
+
+    assert csuite.by_profile == []
+
+
+# ---------------------------------------------------------------------------
+# Step 1e: _compare_events goes through _find_event
+# ---------------------------------------------------------------------------
+
+def _compare(csuite, query, state=None):
+    from intents.events import _compare_events
+    return _compare_events(query, query.lower(), csuite, state)
+
+
+class CompareStub(StubCSuite):
+    """Adds event-detail responses keyed by event_date_id."""
+
+    def __init__(self, events, details=None):
+        super().__init__(events=events)
+        self._details = details or {}
+        self.detail_calls = []
+
+    def get_event_date(self, event_date_id):
+        self.detail_calls.append(event_date_id)
+        detail = self._details.get(event_date_id, {})
+        return {"success": True, "data": detail}
+
+
+def _detail(name, date, emails):
+    return {
+        "event_description": name,
+        "event_date": date,
+        "profiles": [
+            {"event_profile_name": e.split("@")[0], "event_profile_email": e}
+            for e in emails
+        ],
+    }
+
+
+def test_compare_with_one_exact_and_one_ambiguous_side_lists_only_the_ambiguous():
+    gala = event("Spring Gala", date="2026-04-11")
+    iftar_a = event("Iftar 2025", date="2025-03-20")
+    iftar_b = event("Iftar 2026", date="2026-03-20")
+    csuite = CompareStub(events=[gala, iftar_a, iftar_b])
+    state = {}
+
+    result = _compare(csuite, "compare event Spring Gala vs Iftar", state)
+
+    assert isinstance(result, str)
+    # Only the ambiguous side is listed.
+    assert "Iftar 2025" in result and "Iftar 2026" in result
+    assert "Spring Gala" not in result
+    assert "1." in result and "2." in result
+
+    pending = state["pending_event_pick"]
+    assert pending["action"] == "compare"
+    assert pending["side"] == "prior"
+    assert pending["resolved_other"]["event_name"] == "Spring Gala"
+    # The exact side never triggered a detail fetch.
+    assert csuite.detail_calls == []
+
+
+def test_picking_the_ambiguous_side_resumes_the_comparison():
+    gala = event("Spring Gala", date="2026-04-11")
+    iftar_a = event("Iftar 2025", date="2025-03-20")
+    iftar_b = event("Iftar 2026", date="2026-03-20")
+    details = {
+        gala["event_date_id"]: _detail("Spring Gala", "2026-04-11", ["a@x.org"]),
+        iftar_a["event_date_id"]: _detail("Iftar 2025", "2025-03-20",
+                                          ["a@x.org", "lapsed@x.org"]),
+    }
+    csuite = CompareStub(events=[gala, iftar_a, iftar_b], details=details)
+    state = {}
+
+    _compare(csuite, "compare event Spring Gala vs Iftar", state)
+    action, picked, extra = take_pending_event_pick("1", state)
+
+    assert action == "compare"
+    assert picked["event_name"] == "Iftar 2025"
+
+    from intents.events import _dispatch_event_action
+    result = _dispatch_event_action(
+        action, picked, "1", "1", state, None, csuite, extra)
+
+    assert "Event Comparison" in result
+    assert "lapsed@x.org" in result
+    assert "Attended prior but NOT registered for current: 1" in result
+
+
+def test_compare_uses_the_exact_tier_not_a_substring():
+    """"Gala" must not also drag in "Gala Dinner"."""
+    exact = event("Gala", date="2026-04-11")
+    other = event("Gala Dinner", date="2026-05-11")
+    prior = event("Symposium", date="2025-04-11")
+    details = {
+        exact["event_date_id"]: _detail("Gala", "2026-04-11", ["a@x.org"]),
+        prior["event_date_id"]: _detail("Symposium", "2025-04-11", ["b@x.org"]),
+    }
+    csuite = CompareStub(events=[exact, other, prior], details=details)
+
+    result = _compare(csuite, "compare event Gala vs Symposium", {})
+
+    assert "Event Comparison" in result
+    assert set(csuite.detail_calls) == {
+        exact["event_date_id"], prior["event_date_id"]}
+
+
+def test_compare_strips_a_trailing_date_on_a_side():
+    a = event("Iftar", date="2026-03-20")
+    b = event("Iftar", date="2025-03-20")
+    details = {
+        a["event_date_id"]: _detail("Iftar", "2026-03-20", ["a@x.org"]),
+        b["event_date_id"]: _detail("Iftar", "2025-03-20", ["a@x.org", "c@x.org"]),
+    }
+    csuite = CompareStub(events=[a, b], details=details)
+
+    result = _compare(
+        csuite, "compare event Iftar — 2026-03-20 vs Iftar — 2025-03-20", {})
+
+    assert "Event Comparison" in result
+    assert "c@x.org" in result
+
+
+def test_compare_orders_sides_so_the_later_event_is_current():
+    older = event("Iftar 2025", date="2025-03-20")
+    newer = event("Iftar 2026", date="2026-03-20")
+    details = {
+        older["event_date_id"]: _detail("Iftar 2025", "2025-03-20", ["gone@x.org"]),
+        newer["event_date_id"]: _detail("Iftar 2026", "2026-03-20", []),
+    }
+    csuite = CompareStub(events=[older, newer], details=details)
+
+    # Older named first — the renderer must still treat 2026 as "current".
+    result = _compare(csuite, "compare event Iftar 2025 vs Iftar 2026", {})
+
+    assert "Current: **Iftar 2026**" in result
+    assert "Prior: **Iftar 2025**" in result
+    assert "gone@x.org" in result
+
+
+def test_one_sided_compare_still_works_across_years():
+    older = event("Annual Symposium 2025", date="2025-04-11")
+    newer = event("Annual Symposium 2026", date="2026-04-11")
+    details = {
+        older["event_date_id"]: _detail("Annual Symposium 2025", "2025-04-11",
+                                        ["stayed@x.org", "gone@x.org"]),
+        newer["event_date_id"]: _detail("Annual Symposium 2026", "2026-04-11",
+                                        ["stayed@x.org"]),
+    }
+    csuite = CompareStub(events=[older, newer], details=details)
+
+    result = _compare(csuite, "who attended the Annual Symposium last year "
+                              "but hasn't registered this year", {})
+
+    assert "Event Comparison" in result
+    assert "gone@x.org" in result
+    assert "stayed@x.org" not in result.split("NOT registered")[1]
+
+
+def test_one_sided_compare_needs_two_events():
+    only = event("Solo Event", date="2026-04-11")
+    csuite = CompareStub(events=[only])
+
+    result = _compare(csuite, "compare event Solo Event", {})
+
+    assert "Only found one event" in result
+    assert csuite.detail_calls == []
+
+
+def test_compare_refuses_when_both_sides_are_the_same_event():
+    same = event("Iftar", date="2026-03-20")
+    csuite = CompareStub(events=[same])
+
+    result = _compare(csuite, "compare event Iftar vs Iftar", {})
+
+    assert "same event" in result.lower()
+    assert csuite.detail_calls == []
+
+
+def test_events_module_has_no_bespoke_matching_left():
+    """All event matching must funnel through _match_events."""
+    import pathlib
+
+    source = (pathlib.Path(__file__).resolve().parent.parent
+              / "intents" / "events.py").read_text()
+    # The old hand-rolled comparison loop tested descriptions inline.
+    assert 'in (e.get("event_description")' not in source
+    assert source.count("def _match_events") == 1

@@ -58,7 +58,47 @@ FOLLOWUP_PATTERNS = [
     'save to template', 'save this to', 'save to amcf', 'save to giving circle',
     'add link', 'include link', 'switch to', 'change to',
     'more professional', 'add emojis', 'less formal', 'more formal',
+    # Refinement verbs. Spelled out so a refinement never has to rely on the
+    # short-message heuristic below.
+    'shorter', 'longer', 'punchier', 'change tone', 'tone down',
+    'rewrite', 'reword', 'rephrase', 'tighten', 'trim it', 'expand it',
+    'remove emoji', 'fewer emoji', 'more casual', 'less casual',
+    'add a link', 'add hashtags', 'remove hashtags',
 ]
+
+# Cancelling only means "drop the draft" while a draft is actually open.
+# These are deliberately NOT in FOLLOWUP_PATTERNS: "cancel" also ends the
+# events workflow, and content sits ahead of events in HANDLER_CHAIN, so a
+# global match here would swallow that.
+DRAFT_CANCEL_PATTERNS = [
+    'cancel draft', 'discard draft', 'delete draft', 'drop the draft',
+    'cancel the draft', 'discard the draft', 'start over', 'scrap it',
+    'cancel', 'discard', 'nevermind', 'never mind', 'forget it',
+]
+
+# A draft this old is assumed abandoned. It lives in a session cookie, so
+# without an expiry a draft from this morning silently swallows tonight's
+# messages.
+DRAFT_MAX_AGE = timedelta(hours=4)
+
+# Words that mean the user has moved on to another subject. A short message
+# containing one of these is a new question, not feedback on the draft.
+_TOPIC_CHANGE_WORDS = frozenset({
+    'fund', 'funds', 'balance', 'endowment', 'daf', 'grant', 'grants',
+    'donation', 'donations', 'donor', 'donors', 'giving', 'gift',
+    'event', 'events', 'attendee', 'attendees', 'rsvp', 'registered',
+    'ticket', 'tickets', 'task', 'tasks', 'report', 'contact', 'contacts',
+    'profile', 'profiles', 'sync', 'check', 'checks', 'voucher',
+    'invoice', 'fee', 'fees', 'pipeline', 'inquiry', 'inquiries',
+    'newsletter', 'campaign', 'list', 'lists', 'member', 'members',
+})
+
+_INTERROGATIVES = ('what', 'who', 'when', 'where', 'why', 'which', 'how',
+                   'is ', 'are ', 'do ', 'does ', 'can you look',
+                   'show me', 'pull up', 'find ', 'look up', 'tell me about')
+
+# Roughly how long a message can be and still count as a nudge at the draft.
+SHORT_MESSAGE_WORDS = 6
 
 
 # ---------------------------------------------------------------------------
@@ -73,9 +113,74 @@ ALLOWED_ROLES = frozenset({"admin", "staff"})
 # Registry interface
 # ---------------------------------------------------------------------------
 
+def draft_is_active(draft_state: dict | None) -> bool:
+    """True if there is a live draft to talk to.
+
+    A draft past DRAFT_MAX_AGE is treated as inactive: it is not this
+    message's context any more, and the next content command clears it.
+    A draft with no `created_at` predates this check, so it is left alone
+    rather than dropped mid-conversation on deploy.
+    """
+    if not draft_state or not draft_state.get("active"):
+        return False
+    return not draft_is_stale(draft_state)
+
+
+def draft_is_stale(draft_state: dict | None) -> bool:
+    """True if an otherwise-active draft has aged out."""
+    if not draft_state or not draft_state.get("active"):
+        return False
+
+    created = draft_state.get("created_at")
+    if not created:
+        return False
+
+    try:
+        age = datetime.now() - datetime.fromisoformat(created)
+    except (TypeError, ValueError):
+        logger.warning(f"Unparseable draft created_at: {created!r}")
+        return False
+
+    return age > DRAFT_MAX_AGE
+
+
+def _is_draft_cancel(query: str) -> bool:
+    return any(p in query for p in DRAFT_CANCEL_PATTERNS)
+
+
+def _looks_like_topic_change(query: str) -> bool:
+    """True if a short message reads as a new question, not draft feedback.
+
+    "fund balance for END0026" is four words, so a bare word-count rule
+    would hand it to the draft refiner — which is the bug this guards.
+    """
+    if '?' in query:
+        return True
+    if query.startswith(_INTERROGATIVES):
+        return True
+    words = {w.strip('.,;:!?"\'') for w in query.split()}
+    return bool(words & _TOPIC_CHANGE_WORDS)
+
+
+def _claims_draft_message(query: str) -> bool:
+    """Would this message be treated as feedback on an open draft?
+
+    Only explicit follow-ups, cancels, and short nudges that do not read as
+    a change of subject. Anything else leaves the draft pending and
+    untouched rather than being fed to the refiner.
+    """
+    if _is_followup_command(query) or _is_draft_cancel(query):
+        return True
+
+    if len(query.split()) <= SHORT_MESSAGE_WORDS and not _looks_like_topic_change(query):
+        return True
+
+    return False
+
+
 def can_handle(query: str, draft_state: dict = None, **kwargs) -> bool:
     """
-    Check if query is a content-creation command OR if a draft is active.
+    Check if query is a content-creation command OR feedback on a live draft.
     """
     q = query.lower().strip()
 
@@ -87,15 +192,37 @@ def can_handle(query: str, draft_state: dict = None, **kwargs) -> bool:
     if _is_social_post_request(q):
         return True
 
-    # Active draft conversation (refinement, save, cancel, etc.)
-    if draft_state and draft_state.get("active"):
+    # A live draft only claims messages that are plausibly about it. Claiming
+    # everything turned unrelated questions into "feedback", and the model's
+    # "I can't do that" reply was then saved as the new draft body.
+    if draft_is_active(draft_state) and _claims_draft_message(q):
         return True
+
+    # A stale draft is simply ignored here. It still gets cleared, because
+    # the follow-up branch below routes real content commands into handle(),
+    # which drops an aged-out draft before doing anything else.
 
     # Follow-up commands — only match if there's a pending draft
     if _is_followup_command(q):
         return True
 
     return False
+
+
+def claims_by_draft_only(query: str, draft_state: dict = None, **kwargs) -> bool:
+    """True when this module's claim rests solely on a draft being open.
+
+    The router uses this to let a more specific handler win: a message that
+    another handler recognises outright should go there, not to the draft.
+    """
+    q = query.lower().strip()
+
+    if _is_task_creation(q) or _is_email_draft_request(q) or _is_social_post_request(q):
+        return False
+    if _is_followup_command(q):
+        return False
+
+    return bool(draft_state and draft_state.get("active"))
 
 
 def handle(query: str, ctx) -> str:
@@ -112,6 +239,23 @@ def handle(query: str, ctx) -> str:
     """
     q = query.lower().strip()
 
+    # An aged-out draft is not this conversation's context. Clear it before
+    # anything else so it cannot leak into the command being run now.
+    if draft_is_stale(ctx.draft_state):
+        logger.info("Clearing a draft older than %s", DRAFT_MAX_AGE)
+        _clear_draft_state(ctx)
+        if _is_draft_cancel(q):
+            return (
+                "There was no active draft — the previous one had expired, "
+                "so I have cleared it. Let me know if you'd like to start "
+                "something new."
+            )
+
+    # Cancel / discard while a draft is open
+    if draft_is_active(ctx.draft_state) and _is_draft_cancel(q):
+        _clear_draft_state(ctx)
+        return "👍 Draft discarded. Let me know if you'd like to start something new!"
+
     # Task creation (immediate, no draft flow)
     if _is_task_creation(q):
         return _handle_task_creation(query, ctx)
@@ -125,7 +269,7 @@ def handle(query: str, ctx) -> str:
         return _initiate_social_post(query, ctx)
 
     # Active draft — route to conversational handler
-    if ctx.draft_state.get("active"):
+    if draft_is_active(ctx.draft_state):
         return _handle_draft_conversation(query, ctx)
 
     # Follow-up command with no active draft — tell user clearly
@@ -368,8 +512,10 @@ BODY:
 
         subject, body = _parse_email_draft(draft)
 
+        ctx.draft_state.clear()
         ctx.draft_state.update({
             "active": True,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
             "type": "email",
             "subject": subject,
             "body": body,
@@ -497,8 +643,10 @@ Write just the post content, nothing else."""
 
         content = draft.strip()
 
+        ctx.draft_state.clear()
         ctx.draft_state.update({
             "active": True,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
             "type": "social",
             "subject": None,
             "body": content,
@@ -801,7 +949,7 @@ def _handle_draft_conversation(query: str, ctx) -> str:
     query_lower = query.lower().strip()
 
     # Cancel / start over
-    if any(w in query_lower for w in ['cancel', 'start over', 'nevermind', 'forget it']):
+    if _is_draft_cancel(query_lower):
         _clear_draft_state(ctx)
         return "👍 Draft cancelled. Let me know if you'd like to start something new!"
 
@@ -843,6 +991,60 @@ def _handle_draft_conversation(query: str, ctx) -> str:
 # Draft refinement
 # ---------------------------------------------------------------------------
 
+# Openings that mean the model declined or asked a question instead of
+# producing a post. Saving one of these as the draft body is what made the
+# failure compound: the next refinement would then be run against the
+# refusal itself.
+_REFUSAL_OPENINGS = (
+    "i'm sorry", "i am sorry", "sorry,", "sorry —", "sorry -",
+    "it looks like", "it seems like", "it appears",
+    "i'm not able", "i am not able", "i'm unable", "i am unable",
+    "i can't", "i cannot", "i don't have", "i do not have",
+    "unfortunately", "as an ai", "i'm an ai", "i am an ai",
+    "could you clarify", "can you clarify", "could you provide",
+    "can you provide", "please provide", "to help with that",
+    "i'd be happy to", "i would be happy to", "i notice",
+    "there is no", "there's no", "no draft", "i don't see",
+)
+
+# Phrases that give it away wherever they appear.
+_REFUSAL_MARKERS = (
+    "wasn't included", "was not included", "weren't included",
+    "were not included", "no content was provided", "you haven't provided",
+    "you have not provided", "i don't have access", "i do not have access",
+)
+
+# Below this a "post" is not a post.
+_MIN_POST_CHARS = 20
+
+
+def _looks_like_refusal(text: str) -> bool:
+    """True if a model reply is a refusal or clarifying question, not a post."""
+    if not text:
+        return True
+
+    stripped = text.strip()
+    if len(stripped) < _MIN_POST_CHARS:
+        return True
+
+    lowered = stripped.lower()
+    if lowered.startswith(_REFUSAL_OPENINGS):
+        return True
+    return any(marker in lowered for marker in _REFUSAL_MARKERS)
+
+
+def _draft_unchanged_notice(reply: str) -> str:
+    """Report a refusal without touching the draft."""
+    preview = " ".join(reply.strip().split())[:200] if reply else "(empty reply)"
+    return (
+        "⚠️ I couldn't apply that change, so **your draft is unchanged**.\n\n"
+        f"What I got back was:\n> {preview}\n\n"
+        "Your draft is still open. Try rephrasing the change — for example "
+        "*\"make it shorter\"*, *\"more formal\"*, or *\"add a link\"* — or say "
+        "*\"cancel draft\"* to discard it."
+    )
+
+
 def _refine_draft(feedback: str, ctx) -> str:
     """Refine the current draft based on user feedback."""
     draft_type = ctx.draft_state["type"]
@@ -880,8 +1082,18 @@ Return only the revised post content, nothing else."""
             system_prompt="You are a marketing copywriter. Make the requested changes." + ORG_FACTS_PROMPT,
         )
 
+        # Checked before parsing: a refusal parses into a plausible-looking
+        # subject/body pair and would be written straight into the draft.
+        if _looks_like_refusal(revised):
+            logger.warning(
+                "Refinement reply looked like a refusal; draft left unchanged")
+            return _draft_unchanged_notice(revised)
+
         if draft_type == "email":
             subject, body = _parse_email_draft(revised)
+            if not body or not body.strip():
+                logger.warning("Refinement produced no email body; draft kept")
+                return _draft_unchanged_notice(revised)
             ctx.draft_state["subject"] = subject
             ctx.draft_state["body"] = body
 
@@ -1067,18 +1279,27 @@ def _html_to_display(html: str) -> str:
     return text.strip()
 
 
+# The shape a cleared draft is reset to. Mirrors JidhrAssistant._DEFAULT_DRAFT.
+_EMPTY_DRAFT = {
+    "active": False,
+    "type": None,
+    "subject": None,
+    "body": None,
+    "platform": None,
+    "template": None,
+    "link_url": None,
+    "photo_url": None,
+    "created_at": None,
+}
+
+
 def _clear_draft_state(ctx):
-    """Reset the draft state to inactive."""
-    ctx.draft_state.update({
-        "active": False,
-        "type": None,
-        "subject": None,
-        "body": None,
-        "platform": None,
-        "template": None,
-        "link_url": None,
-        "photo_url": None,
-    })
-    # pending_schedule isn't a fixed key on the default draft_state dict —
-    # remove it entirely so it doesn't haunt the next draft session.
-    ctx.draft_state.pop("pending_schedule", None)
+    """Reset the draft state, dropping every key rather than the known ones.
+
+    Handlers stash extras here — pending_schedule is one, and nothing stops
+    another being added — so updating only the default keys left debris that
+    haunted the next draft. clear() then re-seed is the only version that
+    cannot go stale as keys are added.
+    """
+    ctx.draft_state.clear()
+    ctx.draft_state.update(_EMPTY_DRAFT)

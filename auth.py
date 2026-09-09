@@ -245,11 +245,21 @@ def callback():
         return redirect(url_for('auth.login', error='Authentication failed. Please try again.'))
 
 
+# Per-request assistant state that lives in the session cookie. Logging out
+# must drop it: the next person to sign in on this browser would otherwise
+# inherit a half-finished draft, and its contents are not theirs to see.
+SESSION_STATE_KEYS = ("draft_state", "workflow_state")
+
+
 @auth_bp.route('/logout')
 def logout():
     """Log out current user"""
     if current_user.is_authenticated:
         logger.info(f"Logout: {current_user.email}")
+
+    for key in SESSION_STATE_KEYS:
+        session.pop(key, None)
+
     logout_user()
     return redirect(url_for('auth.login'))
 

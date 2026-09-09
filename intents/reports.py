@@ -20,7 +20,12 @@ Sub-handlers:
 import logging
 from datetime import datetime, timedelta
 from config import Config
-from intents.queries import extract_fund_ref
+from intents.queries import (
+    _fund_row_names,
+    extract_fund_ref,
+    resolve_fund_id,
+    split_fund_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -515,17 +520,111 @@ def _report_not_contacted(hubspot, csuite) -> str:
 # E. FEE CALCULATIONS
 # =========================================================================
 
+# Field names taken from scripts/probe_output/csuite_fields.md (funit/feetype).
+# The previous code read fee_name / fee_percent / min_fee, none of which
+# CSuite returns, so every row rendered as "Unknown: ?% (minimum: $0)".
+_FEE_NAME_FIELD = "admin_fee_type_name"
+_FEE_TYPE_FIELD = "admin_fee_type_type"
+_FEE_PERCENT_FIELD = "admin_fee_percent"
+_FEE_AMOUNT_FIELD = "admin_fee_amount"
+_FEE_MIN_FIELD = "admin_fee_min_fee"
+_FEE_MAX_FIELD = "admin_fee_max_fee"
+
+# CSuite exposes no field linking a fund to a fee type: admin_fee_fundgroup_id
+# is null on all 397 funds (probe #3, C9) and funit/feetype's ids match
+# nothing on the fund side. The old code silently applied fee_types[0] to
+# whatever fund was asked about and printed the result as an estimate; that
+# was a guess wearing a dollar sign, so it is gone rather than corrected.
+_FEE_JOIN_NOTE = (
+    "ℹ️ Fee assignment per fund is not exposed by CSuite — confirming with "
+    "Shazeen."
+)
+
+
+def _money(value) -> str | None:
+    """Format a CSuite money string as currency, or None if absent."""
+    if value in (None, ""):
+        return None
+    try:
+        return f"${float(str(value).replace(',', '').strip()):,.2f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _format_fee_type(ft: dict) -> str:
+    """One fee-type line, using whichever of its fields are populated."""
+    name = ft.get(_FEE_NAME_FIELD) or "Unnamed fee type"
+    bits = []
+
+    percent = ft.get(_FEE_PERCENT_FIELD)
+    if percent not in (None, ""):
+        try:
+            bits.append(f"{float(percent):g}%")
+        except (TypeError, ValueError):
+            bits.append(f"{percent}%")
+
+    flat = _money(ft.get(_FEE_AMOUNT_FIELD))
+    if flat:
+        bits.append(f"flat {flat}")
+
+    minimum = _money(ft.get(_FEE_MIN_FIELD))
+    if minimum:
+        bits.append(f"min {minimum}")
+
+    maximum = _money(ft.get(_FEE_MAX_FIELD))
+    if maximum:
+        bits.append(f"max {maximum}")
+
+    kind = ft.get(_FEE_TYPE_FIELD)
+    if kind:
+        bits.append(str(kind).replace("_", " "))
+
+    detail = " · ".join(bits) if bits else "no rate published"
+    return f"• **{name}:** {detail}"
+
+
+def _fund_balance_line(query: str, csuite) -> str | None:
+    """A one-line balance for the fund named in the query, if there is one."""
+    try:
+        fund_id, rows, error = resolve_fund_id(csuite, query)
+    except Exception as e:
+        logger.error(f"Fee report fund lookup failed: {e}")
+        return None
+
+    if error:
+        return f"⚠️ {error}"
+
+    if fund_id is None:
+        if rows:
+            names = ", ".join(
+                (_fund_row_names(r) or ["Unknown"])[0] for r in rows[:5])
+            return (
+                f"⚠️ That fund name matched {len(rows)} funds ({names}). "
+                "Name one exactly, or use its code."
+            )
+        return None
+
+    try:
+        data = csuite.get_fund(fund_id)
+    except Exception as e:
+        logger.error(f"Fee report fund fetch failed: {e}")
+        return f"⚠️ Could not fetch fund {fund_id}: {e}"
+
+    if not data.get("success") or not data.get("data"):
+        return (f"⚠️ Could not fetch fund {fund_id}: "
+                f"{data.get('error', 'unknown error')}")
+
+    fund = data["data"]
+    name, code = split_fund_name(fund.get("fund_name"))
+    balance = _money(fund.get("current_fundbalance")) or "unknown"
+    suffix = f" ({code})" if code else ""
+    return f"💰 **{name or 'Fund'}**{suffix} — balance {balance}"
+
+
 def _report_fees(query: str, csuite) -> str:
-    """Calculate fees for a fund or show fee structure."""
-    logger.info("Running fee calculation...")
+    """Show the fee structure, and the balance of a named fund if given."""
+    logger.info("Running fee report...")
 
-    # Try to extract a fund reference from the query. Shared with
-    # queries.py so "fees for 200 Muslim Women Who Care" cannot be read as
-    # fund 200.
-    ref = extract_fund_ref(query)
-    fund_id = ref["id"] if ref and "id" in ref else None
-
-    # Fetch fee types
     try:
         fee_data = csuite.get_fund_fee_types()
         if not fee_data.get('success') or not fee_data.get('data'):
@@ -534,65 +633,33 @@ def _report_fees(query: str, csuite) -> str:
     except Exception as e:
         return f"❌ Failed to fetch fee types: {e}"
 
-    # If a specific fund, calculate its fee
-    if fund_id:
-        try:
-            fund_data = csuite.get_fund(fund_id)
-            if fund_data.get('success') and fund_data.get('data'):
-                fund = fund_data['data']
-                # current_fundbalance, not `balance`: funit/display has no
-                # field called `balance`, so the old read always gave 0.00.
-                raw_balance = fund.get('current_fundbalance') or 0
-                try:
-                    balance = float(str(raw_balance).replace(',', '').strip())
-                except (TypeError, ValueError):
-                    balance = 0.0
-                fund_name = fund.get('fund_name', 'Unknown')
+    # If the query names a fund, show its balance beside the table. No fee is
+    # computed for it: which fee type applies is exactly what CSuite will not
+    # tell us, so a number here would be a guess presented as an answer.
+    fund_line = _fund_balance_line(query, csuite)
 
-                fee_estimate = _calculate_fee(balance, fee_types)
+    lines = []
+    if fund_line:
+        lines += [fund_line, ""]
+    lines += ["📊 **AMCF Fee Structure**", ""]
 
-                return f"""📊 **Fee Estimate: {fund_name}**
-
-💰 **Balance:** ${balance:,.2f}
-📋 **Estimated quarterly fee:** ${fee_estimate:,.2f}
-📅 **Annualised:** ${fee_estimate * 4:,.2f}
-
-*Based on current fee structure. Actual fees may vary.*"""
-        except Exception as e:
-            logger.error(f"Error fetching fund for fee calc: {e}")
-
-    # No specific fund — show fee structure
-    lines = [
-        "📊 **AMCF Fee Structure**",
-        "",
-    ]
-    for ft in fee_types:
-        name = ft.get('fee_name', 'Unknown')
-        pct = ft.get('fee_percent', '?')
-        min_fee = ft.get('min_fee', '0')
-        lines.append(f"• **{name}:** {pct}% (minimum: ${min_fee})")
+    if fee_types:
+        for ft in fee_types:
+            lines.append(_format_fee_type(ft))
+    else:
+        lines.append("_CSuite returned no fee types._")
 
     lines.append("")
-    lines.append('💡 *To calculate fees for a specific fund, try: "Calculate fees for fund 1234"*')
+    lines.append(_FEE_JOIN_NOTE)
+
+    if not fund_line:
+        lines.append("")
+        lines.append(
+            '💡 *To see a specific fund\'s balance, try: '
+            '"Fees for fund 1234" or "Fees for END0026".*'
+        )
 
     return "\n".join(lines)
-
-
-def _calculate_fee(balance: float, fee_types: list) -> float:
-    """
-    Estimate quarterly fee based on balance and fee structure.
-    Uses the first fee type as default (DAF admin fee).
-    """
-    if not fee_types:
-        return 0.0
-
-    # Use first fee type as default
-    ft = fee_types[0]
-    pct = float(ft.get('fee_percent', 0) or 0)
-    min_fee = float(ft.get('min_fee', 0) or 0)
-
-    calculated = balance * (pct / 100) / 4  # quarterly
-    return max(calculated, min_fee)
 
 
 # =========================================================================

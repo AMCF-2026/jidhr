@@ -102,10 +102,10 @@ def handle(query: str, ctx) -> str:
     # take_pending_event_pick clears the list either way, so a non-numeric
     # message drops it and routing continues normally below.
     if state.get("pending_event_pick"):
-        action, picked = take_pending_event_pick(query, state)
+        action, picked, extra = take_pending_event_pick(query, state)
         if picked is not None:
             return _dispatch_event_action(
-                action, picked, query, q, state, hubspot, csuite)
+                action, picked, query, q, state, hubspot, csuite, extra)
 
     # Active workflow — handle conversation
     if state.get("active") and state.get("workflow_type") == "events":
@@ -113,7 +113,7 @@ def handle(query: str, ctx) -> str:
 
     # New command routing
     if any(p in q for p in _COMPARE_TRIGGERS):
-        return _compare_events(query, q, csuite)
+        return _compare_events(query, q, csuite, state)
 
     if any(p in q for p in _SYNC_TRIGGERS):
         return _start_sync_workflow(query, q, state, csuite)
@@ -458,14 +458,85 @@ def _start_followup(query: str, query_lower: str, csuite, hubspot,
 # Command: Compare events (year-over-year)
 # ---------------------------------------------------------------------------
 
-def _compare_events(query: str, query_lower: str, csuite) -> str:
-    """Compare attendees between two events — who came before but hasn't registered this time.
+# "X vs Y" / "X versus Y" — the only separators unambiguous enough to split
+# on. " and " is not: "Fundraiser and Gala" is one event name.
+_COMPARE_SPLIT_RE = re.compile(r"\s+(?:vs\.?|versus)\s+", re.IGNORECASE)
+
+
+def _split_comparison(query: str):
+    """Split "A vs B" into two sides, or return (query, None) if one-sided."""
+    parts = _COMPARE_SPLIT_RE.split(query, maxsplit=1)
+    if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+        return parts[0].strip(), parts[1].strip()
+    return query, None
+
+
+def _resolve_compare_side(text: str, csuite, state, side: str,
+                          other: dict | None) -> dict | str:
+    """Resolve one side of a comparison through the shared matcher.
+
+    Returns the event, or the message _find_event produced. When that message
+    is a numbered list, the side already resolved rides along in the pending
+    record so picking a number resumes the comparison.
+    """
+    return _find_event(
+        text, text.lower(), csuite, state, action="compare",
+        extra={"side": side, "resolved_other": other},
+    )
+
+
+def _compare_events(query: str, query_lower: str, csuite,
+                    state: dict | None = None, picked: dict | None = None,
+                    picked_side: str | None = None,
+                    other: dict | None = None) -> str:
+    """Compare attendees between two events — who came before but hasn't
+    registered this time.
+
+    Both sides go through _find_event, so they get the same four matching
+    tiers, the same trailing-date stripping and the same numbered-pick
+    behaviour as every other event command.
+
+    Two shapes are accepted:
+      "compare X vs Y"  — each side resolved independently
+      "who attended the symposium last year but not this year" — one name,
+        resolved to every event sharing it, most recent two compared.
 
     Examples:
         "Who attended last year's symposium but hasn't registered this year?"
         "Compare event Annual Symposium 2025 vs 2026"
     """
-    # Fetch all events to find matches
+    # --- Resuming after a numbered pick -----------------------------------
+    if picked is not None:
+        if other is None:
+            return (
+                "I lost track of the other event in that comparison. "
+                "Please ask again with both events named."
+            )
+        if picked_side == "prior":
+            current_event, prior_event = other, picked
+        else:
+            current_event, prior_event = picked, other
+        return _render_comparison(current_event, prior_event, csuite)
+
+    left_text, right_text = _split_comparison(query)
+
+    # --- Two named sides --------------------------------------------------
+    if right_text is not None:
+        left = _resolve_compare_side(left_text, csuite, state, "current", None)
+        if isinstance(left, str):
+            return left  # error, or a numbered list for this side
+
+        right = _resolve_compare_side(right_text, csuite, state, "prior", left)
+        if isinstance(right, str):
+            return right
+
+        current_event, prior_event = _order_by_date(left, right)
+        return _render_comparison(current_event, prior_event, csuite)
+
+    # --- One name, compared across its own occurrences --------------------
+    name_text, date_filter = _split_event_date(query)
+    name = _extract_event_name(name_text, name_text.lower())
+
     try:
         result = csuite.get_event_dates(limit=200)
     except Exception as e:
@@ -478,56 +549,59 @@ def _compare_events(query: str, query_lower: str, csuite) -> str:
     if not events:
         return "No events found."
 
-    # Try to extract the event name from the query
-    name = _extract_event_name(query, query_lower)
-
     if not name:
-        # Fall back to showing recent events for the user to pick
         non_archived = [e for e in events if not e.get("archived")]
         non_archived.sort(key=lambda e: e.get("event_date") or "0000", reverse=True)
-        lines = [
-            "I need to know which event to compare. Here are recent events:\n"
-        ]
+        lines = ["I need to know which event to compare. Here are recent events:\n"]
         for i, e in enumerate(non_archived[:10], 1):
-            desc = e.get("event_description", e.get("event_name", "Unnamed"))
-            date = e.get("event_date", "")
-            lines.append(f"{i}. **{desc}** — {date}")
+            lines.append(f"{i}. **{_event_label(e)}** — {e.get('event_date', '')}")
         lines.append(
             "\nSay something like: *\"Who attended the Annual Symposium last year "
             "but hasn't registered this year?\"*"
         )
         return "\n".join(lines)
 
-    # Find all events matching this name (should get multiple years)
-    matches = [
-        e for e in events
-        if name.lower() in (e.get("event_description") or "").lower()
-        or name.lower() in (e.get("event_name") or "").lower()
-    ]
+    # Same tiers as every other lookup — no bespoke matching here.
+    matches = _match_events(events, name, date_filter)
 
-    if len(matches) < 2:
-        if len(matches) == 1:
-            desc = matches[0].get("event_description", "")
-            return (
-                f"Only found one event matching '{name}': **{desc}**\n\n"
-                f"I need at least two events (e.g., same event in different years) to compare."
-            )
+    if len(matches) == 1:
+        return (
+            f"Only found one event matching '{name}': "
+            f"**{_event_label(matches[0])}**\n\n"
+            "I need at least two events (e.g., same event in different years) "
+            "to compare."
+        )
+    if not matches:
         return f"No events found matching '{name}'."
 
-    # Filter out events without dates, then sort — most recent first
-    matches = [m for m in matches if m.get("event_date") is not None]
-    if len(matches) < 2:
+    dated = [m for m in matches if m.get("event_date") is not None]
+    if len(dated) < 2:
         return f"Not enough dated events matching '{name}' to compare."
-    matches.sort(key=lambda e: e.get("event_date") or "0000", reverse=True)
-    current_event = matches[0]
-    prior_event = matches[1]
 
+    dated.sort(key=lambda e: e.get("event_date") or "0000", reverse=True)
+    return _render_comparison(dated[0], dated[1], csuite)
+
+
+def _order_by_date(a: dict, b: dict):
+    """Return (current, prior) — the later event first."""
+    if (b.get("event_date") or "0000") > (a.get("event_date") or "0000"):
+        return b, a
+    return a, b
+
+
+def _render_comparison(current_event: dict, prior_event: dict, csuite) -> str:
+    """Fetch both attendee lists and report who lapsed."""
     current_eid = current_event.get("event_date_id")
     prior_eid = prior_event.get("event_date_id")
     if not current_eid or not prior_eid:
         return "Could not determine event IDs for comparison."
 
-    # Fetch attendees for both
+    if current_eid == prior_eid:
+        return (
+            "Both sides of that comparison resolved to the same event. "
+            "Name two different events, or add a date to each."
+        )
+
     try:
         current_detail = _fetch_event_detail(current_eid, csuite)
         if isinstance(current_detail, str):
@@ -540,7 +614,6 @@ def _compare_events(query: str, query_lower: str, csuite) -> str:
         logger.exception(f"Event comparison fetch crashed: {e}")
         return f"Something went wrong fetching event details for comparison. Error: {e}"
 
-    # Build email sets
     current_emails = {
         p.get("event_profile_email", "").lower()
         for p in current_detail.get("profiles", [])
@@ -589,8 +662,17 @@ def _compare_events(query: str, query_lower: str, csuite) -> str:
 # ---------------------------------------------------------------------------
 
 def _dispatch_event_action(action, event, query, query_lower, state,
-                           hubspot, csuite) -> str:
+                           hubspot, csuite, extra: dict | None = None) -> str:
     """Resume the command that produced a numbered list, now that one was picked."""
+    extra = extra or {}
+
+    if action == "compare":
+        # `resolved_other` is the side that matched exactly first time round.
+        return _compare_events(
+            query, query_lower, csuite, state,
+            picked=event, picked_side=extra.get("side"),
+            other=extra.get("resolved_other"))
+
     if action == "sync":
         return _start_sync_workflow(query, query_lower, state, csuite, event=event)
     if action == "followup":
@@ -679,8 +761,13 @@ def _match_events(events: list, name: str, date_filter: str | None) -> list:
 
 
 def _format_event_choices(matches: list, name: str, state: dict | None,
-                          action: str | None) -> str:
-    """Number the candidates and remember them, so "2" can answer."""
+                          action: str | None, extra: dict | None = None) -> str:
+    """Number the candidates and remember them, so "2" can answer.
+
+    `extra` is merged into the stored record. The comparison path uses it to
+    keep the side it already resolved, so picking the ambiguous side resumes
+    the comparison instead of starting over.
+    """
     lines = [f"Found {len(matches)} events matching '{name}':\n"]
     for i, event in enumerate(matches, 1):
         lines.append(
@@ -688,40 +775,44 @@ def _format_event_choices(matches: list, name: str, state: dict | None,
     lines.append("\nReply with the number, or add the date to narrow it down.")
 
     if state is not None:
-        state["pending_event_pick"] = {
-            "action": action,
-            "events": matches,
-        }
+        record = {"action": action, "events": matches}
+        record.update(extra or {})
+        state["pending_event_pick"] = record
     return "\n".join(lines)
 
 
 def take_pending_event_pick(query: str, state: dict):
     """Resolve a bare 1-9 against a stored candidate list.
 
-    Returns (action, event) on a successful pick, else (None, None). The
-    pending list is cleared either way: a pick consumes it, and any other
-    message means the user moved on.
+    Returns (action, event, extra) on a successful pick, else
+    (None, None, {}). `extra` carries whatever the caller stashed alongside
+    the candidates — for a comparison, the side already resolved.
+
+    The pending list is cleared either way: a pick consumes it, and any
+    other message means the user moved on.
     """
     pending = (state or {}).get("pending_event_pick")
     if not pending:
-        return None, None
+        return None, None, {}
 
     match = _PICK_RE.match(query or "")
     if not match:
         state.pop("pending_event_pick", None)
-        return None, None
+        return None, None, {}
 
     index = int(match.group(1)) - 1
     events = pending.get("events") or []
+    extra = {k: v for k, v in pending.items() if k not in ("action", "events")}
     state.pop("pending_event_pick", None)
 
     if 0 <= index < len(events):
-        return pending.get("action"), events[index]
-    return None, None
+        return pending.get("action"), events[index], extra
+    return None, None, {}
 
 
 def _find_event(query: str, query_lower: str, csuite,
-                state: dict | None = None, action: str | None = None) -> dict | str:
+                state: dict | None = None, action: str | None = None,
+                extra: dict | None = None) -> dict | str:
     """Search CSuite events by name. Returns an event dict or a message string.
 
     When several events match, the candidates are numbered and remembered in
@@ -779,7 +870,7 @@ def _find_event(query: str, query_lower: str, csuite,
             "'— YYYY-MM-DD'."
         )
 
-    return _format_event_choices(matches, name, state, action)
+    return _format_event_choices(matches, name, state, action, extra)
 
 
 def _extract_event_name(query: str, query_lower: str) -> str:
