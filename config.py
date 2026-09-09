@@ -26,7 +26,11 @@ class Config:
     # =========================================================================
     # FLASK
     # =========================================================================
-    SECRET_KEY = os.environ.get('SECRET_KEY', 'jidhr-dev-key-change-in-production')
+    # No fallback on purpose. A default signing key that ships in the repo
+    # signs session cookies anyone can forge, and a dev default silently
+    # becomes the production key the first time someone forgets to set it.
+    # app.py refuses to start when this is unset.
+    SECRET_KEY = os.environ.get('SECRET_KEY')
     DEBUG = os.environ.get('DEBUG', 'False').lower() == 'true'
     # `or` rather than a default argument: an env var that is present but
     # blank (Railway does this when a variable is cleared rather than removed)
@@ -209,6 +213,8 @@ class Config:
     def validate(cls):
         """Check for required environment variables"""
         missing = []
+        if not cls.SECRET_KEY:
+            missing.append("SECRET_KEY")
         if not cls.OPENROUTER_API_KEY:
             missing.append("OPENROUTER_API_KEY")
         if not cls.HUBSPOT_ACCESS_TOKEN:
@@ -269,7 +275,6 @@ You have access to TWO systems:
 - Create social media posts (Facebook, LinkedIn, Twitter, Instagram)
 - Write newsletter content and outreach emails
 - Personalize outreach using donor/fund context
-- Suggest subject lines for campaigns
 
 ### Events
 - List upcoming events from CSuite
