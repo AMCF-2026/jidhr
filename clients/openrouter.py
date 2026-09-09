@@ -5,10 +5,31 @@ Client for accessing Claude via OpenRouter API.
 """
 
 import logging
+import time
+
 import requests
 from config import Config
 
 logger = logging.getLogger(__name__)
+
+# One retry, after this pause, when OpenRouter rate-limits us.
+RATE_LIMIT_RETRY_SECONDS = 2
+
+
+class OpenRouterError(RuntimeError):
+    """A chat completion could not be obtained.
+
+    Raised rather than returned as text. The old code handed back a string
+    starting "❌ Error communicating with AI", which every caller then stored
+    and displayed as if it were Claude's answer — a failed call was
+    indistinguishable from a successful one, and the error text was appended
+    to conversation history as a real assistant turn.
+    """
+
+    def __init__(self, status, message):
+        self.status = status
+        self.message = message
+        super().__init__(f"OpenRouter failed (status={status}): {message}")
 
 
 class OpenRouterClient:
@@ -31,10 +52,15 @@ class OpenRouterClient:
 
         Returns:
             Claude's response as a string
+
+        Raises:
+            OpenRouterError: on any HTTP, network or parse failure. Callers
+                must decide what the user sees; this client never returns an
+                error message dressed up as an answer.
         """
         if not self.api_key:
             logger.error("OpenRouter API key not configured")
-            return "⚠️ OpenRouter API key not configured. Please set OPENROUTER_API_KEY environment variable."
+            raise OpenRouterError(None, "OPENROUTER_API_KEY is not configured")
         
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -57,27 +83,48 @@ class OpenRouterClient:
             payload["temperature"] = temperature
         
         logger.info(f"OpenRouter request: model={self.model}, messages={len(all_messages)}")
-        
+
+        try:
+            return self._attempt(headers, payload)
+        except OpenRouterError as first:
+            if first.status != 429:
+                raise
+            # Rate limited: one retry, then give up. Retrying anything else
+            # would just double the wait before the user hears about it.
+            logger.warning(
+                "OpenRouter rate limited; retrying once in %ss",
+                RATE_LIMIT_RETRY_SECONDS)
+            time.sleep(RATE_LIMIT_RETRY_SECONDS)
+            return self._attempt(headers, payload)
+
+    def _attempt(self, headers: dict, payload: dict) -> str:
+        """One request. Raises OpenRouterError on any failure."""
         try:
             response = requests.post(
                 f"{self.base_url}/chat/completions",
                 headers=headers,
                 json=payload,
-                timeout=60
+                timeout=60,
             )
-            response.raise_for_status()
-            data = response.json()
-            
-            result = data["choices"][0]["message"]["content"]
-            logger.info(f"OpenRouter response: {len(result)} chars")
-            return result
-            
-        except requests.exceptions.Timeout:
+        except requests.exceptions.Timeout as e:
             logger.error("OpenRouter timeout")
-            return "❌ Request timed out. Please try again."
+            raise OpenRouterError("timeout", "the request timed out") from e
         except requests.exceptions.RequestException as e:
-            logger.error(f"OpenRouter error: {str(e)}")
-            return f"❌ Error communicating with AI: {str(e)}"
-        except (KeyError, IndexError) as e:
-            logger.error(f"OpenRouter parse error: {str(e)}")
-            return f"❌ Unexpected response format: {str(e)}"
+            logger.error(f"OpenRouter transport error: {e}")
+            raise OpenRouterError(None, str(e)) from e
+
+        status = response.status_code
+        if status >= 400:
+            body = (response.text or "")[:200]
+            logger.error(f"OpenRouter HTTP {status}: {body}")
+            raise OpenRouterError(status, body or f"HTTP {status}")
+
+        try:
+            data = response.json()
+            result = data["choices"][0]["message"]["content"]
+        except (ValueError, KeyError, IndexError, TypeError) as e:
+            logger.error(f"OpenRouter parse error: {e}")
+            raise OpenRouterError(status, f"unexpected response format: {e}") from e
+
+        logger.info(f"OpenRouter response: {len(result)} chars")
+        return result

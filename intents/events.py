@@ -196,8 +196,8 @@ def _show_attendees(query: str, query_lower: str, csuite,
             return "Could not determine the event ID. Please try specifying the event name more precisely."
 
         event_detail = _fetch_event_detail(event_date_id, csuite)
-        if isinstance(event_detail, str):
-            return event_detail  # Error message
+        if event_detail is None:
+            return _detail_unavailable(event_data)
 
         profiles = event_detail.get("profiles") or []
         desc = event_detail.get("event_description", event_detail.get("event_name", "Event"))
@@ -262,8 +262,8 @@ def _start_sync_workflow(query: str, query_lower: str, state: dict, csuite,
         logger.exception(f"Event detail fetch crashed: {e}")
         return f"Something went wrong fetching event details. Error: {e}"
 
-    if isinstance(event_detail, str):
-        return event_detail
+    if event_detail is None:
+        return _detail_unavailable(event_data)
 
     profiles = event_detail.get("profiles", [])
     desc = event_detail.get("event_description", event_detail.get("event_name", "Event"))
@@ -325,9 +325,12 @@ def _execute_sync(state: dict, hubspot, csuite) -> str:
 
     # Fetch attendees
     event_detail = _fetch_event_detail(event_date_id, csuite)
-    if isinstance(event_detail, str):
+    if event_detail is None:
         _reset_state(state)
-        return event_detail
+        return (
+            f"⚠️ Couldn't load details for {desc} — nothing was synced. "
+            "Try again in a moment."
+        )
 
     profiles = event_detail.get("profiles", [])
     if not profiles:
@@ -433,8 +436,8 @@ def _start_followup(query: str, query_lower: str, csuite, hubspot,
         return event_data
 
     event_detail = _fetch_event_detail(event_data["event_date_id"], csuite)
-    if isinstance(event_detail, str):
-        return event_detail
+    if event_detail is None:
+        return _detail_unavailable(event_data)
 
     profiles = event_detail.get("profiles", [])
     desc = event_detail.get("event_description", event_detail.get("event_name", "Event"))
@@ -604,12 +607,12 @@ def _render_comparison(current_event: dict, prior_event: dict, csuite) -> str:
 
     try:
         current_detail = _fetch_event_detail(current_eid, csuite)
-        if isinstance(current_detail, str):
-            return current_detail
+        if current_detail is None:
+            return _detail_unavailable(current_event)
 
         prior_detail = _fetch_event_detail(prior_eid, csuite)
-        if isinstance(prior_detail, str):
-            return prior_detail
+        if prior_detail is None:
+            return _detail_unavailable(prior_event)
     except Exception as e:
         logger.exception(f"Event comparison fetch crashed: {e}")
         return f"Something went wrong fetching event details for comparison. Error: {e}"
@@ -890,17 +893,34 @@ def _extract_event_name(query: str, query_lower: str) -> str:
     return name if len(name) > 2 else ""
 
 
-def _fetch_event_detail(event_date_id: int, csuite) -> dict | str:
-    """Fetch full event details including attendees."""
+def _fetch_event_detail(event_date_id: int, csuite) -> dict | None:
+    """Fetch full event details including attendees, or None on failure.
+
+    Returns None rather than an error string. A string return meant every
+    caller had to remember an isinstance check, and a caller that forgot got
+    a str where it expected a dict — .get() on it raises, or worse, the error
+    text flowed on as if it were data.
+    """
     try:
         result = csuite.get_event_date(event_date_id)
     except Exception as e:
-        return f"Failed to fetch event details: {e}"
+        logger.warning(
+            f"Event detail fetch failed for {event_date_id}: {e}", exc_info=True)
+        return None
 
     if not result.get("success") or not result.get("data"):
-        return "Could not retrieve event details from CSuite."
+        logger.warning(
+            "Event detail unavailable for %s: %s",
+            event_date_id, result.get("error", "no data returned"))
+        return None
 
     return result["data"]
+
+
+def _detail_unavailable(event) -> str:
+    """The line a user sees when an event's details could not be loaded."""
+    label = _event_label(event) if isinstance(event, dict) else str(event)
+    return f"⚠️ Couldn't load details for {label}."
 
 
 def _reset_state(state: dict):

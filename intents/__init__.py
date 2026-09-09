@@ -106,15 +106,47 @@ def route_intent(query: str, ctx):
             continue
 
         logger.info(f"Intent matched: {name}")
-        return (name, module.handle)
+        return (name, _guarded(name, module.handle))
 
     if provisional is not None:
         name, module = provisional
         logger.info(f"Intent matched: {name} (via open state)")
-        return (name, module.handle)
+        return (name, _guarded(name, module.handle))
 
     logger.info("No specific intent matched — falling back to context + Claude")
     return None
+
+
+def _guarded(name: str, handle):
+    """Wrap a handler so a crash becomes a plain failure line, not a 500.
+
+    The guarantee belongs here rather than in the caller: whoever invokes
+    route_intent's callable gets the same behaviour, and the message says
+    plainly that nothing changed instead of leaking a traceback.
+
+    A handler that raises part-way through may already have written to
+    HubSpot or CSuite. "Nothing was changed" is about this turn's outcome
+    being unusable, so the message stays deliberately about the failure —
+    anything a handler completed before raising is reported by the handler
+    itself when it succeeds, never here.
+    """
+
+    def guarded_handle(query, ctx):
+        try:
+            return handle(query, ctx)
+        except Exception as e:
+            logger.warning(
+                f"Handler '{name}' handle() raised {type(e).__name__}: {e}",
+                exc_info=True,
+            )
+            return (
+                f"⚠️ {name} hit an error: {e}. Nothing was changed."
+            )
+
+    guarded_handle.__name__ = getattr(handle, "__name__", "handle")
+    guarded_handle.__doc__ = getattr(handle, "__doc__", None)
+    guarded_handle.__wrapped__ = handle
+    return guarded_handle
 
 
 def _claims_weakly(module, query: str, ctx) -> bool:

@@ -184,6 +184,25 @@ def get_queue(hubspot=None) -> list[dict]:
         Empty list on any error (logs ERROR with exc_info).
     """
     try:
+        return fetch_queue(hubspot)
+    except Exception as e:
+        logger.error(f"get_queue: failed: {e}", exc_info=True)
+        return []
+
+
+class QueueUnavailable(RuntimeError):
+    """The live broadcast queue could not be read."""
+
+
+def fetch_queue(hubspot=None) -> list[dict]:
+    """Same as get_queue, but raises instead of returning [] on failure.
+
+    get_queue swallows errors and returns an empty list, which is
+    indistinguishable from "nothing is scheduled". A cadence check that
+    cannot tell those apart passes every post silently, so check_schedule
+    uses this version and reports the difference.
+    """
+    try:
         if hubspot is None:
             # Lazy import — matches content.social_capture.backfill_social_content
             # and content.content_memory.run_email_backfill.
@@ -192,14 +211,10 @@ def get_queue(hubspot=None) -> list[dict]:
 
         raw = hubspot.get_waiting_broadcasts()
         if isinstance(raw, dict) and "error" in raw:
-            logger.error(f"get_queue: client returned error dict: {raw}")
-            return []
+            raise QueueUnavailable(f"HubSpot returned an error: {raw.get('error')}")
         if not isinstance(raw, list):
-            logger.error(
-                f"get_queue: unexpected return type from client: "
-                f"{type(raw).__name__}"
-            )
-            return []
+            raise QueueUnavailable(
+                f"unexpected return type from client: {type(raw).__name__}")
 
         out = []
         for item in raw:
@@ -225,12 +240,37 @@ def get_queue(hubspot=None) -> list[dict]:
                 "link":           link,
             })
         return out
+    except QueueUnavailable:
+        raise
     except Exception as e:
-        logger.error(f"get_queue: failed: {e}", exc_info=True)
-        return []
+        raise QueueUnavailable(f"{type(e).__name__}: {e}") from e
 
 
-def check_schedule(body, link, channel, trigger_at, queue=None) -> list[dict]:
+class CheckResult:
+    """Outcome of a cadence check.
+
+    A bare list could not distinguish "no conflicts" from "the check blew
+    up", and both rendered as silence — the post went out with no cadence
+    review and nothing said so.
+    """
+
+    __slots__ = ("ok", "conflicts", "error")
+
+    def __init__(self, ok: bool, conflicts=None, error=None):
+        self.ok = ok
+        self.conflicts = list(conflicts or [])
+        self.error = error
+
+    def __bool__(self):
+        """Truthy when the check ran AND found nothing. Never guess from this."""
+        return self.ok and not self.conflicts
+
+    def __repr__(self):
+        return (f"CheckResult(ok={self.ok}, conflicts={len(self.conflicts)}, "
+                f"error={self.error!r})")
+
+
+def check_schedule(body, link, channel, trigger_at, queue=None) -> "CheckResult":
     """Flag rule-1 / rule-2 violations against a queue.
 
     Args:
@@ -255,9 +295,11 @@ def check_schedule(body, link, channel, trigger_at, queue=None) -> list[dict]:
     """
     try:
         if queue is None:
-            queue = get_queue()
+            # fetch_queue, not get_queue: a failed fetch must not read as an
+            # empty schedule and wave the post through.
+            queue = fetch_queue()
         if not queue:
-            return []
+            return CheckResult(ok=True, conflicts=[])
 
         if trigger_at.tzinfo is None:
             target_aware = trigger_at.replace(tzinfo=_ET_TZ)
@@ -312,10 +354,10 @@ def check_schedule(body, link, channel, trigger_at, queue=None) -> list[dict]:
                         "matched_on":     matched_on,
                     })
 
-        return violations
+        return CheckResult(ok=True, conflicts=violations)
     except Exception as e:
         logger.error(f"check_schedule: failed: {e}", exc_info=True)
-        return []
+        return CheckResult(ok=False, error=f"{type(e).__name__}: {e}")
 
 
 def suggest_slot(channel, near_date, queue=None):

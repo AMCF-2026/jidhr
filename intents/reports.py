@@ -228,7 +228,7 @@ def _report_grants(query: str, csuite) -> str:
     logger.info(f"Grant report for {label}...")
 
     try:
-        all_grants = _fetch_all_grants(csuite)
+        all_grants, grants_complete = _fetch_all_grants(csuite)
     except Exception as e:
         logger.exception(f"Error fetching grants: {e}")
         return f"❌ Failed to fetch grants: {e}"
@@ -241,6 +241,14 @@ def _report_grants(query: str, csuite) -> str:
             filtered.append(g)
 
     if not filtered:
+        # An empty result after a capped fetch is a false negative: the
+        # grants for this window may simply never have been read.
+        note = partial_note(len(all_grants), grants_complete, "grants")
+        if note:
+            return (
+                f"{note}\n\n📊 No grants found for **{label}** in the records "
+                "I could read — there may be more."
+            )
         return f"📊 No grants found for **{label}**."
 
     # Aggregate
@@ -258,7 +266,11 @@ def _report_grants(query: str, csuite) -> str:
     # Sort by total descending
     sorted_funds = sorted(by_fund.items(), key=lambda x: x[1]["total"], reverse=True)
 
-    lines = [
+    lines = []
+    note = partial_note(len(all_grants), grants_complete, "grants")
+    if note:
+        lines += [note, ""]
+    lines += [
         f"📊 **Grant Report: {label}**",
         "",
         f"**Total:** {count} grants totalling **${total_amount:,.2f}**",
@@ -274,26 +286,43 @@ def _report_grants(query: str, csuite) -> str:
     return "\n".join(lines)
 
 
-def _fetch_all_grants(csuite, max_pages: int = 10) -> list:
-    """Paginate through all grants from CSuite."""
+def partial_note(count: int, complete: bool, label: str = "records") -> str | None:
+    """The banner a capped fetch must carry, or None when the data is whole.
+
+    Every one of these reports used to print a total as if it covered
+    everything, while the fetch behind it stopped at a page cap. A number
+    that is quietly a lower bound is worse than no number.
+    """
+    if complete:
+        return None
+    return (f"⚠️ Partial data: first {count} {label} only — "
+            f"totals below are NOT complete.")
+
+
+def _fetch_all_grants(csuite, max_pages: int = 10):
+    """Paginate through grants. Returns (records, complete)."""
     all_results = []
     offset = 0
     limit = 100
+    complete = False
 
     for _ in range(max_pages):
         data = csuite.get_grants(limit=limit, offset=offset)
         if not data.get('success') or not data.get('data'):
+            # A failed page means we do not know what we are missing.
             break
         results = data['data'].get('results', [])
         if not results:
+            complete = True
             break
         all_results.extend(results)
         if len(results) < limit:
+            complete = True
             break
         offset += limit
 
-    logger.info(f"Fetched {len(all_results)} total grants")
-    return all_results
+    logger.info(f"Fetched {len(all_results)} total grants (complete={complete})")
+    return all_results, complete
 
 
 # =========================================================================
@@ -309,7 +338,7 @@ def _report_lapsed_donors(query: str, csuite, hubspot) -> str:
     prior_range = Config.get_ramadan_range(now.year - 1)
 
     try:
-        all_donations = _fetch_all_donations(csuite)
+        all_donations, donations_complete = _fetch_all_donations(csuite)
     except Exception as e:
         logger.error(f"Error fetching donations: {e}")
         return f"❌ Failed to fetch donations: {e}"
@@ -348,7 +377,11 @@ def _report_lapsed_donors(query: str, csuite, hubspot) -> str:
             pass
         lapsed_details.append(detail)
 
-    lines = [
+    lines = []
+    note = partial_note(len(all_donations), donations_complete, "donations")
+    if note:
+        lines += [note, ""]
+    lines += [
         f"📊 **Ramadan Lapsed Donors**",
         "",
         f"**{len(lapsed)}** donors gave during Ramadan {prior_range[0][:4]} "
@@ -368,11 +401,12 @@ def _report_lapsed_donors(query: str, csuite, hubspot) -> str:
     return "\n".join(lines)
 
 
-def _fetch_all_donations(csuite, max_pages: int = 10) -> list:
-    """Paginate through all donations from CSuite."""
+def _fetch_all_donations(csuite, max_pages: int = 10):
+    """Paginate through donations. Returns (records, complete)."""
     all_results = []
     offset = 0
     limit = 100
+    complete = False
 
     for _ in range(max_pages):
         data = csuite.get_donations(limit=limit, offset=offset)
@@ -380,14 +414,16 @@ def _fetch_all_donations(csuite, max_pages: int = 10) -> list:
             break
         results = data['data'].get('results', [])
         if not results:
+            complete = True
             break
         all_results.extend(results)
         if len(results) < limit:
+            complete = True
             break
         offset += limit
 
-    logger.info(f"Fetched {len(all_results)} total donations")
-    return all_results
+    logger.info(f"Fetched {len(all_results)} total donations (complete={complete})")
+    return all_results, complete
 
 
 # =========================================================================
@@ -399,15 +435,17 @@ def _report_inactive_funds(csuite) -> str:
     logger.info("Running inactive funds analysis...")
 
     try:
-        all_funds_data = csuite.get_funds(limit=200)
+        FUND_PAGE_LIMIT = 200
+        all_funds_data = csuite.get_funds(limit=FUND_PAGE_LIMIT)
         if not all_funds_data.get('success') or not all_funds_data.get('data'):
             return "❌ Failed to fetch funds."
         funds = all_funds_data['data'].get('results', [])
+        funds_complete = len(funds) < FUND_PAGE_LIMIT
     except Exception as e:
         return f"❌ Failed to fetch funds: {e}"
 
     try:
-        all_grants = _fetch_all_grants(csuite)
+        all_grants, grants_complete = _fetch_all_grants(csuite)
     except Exception as e:
         return f"❌ Failed to fetch grants: {e}"
 
@@ -438,7 +476,12 @@ def _report_inactive_funds(csuite) -> str:
     # Sort: never first, then oldest
     inactive.sort(key=lambda x: x[2] if x[2] != "Never" else "0000")
 
-    lines = [
+    lines = []
+    if not funds_complete:
+        lines += [partial_note(len(funds), False, "funds"), ""]
+    elif not grants_complete:
+        lines += [partial_note(len(all_grants), False, "grants"), ""]
+    lines += [
         f"📊 **Inactive Funds** (no grants in 12+ months)",
         "",
         f"**{len(inactive)}** funds identified:",
@@ -671,6 +714,10 @@ def _report_uncashed_checks(csuite) -> str:
     logger.info("Running uncashed checks report...")
 
     try:
+        # The client scans at most 5 pages (500 checks) and returns a
+        # filtered list, so completeness is not recoverable from the result.
+        # The report says what was scanned rather than implying "all".
+        CHECK_SCAN_LIMIT = 500
         checks = csuite.get_uncashed_checks()
     except Exception as e:
         return f"❌ Failed to fetch uncashed checks: {e}"
@@ -699,9 +746,15 @@ def _report_uncashed_checks(csuite) -> str:
         reverse=True,
     )
 
-    capped_note = ""
-    if len(checks) >= 500:
-        capped_note = "\n*Showing oldest 500 uncashed checks — contact Finance for full export.*\n"
+    # The old condition (len(checks) >= 500) almost never fired: the client
+    # scans 500 checks and then FILTERS to uncashed ones, so a fully capped
+    # scan typically returns far fewer than 500 and the report read as
+    # complete. The scan limit is stated unconditionally instead.
+    capped_note = (
+        f"\n⚠️ Partial data: scanned the most recent {CHECK_SCAN_LIMIT} checks "
+        f"only — totals below are NOT complete. Contact Finance for a full "
+        f"export.\n"
+    )
 
     lines = [
         f"📊 **Uncashed Checks Report**",
@@ -742,8 +795,8 @@ def _report_quarterly_summary(query: str, csuite) -> str:
     logger.info(f"Quarterly summary for {q_label} ({start} to {end})...")
 
     try:
-        all_donations = _fetch_all_donations(csuite)
-        all_grants = _fetch_all_grants(csuite)
+        all_donations, donations_complete = _fetch_all_donations(csuite)
+        all_grants, grants_complete = _fetch_all_grants(csuite)
     except Exception as e:
         return f"❌ Failed to fetch data: {e}"
 
@@ -769,7 +822,15 @@ def _report_quarterly_summary(query: str, csuite) -> str:
     # Sort by donations descending
     sorted_funds = sorted(funds.items(), key=lambda x: x[1]["donations"], reverse=True)
 
-    lines = [
+    lines = []
+    if not donations_complete or not grants_complete:
+        lines += [
+            "⚠️ Partial data: donations capped at "
+            f"{len(all_donations)} and grants at {len(all_grants)} — "
+            "totals below are NOT complete.",
+            "",
+        ]
+    lines += [
         f"📊 **Quarterly DAF Summary: {q_label}**",
         f"📅 {start} to {end}",
         "",
@@ -824,14 +885,24 @@ def _report_daf_inquiry_summary(query: str, hubspot) -> str:
     start_ms = int(start.timestamp() * 1000)
     end_ms = int(end.timestamp() * 1000)
 
+    # HubSpot is asked for the most recent N submissions per form, then they
+    # are filtered to the month. If a form returns a full page, older
+    # submissions inside the window may never have been fetched.
+    SUBMISSION_LIMIT = 50
+    capped_forms = []
+
     def _fetch_and_filter(fetch_fn, label):
         """Fetch submissions, filter to the date window, parse key fields."""
         try:
-            resp = fetch_fn(limit=50)
+            resp = fetch_fn(limit=SUBMISSION_LIMIT)
             all_subs = resp.get('results', []) if isinstance(resp, dict) else []
         except Exception as e:
             logger.error(f"Error fetching {label} submissions: {e}")
+            capped_forms.append(f"{label} (fetch failed: {e})")
             return []
+
+        if len(all_subs) >= SUBMISSION_LIMIT:
+            capped_forms.append(label)
 
         filtered = []
         for s in all_subs:
@@ -857,9 +928,23 @@ def _report_daf_inquiry_summary(query: str, hubspot) -> str:
     total = len(daf_subs) + len(endowment_subs)
     if total == 0:
         types = 'DAF or Endowment' if include_endowment else 'DAF'
+        if capped_forms:
+            return (
+                f"⚠️ Couldn't read submissions for {', '.join(capped_forms)} — "
+                f"I can't tell whether there were any {types} inquiries in "
+                f"**{period_label}**. Try again shortly."
+            )
         return f"📭 No {types} inquiry submissions found for **{period_label}**."
 
-    lines = [f"📋 **DAF Inquiry Summary — {period_label}**", ""]
+    lines = []
+    if capped_forms:
+        lines += [
+            f"⚠️ Partial data: only the most recent {SUBMISSION_LIMIT} "
+            f"submissions were fetched for {', '.join(capped_forms)} — "
+            "counts below are NOT complete.",
+            "",
+        ]
+    lines += [f"📋 **DAF Inquiry Summary — {period_label}**", ""]
 
     if daf_subs:
         lines.append(f"**DAF Inquiries ({len(daf_subs)}):**")
@@ -897,10 +982,12 @@ def _report_tasks(hubspot) -> str:
     logger.info("Fetching HubSpot tasks for priority report...")
 
     try:
-        tasks_data = hubspot.get_tasks(limit=50)
+        TASK_LIMIT = 50
+        tasks_data = hubspot.get_tasks(limit=TASK_LIMIT)
         if 'results' not in tasks_data:
             return "❌ Failed to fetch tasks."
         all_tasks = tasks_data['results']
+        tasks_complete = len(all_tasks) < TASK_LIMIT
     except Exception as e:
         return f"❌ Failed to fetch tasks: {e}"
 
@@ -938,7 +1025,11 @@ def _report_tasks(hubspot) -> str:
 
     priority_labels = {"HIGH": "🔴 High", "MEDIUM": "🟡 Medium", "LOW": "🟢 Low"}
 
-    lines = [f"📋 **Task List** ({len(active)} active)", ""]
+    lines = []
+    note = partial_note(len(all_tasks), tasks_complete, "tasks")
+    if note:
+        lines += [note, ""]
+    lines += [f"📋 **Task List** ({len(active)} active)", ""]
 
     for level in ("HIGH", "MEDIUM", "LOW"):
         tasks = groups[level]
@@ -969,7 +1060,8 @@ def _report_investment_requests(hubspot) -> str:
     logger.info("Running investment requests report...")
 
     try:
-        resp = hubspot.get_investment_request_submissions(limit=50)
+        INVESTMENT_LIMIT = 50
+        resp = hubspot.get_investment_request_submissions(limit=INVESTMENT_LIMIT)
     except Exception as e:
         return f"❌ Failed to fetch investment requests: {e}"
 
@@ -977,7 +1069,12 @@ def _report_investment_requests(hubspot) -> str:
     if not results:
         return "No investment request submissions found."
 
-    lines = [f"**Investment Requests** ({len(results)} found)\n"]
+    lines = []
+    note = partial_note(len(results), len(results) < INVESTMENT_LIMIT,
+                        "submissions")
+    if note:
+        lines += [note, ""]
+    lines += [f"**Investment Requests** ({len(results)} found)\n"]
 
     for sub in results:
         # Parse submission timestamp
@@ -1090,7 +1187,14 @@ def _report_endowment_distributions(csuite) -> str:
     # Sort by distribution start date (if available)
     endowments.sort(key=lambda f: f.get("dist_start_date") or "9999")
 
-    lines = [f"**Endowment Funds** ({len(endowments)} found)\n"]
+    lines = []
+    if calls_made >= MAX_DETAIL_CALLS:
+        lines += [
+            f"⚠️ Partial data: checked {calls_made} of {len(all_fund_ids)} "
+            "funds only — the list below is NOT complete.",
+            "",
+        ]
+    lines += [f"**Endowment Funds** ({len(endowments)} found)\n"]
 
     for f in endowments:
         name = f.get("fund_name", "Unnamed")

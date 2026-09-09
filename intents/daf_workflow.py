@@ -240,6 +240,10 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         "hubspot_updated": False,
         "hubspot_created": False,
         "ticket_closed": False,
+        # Set when a ticket was found and the close was attempted but did not
+        # succeed. Distinct from ticket_closed being False because no ticket
+        # matched — that is not a failure, and says nothing to the user.
+        "ticket_close_failed": None,
         "errors": [],
     }
 
@@ -348,14 +352,30 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
                 combined = f"{subj} {content}"
                 if any(term and term in combined for term in search_terms):
                     ticket_id = t.get('id')
-                    hubspot.close_ticket(ticket_id)
                     state["ticket_id"] = ticket_id
-                    results["ticket_closed"] = True
-                    logger.info(f"Closed ticket {ticket_id}")
+
+                    # The return value used to be discarded and ticket_closed
+                    # set to True regardless, so a failed close still printed
+                    # "📋 Ticket closed".
+                    close_result = hubspot.close_ticket(ticket_id)
+                    if close_result and not close_result.get("error"):
+                        results["ticket_closed"] = True
+                        logger.info(f"Closed ticket {ticket_id}")
+                    else:
+                        reason = (
+                            (close_result or {}).get("error")
+                            or "HubSpot returned no confirmation"
+                        )
+                        results["ticket_close_failed"] = reason
+                        logger.warning(
+                            f"Ticket {ticket_id} was NOT closed: {reason}")
                     break
     except Exception as e:
-        logger.error(f"Ticket lookup/close error: {e}")
-        # Non-fatal — don't add to errors
+        logger.error(f"Ticket lookup/close error: {e}", exc_info=True)
+        if state.get("ticket_id") and not results["ticket_closed"]:
+            # A close was attempted for a known ticket and blew up — the user
+            # needs to know it is still open.
+            results["ticket_close_failed"] = str(e)
 
     # --- Build confirmation ---
     state["step"] = "done"
@@ -418,7 +438,7 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
     name = f"{data.get('first_name', '')} {data.get('last_name', '')}".strip()
     lines = []
 
-    if results["errors"]:
+    if results["errors"] or results.get("ticket_close_failed"):
         lines.append(f"⚠️ **{type_label} Created (with warnings)**")
     else:
         lines.append(f"✅ **{type_label} Created!**")
@@ -457,6 +477,14 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
     if results["ticket_closed"]:
         ticket_link = Config.HUBSPOT_TICKET_URL.format(ticket_id=state['ticket_id'])
         lines.append(f"📋 Ticket closed — [View]({ticket_link})")
+    elif results.get("ticket_close_failed"):
+        ticket_id = state.get("ticket_id", "unknown")
+        ticket_link = Config.HUBSPOT_TICKET_URL.format(ticket_id=ticket_id)
+        lines.append(
+            f"⚠️ Ticket {ticket_id} was **NOT closed** "
+            f"({results['ticket_close_failed']}) — close it by hand: "
+            f"[View]({ticket_link})"
+        )
 
     # Errors
     if results["errors"]:

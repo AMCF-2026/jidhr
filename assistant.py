@@ -13,6 +13,7 @@ import logging
 from datetime import datetime
 from config import SYSTEM_PROMPT
 from clients import OpenRouterClient, HubSpotClient, CSuiteClient
+from clients.openrouter import OpenRouterError
 from intents import route_intent
 from intents.context import Actor, RequestContext, Services, new_draft_state
 from intents.queries import gather_context
@@ -140,19 +141,23 @@ class JidhrAssistant:
             if match:
                 name, handler = match
                 logger.info(f"Routing to intent: {name}")
+                # route_intent already wraps the handler so a crash comes back
+                # as a plain failure line. This catch is the backstop for a
+                # caller that got its handler some other way.
                 try:
                     response = handler(user_message, ctx)
                 except Exception as e:
-                    logger.error(f"Intent handler '{name}' error: {e}")
-                    response = f"❌ Something went wrong with {name}: {e}"
+                    logger.exception(f"Intent handler '{name}' error: {e}")
+                    response = f"⚠️ {name} hit an error: {e}. Nothing was changed."
                 self._add_to_history(user_message, response)
                 return response
 
             # --- 2. Fallback: gather context + send to Claude ---
-            self.conversation_history.append({
-                "role": "user",
-                "content": user_message,
-            })
+            # The user turn is built here but only committed to history once
+            # the model actually answers. A failed call used to leave the
+            # question in history with the error string as its "answer",
+            # which then went back to the model on the next turn as context.
+            user_turn = {"role": "user", "content": user_message}
 
             # workflow_state is passed so the fallback gatherer can remember a
             # numbered fund pick between messages; without it the list is
@@ -162,14 +167,25 @@ class JidhrAssistant:
                 ctx.workflow_state)
             if context:
                 enhanced = f"{user_message}\n\n[System Context - Real Data]\n{context}"
-                self.conversation_history[-1]["content"] = enhanced
+                user_turn["content"] = enhanced
                 logger.info(f"Added context: {len(context)} chars")
 
-            response = ctx.services.claude.chat(
-                messages=self.conversation_history,
-                system_prompt=self.get_system_prompt(),
-            )
+            try:
+                response = ctx.services.claude.chat(
+                    messages=self.conversation_history + [user_turn],
+                    system_prompt=self.get_system_prompt(),
+                )
+            except OpenRouterError as e:
+                logger.error(
+                    "OpenRouter call failed (status=%s): %s", e.status, e.message)
+                # Nothing is appended: this turn did not happen as far as the
+                # conversation is concerned, so a retry starts clean.
+                return (
+                    f"⚠️ The AI service didn't respond (HTTP {e.status}). "
+                    "Your message wasn't lost — try again in a moment."
+                )
 
+            self.conversation_history.append(user_turn)
             self.conversation_history.append({
                 "role": "assistant",
                 "content": response,

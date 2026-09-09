@@ -19,7 +19,7 @@ from dateutil import parser as dateutil_parser
 from config import ORG_FACTS_PROMPT
 from intents.context import new_draft_state
 from content.content_analysis import find_topic_matches
-from content.queue_check import check_schedule, get_queue, suggest_slot
+from content.queue_check import CheckResult, check_schedule, get_queue, suggest_slot
 
 logger = logging.getLogger(__name__)
 
@@ -798,20 +798,23 @@ def _save_social_post(query: str, ctx) -> str:
 
     # Cadence gate — runs only when there's an effective trigger time.
     # Drafts (no schedule_time) skip the gate by design.
-    # Fail-open: any check error logs + proceeds. The rules are advisory.
+    #
+    # No longer fail-open-and-silent: a check that could not run used to be
+    # indistinguishable from a clean one, so the post went out with no
+    # cadence review and nothing said so. Now the user is told and decides.
     if schedule_time is not None:
         try:
-            violations = check_schedule(
+            result = check_schedule(
                 body=content,
                 link=link_url,
                 channel=platform,
                 trigger_at=schedule_time,
             )
         except Exception as e:
-            logger.error(f"check_schedule failed (fail-open): {e}", exc_info=True)
-            violations = []
+            logger.error(f"check_schedule raised: {e}", exc_info=True)
+            result = CheckResult(ok=False, error=f"{type(e).__name__}: {e}")
 
-        if violations:
+        if not result.ok or result.conflicts:
             schedule_iso = (
                 schedule_time.isoformat()
                 if isinstance(schedule_time, datetime)
@@ -824,7 +827,17 @@ def _save_social_post(query: str, ctx) -> str:
                 "photo_url":         photo_url,
                 "schedule_time_iso": schedule_iso,
             }
-            return _format_cadence_violations(violations, platform, schedule_time)
+
+            if not result.ok:
+                return (
+                    f"ℹ️ Cadence check unavailable ({result.error}) — "
+                    "posting anyway is your call.\n\n"
+                    "Your post is held and ready. Say *\"schedule anyway\"* to "
+                    "post it without the check, or try again shortly."
+                )
+
+            return _format_cadence_violations(
+                result.conflicts, platform, schedule_time)
 
     # Clean: clear any stale pending_schedule from a previous gate hit.
     ctx.draft_state.pop("pending_schedule", None)

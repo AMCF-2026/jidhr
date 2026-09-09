@@ -214,6 +214,24 @@ def extract_fund_ref(query: str) -> dict | None:
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def _run_gatherer(name: str, gatherer, *args) -> list:
+    """Run one gatherer, and turn its failure into a visible line.
+
+    Each gatherer is independent, so one failing must not cost the user the
+    others. It must also not silently return nothing: an empty context reads
+    to the model as "there is no such data", and it answers confidently from
+    its own priors. The bracketed line says otherwise, in words the model is
+    told not to talk around.
+    """
+    try:
+        return gatherer(*args) or []
+    except Exception as e:
+        logger.warning(
+            f"Context gatherer '{name}' failed: {type(e).__name__}: {e}",
+            exc_info=True)
+        return [f"[{name} lookup failed — do not guess about {name}]"]
+
+
 def gather_context(query: str, hubspot, csuite,
                    workflow_state: dict | None = None) -> str:
     """
@@ -248,44 +266,50 @@ def gather_context(query: str, hubspot, csuite,
     # FUND / BALANCE / DAF / ENDOWMENT / GRANT → CSuite
     # ------------------------------------------------------------------
     if any(w in query_lower for w in ['fund', 'balance', 'daf', 'endowment', 'grant']):
-        context_parts += _gather_fund_context(
-            query, query_lower, csuite, workflow_state)
+        context_parts += _run_gatherer(
+            "fund", _gather_fund_context, query, query_lower, csuite, workflow_state)
 
     # ------------------------------------------------------------------
     # CONTACT / DONOR → HubSpot (+ CSuite cross-reference)
     # ------------------------------------------------------------------
     if any(w in query_lower for w in ['contact', 'donor', 'email', 'person', 'who']):
-        context_parts += _gather_contact_context(query, query_lower, hubspot, csuite)
+        context_parts += _run_gatherer(
+            "contact", _gather_contact_context, query, query_lower, hubspot, csuite)
 
     # ------------------------------------------------------------------
     # FORM / SUBMISSION / INQUIRY → HubSpot
     # ------------------------------------------------------------------
     if any(w in query_lower for w in ['form', 'submission', 'inquiry', 'submitted']):
-        context_parts += _gather_form_context(query_lower, hubspot)
+        context_parts += _run_gatherer(
+            "form", _gather_form_context, query_lower, hubspot)
 
     # ------------------------------------------------------------------
     # SOCIAL / POST / PLATFORM → HubSpot
     # ------------------------------------------------------------------
     if any(w in query_lower for w in ['social', 'post', 'facebook', 'linkedin', 'schedule', 'channel']):
-        context_parts += _gather_social_context(hubspot)
+        context_parts += _run_gatherer(
+            "social", _gather_social_context, hubspot)
 
     # ------------------------------------------------------------------
     # EVENT → CSuite + HubSpot
     # ------------------------------------------------------------------
     if any(w in query_lower for w in ['event', 'symposium', 'webinar', 'registration', 'gala', 'dinner']):
-        context_parts += _gather_event_context(csuite, hubspot)
+        context_parts += _run_gatherer(
+            "event", _gather_event_context, csuite, hubspot)
 
     # ------------------------------------------------------------------
     # DONATION / GIFT → CSuite
     # ------------------------------------------------------------------
     if any(w in query_lower for w in ['donation', 'gift', 'gave', 'contributed', 'recent donations']):
-        context_parts += _gather_donation_context(query, query_lower, csuite)
+        context_parts += _run_gatherer(
+            "donation", _gather_donation_context, query, query_lower, csuite)
 
     # ------------------------------------------------------------------
     # TICKET / SUPPORT → HubSpot
     # ------------------------------------------------------------------
     if any(w in query_lower for w in ['ticket', 'support', 'issue', 'help desk', 'open tickets']):
-        context_parts += _gather_ticket_context(hubspot)
+        context_parts += _run_gatherer(
+            "ticket", _gather_ticket_context, hubspot)
 
     # ------------------------------------------------------------------
     # CLOSED TICKETS → HubSpot (Shazeen)
@@ -293,56 +317,65 @@ def gather_context(query: str, hubspot, csuite,
     if any(w in query_lower for w in ['closed tickets', 'closed ticket', 'resolved tickets',
                                        'which tickets are closed', 'what tickets are closed',
                                        'tickets are done', 'tickets closed']):
-        context_parts += _gather_closed_ticket_context(hubspot)
+        context_parts += _run_gatherer(
+            "closed_ticket", _gather_closed_ticket_context, hubspot)
 
     # ------------------------------------------------------------------
     # CAMPAIGN → HubSpot
     # ------------------------------------------------------------------
     if any(w in query_lower for w in ['campaign', 'marketing campaign']):
-        context_parts += _gather_campaign_context(hubspot)
+        context_parts += _run_gatherer(
+            "campaign", _gather_campaign_context, hubspot)
 
     # ------------------------------------------------------------------
     # TASK → HubSpot
     # ------------------------------------------------------------------
     if any(w in query_lower for w in ['task', 'tasks', 'to do', 'todo', 'my tasks']):
-        context_parts += _gather_task_context(hubspot)
+        context_parts += _run_gatherer(
+            "task", _gather_task_context, hubspot)
 
     # ------------------------------------------------------------------
     # FUND-ASSOCIATED CONTACTS → HubSpot (by csuite_fund_id)
     # ------------------------------------------------------------------
     if any(w in query_lower for w in ['associated with', 'contacts for', 'contacts in fund', 'who is in', 'who\'s in']):
-        context_parts += _gather_fund_contacts_context(query, query_lower, hubspot, csuite)
+        context_parts += _run_gatherer(
+            "fund_contacts", _gather_fund_contacts_context, query, query_lower, hubspot, csuite)
 
     # ------------------------------------------------------------------
     # NEW v1.3: CHECK / UNCASHED → CSuite (Muhi)
     # ------------------------------------------------------------------
     if any(w in query_lower for w in ['check', 'cashed', 'uncashed', 'cleared']):
-        context_parts += _gather_check_context(query_lower, csuite)
+        context_parts += _run_gatherer(
+            "check", _gather_check_context, query_lower, csuite)
 
     # ------------------------------------------------------------------
     # NEW v1.3: FEE → CSuite (Muhi)
     # ------------------------------------------------------------------
     if any(w in query_lower for w in ['fee', 'fees', 'admin fee']):
-        context_parts += _gather_fee_context(csuite)
+        context_parts += _run_gatherer(
+            "fee", _gather_fee_context, csuite)
 
     # ------------------------------------------------------------------
     # NEW v1.3: VOUCHER / PAYMENT → CSuite
     # ------------------------------------------------------------------
     if any(w in query_lower for w in ['voucher', 'payment']):
-        context_parts += _gather_voucher_context(csuite)
+        context_parts += _run_gatherer(
+            "voucher", _gather_voucher_context, csuite)
 
     # ------------------------------------------------------------------
     # NEW v1.3: PROFILE → CSuite
     # ------------------------------------------------------------------
     if any(w in query_lower for w in ['profile', 'profiles']):
-        context_parts += _gather_profile_context(query, csuite)
+        context_parts += _run_gatherer(
+            "profile", _gather_profile_context, query, csuite)
 
     # ------------------------------------------------------------------
     # GIVING CIRCLE → HubSpot (Lisa)
     # ------------------------------------------------------------------
     if any(w in query_lower for w in ['giving circle', 'gc member', 'gc status',
                                        'giving circle member', 'circle member']):
-        context_parts += _gather_giving_circle_context(query_lower, hubspot)
+        context_parts += _run_gatherer(
+            "giving_circle", _gather_giving_circle_context, query_lower, hubspot)
 
     # ------------------------------------------------------------------
     # NEW v1.3: LAPSED / INACTIVE context hints (for reports module)
@@ -768,7 +801,8 @@ def _gather_fund_context(query: str, query_lower: str, csuite,
                 parts.append(f"CSuite Funds:\n" + "\n".join(fund_list))
                 logger.info(f"Found {len(fund_list)} funds")
         except Exception as e:
-            logger.error(f"Error fetching funds: {e}")
+            logger.warning(f"Error fetching funds: {e}", exc_info=True)
+            parts.append("[fund lookup failed — do not guess about fund]")
 
     # Enhanced: grant-specific queries pull grants by fund
     if 'grant' in query_lower and fund_id:
@@ -784,7 +818,8 @@ def _gather_fund_context(query: str, query_lower: str, csuite,
                 parts.append(f"Grants for Fund {fund_id}:\n" + "\n".join(grant_list))
                 logger.info(f"Found {len(grant_list)} grants")
         except Exception as e:
-            logger.error(f"Error fetching grants by fund: {e}")
+            logger.warning(f"Error fetching grants by fund: {e}", exc_info=True)
+            parts.append("[grant lookup failed — do not guess about grant]")
 
     return parts
 
