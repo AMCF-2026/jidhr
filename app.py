@@ -10,6 +10,7 @@ import hmac
 import logging
 import os
 import sys
+from datetime import timedelta
 from flask import Flask, render_template, request, jsonify, session
 from flask_login import login_required, current_user
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -52,8 +53,34 @@ def log_user_action(action, details=""):
 # FLASK APP
 # =============================================================================
 
+# Refuse to start rather than fall back to a guessable key. Without this the
+# app would boot happily and sign session cookies with a value an attacker can
+# read out of the repo, which is worse than being down.
+if not Config.SECRET_KEY:
+    raise RuntimeError(
+        "SECRET_KEY is not set. Jidhr will not start without it: it signs the "
+        "session cookies that carry login state, so a missing or shared key "
+        "means anyone can forge a session. Set SECRET_KEY in the environment "
+        "(Railway: service > Variables; locally: .env). Generate one with "
+        "`python -c \"import secrets; print(secrets.token_hex(32))\"`."
+    )
+
 app = Flask(__name__)
 app.secret_key = Config.SECRET_KEY
+
+# Secure cookies require HTTPS. Railway terminates SSL, but `flask run` locally
+# is plain http, and a Secure cookie is simply never sent over http — which
+# would look like "login silently does nothing" rather than an error.
+_REQUIRE_HTTPS_COOKIES = not Config.DEBUG
+
+app.config.update(
+    SESSION_COOKIE_SECURE=_REQUIRE_HTTPS_COOKIES,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+    REMEMBER_COOKIE_SECURE=_REQUIRE_HTTPS_COOKIES,
+    REMEMBER_COOKIE_HTTPONLY=True,
+)
 
 # Trust proxy headers (Railway terminates SSL)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
@@ -96,13 +123,17 @@ def chat():
         try:
             assistant = get_assistant(current_user.id)
         except Exception as e:
-            logger.exception(f"Failed to initialize assistant for user {current_user.id}: {e}")
+            logger.exception(
+                f"Failed to initialize assistant for user "
+                f"{current_user.id} ({current_user.email}): {e}")
             return jsonify({"error": "Failed to initialize assistant. Please try again."}), 500
 
         try:
             response = assistant.process_query(message, flask_session=session)
         except Exception as e:
-            logger.exception(f"process_query crashed for user {current_user.id}: {e}")
+            logger.exception(
+                f"process_query crashed for user "
+                f"{current_user.id} ({current_user.email}): {e}")
             return jsonify({"error": f"Something went wrong processing your request: {e}"}), 500
 
         log_user_action("Chat response", response[:100] + "..." if len(response) > 100 else response)
@@ -110,7 +141,9 @@ def chat():
         return jsonify({"response": response})
 
     except Exception as e:
-        logger.exception(f"Unhandled chat error for user {current_user.id if current_user.is_authenticated else 'unknown'}: {e}")
+        logger.exception(
+            f"Unhandled chat error for user "
+            f"{current_user.email if current_user.is_authenticated else 'unknown'}: {e}")
         return jsonify({"error": "An unexpected error occurred. Please try again."}), 500
 
 

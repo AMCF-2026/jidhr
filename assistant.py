@@ -175,11 +175,15 @@ class JidhrAssistant:
 # Per-user assistant instances (per-worker; reconstructed if missing)
 # ---------------------------------------------------------------------------
 
-_assistants: dict[str, JidhrAssistant] = {}
+_assistants: dict[int, JidhrAssistant] = {}
 
 
-def get_assistant(user_id: str = "default") -> JidhrAssistant:
+def get_assistant(user_id: int) -> JidhrAssistant:
     """Get or create an assistant instance for the given user.
+
+    Keyed by users.id, not by email address: the id is stable even if
+    someone's address changes, and it keeps conversation history from being
+    shared between two rows that differ only in the case of their email.
 
     Each gunicorn worker maintains its own dict.  If a user's assistant
     doesn't exist on this worker (e.g. request routed to a different

@@ -254,6 +254,27 @@ def mask_value(field_name, value):
     return value
 
 
+def mask_submission_value(value):
+    """Mask a form-submission value unconditionally.
+
+    Form submissions are free-form user input: the field NAME is form
+    metadata and safe, but the VALUE is whatever a donor typed, whatever it
+    is called. Name-driven masking cannot be trusted here — a form field
+    called "message" or "q3_response" can hold a phone number — so every
+    non-null value is redacted regardless. Types are still inferred from the
+    raw value before masking, which leaks nothing.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {k: mask_submission_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [mask_submission_value(v) for v in value]
+    if value == "":
+        return ""
+    return REDACTED
+
+
 # =============================================================================
 # FIELD INSPECTION
 # =============================================================================
@@ -324,8 +345,13 @@ def flatten(record, prefix="", depth=0, max_depth=3):
     return flat
 
 
-def field_stats(records):
-    """Per-field: type, % non-null across the sample, one masked example."""
+def field_stats(records, mask=None):
+    """Per-field: type, % non-null across the sample, one masked example.
+
+    `mask` overrides the default name-driven masker — pass
+    `mask_submission_value` for form submissions, where no field name can be
+    trusted to indicate whether the value is personal.
+    """
     if not records:
         return []
 
@@ -348,7 +374,12 @@ def field_stats(records):
             if v is not None and v != "" and v != [] and v != {}
         ]
         types = Counter(infer_type(v) for v in non_null)
-        example = mask_value(field, non_null[0]) if non_null else None
+        if not non_null:
+            example = None
+        elif mask is not None:
+            example = mask(non_null[0])
+        else:
+            example = mask_value(field, non_null[0])
         stats.append({
             "field": field,
             "type": types.most_common(1)[0][0] if types else "null",
@@ -884,7 +915,7 @@ def probe_csuite(limit, recorder, probe):
     newsletter = _analyse_newsletter(
         profiles_payload, source_ok=full["ok"], source_error=full.get("error"))
 
-    return {
+    extras = {
         "profile_total": full.get("reported_totals", {}),
         "profile_full_page_count": full.get("record_count", 0),
         "newsletter": newsletter,
@@ -895,6 +926,348 @@ def probe_csuite(limit, recorder, probe):
         "dated_event_ids": dated_event_ids,
         "registrant_shaped_events": registrant_events,
     }
+    extras.update(probe_csuite_p3(client, recorder, probe, post_note))
+    return extras
+
+
+# ---------------------------------------------------------------------------
+# Probe #3 CSuite passes
+# ---------------------------------------------------------------------------
+
+# The full display sweep is the expensive part of this run. Bounded so a
+# portfolio that grows unexpectedly cannot turn into an unbounded crawl.
+C9_MAX_FUND_DISPLAYS = 600
+# Seconds between fund display calls. Three unpaced runs in one session
+# tripped CSuite's limiter; this keeps the sweep well under it.
+C9_SWEEP_DELAY_S = 0.15
+C11_PAGE_LIMIT = 10
+C11_OUT_OF_RANGE_OFFSET = 10_000_000
+
+
+def probe_csuite_p3(client, recorder, probe, post_note):
+    """C7-C11: registrant shape, org/individual split, fee model, fund
+    relationships and the pagination contract. All reads."""
+    extras = {}
+
+    # ---- C7: one call against an event that actually has registrants ------
+    registrant_event_id = None
+    for endpoint in [e for e in probe.raw_payloads
+                     if e.startswith("event/display/eventdate")]:
+        if _looks_like_registrants(probe.raw_payloads.get(endpoint)):
+            record = next((r for r in probe.results
+                           if r["endpoint"] == endpoint), None)
+            if record:
+                registrant_event_id = record["request"].get("event_date_id")
+                break
+
+    if registrant_event_id is not None:
+        probe.run(
+            "csuite", "event/display/eventdate (C7 registrant event)",
+            lambda: client.get_event_date(registrant_event_id),
+            {"event_date_id": registrant_event_id},
+            post_transport=True,
+            note="C7 — one call against an event known to return registrants, "
+                 "to read the raw envelope keys intents/events.py expects.",
+        )
+        extras["c7_event_date_id"] = registrant_event_id
+        extras["c7_raw_data_keys"] = _csuite_data_keys(recorder.raw)
+    else:
+        probe.results.append(_skipped_record(
+            "csuite", "event/display/eventdate (C7 registrant event)",
+            "no sampled event returned registrant rows"))
+        extras["c7_event_date_id"] = None
+        extras["c7_raw_data_keys"] = []
+
+    # ---- C8: one organization profile alongside the individual ------------
+    org_profile_id = None
+    for record in find_records(probe.raw_payloads.get("profile/list"))[0]:
+        if str(record.get("ptype", "")).lower() in ("org", "organization") or \
+                record.get("organization"):
+            org_profile_id = record.get("profile_id")
+            break
+    if org_profile_id is not None:
+        probe.run(
+            "csuite", "profile/display (organization)",
+            lambda: client.get_profile(org_profile_id),
+            {"profile_id": org_profile_id},
+            post_transport=True,
+            note="C8 — an organization profile, to contrast with the "
+                 "individual already fetched.",
+        )
+    else:
+        probe.results.append(_skipped_record(
+            "csuite", "profile/display (organization)",
+            "no organization profile found in the profile/list sample"))
+    extras["c8_org_profile_id"] = org_profile_id
+
+    # ---- C11 runs BEFORE the fund sweep ----------------------------------
+    # Ordering matters: the sweep below is ~400 calls and will exhaust
+    # CSuite's rate limit, after which the 21 cheap pagination calls come
+    # back 429 and answer nothing. Cheap questions go first.
+    extras["c11"] = _probe_pagination_contract(client, recorder, probe, post_note)
+
+    # ---- C9/C10: every fund, then every fund's display --------------------
+    all_funds = []
+    offset = 0
+    page_no = 0
+    while True:
+        page_no += 1
+        endpoint = "funit/list (full sweep p{})".format(page_no)
+        record = probe.run(
+            "csuite", endpoint,
+            lambda o=offset: client.get_funds(limit=100, offset=o),
+            {"view_limit": 100, "view_offset": offset},
+            post_transport=True,
+            note="C9/C10 — paging funit/list to completion.",
+        )
+        page = find_records(recorder.raw)[0]
+        all_funds.extend(page)
+        if not record["ok"] or len(page) < 100 or page_no > 20:
+            break
+        offset += 100
+
+    fund_ids_all = [f.get("funit_id") for f in all_funds
+                    if f.get("funit_id") is not None]
+    extras["c9_total_funds"] = len(all_funds)
+    extras["c9_list_row_fields"] = sorted(
+        {k for f in all_funds for k in f}) if all_funds else []
+
+    # funit/list carries neither fgroup_id nor profile_id, so both C9 and C10
+    # need a display per fund. One sweep answers both.
+    display_rows = []
+    truncated = None
+    calls_made = 0
+    budget = min(len(fund_ids_all), C9_MAX_FUND_DISPLAYS)
+    for index, fid in enumerate(fund_ids_all):
+        if index >= C9_MAX_FUND_DISPLAYS:
+            truncated = "safety cap of {} reached".format(C9_MAX_FUND_DISPLAYS)
+            break
+        result = client.get_fund(fid)
+        calls_made += 1
+        status = recorder.status
+        if status == 429:
+            truncated = ("CSuite returned HTTP 429 (rate limit) after {} "
+                         "display calls".format(calls_made))
+            break
+        if status is not None and not 200 <= status < 300:
+            truncated = "HTTP {} after {} display calls".format(
+                status, calls_made)
+            break
+        if isinstance(result, dict) and result.get("success"):
+            data = result.get("data")
+            if isinstance(data, dict):
+                display_rows.append(data)
+        # Paced deliberately: this is a production accounting API and the
+        # sweep is the only part of the probe large enough to hit its limit.
+        if C9_SWEEP_DELAY_S:
+            time.sleep(C9_SWEEP_DELAY_S)
+    extras["c9_display_calls"] = calls_made
+    extras["c9_display_budget"] = budget
+    extras["c9_display_rows"] = len(display_rows)
+    extras["c9_display_truncated"] = truncated
+    extras["c9_coverage_pct"] = (
+        round(100.0 * len(display_rows) / len(fund_ids_all), 1)
+        if fund_ids_all else None)
+
+    # Only aggregates are kept; the rows themselves are never written out.
+    extras["c9_fund_groups"] = _count_values(display_rows, "fgroup_id")
+    extras["c9_admin_fee_on_list"] = any(
+        "admin_fee_fundgroup_id" in f for f in all_funds)
+    extras["c9_admin_fee_populated_pct"] = _populated_pct(
+        display_rows, "admin_fee_fundgroup_id")
+    extras["c9_admin_fee_values"] = _count_values(
+        display_rows, "admin_fee_fundgroup_id")
+    extras["c9_admin_fee_by_group"] = _cross_tab(
+        display_rows, "fgroup_id", "admin_fee_fundgroup_id")
+
+    extras["c10_profile_id_on_list"] = any("profile_id" in f for f in all_funds)
+    extras["c10_profile_id_populated_pct"] = _populated_pct(
+        display_rows, "profile_id")
+    fund_by_profile = {}
+    for row in display_rows:
+        pid = row.get("profile_id")
+        if pid is None:
+            continue
+        fund_by_profile.setdefault(pid, []).append(row)
+    extras["c10_distinct_profiles"] = len(fund_by_profile)
+    extras["c10_profiles_multi_fund"] = sum(
+        1 for rows in fund_by_profile.values() if len(rows) > 1)
+    extras["c10_max_funds_per_profile"] = max(
+        (len(r) for r in fund_by_profile.values()), default=0)
+    extras["c10_profiles_1002_and_1008"] = sum(
+        1 for rows in fund_by_profile.values()
+        if {1002, 1008} <= {r.get("fgroup_id") for r in rows})
+    extras["c10_group_pairs"] = _count_group_pairs(fund_by_profile)
+
+    return extras
+
+
+def _csuite_data_keys(payload):
+    """Top-level keys of a CSuite response's `data` envelope."""
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+        return sorted(payload["data"].keys())
+    return top_level_keys(payload)
+
+
+def _count_values(rows, field, limit=25):
+    counter = Counter()
+    for row in rows:
+        counter[row.get(field)] += 1
+    return [{"value": v, "count": c} for v, c in counter.most_common(limit)]
+
+
+def _populated_pct(rows, field):
+    if not rows:
+        return None
+    filled = sum(1 for r in rows if r.get(field) not in (None, "", []))
+    return round(100.0 * filled / len(rows), 1)
+
+
+def _cross_tab(rows, outer, inner, limit=25):
+    table = {}
+    for row in rows:
+        table.setdefault(row.get(outer), Counter())[row.get(inner)] += 1
+    return {
+        str(group): [{"value": v, "count": c} for v, c in counts.most_common(limit)]
+        for group, counts in sorted(table.items(), key=lambda kv: str(kv[0]))
+    }
+
+
+def _count_group_pairs(fund_by_profile, limit=15):
+    counter = Counter()
+    for rows in fund_by_profile.values():
+        groups = tuple(sorted(str(r.get("fgroup_id")) for r in
+                              rows if r.get("fgroup_id") is not None))
+        if len(groups) > 1:
+            counter[groups] += 1
+    return [{"groups": list(g), "count": c} for g, c in counter.most_common(limit)]
+
+
+C11_ENDPOINTS = [
+    ("profile/list", "get_profiles", {}),
+    ("donation/list", "get_donations", {}),
+    ("grant/list", "get_grants", {}),
+    ("funit/list", "get_funds", {}),
+    ("funit/list/search", "search_funds", {"q": "fund"}),
+    ("event/list/dates", "get_event_dates", {}),
+    ("check/list", "get_checks", {}),
+]
+
+
+def _ids_of(records):
+    """Best-effort record identity for disjointness comparison."""
+    ids = []
+    for record in records:
+        # Most specific first: a donation row also carries profile_id, and the
+        # same donor legitimately appears on consecutive pages.
+        for key in ("donation_id", "grant_id", "check_id", "event_date_id",
+                    "funit_id", "voucher_id", "profile_id", "id"):
+            if record.get(key) is not None:
+                ids.append((key, record[key]))
+                break
+    return ids
+
+
+def _probe_pagination_contract(client, recorder, probe, post_note):
+    """C11 — page 1, page 2 and an out-of-range page for each list endpoint."""
+    contract = {}
+    for endpoint, method_name, extra in C11_ENDPOINTS:
+        row = {"endpoint": endpoint, "supports_offset": None,
+               "limit_honored": None, "count_reported": None,
+               "page2_non_empty": None, "page2_disjoint": None,
+               "out_of_range": "undetermined", "params": None, "error": None}
+
+        method = getattr(client, method_name, None)
+        if method is None:
+            row["error"] = "no client method {}".format(method_name)
+            contract[endpoint] = row
+            continue
+
+        # funit/list/search takes a query, not offsets — the client exposes no
+        # paging parameter for it at all.
+        if extra.get("q") is not None:
+            record = probe.run(
+                "csuite", "{} (C11 p1)".format(endpoint),
+                lambda m=method, e=extra: m(e["q"]),
+                {"q": extra["q"]},
+                post_transport=True, note="C11 pagination contract.")
+            row["params"] = "q only — client exposes no limit/offset"
+            row["supports_offset"] = False
+            row["limit_honored"] = False
+            row["count_reported"] = bool(
+                find_reported_totals(recorder.raw))
+            row["out_of_range"] = "n/a — endpoint takes no page parameter"
+            row["page1_count"] = record["record_count"]
+            contract[endpoint] = row
+            continue
+
+        code = method.__code__
+        takes_offset = "offset" in code.co_varnames[:code.co_argcount]
+        row["params"] = ("view_limit + view_offset" if takes_offset
+                         else "view_limit only")
+        row["supports_offset"] = takes_offset
+
+        def call(off):
+            if takes_offset:
+                return method(limit=C11_PAGE_LIMIT, offset=off)
+            return method(limit=C11_PAGE_LIMIT)
+
+        r1 = probe.run(
+            "csuite", "{} (C11 p1)".format(endpoint),
+            lambda: call(0),
+            {"view_limit": C11_PAGE_LIMIT, "view_offset": 0},
+            post_transport=True, note="C11 pagination contract, page 1.")
+        page1 = find_records(recorder.raw)[0]
+        row["page1_count"] = len(page1)
+        row["limit_honored"] = len(page1) <= C11_PAGE_LIMIT
+        row["effective_page_size"] = len(page1)
+        row["count_reported"] = bool(find_reported_totals(recorder.raw))
+        row["reported_totals"] = r1.get("reported_totals", {})
+
+        if not takes_offset:
+            row["page2_non_empty"] = None
+            row["page2_disjoint"] = None
+            row["out_of_range"] = "n/a — no offset parameter on the client method"
+            contract[endpoint] = row
+            continue
+
+        # Offset by the size the server actually returned, not the size we
+        # asked for. Where view_limit is ignored, offsetting by the requested
+        # limit overlaps page 1 by construction and would read as "offset
+        # broken" when it is only "limit ignored".
+        offset2 = len(page1) or C11_PAGE_LIMIT
+        row["page2_offset"] = offset2
+        probe.run(
+            "csuite", "{} (C11 p2)".format(endpoint),
+            lambda o=offset2: call(o),
+            {"view_limit": C11_PAGE_LIMIT, "view_offset": offset2},
+            post_transport=True, note="C11 pagination contract, page 2.")
+        page2 = find_records(recorder.raw)[0]
+        row["page2_count"] = len(page2)
+        row["page2_non_empty"] = bool(page2)
+        ids1, ids2 = set(_ids_of(page1)), set(_ids_of(page2))
+        row["page2_disjoint"] = (bool(ids1 and ids2) and not (ids1 & ids2))
+        row["page2_overlap"] = len(ids1 & ids2)
+
+        oor = probe.run(
+            "csuite", "{} (C11 out-of-range)".format(endpoint),
+            lambda: call(C11_OUT_OF_RANGE_OFFSET),
+            {"view_limit": C11_PAGE_LIMIT,
+             "view_offset": C11_OUT_OF_RANGE_OFFSET},
+            post_transport=True, note="C11 pagination contract, out of range.")
+        oor_records = find_records(recorder.raw)[0]
+        if not oor.get("ok"):
+            row["out_of_range"] = "error: {}".format(
+                str(oor.get("error"))[:80])
+        elif not oor_records:
+            row["out_of_range"] = "empty list"
+        elif set(_ids_of(oor_records)) & ids1:
+            row["out_of_range"] = "returns page 1 again"
+        else:
+            row["out_of_range"] = "{} unexpected record(s)".format(
+                len(oor_records))
+        contract[endpoint] = row
+    return contract
 
 
 _SYSTEM_FUND_IDS = {1000}
@@ -1046,6 +1419,11 @@ def _property_catalog(payload):
             "origin": "hubspot" if hubspot_defined else "custom",
             "calculated": bool(prop.get("calculated", False)),
             "options_count": len(prop.get("options") or []),
+            # Option labels are schema, not donor data — safe to record.
+            "options": [o.get("label") or o.get("value")
+                        for o in (prop.get("options") or [])][:40],
+            "createdAt": prop.get("createdAt"),
+            "createdUserId": prop.get("createdUserId"),
         })
     catalog.sort(key=lambda p: (p["origin"] != "custom", (p["name"] or "")))
     return catalog
@@ -1276,7 +1654,271 @@ def _probe_hubspot_inner(limit, recorder, probe, client):
     )
     extras["social_channels"] = _summarise_channels(recorder.raw)
 
+    extras.update(probe_hubspot_p3(probe, recorder, client, extras))
     return extras
+
+
+# ---------------------------------------------------------------------------
+# Probe #3 HubSpot passes
+# ---------------------------------------------------------------------------
+
+H6_PROPERTIES = [
+    "fund_type", "endowment_fund_name", "daf_endowment_account_number",
+    "what_is_your_daf_fund", "constituent_codes", "constituent_type",
+]
+
+H8_LIST_IDS = ["179", "180", "182"]
+
+H9_TICKET_PROPERTY_TOKENS = ("csuite", "daf", "endow", "fund", "profile")
+
+# HubSpot generates one of these per pipeline stage; their labels embed the
+# pipeline name ("Cumulative time in DAF Pipeline/New"), so a label-based
+# match returns 40+ rows of noise for every real custom property.
+_HS_STAGE_TIMING_PREFIXES = ("hs_v2_", "hs_date_entered_", "hs_date_exited_",
+                             "hs_time_in_")
+
+# Fabricated-event tells: sync/events.py falls back to a fixed time of day
+# when CSuite gives it no start_time.
+H7_SUSPECT_TIMES = ("10:00:00", "14:00:00")
+
+
+def probe_hubspot_p3(probe, recorder, client, extras):
+    from config import Config
+
+    out = {}
+
+    # ---- H6: a 100-contact sample scoped to the six candidate properties --
+    h6 = probe.run(
+        "hubspot", "crm/v3/objects/contacts (H6 properties)",
+        lambda: client._get("crm/v3/objects/contacts", {
+            "limit": 100, "properties": ",".join(H6_PROPERTIES)}),
+        {"limit": 100, "properties": H6_PROPERTIES},
+        note="H6 — %-populated and distinct values for the RE migration's "
+             "fund/constituent properties.")
+    out["h6_sample_ok"] = h6["ok"]
+    out["h6_distinct"] = _distinct_property_values(recorder.raw, H6_PROPERTIES)
+
+    # ---- H7: all marketing events, paged --------------------------------
+    events = []
+    after = None
+    for page in range(10):
+        params = {"limit": 100}
+        if after:
+            params["after"] = after
+        record = probe.run(
+            "hubspot", "marketing/v3/marketing-events (H7 p{})".format(page + 1),
+            lambda pr=dict(params): client._get(
+                "marketing/v3/marketing-events", pr),
+            params, note="H7 — full marketing event listing.")
+        raw = recorder.raw if isinstance(recorder.raw, dict) else {}
+        events.extend(find_records(raw)[0])
+        after = (raw.get("paging", {}).get("next", {}) or {}).get("after")
+        if not record["ok"] or not after:
+            break
+    out["h7_events"] = _summarise_marketing_events(events)
+
+    # Participation counts, addressable only by the internal object id.
+    for event in out["h7_events"]:
+        internal = event.get("objectId")
+        if not internal:
+            event["participations"] = "undetermined: no internal objectId"
+            continue
+        endpoint = ("marketing/v3/marketing-events/participations/{}"
+                    "/breakdown".format(internal))
+        rec = probe.run(
+            "hubspot", endpoint, lambda ep=endpoint: client._get(ep), {},
+            note="H7 — participation breakdown by internal marketing event id.")
+        if rec["ok"]:
+            body = recorder.raw if isinstance(recorder.raw, dict) else {}
+            event["participations"] = body.get("total", rec["record_count"])
+        else:
+            event["participations"] = "undetermined: HTTP {}".format(
+                rec["http_status"])
+
+    # ---- H8: membership counts for three lists (GET, never delete) -------
+    out["h8_lists"] = {}
+    for list_id in H8_LIST_IDS:
+        endpoint = "crm/v3/lists/{}/memberships".format(list_id)
+        rec = probe.run(
+            "hubspot", endpoint,
+            lambda lid=list_id: client._get(
+                "crm/v3/lists/{}/memberships".format(lid), {"limit": 1}),
+            {"limit": 1},
+            note="H8 — membership count only. Read-only; nothing is deleted.")
+        raw = recorder.raw if isinstance(recorder.raw, dict) else {}
+        out["h8_lists"][list_id] = {
+            "http_status": rec["http_status"],
+            "total": raw.get("total"),
+            "error": rec["error"],
+        }
+
+    # ---- H9: ticket pipeline, properties, objects ------------------------
+    pipelines_rec = probe.run(
+        "hubspot", "crm/v3/pipelines/tickets",
+        lambda: client._get("crm/v3/pipelines/tickets"), {},
+        note="H9 — ticket pipelines and stages.")
+    out["h9_pipelines"] = _summarise_pipelines(recorder.raw)
+    out["h9_pipelines_ok"] = pipelines_rec["ok"]
+
+    props_rec = probe.run(
+        "hubspot", "crm/v3/properties/tickets",
+        lambda: client._get("crm/v3/properties/tickets"), {},
+        note="H9 — ticket property schema.")
+    ticket_props = _property_catalog(recorder.raw)
+    out["h9_ticket_properties_ok"] = props_rec["ok"]
+    out["h9_ticket_custom"] = [
+        p for p in ticket_props
+        if any(tok in (p.get("name") or "").lower()
+               for tok in H9_TICKET_PROPERTY_TOKENS)
+        and not (p.get("name") or "").startswith(_HS_STAGE_TIMING_PREFIXES)]
+
+    probe.run(
+        "hubspot", "crm/v3/objects/tickets",
+        lambda: client._get("crm/v3/objects/tickets", {"limit": 5}),
+        {"limit": 5}, note="H9 — ticket object field stats.")
+
+    # ---- H10: form submissions (values masked unconditionally) -----------
+    out["h10_forms"] = {}
+    for label, form_id in (("DAF inquiry", Config.DAF_INQUIRY_FORM_ID),
+                           ("Endowment inquiry",
+                            Config.ENDOWMENT_INQUIRY_FORM_ID)):
+        endpoint = "form-integrations/v1/submissions/forms/{}".format(form_id)
+        rec = probe.run(
+            "hubspot", endpoint,
+            lambda fid=form_id: client._get(
+                "form-integrations/v1/submissions/forms/{}".format(fid),
+                {"limit": 5}),
+            {"limit": 5},
+            note="H10 — {}. Every submitted value is redacted regardless of "
+                 "its field name.".format(label))
+        out["h10_forms"][label] = _summarise_submissions(
+            recorder.raw, form_id, rec)
+
+    # ---- H11: how many contacts carry csuite_profile_id ------------------
+    search_rec = probe.run(
+        "hubspot", "crm/v3/objects/contacts/search (H11 HAS_PROPERTY)",
+        lambda: client._post("crm/v3/objects/contacts/search", {
+            "filterGroups": [{"filters": [
+                {"propertyName": "csuite_profile_id",
+                 "operator": "HAS_PROPERTY"}]}],
+            "limit": 1,
+        }),
+        {"operator": "HAS_PROPERTY", "propertyName": "csuite_profile_id",
+         "limit": 1},
+        post_transport=True,
+        note="H11 — POST-as-read. HubSpot exposes counting only through "
+             "the search endpoint; only the total is kept.")
+    raw = recorder.raw if isinstance(recorder.raw, dict) else {}
+    out["h11_csuite_profile_id_total"] = (
+        raw.get("total") if search_rec["ok"] else None)
+    out["h11_search_ok"] = search_rec["ok"]
+    out["h11_url_like_properties"] = [
+        {"name": p["name"], "label": p["label"], "origin": p["origin"]}
+        for p in (extras.get("contact_properties") or [])
+        if any(tok in "{} {}".format(p.get("name") or "",
+                                     p.get("label") or "").lower()
+               for tok in ("url", "link"))]
+    return out
+
+
+def _distinct_property_values(payload, names):
+    """Per-property populated % and distinct values over a contact sample."""
+    records = find_records(payload)[0]
+    out = {}
+    total = len(records)
+    for name in names:
+        values = [r.get("properties", {}).get(name) for r in records]
+        non_null = [v for v in values if v not in (None, "")]
+        counter = Counter(mask_value(name, v) for v in non_null)
+        out[name] = {
+            "sample_size": total,
+            "pct_populated": round(100.0 * len(non_null) / total, 1) if total
+                             else None,
+            "distinct": [{"value": v, "count": c}
+                         for v, c in counter.most_common(15)],
+        }
+    return out
+
+
+def _summarise_marketing_events(events):
+    out = []
+    for event in events:
+        out.append({
+            "objectId": event.get("objectId") or event.get("id"),
+            "eventName": event.get("eventName"),
+            "externalEventId": event.get("externalEventId"),
+            "startDateTime": event.get("startDateTime"),
+            "endDateTime": event.get("endDateTime"),
+            "createdAt": event.get("createdAt"),
+            "eventType": event.get("eventType"),
+        })
+    return out
+
+
+def _summarise_pipelines(payload):
+    out = []
+    for pipeline in find_records(payload)[0]:
+        stages = sorted(
+            (pipeline.get("stages") or []),
+            key=lambda st: st.get("displayOrder", 0))
+        out.append({
+            "id": pipeline.get("id"),
+            "label": pipeline.get("label"),
+            "displayOrder": pipeline.get("displayOrder"),
+            "stages": [{"id": st.get("id"), "label": st.get("label"),
+                        "displayOrder": st.get("displayOrder")}
+                       for st in stages],
+        })
+    return out
+
+
+def _summarise_submissions(payload, form_id, record):
+    """Field names and types only; every submitted value is redacted."""
+    if not record.get("ok"):
+        return {"form_id": form_id, "ok": False,
+                "error": record.get("error"),
+                "http_status": record.get("http_status")}
+
+    submissions = find_records(payload)[0]
+    raw = payload if isinstance(payload, dict) else {}
+    field_counter = Counter()
+    types = {}
+    submitted_at = []
+    for sub in submissions:
+        for entry in sub.get("values", []) or []:
+            name = entry.get("name")
+            if not name:
+                continue
+            field_counter[name] += 1
+            types.setdefault(name, infer_type(entry.get("value")))
+        if sub.get("submittedAt") is not None:
+            submitted_at.append(sub["submittedAt"])
+
+    units = "undetermined"
+    if submitted_at:
+        sample = submitted_at[0]
+        if isinstance(sample, (int, float)):
+            units = ("epoch milliseconds" if sample > 10_000_000_000
+                     else "epoch seconds")
+        else:
+            units = "string: {}".format(infer_type(sample))
+
+    return {
+        "form_id": form_id,
+        "ok": True,
+        "submission_count": len(submissions),
+        "total": raw.get("total"),
+        "has_paging": bool(raw.get("paging")),
+        "submitted_at_type": infer_type(submitted_at[0]) if submitted_at else None,
+        "submitted_at_units": units,
+        # The value itself is never recorded, only its shape.
+        "submitted_at_example": (mask_submission_value(submitted_at[0])
+                                 if submitted_at else None),
+        "fields": [{"name": n, "type": types.get(n),
+                    "present_in": c, "of": len(submissions),
+                    "example": REDACTED}
+                   for n, c in field_counter.most_common()],
+    }
 
 
 def _first_external_event_id(payload):
@@ -1752,7 +2394,63 @@ def _property_table(props):
     return rows
 
 
-def write_mapping_draft(csuite_results, hubspot_extras, discovery, path):
+def _build_inputs_block(discovery, csuite_extras, hubspot_extras):
+    """The three probe #3 findings that change what gets built."""
+    by_id = {d["id"]: d for d in discovery}
+    lines = []
+
+    # C10 — fund_relationship cardinality and mirror cost.
+    lines += ["**C10 — `fund_relationship`**", ""]
+    multi = csuite_extras.get("c10_profiles_multi_fund")
+    lines += _table(
+        ["Input", "Value", "Consequence"],
+        [("funds in CSuite", _cell(csuite_extras.get("c9_total_funds")),
+          "one display call each to read `profile_id`"),
+         ("`profile_id` on `funit/list` rows",
+          _tri(csuite_extras.get("c10_profile_id_on_list")),
+          "list paging alone cannot build the mirror"),
+         ("distinct advisor profiles",
+          _cell(csuite_extras.get("c10_distinct_profiles")),
+          "rows in the mirror table"),
+         ("profiles holding >1 fund", _cell(multi),
+          "**multi-valued required**" if multi else "single value would do"),
+         ("profiles holding both 1002 and 1008",
+          _cell(csuite_extras.get("c10_profiles_1002_and_1008")),
+          "DAF + endowment in one household")])
+
+    # H6 — is fund_type usable as-is.
+    lines += ["", "**H6 — `fund_type` and the constituent properties**", ""]
+    distinct = hubspot_extras.get("h6_distinct") or {}
+    props = {p["name"]: p for p in (hubspot_extras.get("contact_properties") or [])}
+    lines += _table(
+        ["Property", "Type", "Options", "% populated", "Candidate use"],
+        [("`%s`" % name,
+          _cell(props.get(name, {}).get("type")),
+          props.get(name, {}).get("options_count") or "—",
+          "{}%".format((distinct.get(name) or {}).get("pct_populated"))
+          if distinct.get(name) else "undetermined",
+          "write target" if not (distinct.get(name) or {}).get("pct_populated")
+          else "already carries data — read before writing")
+         for name in H6_PROPERTIES])
+    if "H6" in by_id:
+        lines += ["", "> {}".format(by_id["H6"]["answer"])]
+
+    # H11 — how much of the mirror already exists.
+    lines += ["", "**H11 — `csuite_profile_id` coverage**", ""]
+    total = hubspot_extras.get("h11_csuite_profile_id_total")
+    lines.append("- contacts already carrying `csuite_profile_id`: {}".format(
+        total if total is not None else "undetermined"))
+    url_props = hubspot_extras.get("h11_url_like_properties") or []
+    lines.append("- existing url/link-named properties: {}".format(
+        ", ".join("`%s`" % p["name"] for p in url_props) or "none"))
+    if "H11" in by_id:
+        lines += ["", "> {}".format(by_id["H11"]["answer"])]
+    return lines
+
+
+def write_mapping_draft(csuite_results, hubspot_extras, discovery, path,
+                        csuite_extras=None):
+    csuite_extras = csuite_extras or {}
     lines = [
         "# CSuite -> HubSpot mapping draft",
         "",
@@ -1780,6 +2478,8 @@ def write_mapping_draft(csuite_results, hubspot_extras, discovery, path):
     lines += _table(["Item", "Finding"],
                     [("**{}**".format(d["id"]), d["answer"].replace("|", "\\|"))
                      for d in discovery])
+    lines += ["", "### 2.1 Build inputs from probe #3 (C10 / H6 / H11)", ""]
+    lines += _build_inputs_block(discovery, csuite_extras, hubspot_extras)
     lines += ["",
               "### 2a. CSuite fields with no HubSpot counterpart", ""]
 
@@ -1847,6 +2547,61 @@ def write_mapping_draft(csuite_results, hubspot_extras, discovery, path):
 def _write(path, text):
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(text.rstrip() + "\n")
+
+
+# =============================================================================
+# OPENROUTER (probe #3, O1)
+# =============================================================================
+
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+
+
+def probe_openrouter(recorder, probe):
+    """O1 — the public model catalogue. GET only; no completion is requested.
+
+    The catalogue is public, so the call is made unauthenticated: sending the
+    API key would add exposure for no benefit. The key's presence is only used
+    as the gate the brief asked for.
+    """
+    import requests as _requests
+    from config import Config as _Config
+
+    if not _Config.OPENROUTER_API_KEY:
+        probe.results.append(_skipped_record(
+            "openrouter", "v1/models",
+            "OPENROUTER_API_KEY not present in .env"))
+        return {"key_present": False}
+
+    def call():
+        start = time.perf_counter()
+        response = _requests.get(OPENROUTER_MODELS_URL, timeout=30)
+        recorder.capture(response,
+                         round((time.perf_counter() - start) * 1000.0, 1))
+        return recorder.raw
+
+    record = probe.run(
+        "openrouter", "v1/models", call, {},
+        note="O1 — public model catalogue, unauthenticated GET. No "
+             "completions request is made.")
+
+    models = [m.get("id") for m in find_records(recorder.raw)[0]
+              if m.get("id")]
+    configured = _Config.CLAUDE_MODEL
+    return {
+        "key_present": True,
+        "ok": record["ok"],
+        "model_count": len(models),
+        "configured_model": configured,
+        "configured_model_exists": (configured in models) if record["ok"]
+                                   else None,
+        "sonnet_ids": sorted(m for m in models
+                             if m.startswith("anthropic/claude-sonnet")),
+        "haiku_ids": sorted(m for m in models
+                            if m.startswith("anthropic/claude-haiku")),
+        "latest_aliases": sorted(
+            m for m in models
+            if m.startswith("anthropic/claude-") and m.endswith("-latest")),
+    }
 
 
 # =============================================================================
@@ -2232,14 +2987,16 @@ def discover_c3(probe, csuite_extras):
     found_any = False
     rsvp_summary = []
 
-    lines += ["", "**Top-level registrant rows** (the `profiles[]` equivalent)",
-              ""]
+    lines += ["", "**Registrant rows** (`data.profiles[]` — see C7)", ""]
     if registrant_rows:
         found_any = True
         top_stats = field_stats(registrant_rows)
-        lines.append("{} registrant row(s). `event/display/eventdate` returns "
-                     "these as its `results` array — there is no nested "
-                     "`profiles[]` key.".format(len(registrant_rows)))
+        lines.append(
+            "{} registrant row(s), read from `data.profiles[]`. (Probe #2 "
+            "described these as top-level rows; C7 shows that was this "
+            "script's record-discovery fallback surfacing the nested array. "
+            "The field statistics below are unaffected.)".format(
+                len(registrant_rows)))
         lines.append("")
         lines += _table(FIELD_HEADERS, _field_rows(top_stats))
         for token in ("rsvp", "attended"):
@@ -2759,7 +3516,716 @@ def discover_h5(extras):
             "lines": lines, "answer": answer}
 
 
-def build_discovery(probe, csuite_extras, hubspot_extras):
+# ---------------------------------------------------------------------------
+# Probe #3 discovery
+# ---------------------------------------------------------------------------
+
+def discover_c7(probe, extras):
+    """Registrant shape conflict between the client, the code and the API."""
+    idx = _by_endpoint(probe)
+    record = idx.get("event/display/eventdate (C7 registrant event)")
+    keys = extras.get("c7_raw_data_keys") or []
+    lines = [
+        "**What the client does** — `clients/csuite.py:588` "
+        "`get_event_date()` is a bare `self._request(\"event/display/"
+        "eventdate\", ...)`. `_request` (`clients/csuite.py:63`) returns "
+        "`{success, data, messages}` with CSuite's `data` passed through "
+        "untouched. **The client does not flatten or rename anything.**",
+        "",
+        "**What the code expects** — `intents/events.py:646` "
+        "`_fetch_event_detail()` returns `result[\"data\"]` verbatim, and the "
+        "callers then read a `profiles` key off it:",
+        "",
+        "- `intents/events.py:175` — `event_detail.get(\"profiles\") or []`",
+        "- `intents/events.py:305` — `event_detail.get(\"profiles\", [])`",
+        "- `intents/events.py:671` — `event_data.get(\"profiles\", [])` "
+        "and `.get(\"tickets\", [])`",
+        "",
+    ]
+
+    blocked = _unavailable(record, "event/display/eventdate (C7)")
+    if blocked:
+        lines.append("**What the API returns:** {}.".format(blocked))
+        return {"id": "C7", "title": "Registrant shape conflict",
+                "lines": lines,
+                "answer": "undetermined: {}".format(blocked)}
+
+    has_profiles = "profiles" in keys
+    has_results = "results" in keys
+    lines.append("**What the API actually returns** — event_date_id "
+                 "`{}`, `data` top-level keys: {}.".format(
+                     extras.get("c7_event_date_id"),
+                     ", ".join("`%s`" % k for k in keys) or "none"))
+    lines.append("")
+    lines += _table(["Key the code reads", "Present in `data`?"],
+                    [("`profiles`", _tri(has_profiles)),
+                     ("`tickets`", _tri("tickets" in keys)),
+                     ("`results` (what CSuite sends)", _tri(has_results))])
+
+    if has_profiles:
+        lines += [
+            "",
+            "**Correction to probe #2 (C3).** Probe #2 reported that "
+            "registrants arrive as top-level rows and that there is no nested "
+            "`profiles[]`. That was an artifact of this script, not of the "
+            "API: `find_records()` falls back to \"first top-level key holding "
+            "a non-empty list of objects\", which silently surfaced "
+            "`data.profiles` as though it were the result set. The C3 tables "
+            "are still correct about the registrant *fields* — they were read "
+            "from `data.profiles` all along — but its claim about where the "
+            "rows live was wrong, and this call settles it.",
+            "",
+            "`data` carries both arrays side by side: `profiles` (registrants) "
+            "and `tickets` (ticket types), plus a `fund` object. That is "
+            "exactly the shape `intents/events.py:671` assumes.",
+        ]
+    else:
+        lines += ["", "Probe #2 sampled event dates that answered with "
+                  "ticket/fund rows and others that answered with registrant "
+                  "rows."]
+
+    if has_profiles:
+        answer = ("neither — the client does not flatten "
+                  "(clients/csuite.py:588) and the code reads the right key: "
+                  "`data` carries `profiles[]` and `tickets[]` side by side, "
+                  "so intents/events.py:175/305/671 are correct. The apparent "
+                  "conflict was this probe's own find_records() fallback "
+                  "surfacing `data.profiles` as the result set, which is also "
+                  "what made probe #2's C3 claim wrong")
+    elif has_results:
+        answer = ("the code reads the wrong key: the client does not flatten "
+                  "(clients/csuite.py:588), `_fetch_event_detail` returns "
+                  "CSuite's `data` verbatim (intents/events.py:646), and that "
+                  "dict has `results`, not `profiles` — so "
+                  "intents/events.py:175/305/671 always see an empty list and "
+                  "attendee display and event sync are silently no-ops")
+    else:
+        answer = ("undetermined: `data` carried neither `profiles` nor "
+                  "`results` on this event ({})".format(
+                      ", ".join(keys) or "no keys"))
+    return {"id": "C7", "title": "Registrant shape conflict", "lines": lines,
+            "answer": answer}
+
+
+def discover_c8(probe, extras):
+    """Individual vs organization, and grantee/donor profile overlap."""
+    idx = _by_endpoint(probe)
+    record = idx.get("profile/list")
+    blocked = _unavailable(record, "profile/list")
+    if blocked:
+        return {"id": "C8", "title": "Individual vs organization",
+                "lines": [blocked], "answer": "undetermined: {}".format(blocked)}
+
+    payload = probe.raw_payloads.get("profile/list")
+    lines = ["Distinguishing fields over the 100-profile sample.", ""]
+    rows = []
+    for field in ("ptype", "organization", "org_contact_name", "individual",
+                  "is_nonprofit", "is_grantee", "is_vendor", "name_link_id"):
+        stat = next((f for f in _fields_of(record) if f["field"] == field), None)
+        if not stat:
+            continue
+        distinct = _distinct_values(payload, field, limit=8)
+        rows.append((("`%s`" % field), ("`%s`" % stat["type"]),
+                     "{}%".format(stat["pct_populated"]),
+                     ", ".join("{} ({})".format(_cell(d["value"]), d["count"])
+                               for d in distinct) or "—"))
+    lines += _table(["Field", "Type", "% populated", "Distinct values"], rows)
+
+    # Individual vs organization display shapes.
+    ind = idx.get("profile/display")
+    org = idx.get("profile/display (organization)")
+    lines += ["", "**Display shapes**", ""]
+    for label, rec in (("individual", ind), ("organization", org)):
+        if rec is None or not rec.get("ok"):
+            lines.append("- {}: {}".format(
+                label, _unavailable(rec, "profile/display") or "unavailable"))
+            continue
+        flags = {f["field"]: f["example"] for f in _fields_of(rec)
+                 if f["field"] in ("ptype", "individual", "is_nonprofit",
+                                   "is_grantee", "is_vendor", "is_sorg",
+                                   "organization")}
+        lines.append("- {} (profile_id {}): {}".format(
+            label, rec["request"].get("profile_id"),
+            ", ".join("`{}`={}".format(k, _cell(v))
+                      for k, v in sorted(flags.items())) or "no flags"))
+
+    # Grantee / donor overlap — counts only, no ids recorded.
+    grant_ids = {r.get("profile_id") for r in
+                 find_records(probe.raw_payloads.get("grant/list"))[0]
+                 if r.get("profile_id") is not None}
+    donor_ids = {r.get("profile_id") for r in
+                 find_records(probe.raw_payloads.get("donation/list"))[0]
+                 if r.get("profile_id") is not None}
+    overlap = grant_ids & donor_ids
+    lines += ["", "**Grantee / donor overlap** (one page each, counts only — "
+              "no profile ids recorded)", "",
+              "- distinct grantee profile_ids on `grant/list`: {}".format(
+                  len(grant_ids)),
+              "- distinct donor profile_ids on `donation/list`: {}".format(
+                  len(donor_ids)),
+              "- **appearing as both: {}**".format(len(overlap))]
+
+    ptype_values = _distinct_values(payload, "ptype", limit=8)
+    answer = ("`ptype` splits them ({}); `organization` populated on {}% of "
+              "the sample; grantee/donor overlap = {} profile(s) across one "
+              "page each".format(
+                  ", ".join("{}={}".format(d["value"], d["count"])
+                            for d in ptype_values) or "no values",
+                  next((f["pct_populated"] for f in _fields_of(record)
+                        if f["field"] == "organization"), "?"),
+                  len(overlap)))
+    return {"id": "C8", "title": "Individual vs organization", "lines": lines,
+            "answer": answer}
+
+
+def discover_c9(probe, extras):
+    """Fee model: how a fund reaches its fee type."""
+    idx = _by_endpoint(probe)
+    total = extras.get("c9_total_funds")
+    if not total:
+        reason = "funit/list full sweep returned no funds"
+        return {"id": "C9", "title": "Fee model", "lines": [reason],
+                "answer": "undetermined: {}".format(reason)}
+
+    truncated = extras.get("c9_display_truncated")
+    lines = [
+        "Paged `funit/list` to completion: **{} funds**, then called "
+        "`funit/display` for {} of them ({} rows returned, {}% coverage).".format(
+            total, extras.get("c9_display_calls"),
+            extras.get("c9_display_rows"), extras.get("c9_coverage_pct")),
+        "",]
+    if truncated:
+        lines += ["> **Partial sweep — {}.** Every count below covers only the "
+                  "funds actually read, so treat them as lower bounds."
+                  .format(truncated), ""]
+    lines += [
+        "`funit/list` row fields: {}.".format(
+            ", ".join("`%s`" % f for f in extras.get("c9_list_row_fields") or [])
+            or "none"),
+        "",
+        "- `admin_fee_fundgroup_id` on list rows: {}".format(
+            _tri(extras.get("c9_admin_fee_on_list"))),
+        "- `admin_fee_fundgroup_id` populated on display rows: {}%".format(
+            extras.get("c9_admin_fee_populated_pct")),
+        "",
+        "**Fund groups (`fgroup_id`) across all funds**",
+        "",
+    ]
+    lines += _table(["fgroup_id", "Funds"],
+                    [(_cell(d["value"]), d["count"])
+                     for d in extras.get("c9_fund_groups") or []])
+
+    lines += ["", "**`admin_fee_fundgroup_id` values**", ""]
+    lines += _table(["Value", "Funds"],
+                    [(_cell(d["value"]), d["count"])
+                     for d in extras.get("c9_admin_fee_values") or []])
+
+    cross = extras.get("c9_admin_fee_by_group") or {}
+    if cross:
+        lines += ["", "**admin_fee_fundgroup_id by fgroup_id**", ""]
+        lines += _table(["fgroup_id", "admin_fee_fundgroup_id (count)"],
+                        [(("`%s`" % g),
+                          ", ".join("{} ({})".format(_cell(d["value"]),
+                                                     d["count"]) for d in vals))
+                         for g, vals in cross.items()])
+
+    feetype = idx.get("funit/feetype")
+    lines += ["", "**`funit/feetype`**", ""]
+    if feetype and feetype.get("ok"):
+        lines += _table(FIELD_HEADERS, _field_rows(_fields_of(feetype)))
+        fee_rows = find_records(probe.raw_payloads.get("funit/feetype"))[0]
+        group_values = {d["value"] for d in extras.get("c9_fund_groups") or []}
+        admin_values = {d["value"] for d in
+                        extras.get("c9_admin_fee_values") or []}
+        coincidental = []
+        real_join = []
+        admin_pct = extras.get("c9_admin_fee_populated_pct") or 0
+        for row in fee_rows:
+            for key, value in row.items():
+                if not isinstance(value, int):
+                    continue
+                if value in group_values:
+                    coincidental.append(
+                        "`{}`={} equals an fgroup_id".format(key, value))
+                # A join only exists if the fund side actually carries the
+                # value. admin_fee_fundgroup_id being null on every fund means
+                # nothing points at a fee type, whatever the numbers look like.
+                if value in admin_values and admin_pct > 0:
+                    real_join.append(
+                        "`{}`={} matches a populated "
+                        "admin_fee_fundgroup_id".format(key, value))
+        lines += ["", "Fee-type ids that merely *equal* a fund-group id "
+                  "(shared numbering, not a join): {}".format(
+                      "; ".join(sorted(set(coincidental))) or "none")]
+        lines += ["", "Fee-type ids reachable from a populated field on a "
+                  "fund: {}".format(
+                      "; ".join(sorted(set(real_join))) or "**none**")]
+        join_visible = bool(real_join)
+    else:
+        lines.append(_unavailable(feetype, "funit/feetype") or "unavailable")
+        join_visible = None
+
+    if join_visible:
+        answer = ("a fund reaches its fee type through a populated "
+                  "admin_fee_fundgroup_id matching funit/feetype")
+    elif join_visible is False:
+        answer = ("no join visible — `funit/feetype` is a flat lookup whose "
+                  "ids match neither `fgroup_id` nor `admin_fee_fundgroup_id`; "
+                  "`admin_fee_fundgroup_id` is display-only ({}% populated) "
+                  "and is the only fee-ish field a fund carries".format(
+                      extras.get("c9_admin_fee_populated_pct")))
+    else:
+        answer = "undetermined: funit/feetype did not return"
+    return {"id": "C9", "title": "Fee model", "lines": lines, "answer": answer}
+
+
+def discover_c10(probe, extras):
+    """fund_relationship inputs and the cost of mirroring them."""
+    total = extras.get("c9_total_funds")
+    if not total:
+        reason = "funit/list full sweep returned no funds"
+        return {"id": "C10", "title": "fund_relationship inputs",
+                "lines": [reason], "answer": "undetermined: {}".format(reason)}
+
+    on_list = extras.get("c10_profile_id_on_list")
+    calls = extras.get("c9_display_calls")
+    truncated = extras.get("c9_display_truncated")
+    lines = []
+    if truncated:
+        lines += ["> **Partial sweep — {}.** Counts below are lower bounds "
+                  "over {}% of the portfolio.".format(
+                      truncated, extras.get("c9_coverage_pct")), ""]
+    lines += [
+        "- `profile_id` on `funit/list` rows: {}".format(_tri(on_list)),
+        "- `profile_id` populated on `funit/display` rows: {}%".format(
+            extras.get("c10_profile_id_populated_pct")),
+        "- distinct advisor profiles across all funds: **{}**".format(
+            extras.get("c10_distinct_profiles")),
+        "- profiles holding more than one fund: **{}**".format(
+            extras.get("c10_profiles_multi_fund")),
+        "- most funds held by one profile: {}".format(
+            extras.get("c10_max_funds_per_profile")),
+        "- profiles holding both a 1002 (DAF) and a 1008 (endowment) fund: "
+        "**{}**".format(extras.get("c10_profiles_1002_and_1008")),
+    ]
+    pairs = extras.get("c10_group_pairs") or []
+    if pairs:
+        lines += ["", "**Fund-group combinations held by one profile**", ""]
+        lines += _table(["fgroup_id combination", "Profiles"],
+                        [(", ".join("`%s`" % g for g in p["groups"]), p["count"])
+                         for p in pairs])
+
+    multi = extras.get("c10_profiles_multi_fund") or 0
+    cost = ("{} display calls ({} list pages would not do it — `profile_id` "
+            "is not on list rows)".format(calls, (total // 100) + 1)
+            if not on_list else
+            "{} list calls — `profile_id` is on the list rows".format(
+                (total // 100) + 1))
+    answer = ("mirror cost = {}; fund_relationship {} be multi-valued "
+              "({} profile(s) hold more than one fund, max {})".format(
+                  cost, "MUST" if multi else "need not",
+                  multi, extras.get("c10_max_funds_per_profile")))
+    return {"id": "C10", "title": "fund_relationship inputs", "lines": lines,
+            "answer": answer}
+
+
+def discover_c11(extras):
+    """Pagination contract, one row per list endpoint."""
+    contract = extras.get("c11") or {}
+    if not contract:
+        return {"id": "C11", "title": "Pagination contract",
+                "lines": ["No pagination probe ran."],
+                "answer": "undetermined: pagination probe did not run"}
+
+    rows = []
+    for endpoint, row in contract.items():
+        rows.append((
+            "`%s`" % endpoint,
+            _cell(row.get("params")),
+            _tri(row.get("limit_honored")),
+            _tri(row.get("count_reported")),
+            _tri(row.get("page2_non_empty")),
+            _tri(row.get("page2_disjoint")),
+            _cell(row.get("out_of_range")),
+        ))
+    lines = _table(["Endpoint", "Params", "Limit honored", "count reported",
+                    "Page 2 non-empty", "Page 2 disjoint", "Out of range"],
+                   rows)
+
+    honored = sum(1 for r in contract.values() if r.get("limit_honored"))
+    disjoint = sum(1 for r in contract.values() if r.get("page2_disjoint"))
+    offsetless = [e for e, r in contract.items()
+                  if r.get("supports_offset") is False]
+    answer = ("{}/{} honor view_limit, {} page cleanly with view_offset; "
+              "no offset parameter on {}".format(
+                  honored, len(contract), disjoint,
+                  ", ".join(offsetless) or "none"))
+    return {"id": "C11", "title": "Pagination contract", "lines": lines,
+            "answer": answer}
+
+
+# Deliberately not the bare word "external": grant/list carries an
+# `external` 0/1 flag meaning "external grant", which has nothing to do with
+# HubSpot and matched the earlier, looser token list.
+_HUBSPOT_REF_TOKENS = ("hubspot", "hs_", "ticket", "crm",
+                       "external_id", "externalid", "external_ref")
+
+
+def discover_c12(probe):
+    """Any HubSpot reference on CSuite records?"""
+    idx = _by_endpoint(probe)
+    lines = []
+    hits = {}
+    for endpoint in ("donation/list", "grant/list", "profile/display"):
+        record = idx.get(endpoint)
+        blocked = _unavailable(record, endpoint)
+        if blocked:
+            lines.append("- `{}`: {}".format(endpoint, blocked))
+            hits[endpoint] = None
+            continue
+        matched = [f["field"] for f in _fields_of(record)
+                   if any(tok in f["field"].lower()
+                          for tok in _HUBSPOT_REF_TOKENS)]
+        hits[endpoint] = matched
+        lines.append("- `{}`: {} field(s) of {} match {} — {}".format(
+            endpoint, len(matched), record["field_count"],
+            "/".join(_HUBSPOT_REF_TOKENS),
+            ", ".join("`%s`" % m for m in matched) or "**none**"))
+
+    if any(v is None for v in hits.values()):
+        answer = "undetermined: {} did not return".format(
+            ", ".join(k for k, v in hits.items() if v is None))
+    elif any(hits.values()):
+        answer = "yes — {}".format("; ".join(
+            "{}: {}".format(k, ", ".join(v)) for k, v in hits.items() if v))
+    else:
+        answer = ("no — neither donation/list, grant/list nor profile/display "
+                  "carries a ticket id, hs_* field or external id; the only "
+                  "join key in either direction is the CSuite profile_id "
+                  "mirrored into HubSpot's csuite_profile_id")
+    return {"id": "C12", "title": "Ticket linkage", "lines": lines,
+            "answer": answer}
+
+
+def discover_h6(extras):
+    """The six RE-migration fund/constituent properties."""
+    props = {p["name"]: p for p in (extras.get("contact_properties") or [])}
+    if not extras.get("contact_properties_ok"):
+        reason = "crm/v3/properties/contacts did not return"
+        return {"id": "H6", "title": "Fund and constituent properties",
+                "lines": [reason], "answer": "undetermined: {}".format(reason)}
+
+    distinct = extras.get("h6_distinct") or {}
+    lines = _table(
+        ["Property", "Type", "Field type", "Options", "createdAt",
+         "createdUserId", "% populated"],
+        [("`%s`" % name,
+          _cell(props.get(name, {}).get("type")),
+          _cell(props.get(name, {}).get("fieldType")),
+          props.get(name, {}).get("options_count") or "—",
+          _cell(props.get(name, {}).get("createdAt")),
+          _cell(props.get(name, {}).get("createdUserId")),
+          "{}%".format(distinct.get(name, {}).get("pct_populated"))
+          if distinct.get(name) else "undetermined")
+         for name in H6_PROPERTIES])
+
+    for name in H6_PROPERTIES:
+        detail = distinct.get(name) or {}
+        options = props.get(name, {}).get("options") or []
+        lines += ["", "**`{}`**".format(name), ""]
+        if options:
+            lines.append("- enumeration options: {}".format(
+                ", ".join("`%s`" % o for o in options)))
+        values = detail.get("distinct") or []
+        lines.append("- observed values ({} contact sample): {}".format(
+            detail.get("sample_size", "?"),
+            ", ".join("{} ({})".format(_cell(d["value"]), d["count"])
+                      for d in values) or "none populated"))
+
+    fund_type = props.get("fund_type") or {}
+    fund_options = fund_type.get("options") or []
+    daf_like = [o for o in fund_options
+                if any(tok in str(o).lower() for tok in ("daf", "donor advised"))]
+    endow_like = [o for o in fund_options if "endow" in str(o).lower()]
+    fund_values = (distinct.get("fund_type") or {}).get("distinct") or []
+    populated = (distinct.get("fund_type") or {}).get("pct_populated")
+
+    if fund_type and daf_like and endow_like and populated:
+        answer = ("yes — `fund_type` is an enumeration carrying both DAF ({}) "
+                  "and endowment ({}) options, and it is {}% populated"
+                  .format(", ".join(daf_like), ", ".join(endow_like), populated))
+    elif fund_type and daf_like and endow_like:
+        answer = ("as a write target yes, as a source no — `fund_type` is an "
+                  "enumeration whose options already cover DAF ({}) and "
+                  "endowment ({}), but it is {}% populated across the "
+                  "100-contact sample, so nothing can be read from it today"
+                  .format(", ".join(daf_like), ", ".join(endow_like),
+                          populated))
+    elif fund_type and not populated:
+        answer = ("`fund_type` exists ({}, {} option(s)) but is 0% populated "
+                  "in the 100-contact sample — usable as a target, not as a "
+                  "source".format(fund_type.get("type"), len(fund_options)))
+    elif fund_type:
+        answer = ("`fund_type` exists ({}) with options {} and {}% populated; "
+                  "observed values {} — check these cover DAF and endowment "
+                  "before relying on it".format(
+                      fund_type.get("type"),
+                      ", ".join(str(o) for o in fund_options) or "none exposed",
+                      populated,
+                      ", ".join(str(d["value"]) for d in fund_values) or "none"))
+    else:
+        answer = "undetermined: `fund_type` not present in the property catalog"
+    return {"id": "H6", "title": "Fund and constituent properties",
+            "lines": lines, "answer": answer}
+
+
+def discover_h7(extras):
+    """Fabricated-event check on the marketing events."""
+    events = extras.get("h7_events") or []
+    if not events:
+        reason = "marketing event listing returned nothing"
+        return {"id": "H7", "title": "Fabricated-event check",
+                "lines": [reason], "answer": "undetermined: {}".format(reason)}
+
+    suspects = []
+    rows = []
+    for event in events:
+        start = str(event.get("startDateTime") or "")
+        created = str(event.get("createdAt") or "")
+        reasons = []
+        if any(t in start for t in H7_SUSPECT_TIMES):
+            reasons.append("fallback time-of-day")
+        if start[:10] and created[:10] and start[:10] == created[:10]:
+            reasons.append("start date == createdAt date")
+        if reasons:
+            suspects.append((event, reasons))
+        rows.append((
+            _cell(event.get("objectId")),
+            _cell(event.get("eventName")),
+            _cell(event.get("externalEventId")),
+            _cell(event.get("startDateTime")),
+            _cell(event.get("endDateTime")),
+            _cell(event.get("createdAt")),
+            _cell(event.get("participations")),
+            ", ".join(reasons) or "",
+        ))
+    lines = _table(["objectId", "Name", "externalEventId", "start", "end",
+                    "createdAt", "Participants", "Suspect"], rows)
+    lines += ["", "Suspect criteria: a start time of {} (the fallback "
+              "`sync/events.py` writes when CSuite gives it no `start_time`), "
+              "or a start date equal to the creation date.".format(
+                  " or ".join(H7_SUSPECT_TIMES))]
+    midnight = [e for e in events
+                if "T00:00:00" in str(e.get("startDateTime") or "")]
+    if midnight:
+        lines += ["", "Also worth a look, though outside the stated criteria: "
+                  "`sync/events.py:format_datetime` falls back to **midnight "
+                  "of the event date** when it cannot parse CSuite's "
+                  "`start_time`. {} event(s) start at exactly 00:00:00Z: "
+                  "{}.".format(len(midnight),
+                               ", ".join(str(e.get("objectId"))
+                                         for e in midnight))]
+
+    if suspects:
+        answer = "{} suspect event(s): {}".format(
+            len(suspects),
+            "; ".join("{} ({})".format(e.get("objectId"), ", ".join(r))
+                      for e, r in suspects))
+    else:
+        answer = "none — no event matches the fallback-time or same-day tells"
+    return {"id": "H7", "title": "Fabricated-event check", "lines": lines,
+            "answer": answer}
+
+
+def discover_h8(extras):
+    lists = extras.get("h8_lists") or {}
+    if not lists:
+        return {"id": "H8", "title": "List membership counts",
+                "lines": ["No membership call ran."],
+                "answer": "undetermined: membership probe did not run"}
+    lines = _table(["List id", "HTTP", "Members"],
+                   [("`%s`" % lid,
+                     _cell(info.get("http_status")),
+                     _cell(info.get("total")) if info.get("error") is None
+                     else "undetermined: {}".format(str(info["error"])[:50]))
+                    for lid, info in lists.items()])
+    lines += ["", "Read-only: `GET .../memberships?limit=1`, taking only the "
+              "reported total. Nothing was deleted."]
+    parts = []
+    for lid, info in lists.items():
+        if info.get("error") is None and info.get("total") is not None:
+            parts.append("{}={}".format(lid, info["total"]))
+        else:
+            parts.append("{}=undetermined (HTTP {})".format(
+                lid, info.get("http_status")))
+    return {"id": "H8", "title": "List membership counts", "lines": lines,
+            "answer": "; ".join(parts)}
+
+
+def discover_h9(probe, extras):
+    idx = _by_endpoint(probe)
+    pipelines = extras.get("h9_pipelines") or []
+    lines = []
+    if not extras.get("h9_pipelines_ok"):
+        lines.append("Ticket pipeline call did not succeed.")
+    for pipeline in pipelines:
+        lines += ["", "**Pipeline `{}` — {}**".format(
+            pipeline.get("id"), _cell(pipeline.get("label"))), ""]
+        lines += _table(["Order", "Stage id", "Label"],
+                        [(st.get("displayOrder"), "`%s`" % st.get("id"),
+                          _cell(st.get("label")))
+                         for st in pipeline.get("stages") or []])
+
+    custom = extras.get("h9_ticket_custom") or []
+    lines += ["", "**Ticket properties matching {}**".format(
+        "/".join(H9_TICKET_PROPERTY_TOKENS)), ""]
+    lines += _table(["Property", "Label", "Type", "Origin"],
+                    [("`%s`" % p["name"], _cell(p["label"]),
+                      "`%s`" % p["type"], p["origin"]) for p in custom]) \
+        if custom else ["_None._"]
+
+    tickets = idx.get("crm/v3/objects/tickets")
+    lines += ["", "**`crm/v3/objects/tickets` sample**", ""]
+    if tickets and tickets.get("ok") and _fields_of(tickets):
+        lines += _table(FIELD_HEADERS, _field_rows(_fields_of(tickets)))
+    else:
+        lines.append(_unavailable(tickets, "crm/v3/objects/tickets")
+                     or "no ticket records returned")
+
+    if pipelines:
+        first = pipelines[0]
+        stage_list = " -> ".join(
+            str(st.get("label")) for st in first.get("stages") or [])
+        answer = ("pipeline `{}` ({}): {}".format(
+            first.get("id"), first.get("label"), stage_list or "no stages"))
+        if len(pipelines) > 1:
+            answer += "; {} further pipeline(s)".format(len(pipelines) - 1)
+    else:
+        answer = "undetermined: no ticket pipeline returned"
+    return {"id": "H9", "title": "Ticket pipeline", "lines": lines,
+            "answer": answer}
+
+
+def discover_h10(extras):
+    forms = extras.get("h10_forms") or {}
+    if not forms:
+        return {"id": "H10", "title": "Form submissions",
+                "lines": ["No submission call ran."],
+                "answer": "undetermined: submission probe did not run"}
+
+    lines = ["Every submitted **value** is redacted unconditionally — form "
+             "field names are metadata, but what a donor typed is not.", ""]
+    answer_bits = []
+    for label, info in forms.items():
+        lines += ["**{}** (`{}`)".format(label, info.get("form_id")), ""]
+        if not info.get("ok"):
+            lines += ["- undetermined: HTTP {} — {}".format(
+                info.get("http_status"), str(info.get("error"))[:120]), ""]
+            answer_bits.append("{}: undetermined (HTTP {})".format(
+                label, info.get("http_status")))
+            continue
+        lines += [
+            "- submissions returned: {}".format(info.get("submission_count")),
+            "- total reported: {}".format(
+                _cell(info.get("total")) if info.get("total") is not None
+                else "not reported"),
+            "- `submittedAt`: type `{}`, {}".format(
+                info.get("submitted_at_type"), info.get("submitted_at_units")),
+            "",
+        ]
+        if info.get("fields"):
+            lines += _table(["Form field", "Type", "Present in", "Example"],
+                            [("`%s`" % f["name"], "`%s`" % f["type"],
+                              "{}/{}".format(f["present_in"], f["of"]),
+                              f["example"]) for f in info["fields"]])
+        else:
+            lines.append("_No submissions to read field names from._")
+        lines.append("")
+        answer_bits.append("{}: {}".format(
+            label, ", ".join(f["name"] for f in info.get("fields") or [])
+            or "no fields (no submissions returned)"))
+    return {"id": "H10", "title": "Form submissions", "lines": lines,
+            "answer": "; ".join(answer_bits)}
+
+
+def discover_h11(extras):
+    total = extras.get("h11_csuite_profile_id_total")
+    url_props = extras.get("h11_url_like_properties") or []
+    lines = [
+        "- contacts with `csuite_profile_id` set: {}".format(
+            total if total is not None else "undetermined — search did not "
+            "return"),
+        "- counted via `POST crm/v3/objects/contacts/search` with "
+        "`HAS_PROPERTY`, `limit: 1`, reading only `total`. HubSpot exposes no "
+        "GET that counts by property, so this is a **POST-as-read** and is "
+        "flagged `post_transport: true`.",
+        "",
+        "**Existing properties whose name or label mentions url/link**",
+        "",
+    ]
+    lines += _table(["Property", "Label", "Origin"],
+                    [("`%s`" % p["name"], _cell(p["label"]), p["origin"])
+                     for p in url_props]) if url_props else ["_None._"]
+
+    csuite_url_dupes = [p["name"] for p in url_props
+                        if "csuite" in p["name"].lower()]
+    answer = ("{} contact(s) carry csuite_profile_id; {} url/link-named "
+              "propert{} exist{}".format(
+                  total if total is not None else "undetermined count of",
+                  len(url_props), "ies" if len(url_props) != 1 else "y",
+                  "" if len(url_props) != 1 else "s"))
+    answer += ("; a new `csuite_profile_url` would duplicate {}".format(
+        ", ".join(csuite_url_dupes)) if csuite_url_dupes
+        else "; none of them is a CSuite link, so `csuite_profile_url` "
+             "would not duplicate anything")
+    return {"id": "H11", "title": "csuite_profile_id population",
+            "lines": lines, "answer": answer}
+
+
+def discover_o1(extras):
+    if not extras.get("key_present"):
+        reason = "OPENROUTER_API_KEY not present in .env"
+        return {"id": "O1", "title": "OpenRouter model catalogue",
+                "lines": [reason], "answer": "undetermined: {}".format(reason)}
+    if not extras.get("ok"):
+        reason = "GET /api/v1/models did not succeed"
+        return {"id": "O1", "title": "OpenRouter model catalogue",
+                "lines": [reason], "answer": "undetermined: {}".format(reason)}
+
+    configured = extras.get("configured_model")
+    exists = extras.get("configured_model_exists")
+    sonnet = extras.get("sonnet_ids") or []
+    haiku = extras.get("haiku_ids") or []
+    aliases = extras.get("latest_aliases") or []
+    lines = [
+        "Catalogue read unauthenticated (it is public); no completion was "
+        "requested. {} models listed.".format(extras.get("model_count")),
+        "",
+        "- configured `CLAUDE_MODEL` = `{}` — present in the catalogue: {}"
+        .format(configured, _tri(exists)),
+        "",
+        "**`anthropic/claude-sonnet*`**", "",
+        ", ".join("`%s`" % m for m in sonnet) or "_none_",
+        "",
+        "**`anthropic/claude-haiku*`**", "",
+        ", ".join("`%s`" % m for m in haiku) or "_none_",
+        "",
+        "**`-latest` aliases under `anthropic/claude-`**", "",
+        ", ".join("`%s`" % m for m in aliases) or "_none_",
+    ]
+    answer = ("`{}` {}; sonnet ids: {}; haiku ids: {}; -latest aliases: {}"
+              .format(configured,
+                      "EXISTS" if exists else "**DOES NOT EXIST**",
+                      ", ".join(sonnet) or "none",
+                      ", ".join(haiku) or "none",
+                      ", ".join(aliases) or "none"))
+    return {"id": "O1", "title": "OpenRouter model catalogue", "lines": lines,
+            "answer": answer}
+
+
+def build_discovery(probe, csuite_extras, hubspot_extras,
+                    openrouter_extras=None):
+    openrouter_extras = openrouter_extras or {}
     return [
         discover_c1(probe),
         discover_c2(probe),
@@ -2772,7 +4238,25 @@ def build_discovery(probe, csuite_extras, hubspot_extras):
         discover_h3(hubspot_extras),
         discover_h4(probe, hubspot_extras),
         discover_h5(hubspot_extras),
+        discover_c7(probe, csuite_extras),
+        discover_c8(probe, csuite_extras),
+        discover_c9(probe, csuite_extras),
+        discover_c10(probe, csuite_extras),
+        discover_c11(csuite_extras),
+        discover_c12(probe),
+        discover_h6(hubspot_extras),
+        discover_h7(hubspot_extras),
+        discover_h8(hubspot_extras),
+        discover_h9(probe, hubspot_extras),
+        discover_h10(hubspot_extras),
+        discover_h11(hubspot_extras),
+        discover_o1(openrouter_extras),
     ]
+
+
+# Items added by probe extension #3.
+P3_IDS = {"C7", "C8", "C9", "C10", "C11", "C12",
+          "H6", "H7", "H8", "H9", "H10", "H11", "O1"}
 
 
 def write_mapping_discovery(sections, path):
@@ -2796,13 +4280,29 @@ def write_mapping_discovery(sections, path):
                     [("**{}**".format(s["id"]),
                       s["answer"].replace("|", "\\|")) for s in sections])
     lines.append("")
-    for section in sections:
-        lines += ["---", "",
-                  "## {} — {}".format(section["id"], section["title"]), ""]
-        lines += section["lines"]
-        lines += ["",
-                  "**ANSWER ({}):** {}".format(section["id"], section["answer"]),
-                  ""]
+
+    earlier = [s for s in sections if s["id"] not in P3_IDS]
+    probe3 = [s for s in sections if s["id"] in P3_IDS]
+
+    def emit(group):
+        out = []
+        for section in group:
+            out += ["---", "",
+                    "## {} — {}".format(section["id"], section["title"]), ""]
+            out += section["lines"]
+            out += ["",
+                    "**ANSWER ({}):** {}".format(section["id"],
+                                                 section["answer"]),
+                    ""]
+        return out
+
+    lines += ["# Probe #2 — schema and mapping", ""]
+    lines += emit(earlier)
+    lines += ["", "# Probe #3 — last discovery pass before build", "",
+              "Registrant shape, org/individual split, fee model, fund "
+              "relationships, pagination contract, ticket linkage, and the "
+              "HubSpot and OpenRouter reads that the build depends on.", ""]
+    lines += emit(probe3)
     _write(path, "\n".join(lines))
 
 
@@ -2908,7 +4408,16 @@ def main(argv=None):
                         help="Records per sample request (default 5).")
     parser.add_argument("--out", default=os.path.join("scripts", "probe_output"),
                         help="Output directory (default scripts/probe_output).")
+    parser.add_argument("--fund-sweep", type=int, default=None, metavar="N",
+                        help="Max funit/display calls for the C9/C10 fund "
+                             "sweep (default: every fund). 0 skips it, which "
+                             "keeps a re-run to ~45 CSuite calls when only "
+                             "the cheap items need re-checking.")
     args = parser.parse_args(argv)
+
+    global C9_MAX_FUND_DISPLAYS
+    if args.fund_sweep is not None:
+        C9_MAX_FUND_DISPLAYS = max(0, args.fund_sweep)
 
     out_dir = os.path.abspath(args.out)
     os.makedirs(out_dir, exist_ok=True)
@@ -2934,14 +4443,25 @@ def main(argv=None):
             probe.results.append(_skipped_record(
                 "hubspot", "<all>", "probe aborted: {}".format(exc)))
 
+    openrouter_extras = {}
+    if args.system == "all":
+        try:
+            openrouter_extras = probe_openrouter(recorder, probe) or {}
+        except Exception as exc:
+            openrouter_extras = {"fatal": "{}: {}".format(type(exc).__name__, exc)}
+            probe.results.append(_skipped_record(
+                "openrouter", "v1/models", "probe aborted: {}".format(exc)))
+
     csuite_results = [r for r in probe.results if r["system"] == "csuite"]
     hubspot_results = [r for r in probe.results if r["system"] == "hubspot"]
 
-    discovery = build_discovery(probe, csuite_extras, hubspot_extras)
+    discovery = build_discovery(probe, csuite_extras, hubspot_extras,
+                                openrouter_extras)
 
     payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "args": {"system": args.system, "limit": args.limit, "out": out_dir},
+        "args": {"system": args.system, "limit": args.limit, "out": out_dir,
+                 "fund_sweep": C9_MAX_FUND_DISPLAYS},
         "masking": {
             "emails": "first char + '*@' + domain",
             "names_addresses_phones": REDACTED,
@@ -2954,6 +4474,17 @@ def main(argv=None):
         "endpoints": probe.results,
         "csuite_extras": csuite_extras,
         "hubspot_extras": hubspot_extras,
+        "openrouter_extras": openrouter_extras,
+        "csuite_call_count": (
+            sum(1 for r in probe.results
+                if r["system"] == "csuite" and not r.get("skipped"))
+            # The C9/C10 fund display sweep calls the client directly rather
+            # than through probe.run, so it is counted separately.
+            + (csuite_extras.get("c9_display_calls") or 0)),
+        "csuite_recorded_endpoints": sum(
+            1 for r in probe.results
+            if r["system"] == "csuite" and not r.get("skipped")),
+        "csuite_fund_display_sweep": csuite_extras.get("c9_display_calls") or 0,
         "discovery": [
             {"id": d["id"], "title": d["title"], "answer": d["answer"]}
             for d in discovery
@@ -2970,7 +4501,8 @@ def main(argv=None):
     write_hubspot_properties(hubspot_results, hubspot_extras,
                              os.path.join(out_dir, "hubspot_properties.md"))
     write_mapping_draft(csuite_results, hubspot_extras, discovery,
-                        os.path.join(out_dir, "mapping_draft.md"))
+                        os.path.join(out_dir, "mapping_draft.md"),
+                        csuite_extras)
     write_mapping_discovery(discovery,
                             os.path.join(out_dir, "mapping_discovery.md"))
 

@@ -14,6 +14,7 @@ from authlib.integrations.base_client.errors import (
     OAuthError,
 )
 from config import Config
+from clients.users import get_or_create_user, get_user_by_id
 
 logger = logging.getLogger(__name__)
 
@@ -31,28 +32,46 @@ oauth = OAuth()
 # =============================================================================
 
 class User(UserMixin):
-    """Simple user class for Flask-Login"""
-    
-    def __init__(self, email, name=None, picture=None):
-        self.id = email  # Flask-Login requires an id attribute
+    """A signed-in user, backed by a row in the `users` table.
+
+    `id` is the users.id primary key, not the email address. Flask-Login
+    serialises it into the session cookie and hands it back as a string, so
+    load_user() converts it once on the way in.
+    """
+
+    def __init__(self, id, email, display_name=None, role="staff",
+                 is_active=True, picture=None):
+        self.id = int(id)
         self.email = email
-        self.name = name or email.split('@')[0]
+        self.display_name = display_name or (email or "").split("@")[0]
+        self.role = role
         self.picture = picture
-    
+        self._is_active = bool(is_active)
+
+    @classmethod
+    def from_row(cls, row, picture=None):
+        """Build a User from a `users` table row."""
+        return cls(
+            id=row["id"],
+            email=row["email"],
+            display_name=row.get("display_name"),
+            role=row.get("role") or "staff",
+            is_active=row.get("is_active", True),
+            picture=picture,
+        )
+
+    @property
+    def is_active(self):
+        """Flask-Login checks this; a deactivated user cannot log in."""
+        return self._is_active
+
+    @property
+    def name(self):
+        """Template-facing alias. chat.html renders `user.name`."""
+        return self.display_name
+
     def __repr__(self):
-        return f"<User {self.email}>"
-
-
-# In-memory user store (sufficient for small team, session-based)
-_users = {}
-
-
-def get_or_create_user(email, name=None, picture=None):
-    """Get existing user or create new one"""
-    if email not in _users:
-        _users[email] = User(email, name, picture)
-        logger.info(f"New user created: {email}")
-    return _users[email]
+        return f"<User {self.id} {self.email} role={self.role}>"
 
 
 # =============================================================================
@@ -61,18 +80,37 @@ def get_or_create_user(email, name=None, picture=None):
 
 @login_manager.user_loader
 def load_user(user_id):
-    """Load user by ID (email) for Flask-Login.
+    """Load a user by users.id for Flask-Login.
 
-    If the user isn't in this worker's memory (e.g. request routed
-    to a different gunicorn worker), reconstruct from the session
-    cookie — the email is the user_id, which is all we need.
+    Read from the database on every request rather than a per-worker cache:
+    that is what makes deactivating someone take effect immediately instead
+    of whenever their gunicorn worker happens to recycle.
+
+    Returns None — which Flask-Login treats as "not logged in" — for an
+    unknown id, a deactivated user, or a database failure. Failing closed is
+    the right default for an auth path.
     """
-    user = _users.get(user_id)
-    if user is None and user_id:
-        # Reconstruct on this worker — the session cookie proves auth
-        user = get_or_create_user(user_id)
-        logger.info(f"Reconstructed user on this worker: {user_id}")
-    return user
+    if not user_id:
+        return None
+
+    try:
+        row = get_user_by_id(int(user_id))
+    except (TypeError, ValueError):
+        logger.warning("Malformed user id in session cookie: %r", user_id)
+        return None
+    except Exception as e:
+        logger.error(f"Could not load user {user_id}: {e}", exc_info=True)
+        return None
+
+    if row is None:
+        logger.info("Session referenced a user that no longer exists: %s", user_id)
+        return None
+
+    if not row.get("is_active", True):
+        logger.warning("Rejected session for deactivated user: %s", row.get("email"))
+        return None
+
+    return User.from_row(row)
 
 
 @login_manager.unauthorized_handler
@@ -157,11 +195,35 @@ def callback():
             logger.warning(f"Access denied - invalid domain: {email}")
             return redirect(url_for('auth.login', error=f'Access restricted to @{Config.ALLOWED_DOMAIN} accounts'))
 
-        # Create/get user and log them in
-        user = get_or_create_user(email, name, picture)
-        login_user(user, remember=True)
+        # Record the login and read back the row that decides access.
+        try:
+            row = get_or_create_user(email, name)
+        except Exception as e:
+            logger.exception(f"Could not record login for {email}: {e}")
+            return redirect(url_for(
+                'auth.login',
+                error='Sign-in is temporarily unavailable. Please try again.'))
 
-        logger.info(f"Login successful: {email}")
+        if row is None:
+            logger.error(f"No user row returned for {email}")
+            return redirect(url_for(
+                'auth.login',
+                error='Sign-in is temporarily unavailable. Please try again.'))
+
+        # A valid Google account is not the same as an active Jidhr account.
+        if not row.get("is_active", True):
+            logger.warning(f"Access denied - deactivated account: {email}")
+            return redirect(url_for(
+                'auth.login',
+                error='This account has been deactivated. Contact an administrator.'))
+
+        user = User.from_row(row, picture=picture)
+
+        # remember=False: no long-lived "remember me" cookie. Access lasts as
+        # long as the session cookie and no longer.
+        login_user(user, remember=False)
+
+        logger.info(f"Login successful: {email} (id={user.id}, role={user.role})")
 
         # Redirect to originally requested page or home
         next_page = session.pop('next', None)

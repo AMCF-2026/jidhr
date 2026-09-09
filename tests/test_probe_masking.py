@@ -415,6 +415,10 @@ def test_csuite_display_envelope_is_still_a_single_record():
 #
 # Regression: CSuite returns `primary_phone_number`, which ends in _number.
 # The id rule matched first and wrote a real phone number into the receipt.
+#
+# The fixture below is in the reserved 555-01xx fictional range. Never use
+# a value observed in live API output as a test fixture: it turns the test
+# file into the leak it is meant to prevent.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("field", [
@@ -422,7 +426,7 @@ def test_csuite_display_envelope_is_still_a_single_record():
     "work_phone_number",
 ])
 def test_phone_fields_are_redacted_even_when_they_end_in_number(field):
-    assert mask_value(field, "415-980-9091") == REDACTED
+    assert mask_value(field, "415-555-0142") == REDACTED
 
 
 def test_check_number_is_still_treated_as_an_identifier():
@@ -438,5 +442,123 @@ def test_government_and_bank_identifiers_are_redacted(field):
 
 def test_no_phone_shaped_value_survives_masking_under_any_phone_field():
     for field in ("primary_phone_number", "phone", "mobile", "fax"):
-        masked = mask_value(field, "415-980-9091")
-        assert "415" not in str(masked)
+        masked = mask_value(field, "415-555-0142")
+        assert "555" not in str(masked)
+
+
+# ---------------------------------------------------------------------------
+# Probe #3 shapes: ticket rows, pipeline stages, form submissions
+# ---------------------------------------------------------------------------
+
+from scripts.probe_apis import (  # noqa: E402
+    field_stats,
+    mask_submission_value,
+)
+
+
+def test_ticket_row_masks_content_but_keeps_pipeline_wiring():
+    ticket = {
+        "id": "3310",
+        "properties": {
+            "subject": "DAF inquiry from a donor",
+            "content": "Please call me on 415-555-0142",
+            "hs_pipeline": "0",
+            "hs_pipeline_stage": "4",
+            "hs_ticket_priority": "HIGH",
+            "createdate": "2026-03-14T10:00:00.000Z",
+            "hubspot_owner_id": "159996166",
+        },
+    }
+    masked = mask_value("ticket", ticket)
+    props = masked["properties"]
+    # Free text goes; the routing fields a report needs stay.
+    assert props["subject"].startswith("<text len=")
+    assert props["content"].startswith("<text len=")
+    assert "415" not in props["content"]
+    assert props["hs_pipeline"] == "0"
+    assert props["hs_pipeline_stage"] == "4"
+    assert props["hs_ticket_priority"] == "HIGH"
+    assert props["createdate"] == "2026-03-14T10:00:00.000Z"
+    assert masked["id"] == "3310"
+
+
+def test_pipeline_stage_labels_are_schema_and_survive():
+    # H9's answer is the stage list; masking it away would defeat the item.
+    stage = {"id": "1", "label": "New", "displayOrder": 0}
+    assert mask_value("stages", stage) == {
+        "id": "1", "label": "New", "displayOrder": 0,
+    }
+
+
+def test_pipeline_stage_label_is_not_treated_as_a_person_name():
+    assert mask_value("label", "Waiting on contact") != REDACTED
+
+
+# ---- Form submissions: mask every value, whatever it is called ------------
+
+@pytest.mark.parametrize("value", [
+    "Someone Real",
+    "someone@example.org",
+    "415-555-0142",
+    "2026-03-14",
+    "50000",
+    "I would like to open a DAF",
+])
+def test_every_submission_value_is_redacted_regardless_of_shape(value):
+    assert mask_submission_value(value) == REDACTED
+
+
+@pytest.mark.parametrize("name", ["profile_id", "created_date", "q3_response"])
+def test_submission_masking_ignores_names_the_normal_rules_would_trust(name):
+    """A form field called `profile_id` is still whatever the donor typed.
+
+    The name-driven masker keeps id- and date-named values verbatim. That is
+    right for API records and wrong for form input, where the field name is
+    chosen by whoever built the form and promises nothing.
+    """
+    assert mask_value(name, "12345") == "12345"       # trusted by name
+    assert mask_submission_value("12345") == REDACTED  # never trusted
+
+
+def test_submission_masking_preserves_null_and_empty_so_shape_is_readable():
+    assert mask_submission_value(None) is None
+    assert mask_submission_value("") == ""
+
+
+def test_submission_masking_recurses_into_the_values_array():
+    submission = {
+        "submittedAt": 1772000000000,
+        "values": [
+            {"name": "email", "value": "donor@example.org"},
+            {"name": "firstname", "value": "Someone"},
+            {"name": "initial_contribution", "value": "250000"},
+        ],
+    }
+    masked = mask_submission_value(submission)
+    for entry in masked["values"]:
+        assert entry["name"] == REDACTED
+        assert entry["value"] == REDACTED
+    assert masked["submittedAt"] == REDACTED
+
+
+def test_no_submitted_value_survives_into_field_stats():
+    submissions = [
+        {"email": "donor@example.org", "phone": "415-555-0142",
+         "initial_contribution": "250000"},
+        {"email": "other@example.org", "phone": "415-555-0143",
+         "initial_contribution": "100"},
+    ]
+    stats = field_stats(submissions, mask=mask_submission_value)
+    for stat in stats:
+        assert stat["example"] == REDACTED
+    # Types and coverage still come through, which is the point.
+    assert {s["field"] for s in stats} == {
+        "email", "phone", "initial_contribution"}
+    assert all(s["pct_populated"] == 100.0 for s in stats)
+
+
+def test_field_stats_without_a_mask_still_uses_the_name_driven_rules():
+    stats = field_stats([{"profile_id": 19879, "name": "Someone"}])
+    by_field = {s["field"]: s["example"] for s in stats}
+    assert by_field["profile_id"] == 19879
+    assert by_field["name"] == REDACTED
