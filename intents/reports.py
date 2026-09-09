@@ -20,6 +20,7 @@ Sub-handlers:
 import logging
 from datetime import datetime, timedelta
 from config import Config
+from intents.queries import extract_fund_ref
 
 logger = logging.getLogger(__name__)
 
@@ -518,10 +519,11 @@ def _report_fees(query: str, csuite) -> str:
     """Calculate fees for a fund or show fee structure."""
     logger.info("Running fee calculation...")
 
-    # Try to extract a fund ID from the query
-    import re
-    id_match = re.search(r'\b(\d{2,})\b', query)
-    fund_id = id_match.group(1) if id_match else None
+    # Try to extract a fund reference from the query. Shared with
+    # queries.py so "fees for 200 Muslim Women Who Care" cannot be read as
+    # fund 200.
+    ref = extract_fund_ref(query)
+    fund_id = ref["id"] if ref and "id" in ref else None
 
     # Fetch fee types
     try:
@@ -538,7 +540,13 @@ def _report_fees(query: str, csuite) -> str:
             fund_data = csuite.get_fund(fund_id)
             if fund_data.get('success') and fund_data.get('data'):
                 fund = fund_data['data']
-                balance = float(fund.get('balance', 0) or 0)
+                # current_fundbalance, not `balance`: funit/display has no
+                # field called `balance`, so the old read always gave 0.00.
+                raw_balance = fund.get('current_fundbalance') or 0
+                try:
+                    balance = float(str(raw_balance).replace(',', '').strip())
+                except (TypeError, ValueError):
+                    balance = 0.0
                 fund_name = fund.get('fund_name', 'Unknown')
 
                 fee_estimate = _calculate_fee(balance, fee_types)

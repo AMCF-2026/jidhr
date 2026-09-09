@@ -79,6 +79,14 @@ def can_handle(query: str, workflow_state: dict = None, **kwargs) -> bool:
     """Match if trigger phrase detected OR events workflow is active."""
     if workflow_state and workflow_state.get("active"):
         return workflow_state.get("workflow_type") == "events"
+
+    # A bare "2" answering a numbered event list. Deliberately narrow: while a
+    # pick is pending this claims digits only, so an unrelated question still
+    # routes wherever it normally would.
+    if workflow_state and workflow_state.get("pending_event_pick"):
+        if _PICK_RE.match(query or ""):
+            return True
+
     q = query.lower().strip()
     return any(p in q for p in ALL_TRIGGERS)
 
@@ -89,6 +97,15 @@ def handle(query: str, ctx) -> str:
     hubspot = ctx.services.hubspot
     csuite = ctx.services.csuite
     q = query.lower().strip()
+
+    # A pending numbered list takes priority: "2" means the second event.
+    # take_pending_event_pick clears the list either way, so a non-numeric
+    # message drops it and routing continues normally below.
+    if state.get("pending_event_pick"):
+        action, picked = take_pending_event_pick(query, state)
+        if picked is not None:
+            return _dispatch_event_action(
+                action, picked, query, q, state, hubspot, csuite)
 
     # Active workflow — handle conversation
     if state.get("active") and state.get("workflow_type") == "events":
@@ -102,10 +119,10 @@ def handle(query: str, ctx) -> str:
         return _start_sync_workflow(query, q, state, csuite)
 
     if any(p in q for p in _ATTENDEE_TRIGGERS):
-        return _show_attendees(query, q, csuite)
+        return _show_attendees(query, q, csuite, state)
 
     if any(p in q for p in _FOLLOWUP_TRIGGERS):
-        return _start_followup(query, q, csuite, hubspot)
+        return _start_followup(query, q, csuite, hubspot, state)
 
     if any(p in q for p in _LIST_TRIGGERS):
         return _list_upcoming(csuite)
@@ -165,10 +182,12 @@ def _list_upcoming(csuite) -> str:
 # Command: Show attendees
 # ---------------------------------------------------------------------------
 
-def _show_attendees(query: str, query_lower: str, csuite) -> str:
+def _show_attendees(query: str, query_lower: str, csuite,
+                    state: dict | None = None, event: dict | None = None) -> str:
     """Show attendees for a specific event."""
     try:
-        event_data = _find_event(query, query_lower, csuite)
+        event_data = event if event is not None else _find_event(
+            query, query_lower, csuite, state, action="attendees")
         if isinstance(event_data, str):
             return event_data  # Error message
 
@@ -219,10 +238,12 @@ def _show_attendees(query: str, query_lower: str, csuite) -> str:
 # Command: Sync event workflow (multi-step)
 # ---------------------------------------------------------------------------
 
-def _start_sync_workflow(query: str, query_lower: str, state: dict, csuite) -> str:
+def _start_sync_workflow(query: str, query_lower: str, state: dict, csuite,
+                         event: dict | None = None) -> str:
     """Step 1: Search for the event and ask for confirmation."""
     try:
-        event_data = _find_event(query, query_lower, csuite)
+        event_data = event if event is not None else _find_event(
+            query, query_lower, csuite, state, action="sync")
     except Exception as e:
         logger.exception(f"Event search crashed: {e}")
         return f"Something went wrong searching for the event. Error: {e}"
@@ -403,9 +424,11 @@ def _execute_sync(state: dict, hubspot, csuite) -> str:
 # Command: Post-event follow-up
 # ---------------------------------------------------------------------------
 
-def _start_followup(query: str, query_lower: str, csuite, hubspot) -> str:
+def _start_followup(query: str, query_lower: str, csuite, hubspot,
+                    state: dict | None = None, event: dict | None = None) -> str:
     """Draft a follow-up email for event attendees."""
-    event_data = _find_event(query, query_lower, csuite)
+    event_data = event if event is not None else _find_event(
+        query, query_lower, csuite, state, action="followup")
     if isinstance(event_data, str):
         return event_data
 
@@ -565,9 +588,148 @@ def _compare_events(query: str, query_lower: str, csuite) -> str:
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _find_event(query: str, query_lower: str, csuite) -> dict | str:
-    """Search CSuite events by name extracted from query. Returns event dict or error string."""
-    # Extract event name from query
+def _dispatch_event_action(action, event, query, query_lower, state,
+                           hubspot, csuite) -> str:
+    """Resume the command that produced a numbered list, now that one was picked."""
+    if action == "sync":
+        return _start_sync_workflow(query, query_lower, state, csuite, event=event)
+    if action == "followup":
+        return _start_followup(query, query_lower, csuite, hubspot,
+                               state, event=event)
+    # "attendees" is the default: it is the command that most often lands on
+    # an ambiguous name.
+    return _show_attendees(query, query_lower, csuite, state, event=event)
+
+
+# Picks are single digits, so never offer more than nine choices.
+_MAX_PICK_CHOICES = 9
+
+# "Spring Gala — 2026-04-11" / "Spring Gala - 2026-04-11". The list this
+# handler prints uses an em dash, so a user pasting a line back is the normal
+# case, not an edge case.
+_EVENT_DATE_SUFFIX_RE = re.compile(r"\s*[—–-]\s*(\d{4}-\d{2}-\d{2})\s*$")
+
+_PICK_RE = re.compile(r"^\s*([1-9])\s*$")
+
+
+def _split_event_date(text: str):
+    """Split a trailing ' — YYYY-MM-DD' off a query.
+
+    Returns (text_without_date, date_filter_or_None).
+    """
+    if not text:
+        return text, None
+    match = _EVENT_DATE_SUFFIX_RE.search(text)
+    if not match:
+        return text, None
+    return text[:match.start()].strip(), match.group(1)
+
+
+def _event_titles(event: dict) -> list:
+    """The strings an event can be matched against."""
+    return [
+        str(event[key]) for key in ("event_description", "event_name")
+        if event.get(key)
+    ]
+
+
+def _event_label(event: dict) -> str:
+    return event.get("event_description") or event.get("event_name") or "Unnamed"
+
+
+def _match_events(events: list, name: str, date_filter: str | None) -> list:
+    """Match by decreasing precision, returning the first tier that hits.
+
+    Tiers: exact title, prefix, whole-phrase substring, then the original
+    word-level behaviour. Without the tiers, "Gala" and "Gala Dinner 2026"
+    were equally good matches for the query "Gala", and the caller got an
+    ambiguity prompt for a query that names one event exactly.
+    """
+    pool = events
+    if date_filter:
+        pool = [e for e in pool if (e.get("event_date") or "") == date_filter]
+
+    if not name:
+        return []
+
+    needle = name.strip().lower()
+
+    def matching(predicate):
+        return [
+            e for e in pool
+            if any(predicate(title.lower()) for title in _event_titles(e))
+        ]
+
+    for predicate in (
+        lambda title: title.strip() == needle,
+        lambda title: title.startswith(needle),
+        lambda title: needle in title,
+    ):
+        found = matching(predicate)
+        if found:
+            return found
+
+    words = [w for w in needle.split() if len(w) >= 3]
+    if words:
+        return [
+            e for e in pool
+            if any(w in title.lower() for title in _event_titles(e) for w in words)
+        ]
+    return []
+
+
+def _format_event_choices(matches: list, name: str, state: dict | None,
+                          action: str | None) -> str:
+    """Number the candidates and remember them, so "2" can answer."""
+    lines = [f"Found {len(matches)} events matching '{name}':\n"]
+    for i, event in enumerate(matches, 1):
+        lines.append(
+            f"{i}. **{_event_label(event)}** — {event.get('event_date', '')}")
+    lines.append("\nReply with the number, or add the date to narrow it down.")
+
+    if state is not None:
+        state["pending_event_pick"] = {
+            "action": action,
+            "events": matches,
+        }
+    return "\n".join(lines)
+
+
+def take_pending_event_pick(query: str, state: dict):
+    """Resolve a bare 1-9 against a stored candidate list.
+
+    Returns (action, event) on a successful pick, else (None, None). The
+    pending list is cleared either way: a pick consumes it, and any other
+    message means the user moved on.
+    """
+    pending = (state or {}).get("pending_event_pick")
+    if not pending:
+        return None, None
+
+    match = _PICK_RE.match(query or "")
+    if not match:
+        state.pop("pending_event_pick", None)
+        return None, None
+
+    index = int(match.group(1)) - 1
+    events = pending.get("events") or []
+    state.pop("pending_event_pick", None)
+
+    if 0 <= index < len(events):
+        return pending.get("action"), events[index]
+    return None, None
+
+
+def _find_event(query: str, query_lower: str, csuite,
+                state: dict | None = None, action: str | None = None) -> dict | str:
+    """Search CSuite events by name. Returns an event dict or a message string.
+
+    When several events match, the candidates are numbered and remembered in
+    `state["pending_event_pick"]` so the next message can just be "2".
+    """
+    query, date_filter = _split_event_date(query)
+    query_lower, _ = _split_event_date(query_lower)
+
     name = _extract_event_name(query, query_lower)
 
     try:
@@ -582,27 +744,7 @@ def _find_event(query: str, query_lower: str, csuite) -> dict | str:
     if not events:
         return "No events found in CSuite."
 
-    # Search by name/description match — try substring first, then word-level
-    if name:
-        name_lower = name.lower()
-        matches = [
-            e for e in events
-            if name_lower in (e.get("event_description") or "").lower()
-            or name_lower in (e.get("event_name") or "").lower()
-        ]
-        # If no substring match, try matching individual words (3+ chars)
-        if not matches:
-            search_words = [w for w in name_lower.split() if len(w) >= 3]
-            if search_words:
-                matches = [
-                    e for e in events
-                    if any(
-                        w in (e.get("event_description") or "").lower()
-                        or w in (e.get("event_name") or "").lower()
-                        for w in search_words
-                    )
-                ]
-    else:
+    if not name:
         # No name extracted — show recent events for user to pick
         non_archived = [
             e for e in events
@@ -612,26 +754,32 @@ def _find_event(query: str, query_lower: str, csuite) -> dict | str:
         recent = non_archived[:5]
         lines = ["I couldn't determine which event. Here are the most recent:\n"]
         for i, e in enumerate(recent, 1):
-            desc = e.get("event_description", e.get("event_name", "Unnamed"))
-            date = e.get("event_date", "")
-            lines.append(f"{i}. **{desc}** — {date}")
+            lines.append(f"{i}. **{_event_label(e)}** — {e.get('event_date', '')}")
         lines.append("\nPlease specify the event name.")
         return "\n".join(lines)
 
+    matches = _match_events(events, name, date_filter)
+
     if not matches:
-        return f"No events found matching '{name}'. Try 'list events' to see what's available."
+        suffix = f" on {date_filter}" if date_filter else ""
+        return (
+            f"No events found matching '{name}'{suffix}. "
+            "Try 'list events' to see what's available."
+        )
 
     if len(matches) == 1:
         return matches[0]
 
-    # Multiple matches — show options
-    lines = [f"Found {len(matches)} events matching '{name}':\n"]
-    for i, e in enumerate(matches, 1):
-        desc = e.get("event_description", e.get("event_name", "Unnamed"))
-        date = e.get("event_date", "")
-        lines.append(f"{i}. **{desc}** — {date}")
-    lines.append("\nPlease be more specific or include the date.")
-    return "\n".join(lines)
+    if len(matches) > _MAX_PICK_CHOICES:
+        # Printing 55 lines helps nobody. Say how many and ask for more words.
+        suffix = f" on {date_filter}" if date_filter else ""
+        return (
+            f"Found {len(matches)} events matching '{name}'{suffix} — too many "
+            "to list. Add more of the event's name, or include the date as "
+            "'— YYYY-MM-DD'."
+        )
+
+    return _format_event_choices(matches, name, state, action)
 
 
 def _extract_event_name(query: str, query_lower: str) -> str:

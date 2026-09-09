@@ -32,12 +32,35 @@ ALLOWED_ROLES = frozenset({"admin", "staff"})
 # Helper: extract a name-like phrase from a query
 # ---------------------------------------------------------------------------
 
-def _extract_name(query: str) -> str | None:
+_NAME_STOP_WORDS = {
+    'fund', 'balance', 'daf', 'endowment', 'grant', 'grants',
+    'contact', 'donor', 'donors', 'email', 'person', 'who',
+    'what', 'how', 'when', 'where', 'show', 'get', 'find',
+    'list', 'tell', 'about', 'the', 'for', 'with', 'from',
+    'look', 'up', 'search', 'check', 'csuite', 'hubspot',
+    'donation', 'donations', 'profile', 'ticket', 'task',
+    'recent', 'latest', 'last', 'all', 'any', 'many',
+    'pull', 'me', 'my', 'a', 'an',
+}
+
+# Nearly every fund is named "<Something> Fund" or "<Something> Endowment",
+# so the general stop list — which drops those words — truncated the name to
+# "Tanvir Family" and no exact match could ever succeed.
+_FUND_NAME_STOP_WORDS = _NAME_STOP_WORDS - {
+    'fund', 'endowment', 'daf', 'grant', 'grants',
+}
+
+
+def _extract_name(query: str, stop_words: set | None = None) -> str | None:
     """
     Try to pull a proper name out of a query.
 
     First strips common command prefixes, then looks for capitalised words.
     Returns the name string or None.
+
+    Args:
+        stop_words: Override the default stop list. The fund path passes a
+                    variant that keeps "Fund"/"Endowment" as part of a name.
     """
     # Strip command prefixes to isolate the name
     _COMMAND_PREFIXES = [
@@ -62,16 +85,7 @@ def _extract_name(query: str) -> str | None:
             cleaned = cleaned[len(prefix):].strip()
             break
 
-    STOP_WORDS = {
-        'fund', 'balance', 'daf', 'endowment', 'grant', 'grants',
-        'contact', 'donor', 'donors', 'email', 'person', 'who',
-        'what', 'how', 'when', 'where', 'show', 'get', 'find',
-        'list', 'tell', 'about', 'the', 'for', 'with', 'from',
-        'look', 'up', 'search', 'check', 'csuite', 'hubspot',
-        'donation', 'donations', 'profile', 'ticket', 'task',
-        'recent', 'latest', 'last', 'all', 'any', 'many',
-        'pull', 'me', 'my', 'a', 'an',
-    }
+    STOP_WORDS = stop_words if stop_words is not None else _NAME_STOP_WORDS
 
     # Find sequences of capitalised words (2+ chars) that aren't stop words
     words = cleaned.split()
@@ -93,9 +107,86 @@ def _extract_name(query: str) -> str | None:
 
 
 def _extract_id(query: str) -> str | None:
-    """Extract a numeric ID from the query (e.g. 'fund 1234')."""
+    """Extract a numeric ID from the query (e.g. 'donations for profile 1234').
+
+    Deliberately loose, and only used for profile/donation lookups. Fund
+    lookups must use extract_fund_ref() instead — see the note there.
+    """
     match = re.search(r'\b(\d{2,})\b', query)
     return match.group(1) if match else None
+
+
+# ---------------------------------------------------------------------------
+# Fund reference extraction
+# ---------------------------------------------------------------------------
+
+# A fund code looks like END0026 or DAF0123: letters then digits, no space.
+_FUND_CODE_RE = re.compile(r'^[A-Za-z]{2,4}\d{3,}$')
+
+# A bare number is only a fund id when something says so. "200 Muslim Women
+# Who Care" is a fund NAME that starts with a number, and the old
+# \b(\d{2,})\b search happily pulled 200 out of it and looked up an
+# unrelated fund.
+_FUND_ID_KEYWORDS = {"fund", "funit", "fund_id", "funit_id", "id", "#"}
+
+_PUNCT_STRIP = "#.,;:!?()[]{}<>\"'"
+
+
+def extract_fund_ref(query: str) -> dict | None:
+    """Pull a fund reference out of a query.
+
+    Returns one of:
+        {"code": "END0026"}  — a fund code, matched anywhere in the query
+        {"id": 1046}         — a numeric fund id
+        None                 — no fund reference; treat the query as a name
+
+    A token is only read as a numeric id when BOTH hold:
+
+      1. the whole token is digits (never a number spliced out of the middle
+         of something longer), and
+      2. the preceding word introduces an id — "fund 1046", "funit 1046",
+         "fund id 1046", "#1046" — or the number is the last word of the
+         query.
+
+    Rule 2 is what the brief's own examples require: "fund 1046" is an id but
+    "fund balance for 200 Muslim Women Who Care" is not, and rule 1 alone
+    cannot tell those apart. As a further guard, a number immediately
+    followed by a Capitalised word is treated as the start of a name.
+
+    Codes need no such guard: the shape is distinctive enough on its own.
+    """
+    if not query:
+        return None
+
+    tokens = query.split()
+    cleaned = [t.strip(_PUNCT_STRIP) for t in tokens]
+
+    # Codes win: they are unambiguous wherever they appear.
+    for token in cleaned:
+        if token and _FUND_CODE_RE.fullmatch(token):
+            return {"code": token.upper()}
+
+    for index, token in enumerate(cleaned):
+        if not token or not re.fullmatch(r'\d+', token):
+            continue
+
+        previous = cleaned[index - 1].lower().lstrip('#') if index else ""
+        introduced = (
+            previous in _FUND_ID_KEYWORDS
+            or tokens[index].startswith('#')
+        )
+        is_last = index == len(cleaned) - 1
+        if not (introduced or is_last):
+            continue
+
+        following = cleaned[index + 1] if index + 1 < len(cleaned) else ""
+        if following[:1].isupper():
+            # "fund 200 Muslim Women Who Care" — a name, not an id.
+            continue
+
+        return {"id": int(token)}
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -236,47 +327,181 @@ def gather_context(query: str, hubspot, csuite) -> str:
 # Per-category gatherers
 # ---------------------------------------------------------------------------
 
+# Fund group ids that are worth naming in context. From config.py's
+# FUND_GROUP_* constants; anything else is reported as the bare id.
+_FUND_GROUP_LABELS = {
+    1002: "DAF",
+    1008: "Endowment",
+}
+
+
+def _fund_row_id(row: dict):
+    """funit id from a row of either shape.
+
+    funit/list returns `funit_id`; funit/list/search returns `id`. Reading
+    only one of them is why fund search used to resolve to nothing.
+    """
+    for key in ("funit_id", "id", "fund_id"):
+        value = row.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _fund_row_names(row: dict) -> list:
+    """Every name-ish string a search row carries, for exact matching."""
+    return [
+        str(row[key]) for key in ("fund_name", "name", "fullname", "public_name")
+        if row.get(key)
+    ]
+
+
+def _format_currency(value) -> str:
+    """Format a CSuite money string as currency, or hand it back untouched."""
+    try:
+        return f"${float(str(value).replace(',', '').strip()):,.2f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _search_funds(csuite, term: str):
+    """Return (rows, error_text). Exactly one of them is meaningful."""
+    try:
+        data = csuite.search_funds(term)
+    except Exception as e:
+        logger.error(f"Error searching funds for {term!r}: {e}")
+        return [], f"CSuite fund search for '{term}' failed: {e}"
+
+    if not data.get("success"):
+        error = data.get("error") or "unknown error"
+        return [], f"CSuite fund search for '{term}' failed: {error}"
+
+    return (data.get("data") or {}).get("results", []) or [], None
+
+
+def _choose_fund(rows: list, term: str):
+    """Pick the one fund a query means, or None if it is ambiguous.
+
+    Order: exact name match, then exact code match, then a lone result.
+    Anything else is ambiguous on purpose — guessing between two funds and
+    reporting one balance as fact is worse than asking.
+    """
+    term_lower = (term or "").strip().lower()
+
+    for row in rows:
+        if any(n.strip().lower() == term_lower for n in _fund_row_names(row)):
+            return row
+
+    for row in rows:
+        code = row.get("short_name")
+        if code and str(code).strip().lower() == term_lower:
+            return row
+
+    if len(rows) == 1:
+        return rows[0]
+
+    return None
+
+
+def _format_fund_candidates(term: str, rows: list) -> str:
+    """List the candidates and stop. No display call, no guessing."""
+    lines = [
+        f"CSuite fund search '{term}' matched {len(rows)} funds. "
+        f"Ask the user which one is meant — do not guess:"
+    ]
+    for row in rows[:10]:
+        names = _fund_row_names(row)
+        name = names[0] if names else "Unknown"
+        code = row.get("short_name")
+        suffix = f", code: {code}" if code else ""
+        lines.append(f"- {name} (id: {_fund_row_id(row)}{suffix})")
+    if len(rows) > 10:
+        lines.append(f"- ...and {len(rows) - 10} more")
+    return "\n".join(lines)
+
+
+def _fund_detail_context(csuite, fund_id) -> str:
+    """Labelled detail lines for one fund, or the literal CSuite error."""
+    try:
+        data = csuite.get_fund(fund_id)
+    except Exception as e:
+        logger.error(f"Error fetching fund {fund_id}: {e}")
+        return f"CSuite fund lookup for id {fund_id} failed: {e}"
+
+    if not data.get("success"):
+        # The literal error, so Claude reports it rather than inventing a
+        # plausible-sounding next step.
+        error = data.get("error") or "unknown error"
+        return f"CSuite fund lookup for id {fund_id} failed: {error}"
+
+    fund = data.get("data") or {}
+    if not fund:
+        return f"CSuite returned no detail for fund id {fund_id}."
+
+    lines = ["CSuite Fund Detail:"]
+    lines.append(f"Fund name: {fund.get('fund_name', 'Unknown')}")
+    lines.append(f"Fund id: {fund.get('funit_id', fund_id)}")
+
+    if fund.get("short_name"):
+        lines.append(f"Fund code: {fund['short_name']}")
+
+    group_id = fund.get("fgroup_id")
+    if group_id is not None:
+        label = _FUND_GROUP_LABELS.get(group_id)
+        lines.append(
+            f"Fund group id: {group_id}" + (f" ({label})" if label else "")
+        )
+
+    # current_fundbalance, NOT "balance" — there is no `balance` field on
+    # funit/display; reading it returned the default and reported $0.
+    if fund.get("current_fundbalance") is not None:
+        lines.append(
+            f"Current balance: {_format_currency(fund['current_fundbalance'])}"
+        )
+
+    for key in sorted(fund):
+        if key.endswith("_date") and fund.get(key):
+            lines.append(f"{key}: {fund[key]}")
+
+    return "\n".join(lines)
+
+
 def _gather_fund_context(query: str, query_lower: str, csuite) -> list:
-    """Fund-related: search by name if possible, else list funds. Also grants."""
+    """Fund-related: resolve one fund and report it, or list the candidates.
+
+    Sequence: a fund code searches by code; a numeric id goes straight to
+    funit/display; anything else searches on the extracted name phrase.
+    """
     parts = []
-    name = _extract_name(query)
-    fund_id = _extract_id(query)
+    ref = extract_fund_ref(query)
+    fund_id = None
 
-    # Enhanced: search by name if a proper name is detected
-    if name:
-        logger.info(f"Searching CSuite funds for: {name}")
-        try:
-            search_data = csuite.search_funds(name)
-            if search_data.get('success') and search_data.get('data'):
-                results = search_data['data'].get('results', [])
-                if results:
-                    fund_list = [
-                        f"{f.get('fund_name', 'Unknown')} (ID: {f.get('funit_id', 'N/A')}, Balance: ${f.get('balance', '0')})"
-                        for f in results[:10]
-                    ]
-                    parts.append(f"CSuite Fund Search '{name}':\n" + "\n".join(fund_list))
-                    logger.info(f"Found {len(fund_list)} matching funds")
-        except Exception as e:
-            logger.error(f"Error searching funds: {e}")
+    if ref and "id" in ref:
+        fund_id = ref["id"]
+    else:
+        term = ref["code"] if ref else _extract_name(
+            query, stop_words=_FUND_NAME_STOP_WORDS)
+        if term:
+            rows, error = _search_funds(csuite, term)
+            if error:
+                parts.append(error)
+                return parts
 
-    # Enhanced: fetch specific fund details if an ID is present
-    if fund_id:
-        logger.info(f"Fetching CSuite fund details for ID: {fund_id}")
-        try:
-            fund_data = csuite.get_fund(fund_id)
-            if fund_data.get('success') and fund_data.get('data'):
-                f = fund_data['data']
-                parts.append(
-                    f"CSuite Fund Detail:\n"
-                    f"Name: {f.get('fund_name', 'Unknown')}\n"
-                    f"ID: {f.get('funit_id', 'N/A')}\n"
-                    f"Balance: ${f.get('balance', '0')}\n"
-                    f"Status: {f.get('status', 'Unknown')}"
-                )
-        except Exception as e:
-            logger.error(f"Error fetching fund detail: {e}")
+            if not rows:
+                parts.append(f"CSuite fund search '{term}' returned no funds.")
+            else:
+                chosen = _choose_fund(rows, term)
+                if chosen is None:
+                    # Ambiguous: report the candidates and stop here.
+                    parts.append(_format_fund_candidates(term, rows))
+                    return parts
+                fund_id = _fund_row_id(chosen)
 
-    # Fallback: generic fund list (only if no specific search produced results)
+    if fund_id is not None:
+        logger.info(f"Fetching CSuite fund details for id {fund_id}")
+        parts.append(_fund_detail_context(csuite, fund_id))
+
+    # Fallback: generic fund list (only if nothing above produced context)
     if not parts:
         logger.info("Fetching CSuite funds (generic)...")
         try:
@@ -756,8 +981,12 @@ def _gather_fund_contacts_context(query: str, query_lower: str, hubspot, csuite)
           → search HubSpot contacts by csuite_fund_id property.
     """
     parts = []
-    name = _extract_name(query)
-    fund_id = _extract_id(query)
+    name = _extract_name(query, stop_words=_FUND_NAME_STOP_WORDS)
+    # Fund path: the same strict reference rules as the balance gatherer.
+    ref = extract_fund_ref(query)
+    fund_id = str(ref["id"]) if ref and "id" in ref else None
+    if ref and "code" in ref:
+        name = ref["code"]
 
     # If no numeric ID, try to resolve fund name → funit_id via CSuite search
     if name and not fund_id:
@@ -767,8 +996,10 @@ def _gather_fund_contacts_context(query: str, query_lower: str, hubspot, csuite)
             if search.get('success') and search.get('data'):
                 results = search['data'].get('results', [])
                 if results:
-                    fund_id = str(results[0].get('funit_id', ''))
-                    fund_display = results[0].get('fund_name', name)
+                    # funit/list/search rows key the id as `id`, not `funit_id`.
+                    fund_id = str(_fund_row_id(results[0]) or '')
+                    names = _fund_row_names(results[0])
+                    fund_display = names[0] if names else name
                     logger.info(f"Resolved '{name}' to fund ID {fund_id}")
         except Exception as e:
             logger.error(f"Error resolving fund name: {e}")
