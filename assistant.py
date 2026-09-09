@@ -14,7 +14,7 @@ from datetime import datetime
 from config import SYSTEM_PROMPT
 from clients import OpenRouterClient, HubSpotClient, CSuiteClient
 from intents import route_intent
-from intents.context import Actor, RequestContext, Services
+from intents.context import Actor, RequestContext, Services, new_draft_state
 from intents.queries import gather_context
 from intents.daf_workflow import default_workflow_state
 
@@ -31,18 +31,6 @@ class JidhrAssistant:
     Conversation history remains in-memory (per-worker) — losing it
     across workers is acceptable; losing draft/workflow state is not.
     """
-
-    # Default empty states (used when session has nothing)
-    _DEFAULT_DRAFT = {
-        "active": False,
-        "type": None,
-        "subject": None,
-        "body": None,
-        "platform": None,
-        "template": None,
-        "link_url": None,
-        "photo_url": None,
-    }
 
     def __init__(self):
         logger.info("Initializing Jidhr Assistant")
@@ -61,7 +49,7 @@ class JidhrAssistant:
         )
 
         # In-memory defaults — overwritten by session on each request
-        self.draft_state = dict(self._DEFAULT_DRAFT)
+        self.draft_state = new_draft_state()
         self.workflow_state = default_workflow_state()
 
     def build_context(self, user_row) -> RequestContext:
@@ -166,8 +154,12 @@ class JidhrAssistant:
                 "content": user_message,
             })
 
+            # workflow_state is passed so the fallback gatherer can remember a
+            # numbered fund pick between messages; without it the list is
+            # printed but a following "1" resolves to nothing.
             context = gather_context(
-                user_message, ctx.services.hubspot, ctx.services.csuite)
+                user_message, ctx.services.hubspot, ctx.services.csuite,
+                ctx.workflow_state)
             if context:
                 enhanced = f"{user_message}\n\n[System Context - Real Data]\n{context}"
                 self.conversation_history[-1]["content"] = enhanced
@@ -199,7 +191,7 @@ class JidhrAssistant:
         """Clear conversation history and all active states."""
         logger.info("Clearing conversation history and states")
         self.conversation_history = []
-        self.draft_state.update(dict(self._DEFAULT_DRAFT))
+        self.draft_state.update(new_draft_state())
         self.workflow_state.update(default_workflow_state())
 
         # Clear session cookie state too

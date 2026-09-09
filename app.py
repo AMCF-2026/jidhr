@@ -41,6 +41,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Chat traffic is logged in full rather than truncated to 100 characters.
+# Diagnosing the draft-hijack bug meant reconstructing what was actually said
+# from a 100-char prefix, which was not enough to see which handler had taken
+# the message or what came back.
+CHAT_LOG_MAX_CHARS = 4000
+
+
+def flatten_for_log(text, limit: int = CHAT_LOG_MAX_CHARS) -> str:
+    """One-line, length-capped form of a message for the log.
+
+    Newlines become " | " so a multi-line draft stays a single log record —
+    Railway's viewer splits on newlines, and a split record loses the user
+    and action prefix from every line after the first.
+    """
+    if text is None:
+        return ""
+    flattened = " | ".join(
+        part.strip() for part in str(text).splitlines() if part.strip()
+    )
+    if len(flattened) <= limit:
+        return flattened
+    return f"{flattened[:limit]}… [truncated, {len(flattened)} chars total]"
+
+
 def log_user_action(action, details=""):
     """Log an action with the current user's email"""
     user_email = current_user.email if current_user.is_authenticated else "anonymous"
@@ -118,7 +142,7 @@ def chat():
             logger.warning("Empty message received")
             return jsonify({"error": "No message provided"}), 400
 
-        log_user_action("Chat request", message[:100] + "..." if len(message) > 100 else message)
+        log_user_action("Chat request", flatten_for_log(message))
 
         # Get per-user assistant (reconstructed if this worker doesn't have it)
         try:
@@ -145,7 +169,7 @@ def chat():
                 f"{current_user.id} ({current_user.email}): {e}")
             return jsonify({"error": f"Something went wrong processing your request: {e}"}), 500
 
-        log_user_action("Chat response", response[:100] + "..." if len(response) > 100 else response)
+        log_user_action("Chat response", flatten_for_log(response))
 
         return jsonify({"response": response})
 

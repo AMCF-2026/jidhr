@@ -296,7 +296,9 @@ def test_clear_drops_keys_the_default_shape_never_had():
 
     C._clear_draft_state(ctx)
 
-    assert set(draft) == set(C._EMPTY_DRAFT)
+    from intents.context import DEFAULT_DRAFT_STATE
+
+    assert set(draft) == set(DEFAULT_DRAFT_STATE)
 
 
 # ---------------------------------------------------------------------------

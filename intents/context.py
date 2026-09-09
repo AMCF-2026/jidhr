@@ -34,6 +34,28 @@ from typing import Any
 VALID_ROLES = frozenset({"admin", "staff", "donor"})
 
 
+# The shape of an empty draft. Defined here rather than in either of its two
+# users: the assistant seeds a new request with it and intents/content.py
+# resets to it, and when those were separate literals they had already drifted
+# apart by one key (`created_at`). Copy it — never hand out the shared dict.
+DEFAULT_DRAFT_STATE = {
+    "active": False,
+    "created_at": None,
+    "type": None,
+    "subject": None,
+    "body": None,
+    "platform": None,
+    "template": None,
+    "link_url": None,
+    "photo_url": None,
+}
+
+
+def new_draft_state() -> dict:
+    """A fresh empty draft. Always a copy, so callers cannot alias the default."""
+    return dict(DEFAULT_DRAFT_STATE)
+
+
 @dataclass(frozen=True)
 class Actor:
     """Who is making this request.

@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from dateutil import parser as dateutil_parser
 
 from config import ORG_FACTS_PROMPT
+from intents.context import new_draft_state
 from content.content_analysis import find_topic_matches
 from content.queue_check import check_schedule, get_queue, suggest_slot
 
@@ -512,18 +513,10 @@ BODY:
 
         subject, body = _parse_email_draft(draft)
 
-        ctx.draft_state.clear()
-        ctx.draft_state.update({
-            "active": True,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "type": "email",
-            "subject": subject,
-            "body": body,
-            "platform": None,
-            "template": "amcf",
-            "link_url": None,
-            "photo_url": None,
-        })
+        # Seeded from the shared shape, so a key added to
+        # DEFAULT_DRAFT_STATE appears on new drafts without a second edit here.
+        _start_draft(ctx, type="email", subject=subject, body=body,
+                     template="amcf")
 
         response = f"""📧 **Email Draft**
 
@@ -643,18 +636,7 @@ Write just the post content, nothing else."""
 
         content = draft.strip()
 
-        ctx.draft_state.clear()
-        ctx.draft_state.update({
-            "active": True,
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "type": "social",
-            "subject": None,
-            "body": content,
-            "platform": platform,
-            "template": None,
-            "link_url": None,
-            "photo_url": None,
-        })
+        _start_draft(ctx, type="social", body=content, platform=platform)
 
         available = ctx.services.hubspot.get_available_social_platforms()
         platform_list = ", ".join(available) if available else "facebook, twitter, linkedin, instagram"
@@ -1278,19 +1260,21 @@ def _html_to_display(html: str) -> str:
     text = re.sub(r'<[^>]+>', '', text)
     return text.strip()
 
+def _start_draft(ctx, **fields):
+    """Replace the draft state with a fresh, active draft.
 
-# The shape a cleared draft is reset to. Mirrors JidhrAssistant._DEFAULT_DRAFT.
-_EMPTY_DRAFT = {
-    "active": False,
-    "type": None,
-    "subject": None,
-    "body": None,
-    "platform": None,
-    "template": None,
-    "link_url": None,
-    "photo_url": None,
-    "created_at": None,
-}
+    Starts from the shared empty shape and overlays only what the caller
+    sets, so the two initiators cannot drift from each other or from
+    intents.context.DEFAULT_DRAFT_STATE.
+    """
+    draft = new_draft_state()
+    draft["active"] = True
+    draft["created_at"] = datetime.now().isoformat(timespec="seconds")
+    draft.update(fields)
+
+    ctx.draft_state.clear()
+    ctx.draft_state.update(draft)
+    return ctx.draft_state
 
 
 def _clear_draft_state(ctx):
@@ -1302,4 +1286,4 @@ def _clear_draft_state(ctx):
     cannot go stale as keys are added.
     """
     ctx.draft_state.clear()
-    ctx.draft_state.update(_EMPTY_DRAFT)
+    ctx.draft_state.update(new_draft_state())

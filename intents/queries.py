@@ -417,6 +417,19 @@ def split_fund_name(raw) -> tuple:
     return clean, (code or None)
 
 
+def fund_url(fund_id) -> str | None:
+    """The CSuite UI link for a fund, built here rather than by the model.
+
+    Uses Config.CSUITE_FUND_URL — the same constant intents/daf_workflow.py
+    and intents/donor_prep.py already deep-link with. Handing Claude a
+    finished URL is the point: asked to compose one it will happily invent a
+    plausible path, and a link that 404s reads exactly like a real one.
+    """
+    if fund_id in (None, ""):
+        return None
+    return Config.CSUITE_FUND_URL.format(funit_id=fund_id)
+
+
 def _norm_for_match(text) -> str:
     """Case-insensitive, whitespace-collapsed form used for name equality."""
     return " ".join(str(text or "").split()).strip().lower()
@@ -586,8 +599,11 @@ def _fund_choice_line(index: int, row: dict) -> str:
     names = _fund_row_names(row)
     name = names[0] if names else "Unknown"
     code = _fund_row_code(row)
+    fund_id = _fund_row_id(row)
     suffix = f", code: {code}" if code else ""
-    return f"{index}. {name} (id: {_fund_row_id(row)}{suffix})"
+    link = fund_url(fund_id)
+    tail = f" — {link}" if link else ""
+    return f"{index}. {name} (id: {fund_id}{suffix}){tail}"
 
 
 def _format_fund_candidates(term: str, rows: list,
@@ -692,6 +708,10 @@ def _fund_detail_context(csuite, fund_id) -> str:
     for key in sorted(fund):
         if key.endswith("_date") and fund.get(key):
             lines.append(f"{key}: {fund[key]}")
+
+    link = fund_url(fund.get("funit_id", fund_id))
+    if link:
+        lines.append(f"CSuite link: {link}")
 
     return "\n".join(lines)
 
