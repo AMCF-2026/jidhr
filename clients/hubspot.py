@@ -21,12 +21,36 @@ Jidhr v1.3 - Complete client covering:
 import json
 import logging
 import re
+import time
 import requests
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from config import Config
+from clients.audit import record_write
 
 logger = logging.getLogger(__name__)
+
+# HubSpot POSTs that read rather than write. Search and batch-read are the
+# only endpoints that take a POST body purely to express a query; auditing
+# them would bury real writes under a pile of lookups.
+HUBSPOT_READ_SHAPED_POST_SUFFIXES = ("/search", "/batch/read")
+
+
+def is_hubspot_write(method: str, endpoint: str) -> bool:
+    """True if this call changes something in HubSpot.
+
+    GET never writes. PUT/PATCH/DELETE always do. POST does unless the path
+    is one of the read-shaped ones above (crm/v3/objects/*/search,
+    crm/v3/lists/search, crm/v3/objects/*/batch/read).
+    """
+    verb = (method or "").upper()
+    if verb == "GET":
+        return False
+    if verb != "POST":
+        return True
+
+    path = str(endpoint or "").split("?")[0].rstrip("/").lower()
+    return not path.endswith(HUBSPOT_READ_SHAPED_POST_SUFFIXES)
 
 # HubSpot portal time zone. Naive datetimes (or naive ISO strings)
 # passed to create_social_post are interpreted in this zone before
@@ -119,69 +143,77 @@ class HubSpotClient:
             logger.error(f"HubSpot GET {endpoint} error: {e}")
             return {"error": str(e)}
 
-    def _post(self, endpoint: str, data: dict = None) -> dict:
-        """Make a POST request to HubSpot API"""
+    def _send(self, method: str, endpoint: str, data: dict = None) -> dict:
+        """Shared body for the write verbs, with auditing.
+
+        POST/PUT/PATCH/DELETE all funnel through here so a new write cannot
+        be added without being audited. Behaviour matches the four methods
+        this replaced: same log lines, same error shapes, same returns.
+        """
         if not self.access_token:
             logger.error("HubSpot access token not configured")
-            return {"error": "HubSpot access token not configured"}
+            result = {"error": "HubSpot access token not configured"}
+            if is_hubspot_write(method, endpoint):
+                # 'skipped', not 'failed': nothing was attempted.
+                record_write(
+                    "hubspot", method, endpoint, payload=data,
+                    status="skipped", error=result["error"], duration_ms=0)
+            return result
 
         url = f"{self.base_url}/{endpoint}"
-        logger.info(f"HubSpot POST: {endpoint}")
+        logger.info(f"HubSpot {method}: {endpoint}")
+
+        audited = is_hubspot_write(method, endpoint)
+        started = time.perf_counter()
 
         try:
-            response = requests.post(url, headers=self.headers, json=data, timeout=30)
-            return self._parse_response(response, "POST", endpoint)
+            # Resolved at call time so tests (and probe scripts) can swap the
+            # requests module out from under the client.
+            sender = getattr(requests, method.lower())
+            kwargs = {"headers": self.headers, "timeout": 30}
+            if method != "DELETE":
+                kwargs["json"] = data
+            response = sender(url, **kwargs)
         except requests.exceptions.RequestException as e:
-            logger.error(f"HubSpot POST {endpoint} error: {e}")
+            logger.error(f"HubSpot {method} {endpoint} error: {e}")
+            if audited:
+                record_write(
+                    "hubspot", method, endpoint, payload=data,
+                    status="failed", error=str(e),
+                    duration_ms=(time.perf_counter() - started) * 1000)
             return {"error": str(e)}
+
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        result = self._parse_response(response, method, endpoint)
+
+        if audited:
+            status_code = getattr(response, "status_code", None)
+            ok = status_code is not None and 200 <= status_code < 300
+            record_write(
+                "hubspot", method, endpoint, payload=data,
+                status="success" if ok else "failed",
+                http_status=status_code,
+                error=None if ok else (
+                    (result or {}).get("error") or f"HTTP {status_code}"),
+                duration_ms=elapsed_ms)
+
+        return result
+
+    def _post(self, endpoint: str, data: dict = None) -> dict:
+        """Make a POST request to HubSpot API"""
+        return self._send("POST", endpoint, data)
 
     def _put(self, endpoint: str, data: dict = None) -> dict:
         """Make a PUT request to HubSpot API"""
-        if not self.access_token:
-            logger.error("HubSpot access token not configured")
-            return {"error": "HubSpot access token not configured"}
-
-        url = f"{self.base_url}/{endpoint}"
-        logger.info(f"HubSpot PUT: {endpoint}")
-
-        try:
-            response = requests.put(url, headers=self.headers, json=data, timeout=30)
-            return self._parse_response(response, "PUT", endpoint)
-        except requests.exceptions.RequestException as e:
-            logger.error(f"HubSpot PUT {endpoint} error: {e}")
-            return {"error": str(e)}
+        return self._send("PUT", endpoint, data)
 
     def _patch(self, endpoint: str, data: dict = None) -> dict:
         """Make a PATCH request to HubSpot API"""
-        if not self.access_token:
-            logger.error("HubSpot access token not configured")
-            return {"error": "HubSpot access token not configured"}
+        return self._send("PATCH", endpoint, data)
 
-        url = f"{self.base_url}/{endpoint}"
-        logger.info(f"HubSpot PATCH: {endpoint}")
-
-        try:
-            response = requests.patch(url, headers=self.headers, json=data, timeout=30)
-            return self._parse_response(response, "PATCH", endpoint)
-        except requests.exceptions.RequestException as e:
-            logger.error(f"HubSpot PATCH {endpoint} error: {e}")
-            return {"error": str(e)}
-    
     def _delete(self, endpoint: str) -> dict:
         """Make a DELETE request to HubSpot API"""
-        if not self.access_token:
-            logger.error("HubSpot access token not configured")
-            return {"error": "HubSpot access token not configured"}
-
-        url = f"{self.base_url}/{endpoint}"
-        logger.info(f"HubSpot DELETE: {endpoint}")
-
-        try:
-            response = requests.delete(url, headers=self.headers, timeout=30)
-            return self._parse_response(response, "DELETE", endpoint)
-        except requests.exceptions.RequestException as e:
-            logger.error(f"HubSpot DELETE {endpoint} error: {e}")
-            return {"error": str(e)}
+        return self._send("DELETE", endpoint)
     
     # =========================================================================
     # CONTACTS

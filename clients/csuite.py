@@ -23,8 +23,24 @@ import time
 import logging
 import requests
 from config import Config
+from clients.audit import record_write
 
 logger = logging.getLogger(__name__)
+
+# CSuite signs the JSON request body, so EVERY call is an HTTP POST — the
+# verb carries no information about whether a call changes anything. The
+# endpoint name is the only signal, so the rule lives here where it can be
+# read, rather than being inferred at each call site.
+#
+# Verified against every endpoint string in this file (40 of them): these
+# five substrings catch 11 writes and match none of the 29 reads.
+CSUITE_WRITE_PATTERNS = ("create", "edit", "delete", "complete", "update")
+
+
+def is_csuite_write(endpoint: str) -> bool:
+    """True if this CSuite endpoint changes something."""
+    name = str(endpoint or "").lower()
+    return any(pattern in name for pattern in CSUITE_WRITE_PATTERNS)
 
 
 class CSuiteClient:
@@ -71,6 +87,12 @@ class CSuiteClient:
         """
         if not self.api_key or not self.api_secret:
             logger.error("CSuite API credentials not configured")
+            if is_csuite_write(endpoint):
+                # 'skipped', not 'failed': nothing was attempted.
+                record_write(
+                    "csuite", "POST", endpoint, payload=data, status="skipped",
+                    error="CSuite API credentials not configured",
+                    duration_ms=0)
             return {"error": "CSuite API credentials not configured"}
         
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
@@ -84,7 +106,17 @@ class CSuiteClient:
         }
         
         logger.info(f"CSuite POST: {endpoint} | data keys: {list((data or {}).keys())}")
-        
+
+        audited = is_csuite_write(endpoint)
+        started = time.perf_counter()
+
+        def audit(status, http_status=None, error=None):
+            if audited:
+                record_write(
+                    "csuite", "POST", endpoint, payload=data, status=status,
+                    http_status=http_status, error=error,
+                    duration_ms=(time.perf_counter() - started) * 1000)
+
         try:
             response = self.session.post(
                 url,
@@ -93,11 +125,13 @@ class CSuiteClient:
                 timeout=30
             )
             logger.info(f"CSuite Response: {response.status_code}")
-            
+            status_code = getattr(response, "status_code", None)
+
             try:
                 json_response = response.json()
-                
+
                 if json_response.get("success") == 1:
+                    audit("success", status_code)
                     return {
                         "success": True,
                         "data": json_response.get("data"),
@@ -106,18 +140,23 @@ class CSuiteClient:
                 else:
                     errors = json_response.get("errors", [])
                     logger.warning(f"CSuite API error: {errors}")
+                    error_text = errors[0] if errors else "Unknown error"
+                    # HTTP 200 with success != 1 is still a failed write.
+                    audit("failed", status_code, error_text)
                     return {
                         "success": False,
-                        "error": errors[0] if errors else "Unknown error",
+                        "error": error_text,
                         "errors": errors
                     }
-                    
+
             except json.JSONDecodeError as e:
                 logger.error(f"CSuite JSON decode error: {str(e)}")
+                audit("failed", status_code, f"Invalid JSON response: {e}")
                 return {"error": f"Invalid JSON response: {str(e)}"}
-                
+
         except requests.exceptions.RequestException as e:
             logger.error(f"CSuite Request error: {str(e)}")
+            audit("failed", None, str(e))
             return {"error": str(e)}
     
     # =========================================================================

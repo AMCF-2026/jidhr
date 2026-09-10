@@ -15,7 +15,14 @@ from config import SYSTEM_PROMPT
 from clients import OpenRouterClient, HubSpotClient, CSuiteClient
 from clients.openrouter import OpenRouterError
 from intents import route_intent
-from intents.context import Actor, RequestContext, Services, new_draft_state
+from intents.context import (
+    Actor,
+    RequestContext,
+    Services,
+    current_actor,
+    current_intent,
+    new_draft_state,
+)
 from intents.queries import gather_context
 from intents.daf_workflow import default_workflow_state
 
@@ -75,6 +82,10 @@ class JidhrAssistant:
                     else None
                 ),
             )
+
+        # Published for code too deep to be handed the context — currently
+        # only clients/audit.py, which needs to say who made a write.
+        current_actor.set(actor)
 
         return RequestContext(
             actor=actor,
@@ -141,6 +152,11 @@ class JidhrAssistant:
             if match:
                 name, handler = match
                 logger.info(f"Routing to intent: {name}")
+                # Set here rather than inside route_intent: the intent has to
+                # be live while the handler runs (that is when writes happen),
+                # and route_intent has returned by then. Reset in `finally`
+                # so a nested call cannot inherit a stale label.
+                intent_token = current_intent.set(name)
                 # route_intent already wraps the handler so a crash comes back
                 # as a plain failure line. This catch is the backstop for a
                 # caller that got its handler some other way.
@@ -153,6 +169,8 @@ class JidhrAssistant:
                         "This action may not have completed — check before "
                         "retrying."
                     )
+                finally:
+                    current_intent.reset(intent_token)
                 self._add_to_history(user_message, response)
                 return response
 

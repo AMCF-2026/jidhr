@@ -26,8 +26,26 @@ here should import a handler, and no handler should import another handler
 through it.
 """
 
+import contextvars
 from dataclasses import dataclass, field
 from typing import Any
+
+# Ambient request identity, for code too deep to be handed a RequestContext.
+#
+# The API clients sit several layers below any handler and take no ctx — but
+# the audit trail has to say who did a thing, and threading an actor through
+# every client method would put identity into signatures that have no other
+# use for it. ContextVar is the narrow exception: set once per request by the
+# assistant, read only by clients/audit.py. Nothing else should read these,
+# and no handler should ever set them.
+#
+# ContextVar (not a global) because gunicorn runs 4 threads per worker: a
+# plain module global would let one user's request label another's writes.
+current_actor: contextvars.ContextVar = contextvars.ContextVar(
+    "jidhr_current_actor", default=None)
+
+current_intent: contextvars.ContextVar = contextvars.ContextVar(
+    "jidhr_current_intent", default=None)
 
 # The complete set of roles the users table allows. Kept here so handlers and
 # tests have one place to agree on, matching the CHECK constraint in schema.sql.
