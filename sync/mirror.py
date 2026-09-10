@@ -37,6 +37,19 @@ constrained vocabulary. Statuses walk:
     running -> fetched -> verified -> writing -> complete
                                    \\-> (dry run stops at 'verified')
     any stage -> failed
+    a database failure mid-write -> aborted
+
+Who started it
+--------------
+`sync_runs.triggered_by` is BIGINT REFERENCES users(id). It holds a user
+id or NULL — never a label. A CLI run has no user, so it writes NULL,
+sets trigger_source='cli', and puts the human-readable label in
+`notes.trigger`. A future chat-triggered run passes the signed-in user's
+id as `triggered_by_user_id` and gets a real foreign key.
+
+Nothing about "who ran this" is worth a broken foreign key, so the two
+are kept in separate parameters and a value in the wrong one is rejected
+rather than coerced.
 
 Counts on the row mean:
     expected_count   what CSuite's data.count claimed
@@ -531,7 +544,50 @@ _START_RUN_SQL = """
 """
 
 
-def _start_run(triggered_by, trigger_source, dry_run, notes) -> int | None:
+DEFAULT_TRIGGER_LABEL = "cli:mirror_refresh"
+
+
+def _user_id(value):
+    """A users.id for the triggered_by column: an int, or None.
+
+    Rejects anything else loudly. triggered_by is a foreign key, so a
+    label like "cli:mirror_refresh" landing here is not a value the
+    database can store — and a run that dies on its own ledger INSERT
+    fails after the work, not before it.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise TypeError(
+            f"triggered_by_user_id must be a users.id or None, got {value!r}")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return int(value.strip())
+    raise TypeError(
+        f"triggered_by_user_id must be a users.id or None, got {value!r}. "
+        "A label describing what started the run belongs in notes.trigger — "
+        "pass it as triggered_by.")
+
+
+def _trigger_label(value):
+    """The human-readable label for notes.trigger.
+
+    An int here is almost certainly a user id put in the wrong parameter,
+    which would otherwise be silently filed as a label and leave the
+    foreign key NULL. Say so instead.
+    """
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        raise TypeError(
+            f"triggered_by is a label, not a user id (got {value!r}). "
+            "Pass a users.id as triggered_by_user_id.")
+    return str(value)
+
+
+def _start_run(triggered_by_user_id, trigger_source, dry_run,
+               notes) -> int | None:
     """Open a sync_runs row and return its id.
 
     Deliberately allowed to raise. Unlike the write audit — which must
@@ -542,7 +598,7 @@ def _start_run(triggered_by, trigger_source, dry_run, notes) -> int | None:
     """
     rows = database.execute_query(
         _START_RUN_SQL,
-        (triggered_by, trigger_source, bool(dry_run),
+        (_user_id(triggered_by_user_id), trigger_source, bool(dry_run),
          canonical_json(notes or {})),
         fetch=True,
     )
@@ -747,11 +803,20 @@ class TypeResult:
 
 def refresh_type(record_type: str, client=None, pace_ms=None,
                  dry_run: bool = False, triggered_by=None,
-                 trigger_source: str = "cli") -> TypeResult:
+                 trigger_source: str = "cli",
+                 triggered_by_user_id=None) -> TypeResult:
     """Fetch one record type and mirror it. Never raises for API failures.
 
     Database failures DO propagate: a mirror that cannot reach its own
     table has nothing useful to report and should stop the run.
+
+    Args:
+        triggered_by_user_id: a users.id, or None. Goes to the
+            sync_runs.triggered_by foreign key. CLI runs have no user and
+            pass None.
+        triggered_by: a label describing what started the run, e.g.
+            "cli:mirror_refresh". Goes to notes.trigger and NEVER to the
+            triggered_by column, which is a BIGINT foreign key.
     """
     if record_type not in GATHERERS:
         raise ValueError(
@@ -761,8 +826,15 @@ def refresh_type(record_type: str, client=None, pace_ms=None,
     started = time.perf_counter()
     client = client or CSuiteClient()
 
-    run_id = _start_run(triggered_by, trigger_source, dry_run,
-                        {"record_type": record_type})
+    label = _trigger_label(triggered_by)
+    if label is None and trigger_source == "cli":
+        label = DEFAULT_TRIGGER_LABEL
+    run_notes = {"record_type": record_type}
+    if label is not None:
+        run_notes["trigger"] = label
+
+    run_id = _start_run(triggered_by_user_id, trigger_source, dry_run,
+                        run_notes)
     result = TypeResult(record_type=record_type, run_id=run_id)
 
     gathered = GATHERERS[record_type](client, pace_ms)
@@ -774,7 +846,7 @@ def refresh_type(record_type: str, client=None, pace_ms=None,
     result.pages = gathered.pages
     result.failed = gathered.failed
     result.notes = dict(gathered.notes)
-    result.notes["record_type"] = record_type
+    result.notes.update(run_notes)
     result.notes["calls"] = gathered.calls
     result.notes["pages"] = gathered.pages
 
@@ -921,7 +993,7 @@ def refresh_type(record_type: str, client=None, pace_ms=None,
 
 def refresh(record_types=None, pace_ms=None, dry_run: bool = False,
             client=None, triggered_by=None,
-            trigger_source: str = "cli") -> list:
+            trigger_source: str = "cli", triggered_by_user_id=None) -> list:
     """Refresh each record type in turn. Returns one TypeResult per type.
 
     A type that fails does not stop the ones after it — each is its own
@@ -942,5 +1014,6 @@ def refresh(record_types=None, pace_ms=None, dry_run: bool = False,
     for record_type in types:
         results.append(refresh_type(
             record_type, client=client, pace_ms=pace_ms, dry_run=dry_run,
-            triggered_by=triggered_by, trigger_source=trigger_source))
+            triggered_by=triggered_by, trigger_source=trigger_source,
+            triggered_by_user_id=triggered_by_user_id))
     return results

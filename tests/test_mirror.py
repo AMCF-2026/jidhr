@@ -791,6 +791,8 @@ def test_the_run_row_records_counts_and_the_record_type(db):
     assert "sync_type, triggered_by, trigger_source, dry_run" in insert_sql
     assert "'mirror'" in insert_sql
     assert json.loads(insert_params[3])["record_type"] == "grant"
+    assert insert_params[0] is None, "a CLI run has no user"
+    assert insert_params[1] == "cli"
 
     assert db.run_field("status") == "complete"
     assert db.run_field("expected_count") == 2
@@ -980,3 +982,135 @@ def test_a_failed_fetch_never_reaches_the_writing_status(db):
                 if sql.startswith("UPDATE sync_runs SET status")]
     assert "writing" not in statuses
     assert statuses[-1] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# Who started the run: sync_runs.triggered_by is BIGINT REFERENCES users(id)
+# ---------------------------------------------------------------------------
+
+def run_grant(db, **kwargs):
+    client = StubClient({"grant/list": [ok([{"grant_id": 1}], count=1),
+                                        ok([])]})
+    return mirror.refresh_type("grant", client=client, pace_ms=0, **kwargs)
+
+
+def insert_columns(db):
+    """(triggered_by, trigger_source, dry_run, notes) from the run INSERT."""
+    _, params = db.run_inserts[0]
+    return params[0], params[1], params[2], json.loads(params[3])
+
+
+def test_a_cli_run_writes_null_to_the_foreign_key(db):
+    run_grant(db)
+    triggered_by, source, _, notes = insert_columns(db)
+
+    assert triggered_by is None
+    assert source == "cli"
+    assert notes["trigger"] == "cli:mirror_refresh"
+
+
+def test_the_label_the_cli_passes_lands_in_notes_not_the_column(db):
+    """scripts/mirror_refresh.py passes triggered_by="cli:mirror_refresh".
+    That string must never reach a BIGINT foreign key."""
+    run_grant(db, triggered_by="cli:mirror_refresh")
+    triggered_by, _, _, notes = insert_columns(db)
+
+    assert triggered_by is None
+    assert notes["trigger"] == "cli:mirror_refresh"
+
+
+def test_no_run_insert_ever_binds_a_string_to_triggered_by(db):
+    mirror.refresh(
+        record_types=["grant", "check"],
+        client=StubClient({
+            "grant/list": [ok([{"grant_id": 1}], count=1), ok([])],
+            "check/list": [ok([{"check_id": 2}], count=1), ok([])],
+        }),
+        pace_ms=0,
+        triggered_by="cli:mirror_refresh",
+        trigger_source="cli",
+    )
+
+    assert len(db.run_inserts) == 2
+    for _, params in db.run_inserts:
+        assert params[0] is None or isinstance(params[0], int)
+        assert not isinstance(params[0], str)
+
+
+def test_a_chat_triggered_run_records_the_user_id(db):
+    run_grant(db, triggered_by_user_id=42, trigger_source="chat",
+              triggered_by="chat:carl@amuslimcf.org")
+    triggered_by, source, _, notes = insert_columns(db)
+
+    assert triggered_by == 42
+    assert source == "chat"
+    assert notes["trigger"] == "chat:carl@amuslimcf.org"
+
+
+def test_a_non_cli_run_without_a_label_gets_no_trigger_note(db):
+    run_grant(db, trigger_source="chat", triggered_by_user_id=7)
+    triggered_by, source, _, notes = insert_columns(db)
+
+    assert triggered_by == 7
+    assert "trigger" not in notes
+
+
+def test_a_numeric_string_user_id_is_accepted_as_an_int(db):
+    run_grant(db, triggered_by_user_id="42")
+    triggered_by, _, _, _ = insert_columns(db)
+    assert triggered_by == 42
+
+
+@pytest.mark.parametrize("bad", [
+    "cli:mirror_refresh",
+    "carl@amuslimcf.org",
+    True,
+    3.5,
+    object(),
+])
+def test_a_non_user_id_in_the_foreign_key_parameter_is_rejected(db, bad):
+    with pytest.raises(TypeError, match="triggered_by_user_id"):
+        run_grant(db, triggered_by_user_id=bad)
+
+
+def test_a_user_id_in_the_label_parameter_is_rejected(db):
+    """Silently filing a user id as a label would leave the foreign key
+    NULL and look like it worked."""
+    with pytest.raises(TypeError, match="label, not a user id"):
+        run_grant(db, triggered_by=42)
+
+
+def test_the_trigger_note_survives_every_later_notes_write(db):
+    """_update_run replaces the notes column rather than merging into it,
+    so the trigger has to be carried through to the final write."""
+    result = run_grant(db, triggered_by="cli:mirror_refresh")
+
+    assert result.notes["trigger"] == "cli:mirror_refresh"
+    assert result.notes["record_type"] == "grant"
+
+    notes_writes = [json.loads(params[-2]) for sql, params in db.run_updates
+                    if "notes = %s::jsonb" in sql]
+    assert notes_writes, "the run should write notes at least once"
+    for notes in notes_writes:
+        assert notes["trigger"] == "cli:mirror_refresh"
+        assert notes["record_type"] == "grant"
+
+
+def test_the_trigger_note_survives_a_failed_run(db):
+    client = StubClient({"grant/list": [fail("boom")]})
+    result = mirror.refresh_type("grant", client=client, pace_ms=0,
+                                 triggered_by="cli:mirror_refresh")
+
+    assert result.status == "failed"
+    assert result.notes["trigger"] == "cli:mirror_refresh"
+
+
+def test_user_id_coercion_in_isolation():
+    assert mirror._user_id(None) is None
+    assert mirror._user_id(7) == 7
+    assert mirror._user_id("7") == 7
+    assert mirror._user_id(" -7 ") == -7
+    with pytest.raises(TypeError):
+        mirror._user_id("cli:mirror_refresh")
+    with pytest.raises(TypeError):
+        mirror._user_id(True)
