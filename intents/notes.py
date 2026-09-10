@@ -303,6 +303,23 @@ def _log_note(hubspot, note: dict, contact: dict) -> str:
         logger.error(f"Error creating {note_type} note: {e}", exc_info=True)
         return f"❌ Failed to log note: {e}"
 
+    # The engagement was created but could not be attached to the contact,
+    # so it was rolled back. No ✅ and no link: there is nothing to view.
+    if isinstance(result, dict) and result.get("association_failed"):
+        noun = {"call": "call", "meeting": "meeting"}.get(note_type, "note")
+        status = result.get("http_status") or "error"
+        message = (
+            f"⚠️ Couldn't attach the {noun} to {label} "
+            f"(HubSpot {status}). Nothing was saved."
+        )
+        if not result.get("orphan_deleted"):
+            # The rollback failed too — say so rather than imply a clean slate.
+            message += (
+                f"\n\nA stray {noun} (id {result.get('orphan_id')}) may be "
+                "left in HubSpot attached to nobody — worth checking."
+            )
+        return message
+
     if not result or (isinstance(result, dict) and result.get("error")):
         reason = (result or {}).get("error", "HubSpot returned no confirmation")
         return f"❌ Failed to log note: {reason}"

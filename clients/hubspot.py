@@ -36,6 +36,24 @@ logger = logging.getLogger(__name__)
 HUBSPOT_READ_SHAPED_POST_SUFFIXES = ("/search", "/batch/read")
 
 
+# An HTML error page is fifteen log lines unless it is flattened first, and
+# Railway's viewer splits on newlines — so every line after the first loses
+# the method/endpoint prefix that made it findable.
+ERROR_BODY_MAX_CHARS = 300
+
+
+def flatten_error_body(text, limit: int = ERROR_BODY_MAX_CHARS) -> str:
+    """One-line, length-capped form of a response body for the log."""
+    if not text:
+        return "(empty)"
+    flattened = " | ".join(
+        part.strip() for part in str(text).splitlines() if part.strip()
+    )
+    if not flattened:
+        return "(empty)"
+    return flattened if len(flattened) <= limit else flattened[:limit] + "…"
+
+
 def is_hubspot_write(method: str, endpoint: str) -> bool:
     """True if this call changes something in HubSpot.
 
@@ -112,7 +130,7 @@ class HubSpotClient:
         logger.info(f"HubSpot {method} {endpoint}: {status}")
 
         if status >= 400:
-            body = response.text[:300] if response.text else "(empty)"
+            body = flatten_error_body(response.text)
             logger.warning(f"HubSpot {method} {endpoint} failed: {status} | {body}")
 
         if not response.text or not response.text.strip():
@@ -123,7 +141,7 @@ class HubSpotClient:
         try:
             return response.json()
         except (ValueError, json.JSONDecodeError):
-            snippet = response.text[:200]
+            snippet = flatten_error_body(response.text)
             logger.error(f"HubSpot {method} {endpoint}: non-JSON response ({status}): {snippet}")
             return {"error": f"Non-JSON response ({status}): {snippet}", "status_code": status}
 
@@ -144,7 +162,18 @@ class HubSpotClient:
             return {"error": str(e)}
 
     def _send(self, method: str, endpoint: str, data: dict = None) -> dict:
-        """Shared body for the write verbs, with auditing.
+        """Shared body for the write verbs, with auditing."""
+        result, _status = self._send_with_status(method, endpoint, data)
+        return result
+
+    def _send_with_status(self, method: str, endpoint: str,
+                          data: dict = None) -> tuple:
+        """As _send, but also returns the HTTP status code.
+
+        Needed because a 4xx with a JSON body parses into an ordinary-looking
+        dict — no "error" key, no status — so a caller inspecting only the
+        body cannot tell a rejection from a success. That is exactly how the
+        405 on association creation was mistaken for a success.
 
         POST/PUT/PATCH/DELETE all funnel through here so a new write cannot
         be added without being audited. Behaviour matches the four methods
@@ -158,7 +187,7 @@ class HubSpotClient:
                 record_write(
                     "hubspot", method, endpoint, payload=data,
                     status="skipped", error=result["error"], duration_ms=0)
-            return result
+            return result, None
 
         url = f"{self.base_url}/{endpoint}"
         logger.info(f"HubSpot {method}: {endpoint}")
@@ -181,13 +210,13 @@ class HubSpotClient:
                     "hubspot", method, endpoint, payload=data,
                     status="failed", error=str(e),
                     duration_ms=(time.perf_counter() - started) * 1000)
-            return {"error": str(e)}
+            return {"error": str(e)}, None
 
         elapsed_ms = (time.perf_counter() - started) * 1000
         result = self._parse_response(response, method, endpoint)
+        status_code = getattr(response, "status_code", None)
 
         if audited:
-            status_code = getattr(response, "status_code", None)
             ok = status_code is not None and 200 <= status_code < 300
             record_write(
                 "hubspot", method, endpoint, payload=data,
@@ -197,7 +226,7 @@ class HubSpotClient:
                     (result or {}).get("error") or f"HTTP {status_code}"),
                 duration_ms=elapsed_ms)
 
-        return result
+        return result, status_code
 
     def _post(self, endpoint: str, data: dict = None) -> dict:
         """Make a POST request to HubSpot API"""
@@ -441,16 +470,7 @@ class HubSpotClient:
         if owner_id:
             properties["hubspot_owner_id"] = owner_id
         
-        # Create the note
-        result = self._post("crm/v3/objects/notes", {"properties": properties})
-        
-        # Associate with contact if provided
-        if contact_id and "id" in result:
-            note_id = result["id"]
-            self._associate_objects("notes", note_id, "contacts", contact_id)
-            logger.info(f"Created note {note_id} associated with contact {contact_id}")
-        
-        return result
+        return self._create_and_associate("notes", properties, contact_id)
     
     def create_call_note(self, body: str, contact_id: str = None,
                          owner_id: str = None, duration_ms: int = None) -> dict:
@@ -478,14 +498,7 @@ class HubSpotClient:
         if duration_ms:
             properties["hs_call_duration"] = str(duration_ms)
         
-        result = self._post("crm/v3/objects/calls", {"properties": properties})
-        
-        if contact_id and "id" in result:
-            call_id = result["id"]
-            self._associate_objects("calls", call_id, "contacts", contact_id)
-            logger.info(f"Created call {call_id} associated with contact {contact_id}")
-        
-        return result
+        return self._create_and_associate("calls", properties, contact_id)
     
     def create_meeting_note(self, title: str, body: str, contact_id: str = None,
                             owner_id: str = None, start_time: datetime = None,
@@ -518,25 +531,106 @@ class HubSpotClient:
         if owner_id:
             properties["hubspot_owner_id"] = owner_id
         
-        result = self._post("crm/v3/objects/meetings", {"properties": properties})
-        
-        if contact_id and "id" in result:
-            meeting_id = result["id"]
-            self._associate_objects("meetings", meeting_id, "contacts", contact_id)
-            logger.info(f"Created meeting {meeting_id} associated with contact {contact_id}")
-        
-        return result
+        return self._create_and_associate("meetings", properties, contact_id)
     
     def _associate_objects(self, from_type: str, from_id: str,
-                           to_type: str, to_id: str) -> dict:
+                           to_type: str, to_id: str) -> tuple:
         """Associate two HubSpot objects (e.g., note ↔ contact).
-        
-        Uses the v4 associations API.
+
+        v4 default associations are created with **PUT**, not POST:
+
+            PUT crm/v4/objects/{fromType}/{fromId}/associations/default/
+                {toType}/{toId}
+
+        The POST form this used to send returned 405 Method Not Allowed, and
+        because the failure was never checked the engagement was left in
+        HubSpot attached to nobody while the user was told it had been saved.
+        The default endpoint takes no body — the association type is implied
+        by the object pair.
+
+        Returns:
+            (result, status_code) — the caller must check both.
         """
-        return self._post(
-            f"crm/v4/objects/{from_type}/{from_id}/associations/{to_type}/{to_id}",
-            [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 0}]
+        return self._send_with_status(
+            "PUT",
+            f"crm/v4/objects/{from_type}/{from_id}/associations/default/"
+            f"{to_type}/{to_id}",
         )
+
+    @staticmethod
+    def _association_failed(result, status_code) -> bool:
+        """True unless the association demonstrably succeeded.
+
+        Fails closed: an unrecognised response is treated as a failure, so
+        the engagement is rolled back rather than silently orphaned.
+        """
+        if status_code is None:
+            return True
+        if not 200 <= status_code < 300:
+            return True
+        if isinstance(result, dict):
+            if result.get("error"):
+                return True
+            if str(result.get("status", "")).lower() == "error":
+                return True
+        return False
+
+    def _create_and_associate(self, object_type: str, properties: dict,
+                              contact_id: str = None) -> dict:
+        """Create an engagement and attach it to a contact, atomically.
+
+        If the association fails the engagement is deleted, because a call or
+        note attached to nobody is invisible in the contact timeline that is
+        the only reason it was created. An orphan is worse than no record:
+        nobody finds it, and the donor's history is quietly wrong.
+
+        Returns the created object on success, or an error dict carrying
+        `association_failed` so the caller can say what went wrong.
+        """
+        result = self._post(f"crm/v3/objects/{object_type}",
+                            {"properties": properties})
+
+        if not isinstance(result, dict) or "id" not in result:
+            return result  # creation itself failed; _parse_response explains
+
+        object_id = result["id"]
+
+        if not contact_id:
+            return result
+
+        assoc, assoc_status = self._associate_objects(
+            object_type, object_id, "contacts", contact_id)
+
+        if not self._association_failed(assoc, assoc_status):
+            logger.info(
+                f"Created {object_type} {object_id} associated with "
+                f"contact {contact_id}")
+            return result
+
+        logger.error(
+            "Association failed for %s %s -> contact %s (HTTP %s); deleting "
+            "the orphan", object_type, object_id, contact_id, assoc_status)
+
+        deleted, delete_status = self._send_with_status(
+            "DELETE", f"crm/v3/objects/{object_type}/{object_id}")
+        orphan_deleted = delete_status is not None and 200 <= delete_status < 300
+
+        if not orphan_deleted:
+            logger.error(
+                "Could not delete orphaned %s %s (HTTP %s) — it needs removing "
+                "by hand", object_type, object_id, delete_status)
+
+        return {
+            "error": (
+                f"Could not attach the {object_type[:-1]} to contact "
+                f"{contact_id} (HubSpot {assoc_status})"
+            ),
+            "association_failed": True,
+            "http_status": assoc_status,
+            "object_type": object_type,
+            "orphan_id": object_id,
+            "orphan_deleted": orphan_deleted,
+        }
     
     # =========================================================================
     # COMPANIES
