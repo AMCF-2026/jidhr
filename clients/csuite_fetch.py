@@ -33,11 +33,25 @@ would duplicate forever. `ENDPOINT_CONTRACTS` records which is which.
 
 Pacing and rate limits
 ----------------------
-CSuite is a live accounting API with a rate limit that probe #3 tripped at
-roughly 400 calls. Every call is separated by CSUITE_PACE_MS (default 150).
-An HTTP 429 buys one 5-second retry; a second 429 stops the fetch with
-complete=False. Nothing in here raises — a caller always gets a
-FetchResult and can see for itself whether the data is whole.
+CSuite is a live accounting API with a rate limit, and we have now
+measured where it is. On 2026-09-10 a run made 401 calls, paused three
+minutes, made 265 more, and was refused at a cumulative ~666. It then
+refused EVERY call for the next 15 seconds and more.
+
+Two things follow, and both were wrong in the first version:
+
+  * The window is cumulative over minutes, not per-second. Pacing alone
+    does not avoid it — a 960-call sweep will hit it whatever the gap
+    between calls. That is what the caller's budget is for.
+  * A 5-second retry is useless. Once tripped, the limiter stays shut for
+    longer than that, so a short retry just spends another call on
+    another 429. Backoff is 30s, 60s, 120s, and a Retry-After header
+    from CSuite overrides all three.
+
+Every call is separated by CSUITE_PACE_MS (default 400). Nothing in here
+raises — a caller always gets a FetchResult and can see for itself
+whether the data is whole, how many times it was refused, and when the
+refusals started.
 """
 
 import json
@@ -46,6 +60,8 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +70,20 @@ logger = logging.getLogger(__name__)
 # Tunables
 # ---------------------------------------------------------------------------
 
-DEFAULT_PACE_MS = 150
-RATE_LIMIT_BACKOFF_S = 5.0
+# Raised from 150 after the 2026-09-10 rate limit. Pacing is not what
+# saves a long sweep, but a slower one spends its budget over a longer
+# window, which is the axis the limiter actually measures.
+DEFAULT_PACE_MS = 400
+
+# Waits after a 429, in order. Three waits, so four attempts in all. The
+# first is 30s because the limiter was observed still refusing 15s after
+# it tripped; 5s was measurably too short.
+RATE_LIMIT_BACKOFFS = (30.0, 60.0, 120.0)
+
+# A Retry-After longer than this is not honoured — CSuite asking us to
+# wait half an hour is a reason to stop the run and come back, not to
+# hold a database connection open through it.
+MAX_RETRY_AFTER_S = 300.0
 
 # A safety stop, not a real limit. donation/list is the largest sweep at
 # ~266 pages; 2000 is far beyond any legitimate run and exists only so a
@@ -63,6 +91,7 @@ RATE_LIMIT_BACKOFF_S = 5.0
 MAX_PAGES = 2000
 
 RATE_LIMITED_ERROR = "rate limited"
+BUDGET_ERROR = "budget reached"
 
 
 @dataclass(frozen=True)
@@ -106,10 +135,24 @@ class FetchResult:
     expected: int | None = None
     error: str | None = None
     calls: int = 0
+    # When CSuite first refused us, and how many times in total. Recorded
+    # even on a fetch that eventually succeeded: the point is to learn the
+    # shape of the limiter from the run ledger rather than from a log
+    # nobody kept.
+    first_429_at: str | None = None
+    total_429s: int = 0
 
     @property
     def count(self) -> int:
         return len(self.records)
+
+    @property
+    def budget_exhausted(self) -> bool:
+        return self.error == BUDGET_ERROR
+
+    @property
+    def rate_limited(self) -> bool:
+        return self.error == RATE_LIMITED_ERROR
 
     @property
     def count_matches_expected(self) -> bool | None:
@@ -172,6 +215,49 @@ def pace_sleep(seconds: float) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Call budget
+# ---------------------------------------------------------------------------
+
+class CallBudget:
+    """A shared ceiling on how many CSuite calls a run may make.
+
+    One budget is threaded through every fetch in a run, so a limit of 500
+    means 500 calls total and not 500 per record type. Stopping at a
+    number we chose is strictly better than stopping at the number CSuite
+    chose: a budget stop leaves staged work behind and a clean
+    complete=False, while a 429 wastes the call it was refused on and
+    every call for the next 15 seconds.
+    """
+
+    __slots__ = ("limit", "used")
+
+    def __init__(self, limit=None):
+        self.limit = limit if limit is None or limit > 0 else None
+        self.used = 0
+
+    @property
+    def remaining(self):
+        if self.limit is None:
+            return None
+        return max(0, self.limit - self.used)
+
+    @property
+    def exhausted(self) -> bool:
+        return self.limit is not None and self.used >= self.limit
+
+    def spend(self, calls: int = 1) -> None:
+        self.used += calls
+
+    def __repr__(self):  # pragma: no cover - diagnostics only
+        return f"CallBudget(used={self.used}, limit={self.limit})"
+
+
+def _budget(budget):
+    """A budget for a call site that was given none: unlimited."""
+    return budget if budget is not None else CallBudget(None)
+
+
+# ---------------------------------------------------------------------------
 # Rate-limit detection
 # ---------------------------------------------------------------------------
 
@@ -192,8 +278,58 @@ def looks_rate_limited(status_code=None, error=None) -> bool:
     return False
 
 
+def parse_retry_after(value, now=None) -> float | None:
+    """Seconds to wait, from a Retry-After header. None if unusable.
+
+    RFC 9110 allows either a delay in seconds or an HTTP date. Both are
+    accepted; anything else, anything negative, and anything longer than
+    MAX_RETRY_AFTER_S is ignored in favour of our own backoff.
+    """
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    seconds = None
+    try:
+        seconds = float(text)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(text)
+        except (TypeError, ValueError):
+            return None
+        if when is None:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        reference = now or datetime.now(timezone.utc)
+        seconds = (when - reference).total_seconds()
+
+    if seconds is None or seconds < 0:
+        return None
+    if seconds > MAX_RETRY_AFTER_S:
+        logger.warning(
+            "CSuite asked us to wait %.0fs, which is past the %.0fs cap — "
+            "stopping instead of holding the run open",
+            seconds, MAX_RETRY_AFTER_S)
+        return None
+    return seconds
+
+
+def _clock() -> str:
+    """UTC wall-clock time, for a log line someone will read tomorrow."""
+    return datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+
+
+def _stamp() -> str:
+    """An ISO timestamp for the run ledger."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 class _StatusTap:
-    """Records the HTTP status of the client's most recent POST.
+    """Records the HTTP status and Retry-After of the most recent POST.
 
     `CSuiteClient._request` deliberately returns a normalised dict and drops
     the status code, and Step 3a may not modify that file. Wrapping the
@@ -211,6 +347,7 @@ class _StatusTap:
         self._original = None
         self._had_own_post = False
         self.status = None
+        self.retry_after = None
 
     def __enter__(self):
         session = getattr(self._client, "session", None)
@@ -229,6 +366,11 @@ class _StatusTap:
         def recording_post(*args, **kwargs):
             response = original(*args, **kwargs)
             self.status = getattr(response, "status_code", None)
+            headers = getattr(response, "headers", None) or {}
+            try:
+                self.retry_after = headers.get("Retry-After")
+            except Exception:  # pragma: no cover - exotic header mapping
+                self.retry_after = None
             return response
 
         try:
@@ -255,6 +397,7 @@ class _StatusTap:
 
     def reset(self):
         self.status = None
+        self.retry_after = None
 
 
 # ---------------------------------------------------------------------------
@@ -322,19 +465,31 @@ class _CallOutcome:
     data: object = None
     error: str | None = None
     calls: int = 0
+    first_429_at: str | None = None
+    total_429s: int = 0
 
 
 def _call_once(client, endpoint: str, request: dict, tap: _StatusTap,
-               label: str) -> _CallOutcome:
-    """One CSuite call. On 429: wait 5s, retry once, then give up.
+               label: str, budget: CallBudget) -> _CallOutcome:
+    """One CSuite call, with the rate-limit policy around it.
 
-    Never raises: a transport exception from deep inside the client becomes
-    an error string like any other failure.
+    A 429 is waited out — Retry-After if CSuite sent one, otherwise 30s,
+    60s, 120s — and retried, up to three waits. A fourth refusal gives up
+    with error="rate limited".
+
+    Never raises: a transport exception from deep inside the client
+    becomes an error string like any other failure.
     """
     outcome = _CallOutcome()
+    attempts = len(RATE_LIMIT_BACKOFFS) + 1
 
-    for attempt in (1, 2):
+    for attempt in range(attempts):
+        if budget.exhausted:
+            outcome.error = BUDGET_ERROR
+            return outcome
+
         tap.reset()
+        budget.spend()
         try:
             result = client._request(endpoint, dict(request))
         except Exception as e:  # pragma: no cover - client swallows its own
@@ -349,21 +504,32 @@ def _call_once(client, endpoint: str, request: dict, tap: _StatusTap,
             outcome.data = _envelope(result)
             return outcome
 
-        if looks_rate_limited(tap.status, error):
-            if attempt == 1:
-                logger.warning(
-                    "CSuite rate limited on %s (%s) — waiting %.0fs for one "
-                    "retry", endpoint, label, RATE_LIMIT_BACKOFF_S)
-                pace_sleep(RATE_LIMIT_BACKOFF_S)
-                continue
+        if not looks_rate_limited(tap.status, error):
+            outcome.error = error
+            return outcome
+
+        outcome.total_429s += 1
+        if outcome.first_429_at is None:
+            outcome.first_429_at = _stamp()
+
+        if attempt >= len(RATE_LIMIT_BACKOFFS):
             logger.error(
-                "CSuite rate limited twice on %s (%s) — stopping",
-                endpoint, label)
+                "CSuite rate limited %d times on %s (%s) — giving up at %s",
+                outcome.total_429s, endpoint, label, _clock())
             outcome.error = RATE_LIMITED_ERROR
             return outcome
 
-        outcome.error = error
-        return outcome
+        retry_after = parse_retry_after(tap.retry_after)
+        wait = retry_after if retry_after is not None \
+            else RATE_LIMIT_BACKOFFS[attempt]
+        source = "Retry-After" if retry_after is not None else "backoff"
+
+        logger.warning(
+            "CSuite rate limited on %s (%s) at %s — waiting %.0fs (%s), "
+            "try %d of %d",
+            endpoint, label, _clock(), wait, source,
+            attempt + 2, attempts)
+        pace_sleep(wait)
 
     return outcome  # pragma: no cover - loop always returns
 
@@ -373,17 +539,23 @@ def _call_once(client, endpoint: str, request: dict, tap: _StatusTap,
 # ---------------------------------------------------------------------------
 
 def fetch_all(client, endpoint: str, params: dict = None, *,
-              pace_ms=None, max_pages: int = MAX_PAGES) -> FetchResult:
+              pace_ms=None, max_pages: int = MAX_PAGES,
+              budget: "CallBudget" = None) -> FetchResult:
     """Every record from a CSuite list endpoint, or an honest partial.
 
     Pages by `view_offset` until a page comes back empty. Endpoints with no
     offset parameter (event/list/dates, funit/feetype) are fetched once —
     see ENDPOINT_CONTRACTS.
 
+    `budget`, if given, is shared across every fetch in a run: the sweep
+    stops cleanly with error="budget reached" rather than running until
+    CSuite refuses it.
+
     Returns a FetchResult. Never raises.
     """
     contract = ENDPOINT_CONTRACTS.get(endpoint, DEFAULT_CONTRACT)
     pace = pace_seconds(pace_ms)
+    budget = _budget(budget)
 
     base = dict(params or {})
     if contract.view_limit is not None:
@@ -394,7 +566,13 @@ def fetch_all(client, endpoint: str, params: dict = None, *,
     calls = 0
     expected = None
     offset = 0
+    first_429_at = None
+    total_429s = 0
     started = time.perf_counter()
+
+    def finish(complete, error):
+        return FetchResult(records, complete, pages, expected, error, calls,
+                           first_429_at, total_429s)
 
     with _StatusTap(client) as tap:
         while True:
@@ -402,8 +580,14 @@ def fetch_all(client, endpoint: str, params: dict = None, *,
                 error = (f"stopped after {max_pages} pages — {endpoint} never "
                          "returned an empty page")
                 logger.error(error)
-                return FetchResult(records, False, pages, expected, error,
-                                   calls)
+                return finish(False, error)
+
+            if budget.exhausted:
+                logger.warning(
+                    "call budget reached on %s after %d rows — stopping "
+                    "cleanly with %d pages fetched",
+                    endpoint, len(records), pages)
+                return finish(False, BUDGET_ERROR)
 
             request = dict(base)
             if contract.paginate:
@@ -413,15 +597,17 @@ def fetch_all(client, endpoint: str, params: dict = None, *,
                 pace_sleep(pace)
 
             outcome = _call_once(client, endpoint, request, tap,
-                                 f"offset {offset}")
+                                 f"offset {offset}", budget)
             calls += outcome.calls
+            total_429s += outcome.total_429s
+            if first_429_at is None:
+                first_429_at = outcome.first_429_at
 
             if outcome.error is not None:
                 logger.error(
-                    "CSuite fetch of %s failed at offset %d after %d rows: %s",
-                    endpoint, offset, len(records), outcome.error)
-                return FetchResult(records, False, pages, expected,
-                                   outcome.error, calls)
+                    "CSuite fetch of %s stopped at offset %d after %d rows: "
+                    "%s", endpoint, offset, len(records), outcome.error)
+                return finish(False, outcome.error)
 
             pages += 1
 
@@ -443,9 +629,10 @@ def fetch_all(client, endpoint: str, params: dict = None, *,
     elapsed = time.perf_counter() - started
     logger.info(
         "CSuite fetch %s: %d records in %d pages / %d calls (%.1fs), "
-        "expected %s",
+        "expected %s%s",
         endpoint, len(records), pages, calls, elapsed,
-        expected if expected is not None else "unreported")
+        expected if expected is not None else "unreported",
+        f", {total_429s} rate limits survived" if total_429s else "")
 
     if expected is not None and len(records) != expected:
         # Not an error. CSuite is live; rows move while a 266-page sweep
@@ -454,27 +641,34 @@ def fetch_all(client, endpoint: str, params: dict = None, *,
             "CSuite fetch %s: got %d but data.count said %d (difference %+d)",
             endpoint, len(records), expected, len(records) - expected)
 
-    return FetchResult(records, True, pages, expected, None, calls)
+    return finish(True, None)
 
 
 def fetch_one(client, endpoint: str, params: dict = None, *,
-              pace_ms=None) -> FetchResult:
-    """One display-style record, with the same pacing and 429 policy.
+              pace_ms=None, budget: "CallBudget" = None) -> FetchResult:
+    """One display-style record, with the same rate-limit policy.
 
     Used for the funit/display sweep, which is one call per fund and needs
-    exactly the rate-limit behaviour fetch_all has. Returns the object at
+    exactly the backoff behaviour fetch_all has. Returns the object at
     `data` as a single-element `records` list.
     """
+    budget = _budget(budget)
+
+    if budget.exhausted:
+        return FetchResult([], False, 0, None, BUDGET_ERROR, 0)
+
     with _StatusTap(client) as tap:
         outcome = _call_once(client, endpoint, dict(params or {}), tap,
-                             "single")
+                             "single", budget)
 
     if outcome.error is not None:
-        return FetchResult([], False, 0, None, outcome.error, outcome.calls)
+        return FetchResult([], False, 0, None, outcome.error, outcome.calls,
+                           outcome.first_429_at, outcome.total_429s)
 
     data = outcome.data
     records = [data] if isinstance(data, dict) else read_records(data)
-    return FetchResult(records, True, 1, None, None, outcome.calls)
+    return FetchResult(records, True, 1, None, None, outcome.calls,
+                       outcome.first_429_at, outcome.total_429s)
 
 
 def canonical_json(payload) -> str:

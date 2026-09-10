@@ -5,14 +5,17 @@ Thin CLI over sync.mirror.refresh.
 
 READ-ONLY against CSuite. Writes only to csuite_mirror and sync_runs.
 
-    # Everything, at the default 150ms pace:
+    # Everything, at the default 400ms pace:
     python scripts/mirror_refresh.py
 
     # See what would change without writing a mirror row:
     python scripts/mirror_refresh.py --dry-run
 
     # One type, slowly, because CSuite is busy:
-    python scripts/mirror_refresh.py --types profile --pace-ms 400
+    python scripts/mirror_refresh.py --types profile --pace-ms 800
+
+    # Half now, half later — the safe way to fill an empty mirror:
+    python scripts/mirror_refresh.py --budget 500
 
 A full run is roughly 960 CSuite calls — 399 of them the funit/display
 sweep and 267 the pages of donation/list. At the default 150ms pace and
@@ -36,6 +39,7 @@ import sys
 # Make the repo root importable when run as `python scripts/mirror_refresh.py`
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from clients.csuite_fetch import CallBudget  # noqa: E402
 from sync.mirror import RECORD_TYPES, refresh  # noqa: E402
 
 
@@ -50,6 +54,8 @@ COLUMNS = (
     ("unchanged", 10, ">"),
     ("deleted", 8, ">"),
     ("calls", 6, ">"),
+    ("reused", 7, ">"),
+    ("429s", 5, ">"),
     ("seconds", 8, ">"),
 )
 
@@ -112,7 +118,14 @@ def main() -> int:
         type=int,
         default=None,
         help="Milliseconds between CSuite calls. "
-             "Default: $CSUITE_PACE_MS, or 150.",
+             "Default: $CSUITE_PACE_MS, or 400.",
+    )
+    parser.add_argument(
+        "--budget",
+        type=int,
+        default=None,
+        help="Stop cleanly before making more than N CSuite calls this "
+             "run, across all types. Default: no budget.",
     )
     parser.add_argument(
         "--dry-run",
@@ -135,7 +148,12 @@ def main() -> int:
 
     mode = "DRY RUN — nothing will be written" if args.dry_run else "writing"
     print(f"CSuite mirror refresh ({mode})")
-    print(f"Types: {', '.join(args.types)}\n")
+    print(f"Types: {', '.join(args.types)}")
+    if args.budget:
+        print(f"Budget: {args.budget} CSuite calls")
+    print()
+
+    budget = CallBudget(args.budget) if args.budget else None
 
     results = refresh(
         record_types=args.types,
@@ -143,6 +161,7 @@ def main() -> int:
         dry_run=args.dry_run,
         trigger_source="cli",
         triggered_by="cli:mirror_refresh",
+        budget=budget,
     )
 
     print(_header())
@@ -156,12 +175,21 @@ def main() -> int:
             result.unchanged,
             result.deleted,
             result.calls,
+            result.reused_staged,
+            result.total_429s,
             result.seconds,
         ]))
 
     total_calls = sum(r.calls for r in results)
     total_seconds = sum(r.seconds for r in results)
     print(f"\n{total_calls} CSuite calls, {total_seconds:.1f}s total.")
+
+    first_429 = next((r.first_429_at for r in results if r.first_429_at), None)
+    total_429s = sum(r.total_429s for r in results)
+    if total_429s:
+        print(f"Rate limited {total_429s}x, first at {first_429}. "
+              "The ledger has the rest: "
+              "SELECT notes FROM sync_runs WHERE sync_type = 'mirror'.")
 
     if any(r.record_type == "donation_agg" for r in results):
         # The two columns count different things for this one type, which
@@ -173,15 +201,27 @@ def main() -> int:
         print("Dry run: 'written' is 0 and 'deleted' is what WOULD be "
               "deleted. No mirror rows changed.")
 
-    failures = [r for r in results if r.status != "complete"
-                and not (args.dry_run and r.status == "verified")]
-    if failures:
-        print("\nFAILED — nothing was written for these types:")
-        for result in failures:
-            print(f"  {result.record_type}: {result.error or result.status}")
-        return 1
+    unfinished = [r for r in results if r.status != "complete"
+                  and not (args.dry_run and r.status == "verified")]
+    if not unfinished:
+        return 0
 
-    return 0
+    # A budget stop is a clean stop we asked for, not a failure. Shouting
+    # "FAILED" at someone who set --budget is how a working safeguard
+    # gets switched off.
+    stopped = [r for r in results if r.stop_reason]
+    print("\nStopped early — nothing was written for these types:"
+          if stopped else
+          "\nFAILED — nothing was written for these types:")
+    for result in unfinished:
+        print(f"  {result.record_type}: {result.error or result.status}")
+
+    if stopped:
+        print("\nNothing is lost. Fund displays fetched this run are staged "
+              "and will be reused for 24h — run the same command again in a "
+              "few minutes to continue.")
+
+    return 1
 
 
 if __name__ == "__main__":

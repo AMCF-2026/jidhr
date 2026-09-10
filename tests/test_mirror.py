@@ -77,10 +77,13 @@ class FakeDB:
     already exists.
     """
 
-    def __init__(self, stored=None, next_run_id=1000):
+    def __init__(self, stored=None, next_run_id=1000, staged=None):
         self.statements = []
         self.stored = dict(stored or {})
         self.next_run_id = next_run_id
+        # {(record_type, source_id): payload dict} — sync_staging rows that
+        # are already there and young enough to reuse.
+        self.staged = dict(staged or {})
 
     def __call__(self, sql, params=None, fetch=True):
         collapsed = " ".join(str(sql).split())
@@ -98,6 +101,29 @@ class FakeDB:
                 for (rtype, csuite_id), data_hash in self.stored.items()
                 if rtype == record_type
             ]
+
+        if collapsed.startswith("SELECT s.source_id, s.proposed_values"):
+            record_type = params[0]
+            return [
+                {"source_id": source_id, "proposed_values": payload}
+                for (rtype, source_id), payload in self.staged.items()
+                if rtype == record_type
+            ]
+
+        if collapsed.startswith("INSERT INTO sync_staging"):
+            _, record_type, source_id, payload = params
+            self.staged[(record_type, source_id)] = json.loads(payload)
+            return 1
+
+        if collapsed.startswith("DELETE FROM sync_staging"):
+            record_type = params[0]
+            source_id = params[1] if len(params) > 1 else None
+            for key in list(self.staged):
+                if key[0] != record_type:
+                    continue
+                if source_id is None or key[1] == source_id:
+                    del self.staged[key]
+            return 1
 
         return 1
 
@@ -118,6 +144,20 @@ class FakeDB:
     @property
     def run_inserts(self):
         return self.matching("INSERT INTO sync_runs")
+
+    @property
+    def staging_inserts(self):
+        return self.matching("INSERT INTO sync_staging")
+
+    @property
+    def staging_deletes(self):
+        return self.matching("DELETE FROM sync_staging")
+
+    @property
+    def staging_clears(self):
+        """Deletes that target a whole record_type, not a single row."""
+        return [(sql, params) for sql, params in self.staging_deletes
+                if len(params) == 1]
 
     @property
     def run_updates(self):
@@ -307,7 +347,7 @@ def test_one_429_is_retried_once_and_succeeds():
     assert result.calls == 3
 
 
-def test_two_429s_stop_the_fetch_incomplete():
+def test_a_wall_of_429s_stops_the_fetch_after_three_backoffs():
     client = StubClient({
         "grant/list": lambda data: fail("HTTP 429 Too Many Requests")
     })
@@ -316,10 +356,13 @@ def test_two_429s_stop_the_fetch_incomplete():
 
     assert result.complete is False
     assert result.error == "rate limited"
-    assert result.calls == 2
+    # One original call plus one per backoff in RATE_LIMIT_BACKOFFS.
+    assert result.calls == len(csuite_fetch.RATE_LIMIT_BACKOFFS) + 1 == 4
+    assert result.total_429s == 4
+    assert result.first_429_at is not None
 
 
-def test_two_429s_write_nothing_and_fail_the_run(db):
+def test_sustained_429s_write_nothing_and_fail_the_run(db):
     client = StubClient({
         "grant/list": lambda data: fail("HTTP 429 Too Many Requests")
     })
@@ -815,9 +858,10 @@ def test_run_rows_are_one_per_record_type(db):
     assert len(db.run_inserts) == 2
 
 
-def test_a_failing_type_does_not_stop_the_next_one(db):
+def test_an_ordinary_failure_does_not_stop_the_next_type(db):
+    """A malformed response on grants says nothing about checks."""
     client = StubClient({
-        "grant/list": lambda data: fail("HTTP 429 Too Many Requests"),
+        "grant/list": lambda data: fail("unexpected server error"),
         "check/list": [ok([{"check_id": 2}], count=1), ok([])],
     })
 
@@ -825,6 +869,25 @@ def test_a_failing_type_does_not_stop_the_next_one(db):
                              pace_ms=0)
 
     assert [r.status for r in results] == ["failed", "complete"]
+
+
+def test_a_rate_limit_stops_the_whole_run(db):
+    """CSuite's limiter is cumulative over minutes. Once it has refused us
+    through the full backoff, the next six sweeps will find it shut too."""
+    client = StubClient({
+        "grant/list": lambda data: fail("HTTP 429 Too Many Requests"),
+        "check/list": [ok([{"check_id": 2}], count=1), ok([])],
+    })
+
+    results = mirror.refresh(record_types=["grant", "check", "profile"],
+                             client=client, pace_ms=0)
+
+    assert [r.record_type for r in results] == ["grant", "check", "profile"]
+    assert [r.status for r in results] == ["failed", "skipped", "skipped"]
+    assert "rate limited" in results[1].error
+    # Nothing was attempted for the skipped types.
+    assert not [e for e, _ in client.calls if e == "check/list"]
+    assert len(db.run_inserts) == 1, "a skipped type gets no run row"
 
 
 def test_unknown_record_type_is_rejected():
@@ -918,7 +981,7 @@ def test_pace_comes_from_the_environment(monkeypatch):
     assert csuite_fetch.configured_pace_ms() == csuite_fetch.DEFAULT_PACE_MS
 
     monkeypatch.delenv("CSUITE_PACE_MS", raising=False)
-    assert csuite_fetch.configured_pace_ms() == 150
+    assert csuite_fetch.configured_pace_ms() == 400
 
 
 def test_duplicate_ids_across_pages_collapse_to_one_row(db):
@@ -1114,3 +1177,433 @@ def test_user_id_coercion_in_isolation():
         mirror._user_id("cli:mirror_refresh")
     with pytest.raises(TypeError):
         mirror._user_id(True)
+
+
+# ---------------------------------------------------------------------------
+# 3a-rate: the 429 policy that replaced the useless 5-second retry
+# ---------------------------------------------------------------------------
+
+class Waits:
+    """Captures every pace_sleep call so backoffs can be asserted on."""
+
+    def __init__(self):
+        self.seconds = []
+
+    def __call__(self, seconds):
+        self.seconds.append(seconds)
+
+    @property
+    def long(self):
+        """Only the rate-limit backoffs, not the inter-call pacing."""
+        return [s for s in self.seconds if s >= 1]
+
+
+@pytest.fixture
+def waits(monkeypatch):
+    recorder = Waits()
+    monkeypatch.setattr(csuite_fetch, "pace_sleep", recorder)
+    monkeypatch.setattr(mirror, "pace_sleep", recorder)
+    return recorder
+
+
+class RateLimitedSession:
+    """A session whose POSTs come back 429, optionally with Retry-After."""
+
+    def __init__(self, retry_after=None, refusals=None):
+        self.retry_after = retry_after
+        self.refusals = refusals
+        self.posts = 0
+
+    def post(self, *args, **kwargs):
+        self.posts += 1
+        limited = self.refusals is None or self.posts <= self.refusals
+        headers = {}
+        if limited and self.retry_after is not None:
+            headers["Retry-After"] = self.retry_after
+        return type("Response", (), {
+            "status_code": 429 if limited else 200,
+            "headers": headers,
+        })()
+
+
+class LimitedClient(StubClient):
+    """A stub whose _request drives a real 429-shaped HTTP response.
+
+    The 429 arrives with no marker in the response body — only the HTTP
+    status and the Retry-After header — so this exercises the _StatusTap
+    path rather than the error-text fallback.
+
+    After `refusals` calls the limiter opens and one page plus a
+    terminating empty page are served.
+    """
+
+    def __init__(self, retry_after=None, refusals=1):
+        super().__init__({})
+        self.session = RateLimitedSession(retry_after, refusals)
+        self.served = 0
+
+    def _request(self, endpoint, data=None):
+        self.calls.append((endpoint, dict(data or {})))
+        response = self.session.post("https://example.invalid")
+        if response.status_code == 429:
+            # A body that says nothing about rate limits: the status code
+            # is the only signal.
+            return {"success": False, "error": "request failed",
+                    "errors": ["request failed"]}
+        self.served += 1
+        if self.served == 1:
+            return ok([{"grant_id": 1}], count=1)
+        return ok([])
+
+
+def test_retry_after_header_is_honoured_over_the_backoff(waits):
+    """CSuite knows when its window reopens; we do not."""
+    client = LimitedClient(retry_after="12", refusals=1)
+
+    result = fetch_all(client, "grant/list", pace_ms=0)
+
+    assert waits.long == [12.0], "the 30s backoff must yield to Retry-After"
+    assert result.total_429s == 1
+    assert result.first_429_at is not None
+
+
+def test_an_http_date_retry_after_is_honoured(waits, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    when = datetime.now(timezone.utc) + timedelta(seconds=45)
+    header = when.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    client = LimitedClient(retry_after=header, refusals=1)
+
+    fetch_all(client, "grant/list", pace_ms=0)
+
+    assert len(waits.long) == 1
+    assert 40 <= waits.long[0] <= 46
+
+
+def test_an_absurd_retry_after_falls_back_to_our_own_backoff(waits):
+    """Half an hour is a reason to stop the run, not to hold it open."""
+    client = LimitedClient(retry_after="1800", refusals=1)
+
+    fetch_all(client, "grant/list", pace_ms=0)
+
+    assert waits.long == [30.0]
+
+
+@pytest.mark.parametrize("header", ["", "soon", "-5", None])
+def test_an_unusable_retry_after_falls_back_to_the_backoff(waits, header):
+    client = LimitedClient(retry_after=header, refusals=1)
+    fetch_all(client, "grant/list", pace_ms=0)
+    assert waits.long == [30.0]
+
+
+def test_three_backoffs_then_fail(waits):
+    """30s, 60s, 120s — then stop. The 5s retry this replaced was useless:
+    the limiter stayed shut for 15s+ once tripped."""
+    client = StubClient({
+        "grant/list": lambda data: fail("HTTP 429 Too Many Requests")
+    })
+
+    result = fetch_all(client, "grant/list", pace_ms=0)
+
+    assert waits.long == [30.0, 60.0, 120.0]
+    assert result.complete is False
+    assert result.error == "rate limited"
+    assert result.calls == 4
+    assert result.total_429s == 4
+
+
+def test_a_429_that_clears_lets_the_fetch_finish(waits):
+    responses = [fail("HTTP 429 Too Many Requests"),
+                 fail("HTTP 429 Too Many Requests"),
+                 ok([{"grant_id": 1}], count=1),
+                 ok([])]
+    client = StubClient({"grant/list": responses})
+
+    result = fetch_all(client, "grant/list", pace_ms=0)
+
+    assert waits.long == [30.0, 60.0]
+    assert result.complete is True
+    assert result.total_429s == 2, "recorded even though the fetch succeeded"
+    assert result.first_429_at is not None
+
+
+def test_retry_after_parsing_in_isolation():
+    from clients.csuite_fetch import parse_retry_after
+    assert parse_retry_after("30") == 30.0
+    assert parse_retry_after("30.5") == 30.5
+    assert parse_retry_after("0") == 0.0
+    assert parse_retry_after(None) is None
+    assert parse_retry_after("") is None
+    assert parse_retry_after("nonsense") is None
+    assert parse_retry_after("-1") is None
+    assert parse_retry_after("99999") is None
+
+
+# ---------------------------------------------------------------------------
+# 3a-rate: staged fund displays
+# ---------------------------------------------------------------------------
+
+def test_each_display_is_staged_as_it_returns(db):
+    client = fund_client()
+    mirror.refresh_type("fund", client=client, pace_ms=0)
+
+    staged = [params for _, params in db.staging_inserts]
+    assert len(staged) == 2
+    for run_id, record_type, source_id, payload in staged:
+        assert record_type == "fund_display"
+        assert run_id is not None
+        assert json.loads(payload)["funit_id"] == int(source_id)
+
+
+def test_a_staged_display_is_reused_and_the_call_is_not_made(db):
+    """The whole point: a display already paid for is not paid for twice."""
+    db.staged[("fund_display", "1000")] = FUND_DISPLAYS[1000]
+    client = fund_client()
+
+    result = mirror.refresh_type("fund", client=client, pace_ms=0)
+
+    assert result.status == "complete"
+    assert result.reused_staged == 1
+
+    called = [d["funit_id"] for e, d in client.calls if e == "funit/display"]
+    assert called == [1001], "fund 1000 must not have been fetched again"
+
+    rows = {row["csuite_id"]: row for row in db.upserted_rows()}
+    assert set(rows) == {"1000", "1001"}
+    assert rows["1000"]["fund_group_id"] == 1002
+
+
+def test_staged_displays_are_read_with_an_age_limit(db):
+    client = fund_client()
+    mirror.refresh_type("fund", client=client, pace_ms=0)
+
+    loads = db.matching("SELECT s.source_id, s.proposed_values")
+    assert len(loads) == 1
+    sql, params = loads[0]
+    assert params == ("fund_display", "24 hours")
+    assert "started_at > NOW() - %s::interval" in sql
+
+
+def test_staging_rows_are_deleted_after_a_complete_fund_write(db):
+    client = fund_client()
+    result = mirror.refresh_type("fund", client=client, pace_ms=0)
+
+    assert result.status == "complete"
+    assert db.staging_clears, "a complete fund write must clear staging"
+    assert db.staging_clears[-1][1] == ("fund_display",)
+    assert not db.staged, "no staged rows should survive"
+
+
+def test_staging_survives_a_stopped_fund_run(db):
+    """A run that dies partway must leave its paid-for displays behind."""
+    def display(data):
+        if data["funit_id"] == 1001:
+            return fail("HTTP 429 Too Many Requests")
+        return ok_object(FUND_DISPLAYS[1000])
+
+    client = StubClient({
+        "funit/list": [ok(FUND_LIST, count=2), ok([])],
+        "funit/display": display,
+    })
+
+    result = mirror.refresh_type("fund", client=client, pace_ms=0)
+
+    assert result.status == "failed"
+    assert db.upserts == [], "an incomplete sweep writes no mirror rows"
+    assert db.staged.get(("fund_display", "1000")) == FUND_DISPLAYS[1000]
+    assert not db.staging_clears, "staging must NOT be cleared on failure"
+
+
+def test_a_second_run_after_a_stop_reuses_everything_staged(db):
+    """Run one dies on fund 1001; run two makes exactly one display call."""
+    window_shut = {"yes": True}
+
+    def display(data):
+        # 1001 is refused for as long as the limiter is shut, including
+        # through every backoff — which is what a real 429 window does.
+        if data["funit_id"] == 1001 and window_shut["yes"]:
+            return fail("HTTP 429 Too Many Requests")
+        return ok_object(FUND_DISPLAYS[data["funit_id"]])
+
+    first = StubClient({"funit/list": [ok(FUND_LIST, count=2), ok([])],
+                        "funit/display": display})
+    assert mirror.refresh_type("fund", client=first,
+                               pace_ms=0).status == "failed"
+
+    window_shut["yes"] = False
+    second = StubClient({"funit/list": [ok(FUND_LIST, count=2), ok([])],
+                         "funit/display": display})
+    result = mirror.refresh_type("fund", client=second, pace_ms=0)
+
+    assert result.status == "complete"
+    assert result.reused_staged == 1
+    called = [d["funit_id"] for e, d in second.calls if e == "funit/display"]
+    assert called == [1001], "only the fund that was never fetched"
+
+
+def test_a_reused_display_costs_no_pacing_pause(db, waits):
+    db.staged[("fund_display", "1000")] = FUND_DISPLAYS[1000]
+    db.staged[("fund_display", "1001")] = FUND_DISPLAYS[1001]
+    client = fund_client()
+
+    mirror.refresh_type("fund", client=client, pace_ms=250)
+
+    assert not [e for e, _ in client.calls if e == "funit/display"]
+    # The only pause is funit/list paging between its two pages. Two reused
+    # displays add none, because neither made a call.
+    assert waits.seconds == [0.25]
+
+
+def test_an_unreadable_staging_table_only_costs_speed(db, monkeypatch):
+    """Staging is an optimisation. It must never be able to fail a run."""
+    original = db.__call__
+
+    def breaking(sql, params=None, fetch=True):
+        if "sync_staging" in sql:
+            raise RuntimeError("relation does not exist")
+        return original(sql, params, fetch)
+
+    monkeypatch.setattr("clients.database.execute_query", breaking)
+    client = fund_client()
+
+    result = mirror.refresh_type("fund", client=client, pace_ms=0)
+
+    assert result.status == "complete"
+    assert result.reused_staged == 0
+    assert len(db.upserted_rows()) == 2
+
+
+# ---------------------------------------------------------------------------
+# 3a-rate: the call budget
+# ---------------------------------------------------------------------------
+
+def test_budget_stops_a_paged_fetch_at_n():
+    client = StubClient({
+        "grant/list": lambda data: ok([{"grant_id": data["view_offset"]}])
+    })
+    budget = csuite_fetch.CallBudget(3)
+
+    result = fetch_all(client, "grant/list", pace_ms=0, budget=budget)
+
+    assert result.complete is False
+    assert result.error == "budget reached"
+    assert result.calls == 3
+    assert budget.used == 3
+    assert len(client.calls) == 3
+
+
+def test_budget_is_shared_across_record_types(db):
+    client = StubClient({
+        "grant/list": lambda data: ok([{"grant_id": data["view_offset"]}]),
+        "check/list": lambda data: ok([{"check_id": data["view_offset"]}]),
+    })
+    budget = csuite_fetch.CallBudget(4)
+
+    results = mirror.refresh(record_types=["grant", "check"], client=client,
+                             pace_ms=0, budget=budget)
+
+    assert budget.used == 4
+    assert results[0].status == "failed"
+    assert results[0].stop_reason == "budget reached"
+    assert results[1].status == "skipped"
+    assert not [e for e, _ in client.calls if e == "check/list"]
+
+
+def test_budget_stops_the_fund_sweep_and_keeps_what_it_staged(db):
+    funds = [{"funit_id": i} for i in range(1000, 1010)]
+    client = StubClient({
+        "funit/list": [ok(funds, count=10), ok([])],
+        "funit/display": lambda d: ok_object({"funit_id": d["funit_id"],
+                                              "fgroup_id": 1002}),
+    })
+    # 2 calls for the listing, then 4 displays.
+    budget = csuite_fetch.CallBudget(6)
+
+    result = mirror.refresh_type("fund", client=client, pace_ms=0,
+                                 budget=budget)
+
+    assert result.status == "failed"
+    assert result.stop_reason == "budget reached"
+    assert "budget reached" in result.error
+    assert db.upserts == [], "an incomplete sweep writes nothing"
+
+    staged_ids = sorted(k[1] for k in db.staged)
+    assert staged_ids == ["1000", "1001", "1002", "1003"]
+    assert not db.staging_clears
+
+
+def test_an_integer_budget_is_accepted(db):
+    client = StubClient({
+        "grant/list": lambda data: ok([{"grant_id": data["view_offset"]}])
+    })
+    results = mirror.refresh(record_types=["grant"], client=client,
+                             pace_ms=0, budget=2)
+    assert results[0].stop_reason == "budget reached"
+
+
+def test_no_budget_means_no_ceiling(db):
+    client = StubClient({"grant/list": [ok([{"grant_id": 1}], count=1),
+                                        ok([])]})
+    result = mirror.refresh_type("grant", client=client, pace_ms=0)
+    assert result.status == "complete"
+
+
+def test_call_budget_arithmetic():
+    budget = csuite_fetch.CallBudget(3)
+    assert budget.remaining == 3 and not budget.exhausted
+    budget.spend(3)
+    assert budget.remaining == 0 and budget.exhausted
+
+    unlimited = csuite_fetch.CallBudget(None)
+    unlimited.spend(10_000)
+    assert unlimited.remaining is None and not unlimited.exhausted
+
+
+# ---------------------------------------------------------------------------
+# 3a-rate: the ledger learns the shape of the limiter
+# ---------------------------------------------------------------------------
+
+def notes_written(db):
+    """The last notes payload written to sync_runs."""
+    writes = [json.loads(params[-2]) for sql, params in db.run_updates
+              if "notes = %s::jsonb" in sql]
+    assert writes, "the run should write notes at least once"
+    return writes[-1]
+
+
+def test_every_run_row_carries_the_rate_limit_fields(db):
+    client = StubClient({"grant/list": [ok([{"grant_id": 1}], count=1),
+                                        ok([])]})
+    result = mirror.refresh_type("grant", client=client, pace_ms=0)
+
+    notes = notes_written(db)
+    assert notes["first_429_at"] is None
+    assert notes["total_429s"] == 0
+    assert notes["reused_staged"] == 0
+    assert result.notes["total_429s"] == 0
+
+
+def test_a_rate_limited_run_records_when_and_how_often(db, waits):
+    client = StubClient({
+        "grant/list": lambda data: fail("HTTP 429 Too Many Requests")
+    })
+    result = mirror.refresh_type("grant", client=client, pace_ms=0)
+
+    notes = notes_written(db)
+    assert notes["total_429s"] == 4
+    assert notes["first_429_at"] is not None
+    assert notes["stop_reason"] == "rate limited"
+    assert result.total_429s == 4
+
+
+def test_a_fund_run_records_how_many_displays_it_reused(db):
+    db.staged[("fund_display", "1000")] = FUND_DISPLAYS[1000]
+    client = fund_client()
+    mirror.refresh_type("fund", client=client, pace_ms=0)
+
+    assert notes_written(db)["reused_staged"] == 1
+
+
+def test_the_default_pace_is_slower_than_it_was():
+    """150ms was measured into a rate limit at 666 cumulative calls."""
+    assert csuite_fetch.DEFAULT_PACE_MS == 400

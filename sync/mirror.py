@@ -20,6 +20,24 @@ to refresh would keep their old `synced_at` while their neighbours moved
 on, and the delete-what-we-did-not-see pass would drop live records
 purely because the sweep stopped early.
 
+Surviving the rate limit
+------------------------
+On 2026-09-10 a fund refresh made 666 cumulative calls over a few minutes
+and CSuite started refusing everything. 261 funit/display results — 261
+calls already paid for — were thrown away, because they were held in
+memory until the whole sweep finished.
+
+They are now staged as they arrive. Each display is written to
+`sync_staging` the moment it comes back, and the next fund run reuses any
+staged row less than 24 hours old instead of calling for it again. A run
+that stops halfway therefore costs nothing: the next one picks up where
+it left off. The staging rows are deleted once a complete fund fetch has
+been written to the mirror, and the 96h expiry sweep catches any orphans.
+
+The other half of the answer is not making the calls at all: `refresh`
+takes a CallBudget shared across every record type, so a run can stop at
+a number we chose rather than the number CSuite chose.
+
 Freshness
 ---------
 Reference data (fund, fee_type, event, grant, check) has no expiry — it
@@ -61,6 +79,7 @@ Counts on the row mean:
 """
 
 import hashlib
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -69,6 +88,9 @@ from decimal import Decimal, InvalidOperation
 from clients import database
 from clients.csuite import CSuiteClient
 from clients.csuite_fetch import (
+    BUDGET_ERROR,
+    RATE_LIMITED_ERROR,
+    CallBudget,
     canonical_json,
     fetch_all,
     fetch_one,
@@ -132,6 +154,15 @@ DELETE_BATCH = 1000
 # notes.deleted_ids is a sample, not the full list: a type that lost 5,000
 # records should not put 5,000 ids in a jsonb column.
 MAX_NOTED_IDS = 50
+
+# sync_staging.record_type for one funit/display payload.
+STAGED_FUND_DISPLAY = "fund_display"
+
+# How old a staged display may be and still be reused instead of re-fetched.
+# A fund's display payload changes when someone edits the fund or a
+# transaction posts to it; a day is short enough that a reused row is not
+# meaningfully staler than the mirror row it becomes.
+STAGED_MAX_AGE = "24 hours"
 
 
 # ---------------------------------------------------------------------------
@@ -238,20 +269,52 @@ class Gathered:
     failed: int = 0
     error: str | None = None
     notes: dict = field(default_factory=dict)
+    first_429_at: str | None = None
+    total_429s: int = 0
+    reused_staged: int = 0
+    # The bare sentinel behind `error`, when there is one. `error` is
+    # prose meant for a human reading the ledger and gets wrapped with
+    # context ("...after 136 of 397 funds"); this stays comparable.
+    stop_reason: str | None = None
+
+    def absorb(self, result) -> None:
+        """Fold one FetchResult's call and rate-limit counters in."""
+        self.calls += result.calls
+        self.total_429s += result.total_429s
+        if self.first_429_at is None:
+            self.first_429_at = result.first_429_at
+        if result.error in (BUDGET_ERROR, RATE_LIMITED_ERROR):
+            self.stop_reason = result.error
 
 
-def _gather_list(client, endpoint: str, key_names, pace_ms) -> Gathered:
+@dataclass
+class GatherContext:
+    """Everything a gatherer needs that is not the record type itself.
+
+    Passed as one object rather than four positional arguments so that
+    adding the next one — a budget, a run id — does not mean editing every
+    gatherer signature again.
+    """
+
+    client: object
+    pace_ms: object = None
+    budget: object = None
+    run_id: object = None
+
+
+def _gather_list(ctx: GatherContext, endpoint: str, key_names) -> Gathered:
     """A plain list endpoint: every row, keyed by its id."""
-    result = fetch_all(client, endpoint, pace_ms=pace_ms)
+    result = fetch_all(ctx.client, endpoint, pace_ms=ctx.pace_ms,
+                       budget=ctx.budget)
 
     gathered = Gathered(
         complete=result.complete,
         expected=result.expected,
-        calls=result.calls,
         pages=result.pages,
         error=result.error,
         notes={"endpoint": endpoint},
     )
+    gathered.absorb(result)
     if not result.complete:
         return gathered
 
@@ -274,23 +337,29 @@ def _gather_list(client, endpoint: str, key_names, pace_ms) -> Gathered:
     return gathered
 
 
-def _gather_fund(client, pace_ms) -> Gathered:
+def _gather_fund(ctx: GatherContext) -> Gathered:
     """Every fund, as its funit/display payload.
 
     funit/list carries six fields and neither fgroup_id nor the balance, so
     the useful record is the display. That is one call per fund — the
-    largest paced sweep in this module at ~397 calls.
+    largest paced sweep in this module at ~397 calls, and the one that got
+    us rate limited.
+
+    Each display is staged the moment it arrives. A run that stops
+    partway — budget, rate limit, anything — leaves those results behind
+    for the next run to pick up instead of paying for them twice.
     """
-    listing = fetch_all(client, "funit/list", pace_ms=pace_ms)
+    listing = fetch_all(ctx.client, "funit/list", pace_ms=ctx.pace_ms,
+                        budget=ctx.budget)
 
     gathered = Gathered(
         complete=False,
         expected=listing.expected,
-        calls=listing.calls,
         pages=listing.pages,
         error=listing.error,
         notes={"endpoint": "funit/list + funit/display"},
     )
+    gathered.absorb(listing)
     if not listing.complete:
         return gathered
 
@@ -300,30 +369,58 @@ def _gather_fund(client, pace_ms) -> Gathered:
         if key is not None:
             fund_ids.append(key)
 
+    staged = _load_staged_displays()
+    reusable = [fund_id for fund_id in fund_ids if fund_id in staged]
+    to_fetch = [fund_id for fund_id in fund_ids if fund_id not in staged]
+
+    gathered.reused_staged = len(reusable)
     gathered.notes["funds_listed"] = len(listing.records)
-    gathered.notes["display_calls_planned"] = len(fund_ids)
+    gathered.notes["display_calls_planned"] = len(to_fetch)
+    gathered.notes["reused_staged"] = len(reusable)
 
-    pause = pace_seconds(pace_ms)
-    for index, fund_id in enumerate(fund_ids):
-        if index:
-            # fetch_all paces between its own pages; this sweep is a series
-            # of separate single calls, so it paces itself.
-            pace_sleep(pause)
+    logger.info("reused %d staged displays, fetching %d",
+                len(reusable), len(to_fetch))
 
-        display = fetch_one(client, "funit/display",
-                            {"funit_id": _display_id(fund_id)},
-                            pace_ms=pace_ms)
-        gathered.calls += display.calls
+    pause = pace_seconds(ctx.pace_ms)
+    called = 0
 
-        if not display.complete or not display.records:
-            gathered.failed += 1
-            gathered.error = (
-                f"funit/display failed for fund {fund_id} after "
-                f"{len(gathered.rows)} of {len(fund_ids)} funds: "
-                f"{display.error or 'empty response'}")
-            return gathered
+    for fund_id in fund_ids:
+        payload = staged.get(fund_id)
 
-        payload = display.records[0]
+        if payload is None:
+            if called:
+                # fetch_all paces between its own pages; this sweep is a
+                # series of separate single calls, so it paces itself. A
+                # reused display costs no call and so earns no pause.
+                pace_sleep(pause)
+
+            display = fetch_one(ctx.client, "funit/display",
+                                {"funit_id": _display_id(fund_id)},
+                                pace_ms=ctx.pace_ms, budget=ctx.budget)
+            called += 1
+            gathered.absorb(display)
+
+            if not display.complete or not display.records:
+                gathered.failed += 1
+                reason = display.error or "empty response"
+                if reason == BUDGET_ERROR:
+                    gathered.error = (
+                        f"budget reached after {len(gathered.rows)} of "
+                        f"{len(fund_ids)} funds — "
+                        f"{called - 1} displays staged for the next run")
+                else:
+                    gathered.error = (
+                        f"funit/display failed for fund {fund_id} after "
+                        f"{len(gathered.rows)} of {len(fund_ids)} funds: "
+                        f"{reason}")
+                logger.warning(
+                    "fund sweep stopped: %s. Staged results are kept.",
+                    gathered.error)
+                return gathered
+
+            payload = display.records[0]
+            _stage_display(ctx.run_id, fund_id, payload)
+
         gathered.rows.append(MirrorRow(
             csuite_id=_first_key(payload, ("funit_id",)) or fund_id,
             data=payload,
@@ -347,18 +444,19 @@ def _display_id(key: str):
         return key
 
 
-def _gather_profile(client, pace_ms) -> Gathered:
+def _gather_profile(ctx: GatherContext) -> Gathered:
     """Every profile, reduced to the whitelisted fields and nothing else."""
-    result = fetch_all(client, "profile/list", pace_ms=pace_ms)
+    result = fetch_all(ctx.client, "profile/list", pace_ms=ctx.pace_ms,
+                       budget=ctx.budget)
 
     gathered = Gathered(
         complete=result.complete,
         expected=result.expected,
-        calls=result.calls,
         pages=result.pages,
         error=result.error,
         notes={"endpoint": "profile/list"},
     )
+    gathered.absorb(result)
     if not result.complete:
         return gathered
 
@@ -393,7 +491,7 @@ def profile_record(row: dict) -> dict:
     return record
 
 
-def _gather_donation_agg(client, pace_ms) -> Gathered:
+def _gather_donation_agg(ctx: GatherContext) -> Gathered:
     """Donations, aggregated per profile in memory and never stored raw.
 
     26,500 donation rows go in; roughly one row per giving profile comes
@@ -401,16 +499,17 @@ def _gather_donation_agg(client, pace_ms) -> Gathered:
     the accounting system's job, and a local copy of every gift is a
     liability with no query this assistant needs.
     """
-    result = fetch_all(client, "donation/list", pace_ms=pace_ms)
+    result = fetch_all(ctx.client, "donation/list", pace_ms=ctx.pace_ms,
+                       budget=ctx.budget)
 
     gathered = Gathered(
         complete=result.complete,
         expected=result.expected,
-        calls=result.calls,
         pages=result.pages,
         error=result.error,
         notes={"endpoint": "donation/list"},
     )
+    gathered.absorb(result)
     if not result.complete:
         return gathered
 
@@ -517,14 +616,14 @@ def aggregate_donations(rows) -> tuple[dict, int]:
 # mirrors — funit/list/search already does exactly that.
 GATHERERS = {
     "fund": _gather_fund,
-    "fee_type": lambda c, p: _gather_list(
-        c, "funit/feetype", ("fund_fee_type_id", "id"), p),
-    "event": lambda c, p: _gather_list(
-        c, "event/list/dates", ("event_date_id", "id"), p),
-    "grant": lambda c, p: _gather_list(
-        c, "grant/list", ("grant_id", "id"), p),
-    "check": lambda c, p: _gather_list(
-        c, "check/list", ("check_id", "id"), p),
+    "fee_type": lambda ctx: _gather_list(
+        ctx, "funit/feetype", ("fund_fee_type_id", "id")),
+    "event": lambda ctx: _gather_list(
+        ctx, "event/list/dates", ("event_date_id", "id")),
+    "grant": lambda ctx: _gather_list(
+        ctx, "grant/list", ("grant_id", "id")),
+    "check": lambda ctx: _gather_list(
+        ctx, "check/list", ("check_id", "id")),
     "profile": _gather_profile,
     "donation_agg": _gather_donation_agg,
 }
@@ -692,6 +791,122 @@ _DELETE_SQL = """
 """
 
 
+# ---------------------------------------------------------------------------
+# Staging (sync_staging) — results kept across a stopped run
+# ---------------------------------------------------------------------------
+
+# Written as one delete + one insert rather than an upsert. An ON CONFLICT
+# needs a unique constraint, and reuse is explicitly "any run", so the
+# natural key is (record_type, source_id) — which is not necessarily what
+# the table is actually constrained on. Delete-then-insert reaches the
+# same end state without betting on a constraint name.
+_STAGE_DELETE_SQL = """
+    DELETE FROM sync_staging
+     WHERE record_type = %s
+       AND source_id = %s
+"""
+
+_STAGE_INSERT_SQL = """
+    INSERT INTO sync_staging (
+        run_id, record_type, source_id, proposed_values, status
+    )
+    VALUES (%s, %s, %s, %s::jsonb, 'staged')
+"""
+
+# Age comes from the run that staged the row, not from a timestamp on the
+# staging row itself: sync_runs.started_at is a column these briefs have
+# confirmed, and a run lasts minutes, so it is an accurate proxy.
+_STAGED_LOAD_SQL = """
+    SELECT s.source_id, s.proposed_values
+      FROM sync_staging s
+      JOIN sync_runs r ON r.id = s.run_id
+     WHERE s.record_type = %s
+       AND s.status = 'staged'
+       AND r.started_at > NOW() - %s::interval
+"""
+
+_STAGE_CLEAR_SQL = """
+    DELETE FROM sync_staging
+     WHERE record_type = %s
+"""
+
+
+def _stage_display(run_id, fund_id, payload) -> None:
+    """Keep one funit/display result so a stopped run does not waste it.
+
+    Failure here is logged and swallowed. Staging is an optimisation: a
+    run that cannot stage is slower next time, but a run that dies because
+    it could not write a cache row has turned a saving into a liability.
+    """
+    try:
+        database.execute_query(
+            _STAGE_DELETE_SQL, (STAGED_FUND_DISPLAY, fund_id), fetch=False)
+        database.execute_query(
+            _STAGE_INSERT_SQL,
+            (run_id, STAGED_FUND_DISPLAY, fund_id, canonical_json(payload)),
+            fetch=False,
+        )
+    except Exception as e:
+        logger.warning("could not stage display for fund %s: %s", fund_id, e)
+
+
+def _load_staged_displays() -> dict:
+    """{funit_id: payload} for staged displays younger than STAGED_MAX_AGE.
+
+    Swallows its own failure for the same reason as _stage_display: an
+    unreadable cache means a slower run, not a failed one.
+    """
+    try:
+        rows = database.execute_query(
+            _STAGED_LOAD_SQL, (STAGED_FUND_DISPLAY, STAGED_MAX_AGE),
+            fetch=True)
+    except Exception as e:
+        logger.warning("could not read staged displays: %s", e)
+        return {}
+
+    if not isinstance(rows, (list, tuple)):
+        # execute_query returns a rowcount rather than rows when fetch is
+        # False; anything but a sequence here means the query did not do
+        # what this function assumes, and guessing would be worse.
+        logger.warning(
+            "staged display query returned %s, not rows — ignoring the cache",
+            type(rows).__name__)
+        return {}
+
+    staged = {}
+    for row in rows:
+        if isinstance(row, dict):
+            source_id, payload = row.get("source_id"), row.get(
+                "proposed_values")
+        else:
+            source_id, payload = row[0], row[1]
+
+        key = _key(source_id)
+        if key is None:
+            continue
+        # psycopg2 hands back jsonb as a dict; a text column would arrive
+        # as a string. Accept both rather than assuming the column type.
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except ValueError:
+                continue
+        if isinstance(payload, dict):
+            staged[key] = payload
+
+    return staged
+
+
+def _clear_staging(record_type: str = STAGED_FUND_DISPLAY) -> int:
+    """Drop staged rows once their contents are safely in the mirror."""
+    try:
+        return database.execute_query(
+            _STAGE_CLEAR_SQL, (record_type,), fetch=False)
+    except Exception as e:
+        logger.warning("could not clear %s staging rows: %s", record_type, e)
+        return 0
+
+
 def _deduplicate(rows) -> tuple[list, int]:
     """One row per csuite_id, keeping the last seen. Returns (rows, dropped).
 
@@ -799,12 +1014,16 @@ class TypeResult:
     seconds: float = 0.0
     error: str | None = None
     notes: dict = field(default_factory=dict)
+    first_429_at: str | None = None
+    total_429s: int = 0
+    reused_staged: int = 0
+    stop_reason: str | None = None
 
 
 def refresh_type(record_type: str, client=None, pace_ms=None,
                  dry_run: bool = False, triggered_by=None,
                  trigger_source: str = "cli",
-                 triggered_by_user_id=None) -> TypeResult:
+                 triggered_by_user_id=None, budget=None) -> TypeResult:
     """Fetch one record type and mirror it. Never raises for API failures.
 
     Database failures DO propagate: a mirror that cannot reach its own
@@ -817,6 +1036,9 @@ def refresh_type(record_type: str, client=None, pace_ms=None,
         triggered_by: a label describing what started the run, e.g.
             "cli:mirror_refresh". Goes to notes.trigger and NEVER to the
             triggered_by column, which is a BIGINT foreign key.
+        budget: a CallBudget shared with the rest of the run. When it runs
+            out the fetch stops cleanly, marked incomplete with
+            "budget reached", and nothing is written.
     """
     if record_type not in GATHERERS:
         raise ValueError(
@@ -837,7 +1059,8 @@ def refresh_type(record_type: str, client=None, pace_ms=None,
                         run_notes)
     result = TypeResult(record_type=record_type, run_id=run_id)
 
-    gathered = GATHERERS[record_type](client, pace_ms)
+    gathered = GATHERERS[record_type](GatherContext(
+        client=client, pace_ms=pace_ms, budget=budget, run_id=run_id))
 
     result.expected = gathered.expected
     result.fetched = len(gathered.rows)
@@ -845,10 +1068,23 @@ def refresh_type(record_type: str, client=None, pace_ms=None,
     result.calls = gathered.calls
     result.pages = gathered.pages
     result.failed = gathered.failed
+    result.first_429_at = gathered.first_429_at
+    result.total_429s = gathered.total_429s
+    result.reused_staged = gathered.reused_staged
+    result.stop_reason = gathered.stop_reason
+
     result.notes = dict(gathered.notes)
     result.notes.update(run_notes)
     result.notes["calls"] = gathered.calls
     result.notes["pages"] = gathered.pages
+    # On every row, not only the ones that were refused: a run with
+    # total_429s of 0 at 600 calls is as much of a data point as one that
+    # was refused at 666, and the window is only learnable from both.
+    result.notes["first_429_at"] = gathered.first_429_at
+    result.notes["total_429s"] = gathered.total_429s
+    result.notes["reused_staged"] = gathered.reused_staged
+    if gathered.stop_reason:
+        result.notes["stop_reason"] = gathered.stop_reason
 
     logger.info(
         "mirror %s: %d records from %d CSuite calls (complete=%s)",
@@ -968,6 +1204,12 @@ def refresh_type(record_type: str, client=None, pace_ms=None,
                      record_type, result.error)
         raise
 
+    if record_type == "fund":
+        # The displays are in the mirror now, so the staged copies have
+        # nothing left to protect. Only after the write, never before.
+        cleared = _clear_staging(STAGED_FUND_DISPLAY)
+        result.notes["staging_cleared"] = cleared
+
     result.status = "complete"
     result.seconds = round(time.perf_counter() - started, 2)
     result.notes["write_seconds"] = round(
@@ -993,14 +1235,28 @@ def refresh_type(record_type: str, client=None, pace_ms=None,
 
 def refresh(record_types=None, pace_ms=None, dry_run: bool = False,
             client=None, triggered_by=None,
-            trigger_source: str = "cli", triggered_by_user_id=None) -> list:
+            trigger_source: str = "cli", triggered_by_user_id=None,
+            budget=None) -> list:
     """Refresh each record type in turn. Returns one TypeResult per type.
 
     A type that fails does not stop the ones after it — each is its own
-    run row and its own transaction, and a rate limit on profiles says
-    nothing about whether grants can be fetched. The caller sees every
-    result and can decide what a partial success means.
+    run row and its own transaction, and a bad response on profiles says
+    nothing about whether grants can be fetched.
+
+    A rate limit is the exception. CSuite's limiter is cumulative over
+    minutes and stays shut for at least fifteen seconds, so once it has
+    refused us four times through the full backoff there is no reason to
+    believe the next record type will fare better — carrying on would
+    spend six more sweeps discovering the same thing. The run stops, and
+    the types not attempted are returned as 'skipped' so the caller can
+    see what did not run rather than inferring it from a short list.
+
+    Args:
+        budget: total CSuite calls this run may make, as a CallBudget or a
+            plain int. Shared across every record type.
     """
+    if budget is not None and not isinstance(budget, CallBudget):
+        budget = CallBudget(int(budget))
     types = list(record_types) if record_types else list(RECORD_TYPES)
 
     unknown = [t for t in types if t not in GATHERERS]
@@ -1011,9 +1267,26 @@ def refresh(record_types=None, pace_ms=None, dry_run: bool = False,
 
     client = client or CSuiteClient()
     results = []
-    for record_type in types:
-        results.append(refresh_type(
+
+    for index, record_type in enumerate(types):
+        result = refresh_type(
             record_type, client=client, pace_ms=pace_ms, dry_run=dry_run,
             triggered_by=triggered_by, trigger_source=trigger_source,
-            triggered_by_user_id=triggered_by_user_id))
+            triggered_by_user_id=triggered_by_user_id, budget=budget)
+        results.append(result)
+
+        if result.stop_reason in (RATE_LIMITED_ERROR, BUDGET_ERROR):
+            remaining = types[index + 1:]
+            if remaining:
+                logger.warning(
+                    "stopping after %s (%s) — not attempting %s",
+                    record_type, result.stop_reason, ", ".join(remaining))
+                results.extend(
+                    TypeResult(record_type=name, status="skipped",
+                               error=f"not attempted: {result.stop_reason} on "
+                                     f"{record_type}",
+                               stop_reason=result.stop_reason)
+                    for name in remaining)
+            break
+
     return results
