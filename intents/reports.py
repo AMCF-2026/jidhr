@@ -13,17 +13,41 @@ Sub-handlers:
   C. Inactive funds
   D. Donors not contacted
   E. Fee calculations
-  F. Uncashed checks
+  F. Grants issued but not cleared
   G. Quarterly DAF summary
+
+Where the numbers come from
+---------------------------
+Everything CSuite-sourced here reads `csuite_mirror` and makes NO live
+CSuite call. That is the whole point of Step 3c: each of these reports
+used to paginate a live endpoint behind a page cap — 10 pages of grants,
+200 funds, 500 checks, 50 fund-detail calls — and print the result as if
+it were the whole picture. "6 dormant funds" meant "6 of the 200 funds I
+happened to read".
+
+The caps are gone rather than raised, because a report that makes 2,000
+CSuite calls is a report that gets rate limited. Each of these now answers
+from a complete local copy and ends with `as_of_line()` naming when that
+copy was taken. If the mirror is empty for a type a report needs, the
+report says so and stops — see clients/mirror_read.py for why there is no
+fallback to the old capped fetch.
+
+The HubSpot-sourced reports (DAF inquiries, tasks, investment requests,
+donors-not-contacted) are unchanged and still carry their partial_note
+banners: those really are capped fetches.
 """
 
 import logging
 from datetime import datetime, timedelta
+
+from clients import mirror_read
 from config import Config
 from intents.queries import (
+    _fund_row_code,
     _fund_row_names,
+    _norm_for_match,
+    extract_fund_name_phrase,
     extract_fund_ref,
-    resolve_fund_id,
     split_fund_name,
 )
 
@@ -128,26 +152,32 @@ def handle(query: str, ctx) -> str:
     hubspot = ctx.services.hubspot
     csuite = ctx.services.csuite
 
+    # The CSuite-sourced reports take no client: they read the mirror.
     if any(t in q for t in _GRANT_TRIGGERS):
-        return _report_grants(q, csuite)
+        return _report_grants(q)
 
     if any(t in q for t in _LAPSED_TRIGGERS):
-        return _report_lapsed_donors(q, csuite, hubspot)
+        return _report_lapsed_donors(q)
 
     if any(t in q for t in _INACTIVE_FUND_TRIGGERS):
-        return _report_inactive_funds(csuite)
+        return _report_inactive_funds()
 
     if any(t in q for t in _NOT_CONTACTED_TRIGGERS):
         return _report_not_contacted(hubspot, csuite)
 
     if any(t in q for t in _FEE_TRIGGERS):
-        return _report_fees(q, csuite)
+        # The ORIGINAL query, not the lowercased one: the fund-name
+        # extractor keys on capitalisation, so "Fees for Alpha Family Fund"
+        # resolved to nothing when it was handed `q`. Only codes and ids
+        # ever worked. Every other report here matches on lowercase
+        # keywords and still gets `q`.
+        return _report_fees(query)
 
     if any(t in q for t in _CHECK_TRIGGERS):
-        return _report_uncashed_checks(csuite)
+        return _report_uncleared_grants()
 
     if any(t in q for t in _QUARTERLY_TRIGGERS):
-        return _report_quarterly_summary(q, csuite)
+        return _report_quarterly_summary(q)
 
     if any(t in q for t in _DAF_INQUIRY_TRIGGERS):
         return _report_daf_inquiry_summary(q, hubspot)
@@ -159,9 +189,124 @@ def handle(query: str, ctx) -> str:
         return _report_investment_requests(hubspot)
 
     if any(t in q for t in _ENDOWMENT_DIST_TRIGGERS):
-        return _report_endowment_distributions(csuite)
+        return _report_endowment_distributions()
 
     return "❌ Report type not recognised."
+
+
+# ---------------------------------------------------------------------------
+# Mirror helpers
+# ---------------------------------------------------------------------------
+
+# Fund group ids, from Config (which took them from funit/list/fgroup).
+FUND_GROUP_LABELS = {
+    Config.FUND_GROUP_SYSTEM: "System",
+    Config.FUND_GROUP_FISCAL_SPONSORSHIP: "Fiscal Sponsorship",
+    Config.FUND_GROUP_DAF: "DAF",
+    Config.FUND_GROUP_MICROPHILANTHROPY: "Microphilanthropy",
+    Config.FUND_GROUP_MIGRATION: "Migration",
+    Config.FUND_GROUP_FISCAL_DAF: "Fiscal DAF",
+    Config.FUND_GROUP_GIVING_CIRCLE: "Giving Circle",
+    Config.FUND_GROUP_ENDOWMENT: "Endowment",
+    Config.FUND_GROUP_GRANT: "Grant",
+}
+
+DAF_GROUP_ID = Config.FUND_GROUP_DAF
+ENDOWMENT_GROUP_ID = Config.FUND_GROUP_ENDOWMENT
+
+# grant_status values observed across the sample (probe #2, C2):
+#   paid (60), voucher (35), new (4), complete (1)
+# 'paid' is issued-but-not-yet-cleared; 'complete' has cleared. grant/list
+# carries no check_id or check_num, so grants cannot be joined to checks at
+# all — which is why the old uncashed-check report is gone rather than
+# fixed.
+GRANT_STATUS_ISSUED = "paid"
+
+
+def _fund_group_id(fund: dict):
+    """A mirrored fund's group id.
+
+    The mirror stores it in its own column (fund_group_id); CSuite's field
+    inside the payload is fgroup_id. Both are read so a fund written before
+    the column existed still reports its group.
+    """
+    for key in ("fund_group_id", "fgroup_id"):
+        value = fund.get(key)
+        if value not in (None, ""):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return value
+    return None
+
+
+def _fund_group_label(fund: dict) -> str:
+    group_id = _fund_group_id(fund)
+    if group_id is None:
+        return "Ungrouped"
+    return FUND_GROUP_LABELS.get(group_id, f"Group {group_id}")
+
+
+def _amount(value) -> float:
+    """A CSuite money string as a float, for totalling in a report."""
+    if value in (None, ""):
+        return 0.0
+    try:
+        return float(str(value).replace("$", "").replace(",", "").strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fund_index() -> dict:
+    """{funit_id (str): mirrored fund row}."""
+    return {str(f.get("csuite_id")): f for f in mirror_read.rows("fund")}
+
+
+def _find_mirrored_fund(query: str) -> tuple:
+    """(fund, ambiguous_rows) for the fund named in a query, from the mirror.
+
+    Returns (None, []) when the query names no fund, (fund, []) on an exact
+    resolution, and (None, rows) when the name matched more than one — the
+    same never-guess rule the live lookup follows, applied to local rows.
+    """
+    funds = mirror_read.rows("fund")
+    if not funds:
+        return None, []
+
+    ref = extract_fund_ref(query) or {}
+
+    fund_id = ref.get("fund_id")
+    if fund_id is not None:
+        for fund in funds:
+            if str(fund.get("csuite_id")) == str(fund_id):
+                return fund, []
+        return None, []
+
+    code = ref.get("code")
+    if code:
+        wanted = str(code).strip().upper()
+        matches = [f for f in funds
+                   if (_fund_row_code(f) or "").upper() == wanted]
+        if len(matches) == 1:
+            return matches[0], []
+        return None, matches
+
+    phrase = extract_fund_name_phrase(query)
+    if not phrase:
+        return None, []
+
+    needle = _norm_for_match(phrase)
+    if not needle:
+        return None, []
+
+    matches = [
+        f for f in funds
+        if any(needle in _norm_for_match(name)
+               for name in _fund_row_names(f))
+    ]
+    if len(matches) == 1:
+        return matches[0], []
+    return None, matches
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +351,16 @@ def _parse_date_range(query: str) -> tuple:
     return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
 
+def _year_quarter(date_str: str) -> tuple:
+    """(year, quarter) for a YYYY-MM-DD string — the donation_fund_quarter key."""
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        now = datetime.now()
+        return now.year, (now.month - 1) // 3 + 1
+    return dt.year, (dt.month - 1) // 3 + 1
+
+
 def _get_quarter_label(date_str: str) -> str:
     """Return 'Q1 2026' style label from a date string."""
     try:
@@ -220,78 +375,63 @@ def _get_quarter_label(date_str: str) -> str:
 # A. GRANT REPORTING
 # =========================================================================
 
-def _report_grants(query: str, csuite) -> str:
-    """Grant counts and totals for a date range."""
+def _report_grants(query: str) -> str:
+    """Grant counts and totals for a date range, from the mirror."""
+    missing = mirror_read.require("grant")
+    if missing:
+        return missing
+
     start, end = _parse_date_range(query)
     label = f"{start} to {end}"
+    logger.info(f"Grant report for {label} (mirror)...")
 
-    logger.info(f"Grant report for {label}...")
-
-    try:
-        all_grants, grants_complete = _fetch_all_grants(csuite)
-    except Exception as e:
-        logger.exception(f"Error fetching grants: {e}")
-        return f"❌ Failed to fetch grants: {e}"
-
-    # Filter by date range
-    filtered = []
-    for g in all_grants:
-        g_date = g.get('grant_date', '')
-        if g_date and start <= g_date <= end:
-            filtered.append(g)
+    # Filtered in SQL rather than in Python: the alternative is pulling all
+    # 6,700 grant documents across the wire to keep a few dozen.
+    filtered = mirror_read.rows(
+        "grant",
+        "AND data->>'grant_date' >= %s AND data->>'grant_date' <= %s",
+        (start, end),
+    )
 
     if not filtered:
-        # An empty result after a capped fetch is a false negative: the
-        # grants for this window may simply never have been read.
-        note = partial_note(len(all_grants), grants_complete, "grants")
-        if note:
-            return (
-                f"{note}\n\n📊 No grants found for **{label}** in the records "
-                "I could read — there may be more."
-            )
-        return f"📊 No grants found for **{label}**."
+        return (f"📊 No grants found for **{label}**.\n\n"
+                f"{mirror_read.as_of_line('grant')}")
 
-    # Aggregate
-    total_amount = sum(float(g.get('grant_amount', 0) or 0) for g in filtered)
-    count = len(filtered)
+    total_amount = sum(_amount(g.get("grant_amount")) for g in filtered)
 
-    # Group by fund
     by_fund = {}
-    for g in filtered:
-        fund = g.get('fund_name', 'Unknown')
-        by_fund.setdefault(fund, {"count": 0, "total": 0})
-        by_fund[fund]["count"] += 1
-        by_fund[fund]["total"] += float(g.get('grant_amount', 0) or 0)
+    for grant in filtered:
+        fund = grant.get("fund_name") or "Unknown"
+        stats = by_fund.setdefault(fund, {"count": 0, "total": 0.0})
+        stats["count"] += 1
+        stats["total"] += _amount(grant.get("grant_amount"))
 
-    # Sort by total descending
-    sorted_funds = sorted(by_fund.items(), key=lambda x: x[1]["total"], reverse=True)
+    sorted_funds = sorted(by_fund.items(), key=lambda x: x[1]["total"],
+                          reverse=True)
 
-    lines = []
-    note = partial_note(len(all_grants), grants_complete, "grants")
-    if note:
-        lines += [note, ""]
-    lines += [
+    lines = [
         f"📊 **Grant Report: {label}**",
         "",
-        f"**Total:** {count} grants totalling **${total_amount:,.2f}**",
+        f"**Total:** {len(filtered)} grants totalling **${total_amount:,.2f}**",
         "",
         "**By Fund (top 10):**",
     ]
     for fund_name, stats in sorted_funds[:10]:
-        lines.append(f"• {fund_name}: {stats['count']} grants, ${stats['total']:,.2f}")
-
+        lines.append(
+            f"• {fund_name}: {stats['count']} grants, ${stats['total']:,.2f}")
     if len(sorted_funds) > 10:
         lines.append(f"• ... and {len(sorted_funds) - 10} more funds")
 
+    lines += ["", mirror_read.as_of_line("grant")]
     return "\n".join(lines)
 
 
 def partial_note(count: int, complete: bool, label: str = "records") -> str | None:
     """The banner a capped fetch must carry, or None when the data is whole.
 
-    Every one of these reports used to print a total as if it covered
-    everything, while the fetch behind it stopped at a page cap. A number
-    that is quietly a lower bound is worse than no number.
+    Still used by the HubSpot-sourced reports below, which really are
+    capped. The CSuite reports no longer need it: they read a complete
+    mirror and state its age instead.
     """
     if complete:
         return None
@@ -299,203 +439,190 @@ def partial_note(count: int, complete: bool, label: str = "records") -> str | No
             f"totals below are NOT complete.")
 
 
-def _fetch_all_grants(csuite, max_pages: int = 10):
-    """Paginate through grants. Returns (records, complete)."""
-    all_results = []
-    offset = 0
-    limit = 100
-    complete = False
-
-    for _ in range(max_pages):
-        data = csuite.get_grants(limit=limit, offset=offset)
-        if not data.get('success') or not data.get('data'):
-            # A failed page means we do not know what we are missing.
-            break
-        results = data['data'].get('results', [])
-        if not results:
-            complete = True
-            break
-        all_results.extend(results)
-        if len(results) < limit:
-            complete = True
-            break
-        offset += limit
-
-    logger.info(f"Fetched {len(all_results)} total grants (complete={complete})")
-    return all_results, complete
-
-
 # =========================================================================
 # B. RAMADAN LAPSED DONORS
 # =========================================================================
 
-def _report_lapsed_donors(query: str, csuite, hubspot) -> str:
-    """Donors who gave during prior Ramadan but not the current one."""
-    logger.info("Running Ramadan lapsed donor analysis...")
+# Only living individuals are worth an outreach list: `dead` marks a
+# deceased profile, and ptype is 'indiv' or 'org' (probe #2, C8 — those
+# are the only two values observed across the sample).
+PROFILE_TYPE_INDIVIDUAL = "indiv"
+
+_LAPSED_NAMES_SHOWN = 25
+
+
+def _is_outreachable(profile: dict) -> bool:
+    """True if this profile belongs on a donor outreach list."""
+    if not profile:
+        return False
+    dead = profile.get("dead")
+    if dead in (1, "1", True):
+        return False
+    return str(profile.get("ptype") or "").strip().lower() == \
+        PROFILE_TYPE_INDIVIDUAL
+
+
+def _report_lapsed_donors(query: str) -> str:
+    """Donors who gave during last Ramadan but not this one.
+
+    Reads donation_agg.ramadan_years, which sync/mirror.py computed once
+    over the whole donation history. The old version paged the live
+    donation endpoint 10 pages deep — 1,000 of 26,500 donations — and
+    called the result a lapsed-donor list.
+    """
+    missing = mirror_read.require("donation_agg", "profile")
+    if missing:
+        return missing
+
+    logger.info("Running Ramadan lapsed donor analysis (mirror)...")
 
     now = datetime.now()
-    current_range = Config.get_ramadan_range(now.year)
-    prior_range = Config.get_ramadan_range(now.year - 1)
+    this_year = now.year
+    last_year = this_year - 1
 
-    try:
-        all_donations, donations_complete = _fetch_all_donations(csuite)
-    except Exception as e:
-        logger.error(f"Error fetching donations: {e}")
-        return f"❌ Failed to fetch donations: {e}"
+    lapsed = []
+    for agg in mirror_read.rows("donation_agg"):
+        years = agg.get("ramadan_years") or []
+        try:
+            years = {int(y) for y in years}
+        except (TypeError, ValueError):
+            continue
+        if last_year not in years or this_year in years:
+            continue
 
-    # Bucket by profile
-    prior_donors = set()
-    current_donors = set()
+        profile = mirror_read.get("profile", agg.get("csuite_id"))
+        if not _is_outreachable(profile):
+            continue
 
-    for d in all_donations:
-        d_date = d.get('donation_date', '')
-        profile_id = d.get('profile_id') or d.get('name', 'Unknown')
-        if d_date and prior_range[0] <= d_date <= prior_range[1]:
-            prior_donors.add(profile_id)
-        if d_date and current_range[0] <= d_date <= current_range[1]:
-            current_donors.add(profile_id)
+        lapsed.append({
+            "profile_id": agg.get("csuite_id"),
+            "name": profile.get("name") or profile.get("primary_email")
+                    or str(agg.get("csuite_id")),
+            "email": profile.get("primary_email") or "",
+            "lifetime": agg.get("lifetime_total"),
+        })
 
-    lapsed = prior_donors - current_donors
+    footer = mirror_read.as_of_line("donation_agg", "profile")
 
     if not lapsed:
         return (
-            f"✅ **No lapsed Ramadan donors!** Everyone who gave during "
-            f"Ramadan {prior_range[0][:4]} has also given in {current_range[0][:4]} so far."
+            f"✅ **No lapsed Ramadan donors.** Every individual who gave "
+            f"during Ramadan {last_year} has also given in Ramadan "
+            f"{this_year}.\n\n{footer}"
         )
 
-    # Try to enrich with names/emails from HubSpot
-    lapsed_details = []
-    for pid in list(lapsed)[:20]:
-        detail = {"profile_id": pid, "name": str(pid), "email": ""}
-        try:
-            # Find matching donation record for the name
-            for d in all_donations:
-                if (d.get('profile_id') or d.get('name', '')) == pid:
-                    detail["name"] = d.get('name', str(pid))
-                    break
-        except Exception:
-            pass
-        lapsed_details.append(detail)
+    lapsed.sort(key=lambda d: d["name"].lower())
 
-    lines = []
-    note = partial_note(len(all_donations), donations_complete, "donations")
-    if note:
-        lines += [note, ""]
-    lines += [
-        f"📊 **Ramadan Lapsed Donors**",
+    lines = [
+        "📊 **Ramadan Lapsed Donors**",
         "",
-        f"**{len(lapsed)}** donors gave during Ramadan {prior_range[0][:4]} "
-        f"but have **not yet** given in Ramadan {current_range[0][:4]}.",
+        f"**{len(lapsed)}** individual donors gave during Ramadan "
+        f"{last_year} but have **not** given in Ramadan {this_year}.",
         "",
-        "**Donors to re-engage (up to 20):**",
+        f"**Donors to re-engage (showing "
+        f"{min(len(lapsed), _LAPSED_NAMES_SHOWN)} of {len(lapsed)}):**",
     ]
-    for ld in lapsed_details:
-        lines.append(f"• {ld['name']} (Profile: {ld['profile_id']})")
+    for donor in lapsed[:_LAPSED_NAMES_SHOWN]:
+        email = f" — {donor['email']}" if donor["email"] else ""
+        lines.append(f"• **{donor['name']}** (Profile {donor['profile_id']})"
+                     f"{email}")
 
-    if len(lapsed) > 20:
-        lines.append(f"• ... and {len(lapsed) - 20} more")
+    if len(lapsed) > _LAPSED_NAMES_SHOWN:
+        lines.append(
+            f"• ... and {len(lapsed) - _LAPSED_NAMES_SHOWN} more "
+            f"({len(lapsed)} in total)")
 
-    lines.append("")
-    lines.append("💡 *Consider a targeted outreach campaign for these donors.*")
-
+    lines += [
+        "",
+        "💡 *Deceased profiles and organisations are excluded.*",
+        "",
+        footer,
+    ]
     return "\n".join(lines)
-
-
-def _fetch_all_donations(csuite, max_pages: int = 10):
-    """Paginate through donations. Returns (records, complete)."""
-    all_results = []
-    offset = 0
-    limit = 100
-    complete = False
-
-    for _ in range(max_pages):
-        data = csuite.get_donations(limit=limit, offset=offset)
-        if not data.get('success') or not data.get('data'):
-            break
-        results = data['data'].get('results', [])
-        if not results:
-            complete = True
-            break
-        all_results.extend(results)
-        if len(results) < limit:
-            complete = True
-            break
-        offset += limit
-
-    logger.info(f"Fetched {len(all_results)} total donations (complete={complete})")
-    return all_results, complete
 
 
 # =========================================================================
 # C. INACTIVE FUNDS
 # =========================================================================
 
-def _report_inactive_funds(csuite) -> str:
-    """Funds with no grant activity in 12+ months."""
-    logger.info("Running inactive funds analysis...")
+def _report_inactive_funds() -> str:
+    """Every fund with no grant in the last 12 months.
 
-    try:
-        FUND_PAGE_LIMIT = 200
-        all_funds_data = csuite.get_funds(limit=FUND_PAGE_LIMIT)
-        if not all_funds_data.get('success') or not all_funds_data.get('data'):
-            return "❌ Failed to fetch funds."
-        funds = all_funds_data['data'].get('results', [])
-        funds_complete = len(funds) < FUND_PAGE_LIMIT
-    except Exception as e:
-        return f"❌ Failed to fetch funds: {e}"
+    ALL funds, not the first page of them. The old version read
+    the fund list capped at 200 against 397 real funds, and paged grants
+    10 deep,
+    so "dormant" meant "dormant among the half of the funds I read".
+    """
+    missing = mirror_read.require("fund", "grant")
+    if missing:
+        return missing
 
-    try:
-        all_grants, grants_complete = _fetch_all_grants(csuite)
-    except Exception as e:
-        return f"❌ Failed to fetch grants: {e}"
+    logger.info("Running dormant funds analysis (mirror)...")
 
-    # Build map: fund_id → last grant date
-    last_grant = {}
-    for g in all_grants:
-        fid = g.get('funit_id') or g.get('fund_id')
-        g_date = g.get('grant_date', '')
-        if fid and g_date:
-            if fid not in last_grant or g_date > last_grant[fid]:
-                last_grant[fid] = g_date
-
+    funds = mirror_read.rows("fund")
     cutoff = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
-    inactive = []
 
-    for f in funds:
-        fid = str(f.get('funit_id', ''))
-        fund_name = f.get('fund_name', 'Unknown')
-        lg = last_grant.get(fid)
-        if lg is None:
-            inactive.append((fund_name, fid, "Never"))
-        elif lg < cutoff:
-            inactive.append((fund_name, fid, lg))
+    last_grant = {}
+    for grant in mirror_read.rows("grant"):
+        fund_id = grant.get("funit_id")
+        grant_date = grant.get("grant_date")
+        if fund_id in (None, "") or not grant_date:
+            continue
+        key = str(fund_id)
+        if key not in last_grant or grant_date > last_grant[key]:
+            last_grant[key] = grant_date
 
-    if not inactive:
-        return "✅ **All funds have had grant activity in the last 12 months!**"
+    dormant = []
+    for fund in funds:
+        key = str(fund.get("csuite_id"))
+        latest = last_grant.get(key)
+        if latest is not None and latest >= cutoff:
+            continue
+        name, code = split_fund_name(fund.get("fund_name"))
+        dormant.append({
+            "name": name or fund.get("fund_name") or "Unknown",
+            "code": code,
+            "fund_id": key,
+            "group": _fund_group_label(fund),
+            "last": latest or "Never",
+        })
 
-    # Sort: never first, then oldest
-    inactive.sort(key=lambda x: x[2] if x[2] != "Never" else "0000")
+    footer = mirror_read.as_of_line("fund", "grant")
 
-    lines = []
-    if not funds_complete:
-        lines += [partial_note(len(funds), False, "funds"), ""]
-    elif not grants_complete:
-        lines += [partial_note(len(all_grants), False, "grants"), ""]
-    lines += [
-        f"📊 **Inactive Funds** (no grants in 12+ months)",
+    if not dormant:
+        return (f"✅ **All {len(funds)} funds have had grant activity in the "
+                f"last 12 months.**\n\n{footer}")
+
+    # Never-granted funds first, then oldest last-grant date.
+    dormant.sort(key=lambda f: (f["last"] if f["last"] != "Never" else "0000",
+                                f["name"].lower()))
+
+    by_group = {}
+    for fund in dormant:
+        by_group.setdefault(fund["group"], []).append(fund)
+
+    lines = [
+        "📊 **Dormant Funds** (no grants in 12+ months)",
         "",
-        f"**{len(inactive)}** funds identified:",
+        f"**{len(dormant)}** of {len(funds)} funds, grouped by fund type:",
         "",
     ]
-    for name, fid, last in inactive[:25]:
-        lines.append(f"• **{name}** (ID: {fid}) — Last grant: {last}")
+    for group in sorted(by_group, key=lambda g: (-len(by_group[g]), g)):
+        group_funds = by_group[group]
+        lines.append(f"**{group}** ({len(group_funds)})")
+        for fund in group_funds:
+            suffix = f" ({fund['code']})" if fund["code"] else ""
+            lines.append(
+                f"• **{fund['name']}**{suffix} — id {fund['fund_id']}, "
+                f"last grant: {fund['last']}")
+        lines.append("")
 
-    if len(inactive) > 25:
-        lines.append(f"• ... and {len(inactive) - 25} more")
-
-    lines.append("")
-    lines.append("💡 *Consider reaching out to fund advisors to discuss grant recommendations.*")
-
+    lines += [
+        "💡 *Consider reaching out to fund advisors to discuss grant "
+        "recommendations.*",
+        "",
+        footer,
+    ]
     return "\n".join(lines)
 
 
@@ -626,60 +753,45 @@ def _format_fee_type(ft: dict) -> str:
     return f"• **{name}:** {detail}"
 
 
-def _fund_balance_line(query: str, csuite) -> str | None:
-    """A one-line balance for the fund named in the query, if there is one."""
+def _fund_balance_line(query: str) -> str | None:
+    """A one-line balance for the fund named in the query, from the mirror."""
     try:
-        fund_id, rows, error = resolve_fund_id(csuite, query)
+        fund, ambiguous = _find_mirrored_fund(query)
     except Exception as e:
         logger.error(f"Fee report fund lookup failed: {e}")
         return None
 
-    if error:
-        return f"⚠️ {error}"
-
-    if fund_id is None:
-        if rows:
+    if fund is None:
+        if ambiguous:
             names = ", ".join(
-                (_fund_row_names(r) or ["Unknown"])[0] for r in rows[:5])
+                (_fund_row_names(f) or ["Unknown"])[0] for f in ambiguous[:5])
             return (
-                f"⚠️ That fund name matched {len(rows)} funds ({names}). "
+                f"⚠️ That fund name matched {len(ambiguous)} funds ({names}). "
                 "Name one exactly, or use its code."
             )
         return None
 
-    try:
-        data = csuite.get_fund(fund_id)
-    except Exception as e:
-        logger.error(f"Fee report fund fetch failed: {e}")
-        return f"⚠️ Could not fetch fund {fund_id}: {e}"
-
-    if not data.get("success") or not data.get("data"):
-        return (f"⚠️ Could not fetch fund {fund_id}: "
-                f"{data.get('error', 'unknown error')}")
-
-    fund = data["data"]
     name, code = split_fund_name(fund.get("fund_name"))
     balance = _money(fund.get("current_fundbalance")) or "unknown"
     suffix = f" ({code})" if code else ""
     return f"💰 **{name or 'Fund'}**{suffix} — balance {balance}"
 
 
-def _report_fees(query: str, csuite) -> str:
+def _report_fees(query: str) -> str:
     """Show the fee structure, and the balance of a named fund if given."""
-    logger.info("Running fee report...")
+    missing = mirror_read.require("fee_type")
+    if missing:
+        return missing
 
-    try:
-        fee_data = csuite.get_fund_fee_types()
-        if not fee_data.get('success') or not fee_data.get('data'):
-            return "❌ Failed to fetch fee structure."
-        fee_types = fee_data['data'].get('results', [])
-    except Exception as e:
-        return f"❌ Failed to fetch fee types: {e}"
+    logger.info("Running fee report (mirror)...")
+
+    fee_types = mirror_read.rows("fee_type")
 
     # If the query names a fund, show its balance beside the table. No fee is
     # computed for it: which fee type applies is exactly what CSuite will not
     # tell us, so a number here would be a guess presented as an answer.
-    fund_line = _fund_balance_line(query, csuite)
+    fund_line = _fund_balance_line(query)
+    read_types = ["fee_type"] + (["fund"] if fund_line else [])
 
     lines = []
     if fund_line:
@@ -687,10 +799,10 @@ def _report_fees(query: str, csuite) -> str:
     lines += ["📊 **AMCF Fee Structure**", ""]
 
     if fee_types:
-        for ft in fee_types:
-            lines.append(_format_fee_type(ft))
+        for fee_type in fee_types:
+            lines.append(_format_fee_type(fee_type))
     else:
-        lines.append("_CSuite returned no fee types._")
+        lines.append("_The mirror holds no fee types._")
 
     lines.append("")
     lines.append(_FEE_JOIN_NOTE)
@@ -702,84 +814,100 @@ def _report_fees(query: str, csuite) -> str:
             '"Fees for fund 1234" or "Fees for END0026".*'
         )
 
+    lines += ["", mirror_read.as_of_line(*read_types)]
     return "\n".join(lines)
 
 
 # =========================================================================
-# F. UNCASHED CHECKS
+# F. GRANTS ISSUED BUT NOT CLEARED
 # =========================================================================
 
-def _report_uncashed_checks(csuite) -> str:
-    """List uncashed grant checks grouped by recipient."""
-    logger.info("Running uncashed checks report...")
+_UNCLEARED_GRANTEES_SHOWN = 20
 
-    try:
-        # The client scans at most 5 pages (500 checks) and returns a
-        # filtered list, so completeness is not recoverable from the result.
-        # The report says what was scanned rather than implying "all".
-        CHECK_SCAN_LIMIT = 500
-        checks = csuite.get_uncashed_checks()
-    except Exception as e:
-        return f"❌ Failed to fetch uncashed checks: {e}"
 
-    if not checks:
-        return "✅ **No uncashed checks outstanding!**"
+def _report_uncleared_grants() -> str:
+    """Grants at status 'paid' — issued, not yet cleared.
 
-    # Group by account
-    by_account = {}
-    total = 0
-    for c in checks:
-        account = c.get('account_name', 'Unknown Account')
-        amount = float(c.get('amount', 0) or 0)
+    This replaces an uncashed-CHECK report. grant/list carries no check_id
+    and no check_num (probe #2, C2), so a grant cannot be joined to the
+    check that paid it; the old report grouped check rows by
+    account_name, which is the AMCF bank account, not the grantee — so it
+    answered "which of our accounts has uncleared checks" while being read
+    as "which charities have not cashed". That question cannot be answered
+    from this API, and this one can.
+    """
+    missing = mirror_read.require("grant")
+    if missing:
+        return missing
+
+    logger.info("Running uncleared grants report (mirror)...")
+
+    grants = mirror_read.rows(
+        "grant",
+        "AND data->>'grant_status' = %s",
+        (GRANT_STATUS_ISSUED,),
+    )
+
+    footer = mirror_read.as_of_line("grant")
+
+    if not grants:
+        return ("✅ **No grants are sitting at status "
+                f"'{GRANT_STATUS_ISSUED}'.**\n\n{footer}")
+
+    by_grantee = {}
+    total = 0.0
+    for grant in grants:
+        grantee = grant.get("name") or "Unknown grantee"
+        amount = _amount(grant.get("grant_amount"))
         total += amount
-        by_account.setdefault(account, []).append({
-            "number": c.get('check_num') or c.get('check_id', '?'),
+        by_grantee.setdefault(grantee, []).append({
+            "grant_id": grant.get("csuite_id"),
+            "date": grant.get("grant_date") or "no date",
             "amount": amount,
-            "date": c.get('check_date', 'N/A'),
-            "electronic": c.get('is_electronic', 0),
+            "fund": grant.get("fund_name") or "Unknown fund",
         })
 
-    # Sort accounts by total outstanding
-    sorted_accounts = sorted(
-        by_account.items(),
-        key=lambda x: sum(ch["amount"] for ch in x[1]),
-        reverse=True,
-    )
+    for entries in by_grantee.values():
+        entries.sort(key=lambda g: g["date"])
 
-    # The old condition (len(checks) >= 500) almost never fired: the client
-    # scans 500 checks and then FILTERS to uncashed ones, so a fully capped
-    # scan typically returns far fewer than 500 and the report read as
-    # complete. The scan limit is stated unconditionally instead.
-    capped_note = (
-        f"\n⚠️ Partial data: scanned the most recent {CHECK_SCAN_LIMIT} checks "
-        f"only — totals below are NOT complete. Contact Finance for a full "
-        f"export.\n"
-    )
+    # Oldest first: the point of the report is what has been outstanding
+    # longest, not who is owed the most.
+    ordered = sorted(by_grantee.items(), key=lambda kv: kv[1][0]["date"])
 
     lines = [
-        f"📊 **Uncashed Checks Report**",
+        f"📊 **Grants issued but not yet cleared (status "
+        f"'{GRANT_STATUS_ISSUED}')**",
         "",
-        f"**{len(checks)}** checks outstanding totalling **${total:,.2f}**",
-        capped_note,
-        "**By Account:**",
+        f"**{len(grants)}** grants across **{len(by_grantee)}** grantees, "
+        f"totalling **${total:,.2f}**",
+        "",
+        "**By grantee, oldest first:**",
     ]
+    for grantee, entries in ordered[:_UNCLEARED_GRANTEES_SHOWN]:
+        grantee_total = sum(e["amount"] for e in entries)
+        lines.append(
+            f"• **{grantee}** — {len(entries)} grant(s), "
+            f"${grantee_total:,.2f}")
+        for entry in entries[:3]:
+            lines.append(
+                f"  {entry['date']}: ${entry['amount']:,.2f} "
+                f"(grant {entry['grant_id']}, {entry['fund']})")
+        if len(entries) > 3:
+            lines.append(f"  ... and {len(entries) - 3} more")
 
-    for account, account_checks in sorted_accounts[:15]:
-        account_total = sum(ch["amount"] for ch in account_checks)
-        e_count = sum(1 for ch in account_checks if ch["electronic"])
-        type_note = f" ({e_count} electronic)" if e_count else ""
-        lines.append(f"• **{account}** — {len(account_checks)} check(s), ${account_total:,.2f}{type_note}")
-        for ch in account_checks[:3]:
-            lines.append(f"  Check {ch['number']}: ${ch['amount']:,.2f} ({ch['date']})")
-        if len(account_checks) > 3:
-            lines.append(f"  ... and {len(account_checks) - 3} more")
+    if len(ordered) > _UNCLEARED_GRANTEES_SHOWN:
+        lines.append(
+            f"• ... and {len(ordered) - _UNCLEARED_GRANTEES_SHOWN} more "
+            "grantees")
 
-    if len(sorted_accounts) > 15:
-        lines.append(f"• ... and {len(sorted_accounts) - 15} more accounts")
-
-    lines.append("")
-    lines.append("💡 *Consider following up on older uncashed checks.*")
-
+    lines += [
+        "",
+        "ℹ️ *CSuite exposes no link from a grant to the check that paid it, "
+        "so this is grant status, not bank clearance. Finance can confirm "
+        "against the account.*",
+        "",
+        footer,
+    ]
     return "\n".join(lines)
 
 
@@ -787,73 +915,120 @@ def _report_uncashed_checks(csuite) -> str:
 # G. QUARTERLY DAF SUMMARY
 # =========================================================================
 
-def _report_quarterly_summary(query: str, csuite) -> str:
-    """Quarterly summary: donations in, grants out, net per fund."""
+def _report_quarterly_summary(query: str) -> str:
+    """Donations in and grants out for one quarter, split DAF vs Endowment.
+
+    Donations come from donation_fund_quarter, which sync/mirror.py rolled
+    up per fund per quarter over the whole 26,500-row history. Grants are
+    filtered from the mirrored grant rows. Neither is capped.
+    """
+    missing = mirror_read.require("donation_fund_quarter", "grant", "fund")
+    if missing:
+        return missing
+
     start, end = _parse_date_range(query)
     q_label = _get_quarter_label(start)
+    year, quarter = _year_quarter(start)
 
-    logger.info(f"Quarterly summary for {q_label} ({start} to {end})...")
+    logger.info(f"Quarterly summary for {q_label} ({start} to {end}, mirror)")
 
-    try:
-        all_donations, donations_complete = _fetch_all_donations(csuite)
-        all_grants, grants_complete = _fetch_all_grants(csuite)
-    except Exception as e:
-        return f"❌ Failed to fetch data: {e}"
+    funds = _fund_index()
 
-    # Filter to date range
-    q_donations = [d for d in all_donations if start <= d.get('donation_date', '') <= end]
-    q_grants = [g for g in all_grants if start <= g.get('grant_date', '') <= end]
+    donations = mirror_read.rows(
+        "donation_fund_quarter",
+        "AND data->>'year' = %s AND data->>'quarter' = %s",
+        (str(year), str(quarter)),
+    )
+    grants = mirror_read.rows(
+        "grant",
+        "AND data->>'grant_date' >= %s AND data->>'grant_date' <= %s",
+        (start, end),
+    )
 
-    # Aggregate by fund
-    funds = {}
-    for d in q_donations:
-        fund = d.get('fund_name', 'Unknown')
-        funds.setdefault(fund, {"donations": 0, "grants": 0})
-        funds[fund]["donations"] += float(d.get('donation_amount', 0) or 0)
+    # Per fund, then folded into group totals. Keeping the per-fund rows is
+    # what lets the top-15 list and the DAF/Endowment split come from the
+    # same pass.
+    per_fund = {}
 
-    for g in q_grants:
-        fund = g.get('fund_name', 'Unknown')
-        funds.setdefault(fund, {"donations": 0, "grants": 0})
-        funds[fund]["grants"] += float(g.get('grant_amount', 0) or 0)
+    def bucket(fund_id, fund_name):
+        key = str(fund_id) if fund_id not in (None, "") else "unknown"
+        entry = per_fund.get(key)
+        if entry is None:
+            fund = funds.get(key, {})
+            name, _code = split_fund_name(
+                fund.get("fund_name") or fund_name or "Unknown")
+            entry = per_fund[key] = {
+                "name": name or fund_name or "Unknown",
+                "group_id": _fund_group_id(fund),
+                "donations": 0.0,
+                "grants": 0.0,
+            }
+        return entry
 
-    total_in = sum(f["donations"] for f in funds.values())
-    total_out = sum(f["grants"] for f in funds.values())
+    for row in donations:
+        entry = bucket(row.get("funit_id"), row.get("fund_name"))
+        entry["donations"] += _amount(row.get("total"))
 
-    # Sort by donations descending
-    sorted_funds = sorted(funds.items(), key=lambda x: x[1]["donations"], reverse=True)
+    for grant in grants:
+        entry = bucket(grant.get("funit_id"), grant.get("fund_name"))
+        entry["grants"] += _amount(grant.get("grant_amount"))
 
-    lines = []
-    if not donations_complete or not grants_complete:
-        lines += [
-            "⚠️ Partial data: donations capped at "
-            f"{len(all_donations)} and grants at {len(all_grants)} — "
-            "totals below are NOT complete.",
-            "",
-        ]
-    lines += [
-        f"📊 **Quarterly DAF Summary: {q_label}**",
-        f"📅 {start} to {end}",
+    total_in = sum(f["donations"] for f in per_fund.values())
+    total_out = sum(f["grants"] for f in per_fund.values())
+
+    groups = {DAF_GROUP_ID: {"in": 0.0, "out": 0.0, "funds": 0},
+              ENDOWMENT_GROUP_ID: {"in": 0.0, "out": 0.0, "funds": 0},
+              None: {"in": 0.0, "out": 0.0, "funds": 0}}
+    for entry in per_fund.values():
+        key = entry["group_id"] if entry["group_id"] in groups else None
+        groups[key]["in"] += entry["donations"]
+        groups[key]["out"] += entry["grants"]
+        groups[key]["funds"] += 1
+
+    lines = [
+        f"📊 **Quarterly Summary: {q_label}**",
+        f"🗓 {start} to {end}",
         "",
         f"💰 **Total Donations In:** ${total_in:,.2f}",
         f"🎁 **Total Grants Out:** ${total_out:,.2f}",
         f"📈 **Net:** ${total_in - total_out:,.2f}",
         "",
-        f"**Active Funds:** {len(funds)}",
-        "",
-        "**By Fund (top 15):**",
+        "**By fund group:**",
     ]
-
-    for fund_name, stats in sorted_funds[:15]:
-        net = stats["donations"] - stats["grants"]
-        net_str = f"+${net:,.2f}" if net >= 0 else f"-${abs(net):,.2f}"
+    for group_id, label in ((DAF_GROUP_ID, "DAF"),
+                            (ENDOWMENT_GROUP_ID, "Endowment")):
+        stats = groups[group_id]
+        net = stats["in"] - stats["out"]
         lines.append(
-            f"• **{fund_name}**: In ${stats['donations']:,.2f} / "
-            f"Out ${stats['grants']:,.2f} / Net {net_str}"
-        )
+            f"• **{label}** ({stats['funds']} funds): "
+            f"In ${stats['in']:,.2f} / Out ${stats['out']:,.2f} / "
+            f"Net ${net:,.2f}")
+    other = groups[None]
+    if other["funds"]:
+        net = other["in"] - other["out"]
+        lines.append(
+            f"• **Other groups** ({other['funds']} funds): "
+            f"In ${other['in']:,.2f} / Out ${other['out']:,.2f} / "
+            f"Net ${net:,.2f}")
 
-    if len(sorted_funds) > 15:
-        lines.append(f"• ... and {len(sorted_funds) - 15} more funds")
+    ordered = sorted(per_fund.values(),
+                     key=lambda f: f["donations"], reverse=True)
+    lines += ["", f"**Active Funds:** {len(per_fund)}", "",
+              "**By Fund (top 15):**"]
+    for entry in ordered[:15]:
+        net = entry["donations"] - entry["grants"]
+        net_str = f"+${net:,.2f}" if net >= 0 else f"-${abs(net):,.2f}"
+        label = FUND_GROUP_LABELS.get(entry["group_id"])
+        tag = f" [{label}]" if label else ""
+        lines.append(
+            f"• **{entry['name']}**{tag}: In ${entry['donations']:,.2f} / "
+            f"Out ${entry['grants']:,.2f} / Net {net_str}")
 
+    if len(ordered) > 15:
+        lines.append(f"• ... and {len(ordered) - 15} more funds")
+
+    lines += ["",
+              mirror_read.as_of_line("donation_fund_quarter", "grant", "fund")]
     return "\n".join(lines)
 
 
@@ -1122,107 +1297,63 @@ def _report_investment_requests(hubspot) -> str:
 # Report: Endowment Distribution Dates (#7)
 # ---------------------------------------------------------------------------
 
-def _report_endowment_distributions(csuite) -> str:
-    """List endowment funds with their distribution schedule and dates."""
-    logger.info("Running endowment distribution report...")
+def _report_endowment_distributions() -> str:
+    """Open endowment funds and their distribution schedule.
 
-    ENDOWMENT_FGROUP_ID = 1008
-    MAX_DETAIL_CALLS = 50  # Budget for detail calls (24 endowments expected)
+    Every endowment, not the first 50 funds checked. The old version paged
+    the fund list, then spent one funit/display call per fund up to a hard
+    cap of fifty — against 397 funds, so it could only ever see an eighth
+    of them and said "some endowments may not be shown". The
+    mirror already holds every display payload.
 
-    # Step 1: Get all fund IDs from the paginated fund list.
-    # The list endpoint doesn't include fgroup_id, so we must fetch
-    # details to filter. We iterate all funds but stop detail calls
-    # at MAX_DETAIL_CALLS to protect workers.
-    all_fund_ids = []
-    try:
-        result = csuite.get_funds(limit=100, offset=0)
-        if result.get("success") and result.get("data"):
-            fund_list = result["data"].get("results", [])
-            all_fund_ids = [f.get("funit_id") for f in fund_list if f.get("funit_id")]
-            total_pages = result["data"].get("pages", 1)
+    Distribution field names are from scripts/probe_output/csuite_fields.md
+    (funit/display): dist_start_date, distribution_interval, dist_type_id.
+    All three were null on the sampled fund, so "Not configured" here is a
+    real answer about CSuite, not a lookup failure.
+    """
+    missing = mirror_read.require("fund")
+    if missing:
+        return missing
 
-            for page in range(1, min(total_pages, 4)):
-                more = csuite.get_funds(limit=100, offset=page * 100)
-                if more.get("success") and more.get("data"):
-                    for f in more["data"].get("results", []):
-                        if f.get("funit_id"):
-                            all_fund_ids.append(f["funit_id"])
-    except Exception as e:
-        logger.exception(f"Error fetching fund list: {e}")
-        return f"Failed to fetch funds: {e}"
+    logger.info("Running endowment distribution report (mirror)...")
 
-    if not all_fund_ids:
-        return "No funds found in CSuite."
+    endowments = [
+        fund for fund in mirror_read.rows("fund")
+        if _fund_group_id(fund) == ENDOWMENT_GROUP_ID
+        and not fund.get("fund_closed")
+    ]
 
-    logger.info(f"Found {len(all_fund_ids)} total funds, checking for endowments...")
-
-    # Step 2: Fetch details and filter to endowments (fgroup_id=1008).
-    endowments = []
-    calls_made = 0
-    for fid in all_fund_ids:
-        if calls_made >= MAX_DETAIL_CALLS:
-            logger.warning(f"Hit detail call cap ({MAX_DETAIL_CALLS}) — found {len(endowments)} endowments so far")
-            break
-        try:
-            detail = csuite.get_fund(fid)
-            calls_made += 1
-        except Exception:
-            calls_made += 1
-            continue
-
-        if not detail.get("success") or not detail.get("data"):
-            continue
-
-        fund_data = detail["data"]
-        if fund_data.get("fgroup_id") != ENDOWMENT_FGROUP_ID:
-            continue
-        if fund_data.get("fund_closed"):
-            continue
-
-        endowments.append(fund_data)
+    footer = mirror_read.as_of_line("fund")
 
     if not endowments:
-        return "No open endowment funds found in CSuite."
+        return f"No open endowment funds found in the mirror.\n\n{footer}"
 
-    # Sort by distribution start date (if available)
     endowments.sort(key=lambda f: f.get("dist_start_date") or "9999")
 
-    lines = []
-    if calls_made >= MAX_DETAIL_CALLS:
-        lines += [
-            f"⚠️ Partial data: checked {calls_made} of {len(all_fund_ids)} "
-            "funds only — the list below is NOT complete.",
-            "",
-        ]
-    lines += [f"**Endowment Funds** ({len(endowments)} found)\n"]
+    lines = [f"**Endowment Funds** ({len(endowments)} found)", ""]
 
-    for f in endowments:
-        name = f.get("fund_name", "Unnamed")
-        balance = f.get("current_fundbalance", "N/A")
-        dist_interval = f.get("distribution_interval") or "Not set"
-        dist_start = f.get("dist_start_date") or "Not set"
-        dist_type = f.get("dist_type_id")
+    for fund in endowments:
+        name, code = split_fund_name(fund.get("fund_name"))
+        suffix = f" ({code})" if code else ""
+        balance = _money(fund.get("current_fundbalance")) or "N/A"
+        interval = fund.get("distribution_interval")
+        starts = fund.get("dist_start_date")
 
-        line = f"- **{name}** — Balance: ${balance}"
-        if dist_interval != "Not set" or dist_start != "Not set":
-            line += f" | Distribution: {dist_interval}, starts {dist_start}"
+        line = f"- **{name or 'Unnamed'}**{suffix} — Balance: {balance}"
+        if interval or starts:
+            line += (f" | Distribution: {interval or 'interval not set'}, "
+                     f"starts {starts or 'not set'}")
         else:
             line += " | Distribution: Not configured"
-
         lines.append(line)
 
-    # Check if no endowments have distributions configured
     configured = [f for f in endowments
                   if f.get("distribution_interval") or f.get("dist_start_date")]
     if not configured:
         lines.append(
-            "\n*Note: No endowment funds currently have distribution schedules configured in CSuite.*"
-        )
+            "\n*Note: no endowment fund has a distribution schedule set in "
+            "CSuite — the distribution fields are empty on all "
+            f"{len(endowments)} of them.*")
 
-    if calls_made >= MAX_DETAIL_CALLS:
-        lines.append(
-            f"\n*Note: Checked {calls_made} of {len(all_fund_ids)} funds. "
-            f"Some endowments may not be shown.*"
-        )
-
+    lines += ["", footer]
     return "\n".join(lines)

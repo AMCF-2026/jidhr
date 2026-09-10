@@ -617,74 +617,64 @@ class TestPartialData:
         assert "1000 grants" in note
         assert "NOT complete" in note
 
-    def _csuite(self, pages):
-        class Csuite:
-            def __init__(self):
-                self.calls = 0
+    # The capped page-walkers these used to cover (_fetch_all_grants,
+    # _fetch_all_donations) are gone as of Step 3c. Their whole purpose was
+    # to report "complete=False" so a report could print a banner over a
+    # lower-bound total. The reports now read a complete mirror instead, so
+    # there is no lower bound to warn about — see tests/test_mirror_reports.py
+    # for what replaced them. partial_note itself stays, because the
+    # HubSpot-sourced reports are still genuinely capped.
 
-            def get_grants(self, limit=100, offset=0):
-                self.calls += 1
-                if self.calls > pages:
-                    return {"success": True, "data": {"results": []}}
-                today = datetime.now().strftime("%Y-%m-%d")
-                return {"success": True, "data": {"results": [
-                    {"grant_id": i, "grant_amount": "10.00",
-                     "grant_date": today, "fund_name": "F"}
-                    for i in range(limit)]}}
+    def test_the_capped_hubspot_reports_still_carry_the_banner(self):
+        from intents.reports import _report_tasks
 
-        return Csuite()
+        class HubSpot:
+            def get_tasks(self, limit=50):
+                return {"results": [
+                    {"properties": {"hs_task_subject": f"Task {i}",
+                                    "hs_task_status": "NOT_STARTED",
+                                    "hs_task_priority": "HIGH"}}
+                    for i in range(limit)]}
 
-    def test_a_capped_page_walk_reports_incomplete(self):
-        from intents.reports import _fetch_all_grants
+            def get_task_url(self):
+                return "https://example.invalid/tasks"
 
-        records, complete = _fetch_all_grants(self._csuite(99), max_pages=2)
-
-        assert len(records) == 200
-        assert complete is False
-
-    def test_a_short_final_page_reports_complete(self):
-        from intents.reports import _fetch_all_grants
-
-        class Csuite:
-            def get_grants(self, limit=100, offset=0):
-                return {"success": True, "data": {"results": [
-                    {"grant_id": 1, "grant_amount": "1.00"}]}}
-
-        records, complete = _fetch_all_grants(Csuite(), max_pages=5)
-
-        assert complete is True and len(records) == 1
-
-    def test_a_failed_page_is_not_reported_as_complete(self):
-        from intents.reports import _fetch_all_grants
-
-        class Csuite:
-            def get_grants(self, limit=100, offset=0):
-                return {"success": False, "error": "boom"}
-
-        records, complete = _fetch_all_grants(Csuite(), max_pages=5)
-
-        assert complete is False
-
-    def test_the_grant_report_carries_the_banner(self):
-        from intents.reports import _report_grants
-
-        out = _report_grants("grant report this quarter", self._csuite(99))
+        out = _report_tasks(HubSpot())
 
         assert "Partial data" in out
         assert "NOT complete" in out
 
-    def test_the_uncashed_check_report_states_its_scan_limit(self):
-        from intents.reports import _report_uncashed_checks
+    def test_the_mirror_backed_reports_no_longer_carry_it(self, monkeypatch):
+        """A banner saying "NOT complete" over complete data is its own
+        kind of lie, and it trains people to ignore the banner."""
+        import intents.reports as reports_module
 
-        class Csuite:
-            def get_uncashed_checks(self):
-                return [{"amount": "10.00", "check_num": "1",
-                         "account_name": "BoA", "check_date": "2026-01-01",
-                         "is_electronic": 0}]
+        rows = {
+            "grant": [{"csuite_id": "1", "fund_group_id": None,
+                       "data": {"grant_id": 1, "grant_amount": "10.00",
+                                "grant_date": datetime.now().strftime(
+                                    "%Y-%m-%d"),
+                                "fund_name": "F"},
+                       "synced_at": datetime(2026, 9, 10, 12, 0)}],
+        }
 
-        out = _report_uncashed_checks(Csuite())
-        assert "Partial data" in out
-        assert "500" in out
+        def fake_query(sql, params=None, fetch=True):
+            collapsed = " ".join(str(sql).split())
+            record_type = (params or ("",))[0]
+            found = rows.get(record_type, [])
+            if collapsed.startswith("SELECT COUNT(*)"):
+                return [{"n": len(found)}]
+            if collapsed.startswith("SELECT MAX(synced_at)"):
+                return [{"synced_at": found[0]["synced_at"] if found else None}]
+            return found
+
+        monkeypatch.setattr("clients.database.execute_query", fake_query)
+
+        out = reports_module._report_grants("grant report this quarter")
+
+        assert "Partial data" not in out
+        assert "NOT complete" not in out
+        assert "(CSuite mirror)" in out
 
 
 # ===========================================================================

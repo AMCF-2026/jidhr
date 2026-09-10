@@ -7,6 +7,8 @@ go through split_fund_name. No network — the CSuite client is a stub that
 records which endpoint it was asked for.
 """
 
+from datetime import datetime
+
 import pytest
 
 from intents.queries import (
@@ -340,24 +342,58 @@ def test_fee_line_survives_a_type_with_no_rate():
     assert "no rate published" in line
 
 
-def test_fee_report_lists_types_and_states_the_join_is_unknown():
-    csuite = StubCSuite(fee_types=REAL_FEE_TYPES)
-    out = _report_fees("what are our fees", csuite)
+# The fee report reads the mirror as of Step 3c, so these drive it through
+# a fake csuite_mirror rather than a CSuite stub. _format_fee_type above is
+# unchanged and still parses the real funit/feetype field names.
+
+def _mirror_db(fee_types=None, funds=None, stamp=None):
+    """A fake clients.database.execute_query over csuite_mirror."""
+    stamp = stamp or datetime(2026, 9, 10, 12, 0)
+    tables = {
+        "fee_type": [{"csuite_id": str(f["fund_fee_type_id"]),
+                      "fund_group_id": None, "data": f, "synced_at": stamp}
+                     for f in (fee_types or [])],
+        "fund": [{"csuite_id": str(f["funit_id"]), "fund_group_id": 1002,
+                  "data": f, "synced_at": stamp}
+                 for f in (funds or [])],
+    }
+
+    def query(sql, params=None, fetch=True):
+        collapsed = " ".join(str(sql).split())
+        record_type = (params or ("",))[0]
+        rows = tables.get(record_type, [])
+        if collapsed.startswith("SELECT COUNT(*)"):
+            return [{"n": len(rows)}]
+        if collapsed.startswith("SELECT MAX(synced_at)"):
+            return [{"synced_at": stamp if rows else None}]
+        if "csuite_id = %s" in collapsed:
+            wanted = str(params[1])
+            return [r for r in rows if r["csuite_id"] == wanted]
+        return rows
+
+    return query
+
+
+def test_fee_report_lists_types_and_states_the_join_is_unknown(monkeypatch):
+    monkeypatch.setattr("clients.database.execute_query",
+                        _mirror_db(fee_types=REAL_FEE_TYPES))
+
+    out = _report_fees("what are our fees")
 
     assert "Standard DAF" in out and "Endowment" in out
     assert "1%" in out and "0.5%" in out
     assert "not exposed by CSuite" in out
     assert "Shazeen" in out
+    assert "(CSuite mirror)" in out
 
 
-def test_fee_report_shows_the_balance_of_a_named_fund():
-    csuite = StubCSuite(
+def test_fee_report_shows_the_balance_of_a_named_fund(monkeypatch):
+    monkeypatch.setattr("clients.database.execute_query", _mirror_db(
         fee_types=REAL_FEE_TYPES,
-        search_results=[{"id": 222, "name": FULL_RAW}],
-        fund={"funit_id": 222, "fund_name": FULL_RAW,
-              "current_fundbalance": "48250.00"})
+        funds=[{"funit_id": 222, "fund_name": FULL_RAW,
+                "current_fundbalance": "48250.00"}]))
 
-    out = _report_fees(f"fees for {FULL_CLEAN}", csuite)
+    out = _report_fees(f"fees for {FULL_CLEAN}")
 
     assert "$48,250.00" in out
     assert FULL_CLEAN in out
@@ -365,18 +401,37 @@ def test_fee_report_shows_the_balance_of_a_named_fund():
     assert "Standard DAF" in out
 
 
-def test_fee_report_never_asserts_a_per_fund_fee():
-    """No estimate is printed, because the join does not exist."""
-    csuite = StubCSuite(
+def test_fee_report_finds_a_fund_by_its_code(monkeypatch):
+    monkeypatch.setattr("clients.database.execute_query", _mirror_db(
         fee_types=REAL_FEE_TYPES,
-        search_results=[{"id": 222, "name": FULL_RAW}],
-        fund={"funit_id": 222, "fund_name": FULL_RAW,
-              "current_fundbalance": "48250.00"})
+        funds=[{"funit_id": 222, "fund_name": FULL_RAW,
+                "current_fundbalance": "48250.00"}]))
 
-    out = _report_fees(f"fees for {FULL_CLEAN}", csuite).lower()
+    out = _report_fees("fees for END0026")
+
+    assert "$48,250.00" in out
+
+
+def test_fee_report_never_asserts_a_per_fund_fee(monkeypatch):
+    """No estimate is printed, because the join does not exist."""
+    monkeypatch.setattr("clients.database.execute_query", _mirror_db(
+        fee_types=REAL_FEE_TYPES,
+        funds=[{"funit_id": 222, "fund_name": FULL_RAW,
+                "current_fundbalance": "48250.00"}]))
+
+    out = _report_fees(f"fees for {FULL_CLEAN}").lower()
 
     assert "estimated quarterly fee" not in out
     assert "annualised" not in out
+
+
+def test_fee_report_stops_when_the_mirror_is_empty(monkeypatch):
+    monkeypatch.setattr("clients.database.execute_query", _mirror_db())
+
+    out = _report_fees("what are our fees")
+
+    assert out == ("⚠️ CSuite mirror not loaded for fee_type — "
+                   "run mirror_refresh.")
 
 
 def test_the_invented_fund_to_fee_join_is_gone():

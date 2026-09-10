@@ -12,6 +12,8 @@ Keyword-dispatched read-only gatherers, one per data domain
 
 import logging
 import re
+
+from clients import mirror_read
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -716,23 +718,69 @@ def _contact_ambiguity_directive(name: str, count: int) -> str:
     )
 
 
+def _mirrored_fund_fallback(fund_id, reason: str) -> str:
+    """The mirror's copy of a fund, offered only when the live call failed.
+
+    Deliberately NOT the primary path. Fund balances move with every gift
+    and every grant, so an answer about a balance has to be live or it has
+    to say how old it is. This is the second of those: a stale number
+    stamped with its date beats "lookup failed" for someone who just wants
+    to know roughly where a fund stands.
+    """
+    try:
+        fund = mirror_read.get("fund", fund_id)
+    except Exception as e:
+        logger.error(f"Mirror fund fallback failed for {fund_id}: {e}")
+        fund = None
+
+    if not fund:
+        return reason
+
+    balance = fund.get("current_fundbalance")
+    if balance is None:
+        return reason
+
+    stamp = fund.get("synced_at")
+    when = (stamp.strftime("%Y-%m-%d %H:%M UTC")
+            if hasattr(stamp, "strftime") else str(stamp or "unknown"))
+    name, code = split_fund_name(fund.get("fund_name"))
+    suffix = f" ({code})" if code else ""
+
+    return (
+        f"{reason}\n"
+        f"Live lookup failed; mirror balance as of {when}: "
+        f"{_format_currency(balance)} for {name or 'fund'}{suffix} "
+        f"(id {fund_id}). Say that this figure is from the mirror and give "
+        f"its date — do not present it as the current balance."
+    )
+
+
 def _fund_detail_context(csuite, fund_id) -> str:
-    """Labelled detail lines for one fund, or the literal CSuite error."""
+    """Labelled detail lines for one fund, or the literal CSuite error.
+
+    Stays LIVE. Everything else in Step 3c moved to the mirror, but a fund
+    balance is the one number that must be current — this is what someone
+    reads out on a call. The mirror is only a fallback, and only ever
+    labelled as one.
+    """
     try:
         data = csuite.get_fund(fund_id)
     except Exception as e:
         logger.error(f"Error fetching fund {fund_id}: {e}")
-        return f"CSuite fund lookup for id {fund_id} failed: {e}"
+        return _mirrored_fund_fallback(
+            fund_id, f"CSuite fund lookup for id {fund_id} failed: {e}")
 
     if not data.get("success"):
         # The literal error, so Claude reports it rather than inventing a
         # plausible-sounding next step.
         error = data.get("error") or "unknown error"
-        return f"CSuite fund lookup for id {fund_id} failed: {error}"
+        return _mirrored_fund_fallback(
+            fund_id, f"CSuite fund lookup for id {fund_id} failed: {error}")
 
     fund = data.get("data") or {}
     if not fund:
-        return f"CSuite returned no detail for fund id {fund_id}."
+        return _mirrored_fund_fallback(
+            fund_id, f"CSuite returned no detail for fund id {fund_id}.")
 
     clean_name, code = split_fund_name(fund.get("fund_name"))
 
@@ -1057,21 +1105,17 @@ def _gather_donation_context(query: str, query_lower: str, csuite) -> list:
     parts = []
     profile_id = _extract_id(query)
 
-    # Enhanced: donations for a specific profile
+    # Giving history for a specific profile, from the mirror's aggregate.
+    #
+    # This used to call get_donations_by_profile(profile_id, limit=10).
+    # That method takes no `limit` (clients/csuite.py), so the call raised
+    # TypeError on every request; the except swallowed it and the handler
+    # fell through to the generic "recent donations" block below — so
+    # asking about one donor silently answered with the last five gifts
+    # from anybody.
     if profile_id:
-        logger.info(f"Fetching donations for profile {profile_id}...")
-        try:
-            donations_data = csuite.get_donations_by_profile(profile_id, limit=10)
-            if donations_data.get('success') and donations_data.get('data'):
-                results = donations_data['data'].get('results', [])
-                donation_list = [
-                    f"${d.get('donation_amount', '0')} to {d.get('fund_name', 'Unknown')} ({d.get('donation_date', 'No date')})"
-                    for d in results[:10]
-                ]
-                parts.append(f"Donations for Profile {profile_id}:\n" + "\n".join(donation_list))
-                logger.info(f"Found {len(donation_list)} donations for profile")
-        except Exception as e:
-            logger.error(f"Error fetching profile donations: {e}")
+        logger.info(f"Reading mirrored giving for profile {profile_id}...")
+        parts.extend(_profile_giving_context(profile_id))
 
     # Fallback: recent donations
     if not parts:
@@ -1090,6 +1134,50 @@ def _gather_donation_context(query: str, query_lower: str, csuite) -> list:
             logger.error(f"Error fetching donations: {e}")
 
     return parts
+
+
+def _profile_giving_context(profile_id) -> list:
+    """Labelled giving lines for one profile, or an explicit 'nothing'.
+
+    Returns a line either way. An empty list here would fall through to
+    the generic recent-donations block, which is what made this handler
+    answer a question about one donor with somebody else's gifts.
+    """
+    try:
+        agg = mirror_read.get("donation_agg", profile_id)
+    except Exception as e:
+        logger.error(f"Mirror giving lookup failed for {profile_id}: {e}")
+        return [f"Giving history for profile {profile_id} is unavailable: "
+                f"the CSuite mirror could not be read ({e}). Do not guess a "
+                f"total."]
+
+    if not agg:
+        return [f"Profile {profile_id} has no recorded donations in the "
+                f"CSuite mirror."]
+
+    lines = [f"CSuite Giving Summary for Profile {profile_id}:"]
+    lines.append(f"Lifetime total: {_format_currency(agg.get('lifetime_total'))}")
+    lines.append(f"Number of donations: {agg.get('count')}")
+
+    if agg.get("first_date"):
+        lines.append(
+            f"First donation: {_format_currency(agg.get('first_amount'))} to "
+            f"{agg.get('first_fund') or 'Unknown'} on {agg['first_date']}")
+    if agg.get("latest_date"):
+        lines.append(
+            f"Latest donation: {_format_currency(agg.get('latest_amount'))} to "
+            f"{agg.get('latest_fund') or 'Unknown'} on {agg['latest_date']}")
+    if agg.get("greatest_amount"):
+        lines.append(
+            f"Largest donation: {_format_currency(agg.get('greatest_amount'))}"
+            + (f" on {agg['greatest_date']}" if agg.get("greatest_date")
+               else ""))
+    if agg.get("ramadan_years"):
+        lines.append("Gave during Ramadan in: "
+                     + ", ".join(str(y) for y in agg["ramadan_years"]))
+
+    lines.append(mirror_read.as_of_line("donation_agg"))
+    return ["\n".join(lines)]
 
 
 def _gather_ticket_context(hubspot) -> list:

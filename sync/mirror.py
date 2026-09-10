@@ -82,11 +82,12 @@ import hashlib
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 
 from clients import database
 from clients.csuite import CSuiteClient
+from config import Config
 from clients.csuite_fetch import (
     BUDGET_ERROR,
     RATE_LIMITED_ERROR,
@@ -115,7 +116,14 @@ RECORD_TYPES = (
     "check",
     "profile",
     "donation_agg",
+    "donation_fund_quarter",
 )
+
+# donation_agg and donation_fund_quarter are two shapes of the same 267-page
+# donation/list sweep, so asking for one always produces the other. The
+# fetch itself is cached per refresh() call, which is what makes the second
+# one free.
+COMPANION_TYPES = {"donation_agg": "donation_fund_quarter"}
 
 # Hours until a row stops being trusted. Absent = never expires.
 TTL_HOURS = {
@@ -238,6 +246,48 @@ def _date(value) -> str | None:
     return text or None
 
 
+def ramadan_year(donation_date) -> int | None:
+    """The Ramadan year a gift falls in, or None if it falls outside one.
+
+    Config.get_ramadan_range keys its ranges by Gregorian year, so a date
+    is checked against its own year and the two either side: Ramadan moves
+    ~11 days earlier annually and will straddle a New Year within a decade,
+    at which point checking only the date's own year would start silently
+    dropping gifts.
+    """
+    date = _date(donation_date)
+    if not date or len(date) < 4:
+        return None
+    try:
+        year = int(date[:4])
+    except ValueError:
+        return None
+
+    for candidate in (year - 1, year, year + 1):
+        try:
+            start, end = Config.get_ramadan_range(candidate)
+        except Exception:  # pragma: no cover - config always returns a pair
+            continue
+        if start <= date <= end:
+            return candidate
+    return None
+
+
+def quarter_of(date_str) -> tuple:
+    """(year, quarter) for a YYYY-MM-DD date, or (None, None)."""
+    date = _date(date_str)
+    if not date or len(date) < 7:
+        return None, None
+    try:
+        year = int(date[:4])
+        month = int(date[5:7])
+    except ValueError:
+        return None, None
+    if not 1 <= month <= 12:
+        return None, None
+    return year, (month - 1) // 3 + 1
+
+
 def _order_id(value) -> int:
     """A tiebreaker for two donations on the same date."""
     try:
@@ -300,6 +350,34 @@ class GatherContext:
     pace_ms: object = None
     budget: object = None
     run_id: object = None
+    # Endpoint results already fetched during this refresh() call, so two
+    # record types built from the same sweep pay for it once. Keyed by
+    # endpoint; lives only as long as the refresh call that made it.
+    cache: dict = field(default_factory=dict)
+
+    def fetch_shared(self, endpoint: str):
+        """fetch_all for an endpoint, reusing this run's result if there is one.
+
+        A cache hit is returned with its call counters zeroed. They belong
+        to the run row of the type that actually made the calls; leaving
+        them on would bill 267 donation pages twice and make the CLI
+        report 534 calls for a 267-call sweep.
+        """
+        cached = self.cache.get(endpoint)
+        if cached is not None:
+            logger.info("reusing the %s fetch from earlier in this run "
+                        "(%d records, 0 further calls)",
+                        endpoint, len(cached.records))
+            return replace(cached, calls=0, pages=0, total_429s=0,
+                           first_429_at=None)
+        result = fetch_all(self.client, endpoint, pace_ms=self.pace_ms,
+                           budget=self.budget)
+        if result.complete:
+            # Only a whole fetch is worth reusing. Caching a partial one
+            # would hand the second record type a truncated sweep with no
+            # way to tell it apart from a good one.
+            self.cache[endpoint] = result
+        return result
 
 
 def _gather_list(ctx: GatherContext, endpoint: str, key_names) -> Gathered:
@@ -499,8 +577,7 @@ def _gather_donation_agg(ctx: GatherContext) -> Gathered:
     the accounting system's job, and a local copy of every gift is a
     liability with no query this assistant needs.
     """
-    result = fetch_all(ctx.client, "donation/list", pace_ms=ctx.pace_ms,
-                       budget=ctx.budget)
+    result = ctx.fetch_shared("donation/list")
 
     gathered = Gathered(
         complete=result.complete,
@@ -538,6 +615,9 @@ def aggregate_donations(rows) -> tuple[dict, int]:
     ties so the same input always produces the same output. A donation
     with no date still counts toward the total and the count, but can
     never be the first or latest — a missing date is unknown, not oldest.
+
+    ramadan_years is the sorted set of Ramadan years the profile gave in,
+    per Config.get_ramadan_range.
     """
     working: dict = {}
     dropped = 0
@@ -566,10 +646,15 @@ def aggregate_donations(rows) -> tuple[dict, int]:
                 "first": None,
                 "latest": None,
                 "greatest": None,
+                "ramadan_years": set(),
             }
 
         agg["count"] += 1
         agg["total"] += amount
+
+        ramadan = ramadan_year(date)
+        if ramadan is not None:
+            agg["ramadan_years"].add(ramadan)
 
         entry = {"date": date, "amount": amount, "fund": fund, "order": order}
 
@@ -606,9 +691,97 @@ def aggregate_donations(rows) -> tuple[dict, int]:
             "greatest_amount": (_money_str(greatest["amount"])
                                 if greatest else None),
             "greatest_date": greatest["date"] if greatest else None,
+            # Which Ramadans this profile gave in — the whole input to the
+            # lapsed-donor report, computed once here rather than by
+            # re-reading 26,500 donations every time someone asks.
+            "ramadan_years": sorted(agg["ramadan_years"]),
         }
 
     return aggregates, dropped
+
+
+def _gather_donation_fund_quarter(ctx: GatherContext) -> Gathered:
+    """Donations rolled up to one row per fund per calendar quarter.
+
+    Reads the same donation/list sweep as donation_agg — via
+    ctx.fetch_shared, so running both costs one fetch — and rolls it the
+    other way: by fund and quarter instead of by profile.
+
+    Carries no profile ids and no donor names. The quarterly report needs
+    "what came into this fund in Q3" and nothing more, so this aggregate
+    is not donor data at all and has no expiry.
+    """
+    result = ctx.fetch_shared("donation/list")
+
+    gathered = Gathered(
+        complete=result.complete,
+        expected=result.expected,
+        pages=result.pages,
+        error=result.error,
+        notes={"endpoint": "donation/list"},
+    )
+    gathered.absorb(result)
+    if not result.complete:
+        return gathered
+
+    aggregates, dropped = aggregate_donations_by_fund_quarter(result.records)
+
+    for key, record in aggregates.items():
+        gathered.rows.append(MirrorRow(csuite_id=key, data=record))
+
+    gathered.notes["donations_read"] = len(result.records)
+    gathered.notes["fund_quarters"] = len(aggregates)
+    if dropped:
+        gathered.notes["donations_unbucketed"] = dropped
+        logger.warning(
+            "donation/list: %d donations had no fund or no usable date and "
+            "are in no quarter total", dropped)
+
+    return gathered
+
+
+def aggregate_donations_by_fund_quarter(rows) -> tuple[dict, int]:
+    """{"<funit_id>:<YYYY>Q<n>": {...}} from raw donation rows.
+
+    Returns (aggregates, donations_dropped). A donation with no fund id or
+    no parseable date is dropped and counted rather than filed under
+    "Unknown", which would make a bucket that looks like a fund.
+    """
+    working: dict = {}
+    dropped = 0
+
+    for row in rows:
+        if not isinstance(row, dict):
+            dropped += 1
+            continue
+
+        funit_id = _first_key(row, ("funit_id", "fund_name_link_id"))
+        year, quarter = quarter_of(row.get("donation_date"))
+        if funit_id is None or year is None:
+            dropped += 1
+            continue
+
+        key = f"{funit_id}:{year}Q{quarter}"
+        bucket = working.get(key)
+        if bucket is None:
+            bucket = working[key] = {
+                "funit_id": funit_id,
+                "fund_name": row.get("fund_name"),
+                "year": year,
+                "quarter": quarter,
+                "total": Decimal("0"),
+                "count": 0,
+            }
+        bucket["total"] += _money(row.get("donation_amount"))
+        bucket["count"] += 1
+        if not bucket["fund_name"] and row.get("fund_name"):
+            bucket["fund_name"] = row.get("fund_name")
+
+    return (
+        {key: dict(bucket, total=_money_str(bucket["total"]))
+         for key, bucket in working.items()},
+        dropped,
+    )
 
 
 # How each record type is gathered. Keyed lookups use the first id field
@@ -626,6 +799,7 @@ GATHERERS = {
         ctx, "check/list", ("check_id", "id")),
     "profile": _gather_profile,
     "donation_agg": _gather_donation_agg,
+    "donation_fund_quarter": _gather_donation_fund_quarter,
 }
 
 
@@ -1023,7 +1197,8 @@ class TypeResult:
 def refresh_type(record_type: str, client=None, pace_ms=None,
                  dry_run: bool = False, triggered_by=None,
                  trigger_source: str = "cli",
-                 triggered_by_user_id=None, budget=None) -> TypeResult:
+                 triggered_by_user_id=None, budget=None,
+                 cache=None) -> TypeResult:
     """Fetch one record type and mirror it. Never raises for API failures.
 
     Database failures DO propagate: a mirror that cannot reach its own
@@ -1039,6 +1214,8 @@ def refresh_type(record_type: str, client=None, pace_ms=None,
         budget: a CallBudget shared with the rest of the run. When it runs
             out the fetch stops cleanly, marked incomplete with
             "budget reached", and nothing is written.
+        cache: endpoint results shared with the rest of the run, so two
+            record types built from one sweep fetch it once.
     """
     if record_type not in GATHERERS:
         raise ValueError(
@@ -1060,7 +1237,8 @@ def refresh_type(record_type: str, client=None, pace_ms=None,
     result = TypeResult(record_type=record_type, run_id=run_id)
 
     gathered = GATHERERS[record_type](GatherContext(
-        client=client, pace_ms=pace_ms, budget=budget, run_id=run_id))
+        client=client, pace_ms=pace_ms, budget=budget, run_id=run_id,
+        cache=cache if cache is not None else {}))
 
     result.expected = gathered.expected
     result.fetched = len(gathered.rows)
@@ -1233,6 +1411,26 @@ def refresh_type(record_type: str, client=None, pace_ms=None,
     return result
 
 
+def expand_types(record_types=None) -> list:
+    """The types to run, with companions added and original order kept.
+
+    Asking for donation_agg gets donation_fund_quarter too: they are two
+    roll-ups of one sweep, and refreshing one without the other leaves the
+    quarterly report reading numbers from a different day than the lapsed
+    donor report.
+    """
+    types = list(record_types) if record_types else list(RECORD_TYPES)
+
+    expanded = []
+    for record_type in types:
+        if record_type not in expanded:
+            expanded.append(record_type)
+        companion = COMPANION_TYPES.get(record_type)
+        if companion and companion not in expanded:
+            expanded.append(companion)
+    return expanded
+
+
 def refresh(record_types=None, pace_ms=None, dry_run: bool = False,
             client=None, triggered_by=None,
             trigger_source: str = "cli", triggered_by_user_id=None,
@@ -1257,7 +1455,7 @@ def refresh(record_types=None, pace_ms=None, dry_run: bool = False,
     """
     if budget is not None and not isinstance(budget, CallBudget):
         budget = CallBudget(int(budget))
-    types = list(record_types) if record_types else list(RECORD_TYPES)
+    types = expand_types(record_types)
 
     unknown = [t for t in types if t not in GATHERERS]
     if unknown:
@@ -1267,12 +1465,16 @@ def refresh(record_types=None, pace_ms=None, dry_run: bool = False,
 
     client = client or CSuiteClient()
     results = []
+    # One cache for the whole run, discarded when it returns. This is what
+    # makes donation_fund_quarter cost nothing once donation_agg has run.
+    cache: dict = {}
 
     for index, record_type in enumerate(types):
         result = refresh_type(
             record_type, client=client, pace_ms=pace_ms, dry_run=dry_run,
             triggered_by=triggered_by, trigger_source=trigger_source,
-            triggered_by_user_id=triggered_by_user_id, budget=budget)
+            triggered_by_user_id=triggered_by_user_id, budget=budget,
+            cache=cache)
         results.append(result)
 
         if result.stop_reason in (RATE_LIMITED_ERROR, BUDGET_ERROR):

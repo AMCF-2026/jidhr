@@ -506,19 +506,25 @@ def test_a_type_with_no_stale_rows_issues_no_delete(db):
 # Donation aggregation
 # ---------------------------------------------------------------------------
 
-# Six invented donations across two profiles.
+# Six invented donations across two profiles and four funds.
 DONATIONS = [
-    {"donation_id": 1, "profile_id": 7001, "donation_amount": "100.00",
+    {"donation_id": 1, "profile_id": 7001, "funit_id": 1000,
+     "donation_amount": "100.00",
      "donation_date": "2023-01-15", "fund_name": "Alpha Fund-(DAF0001)"},
-    {"donation_id": 2, "profile_id": 7001, "donation_amount": "2500.00",
+    {"donation_id": 2, "profile_id": 7001, "funit_id": 1001,
+     "donation_amount": "2500.00",
      "donation_date": "2024-06-01", "fund_name": "Beta Fund-(DAF0002)"},
-    {"donation_id": 3, "profile_id": 7001, "donation_amount": "75.50",
+    {"donation_id": 3, "profile_id": 7001, "funit_id": 1000,
+     "donation_amount": "75.50",
      "donation_date": "2025-03-09", "fund_name": "Alpha Fund-(DAF0001)"},
-    {"donation_id": 4, "profile_id": 7002, "donation_amount": "40.00",
+    {"donation_id": 4, "profile_id": 7002, "funit_id": 1002,
+     "donation_amount": "40.00",
      "donation_date": "2022-11-30", "fund_name": "Gamma Fund-(END0003)"},
-    {"donation_id": 5, "profile_id": 7002, "donation_amount": "40.00",
+    {"donation_id": 5, "profile_id": 7002, "funit_id": 1002,
+     "donation_amount": "40.00",
      "donation_date": "2024-02-02", "fund_name": "Gamma Fund-(END0003)"},
-    {"donation_id": 6, "profile_id": 7002, "donation_amount": "1000.25",
+    {"donation_id": 6, "profile_id": 7002, "funit_id": 1003,
+     "donation_amount": "1000.25",
      "donation_date": "2023-07-04", "fund_name": "Delta Fund-(DAF0004)"},
 ]
 
@@ -621,7 +627,7 @@ def test_donation_agg_stores_one_row_per_profile_and_no_raw_donations(db):
             "profile_id", "lifetime_total", "count",
             "first_date", "first_amount", "first_fund",
             "latest_date", "latest_amount", "latest_fund",
-            "greatest_amount", "greatest_date",
+            "greatest_amount", "greatest_date", "ramadan_years",
         }
 
 
@@ -1607,3 +1613,180 @@ def test_a_fund_run_records_how_many_displays_it_reused(db):
 def test_the_default_pace_is_slower_than_it_was():
     """150ms was measured into a rate limit at 666 cumulative calls."""
     assert csuite_fetch.DEFAULT_PACE_MS == 400
+
+
+# ---------------------------------------------------------------------------
+# 3c: ramadan_years and the per-fund-per-quarter aggregate
+# ---------------------------------------------------------------------------
+
+def test_ramadan_year_uses_the_configured_ranges():
+    from config import Config
+
+    start, end = Config.get_ramadan_range(2026)
+    assert mirror.ramadan_year(start) == 2026
+    assert mirror.ramadan_year(end) == 2026
+    assert mirror.ramadan_year("2026-07-04") is None
+    assert mirror.ramadan_year(None) is None
+    assert mirror.ramadan_year("not-a-date") is None
+
+
+def test_ramadan_year_checks_the_adjacent_years_too():
+    """Ramadan moves ~11 days earlier a year and will straddle New Year
+    within a decade; checking only the date's own year would then start
+    dropping gifts silently."""
+    from config import Config
+
+    start, _ = Config.get_ramadan_range(2025)
+    assert mirror.ramadan_year(start) == 2025
+
+
+def test_donation_agg_records_which_ramadans_a_donor_gave_in():
+    from config import Config
+
+    r2025, _ = Config.get_ramadan_range(2025)
+    r2026, _ = Config.get_ramadan_range(2026)
+    rows = [
+        {"donation_id": 1, "profile_id": 7001, "donation_amount": "50.00",
+         "donation_date": r2025, "fund_name": "A"},
+        {"donation_id": 2, "profile_id": 7001, "donation_amount": "60.00",
+         "donation_date": r2026, "fund_name": "A"},
+        {"donation_id": 3, "profile_id": 7001, "donation_amount": "10.00",
+         "donation_date": "2026-08-01", "fund_name": "A"},
+        {"donation_id": 4, "profile_id": 7002, "donation_amount": "20.00",
+         "donation_date": "2026-08-01", "fund_name": "A"},
+    ]
+    aggregates, _ = mirror.aggregate_donations(rows)
+
+    assert aggregates["7001"]["ramadan_years"] == [2025, 2026]
+    assert aggregates["7002"]["ramadan_years"] == []
+
+
+def test_quarter_of():
+    assert mirror.quarter_of("2026-01-01") == (2026, 1)
+    assert mirror.quarter_of("2026-03-31") == (2026, 1)
+    assert mirror.quarter_of("2026-04-01") == (2026, 2)
+    assert mirror.quarter_of("2026-12-31") == (2026, 4)
+    assert mirror.quarter_of(None) == (None, None)
+    assert mirror.quarter_of("2026-13-01") == (None, None)
+
+
+def test_fund_quarter_aggregation_math():
+    rows = [
+        {"donation_id": 1, "profile_id": 1, "funit_id": 1000,
+         "fund_name": "Alpha", "donation_amount": "100.00",
+         "donation_date": "2026-01-15"},
+        {"donation_id": 2, "profile_id": 2, "funit_id": 1000,
+         "fund_name": "Alpha", "donation_amount": "250.50",
+         "donation_date": "2026-03-31"},
+        {"donation_id": 3, "profile_id": 3, "funit_id": 1000,
+         "fund_name": "Alpha", "donation_amount": "10.00",
+         "donation_date": "2026-04-01"},
+        {"donation_id": 4, "profile_id": 4, "funit_id": 1001,
+         "fund_name": "Beta", "donation_amount": "75.00",
+         "donation_date": "2026-01-20"},
+    ]
+    aggregates, dropped = mirror.aggregate_donations_by_fund_quarter(rows)
+
+    assert dropped == 0
+    assert set(aggregates) == {"1000:2026Q1", "1000:2026Q2", "1001:2026Q1"}
+
+    q1 = aggregates["1000:2026Q1"]
+    assert q1 == {"funit_id": "1000", "fund_name": "Alpha", "year": 2026,
+                  "quarter": 1, "total": "350.50", "count": 2}
+    assert aggregates["1000:2026Q2"]["total"] == "10.00"
+
+
+def test_fund_quarter_carries_no_profile_ids():
+    rows = [{"donation_id": 1, "profile_id": 7001, "funit_id": 1000,
+             "fund_name": "Alpha", "donation_amount": "100.00",
+             "donation_date": "2026-01-15"}]
+    aggregates, _ = mirror.aggregate_donations_by_fund_quarter(rows)
+
+    for record in aggregates.values():
+        assert "profile_id" not in record
+        assert "7001" not in json.dumps(record)
+
+
+def test_fund_quarter_drops_rows_it_cannot_bucket():
+    rows = [
+        {"donation_id": 1, "profile_id": 1, "donation_amount": "10.00",
+         "donation_date": "2026-01-15"},                      # no fund
+        {"donation_id": 2, "profile_id": 1, "funit_id": 1000,
+         "donation_amount": "10.00", "donation_date": None},  # no date
+    ]
+    aggregates, dropped = mirror.aggregate_donations_by_fund_quarter(rows)
+
+    assert aggregates == {}
+    assert dropped == 2
+
+
+def test_asking_for_donation_agg_produces_both_aggregates(db):
+    client = StubClient({"donation/list": [ok(DONATIONS, count=6), ok([])]})
+
+    results = mirror.refresh(record_types=["donation_agg"], client=client,
+                             pace_ms=0)
+
+    assert [r.record_type for r in results] == ["donation_agg",
+                                                "donation_fund_quarter"]
+    assert all(r.status == "complete" for r in results)
+
+    written = {row["record_type"] for row in db.upserted_rows()}
+    assert written == {"donation_agg", "donation_fund_quarter"}
+
+
+def test_the_second_aggregate_costs_no_extra_csuite_calls(db):
+    client = StubClient({"donation/list": [ok(DONATIONS, count=6), ok([])]})
+
+    results = mirror.refresh(record_types=["donation_agg"], client=client,
+                             pace_ms=0)
+
+    assert results[0].calls == 2, "one page plus the empty terminator"
+    assert results[1].calls == 0, "the second roll-up reuses the same sweep"
+    assert len([c for c in client.calls if c[0] == "donation/list"]) == 2
+
+
+def test_a_partial_donation_sweep_is_not_cached_for_the_companion(db):
+    """Caching a truncated fetch would hand the second aggregate a partial
+    sweep with no way to tell it from a good one."""
+    client = StubClient({
+        "donation/list": lambda data: fail("HTTP 429 Too Many Requests")
+    })
+
+    results = mirror.refresh(record_types=["donation_agg"], client=client,
+                             pace_ms=0)
+
+    assert results[0].status == "failed"
+    assert results[1].status == "skipped"
+    assert db.upserts == []
+
+
+def test_fund_quarter_rows_never_expire():
+    assert mirror._expires_clause("donation_fund_quarter") is None
+
+
+def test_expand_types_keeps_order_and_does_not_duplicate():
+    assert mirror.expand_types(["fund", "donation_agg"]) == [
+        "fund", "donation_agg", "donation_fund_quarter"]
+    assert mirror.expand_types(["donation_agg", "donation_fund_quarter"]) == [
+        "donation_agg", "donation_fund_quarter"]
+    assert mirror.expand_types(["donation_fund_quarter"]) == [
+        "donation_fund_quarter"]
+    assert mirror.expand_types() == list(mirror.RECORD_TYPES)
+
+
+def test_donation_fund_quarter_is_a_record_type():
+    assert "donation_fund_quarter" in mirror.RECORD_TYPES
+    assert "donation_fund_quarter" in mirror.GATHERERS
+
+
+def test_the_reused_sweep_is_not_billed_twice(db):
+    """A cache hit must not carry the first type's call counters: the CLI
+    would report 534 calls for a 267-call donation sweep."""
+    client = StubClient({"donation/list": [ok(DONATIONS, count=6), ok([])]})
+
+    results = mirror.refresh(record_types=["donation_agg"], client=client,
+                             pace_ms=0)
+
+    assert sum(r.calls for r in results) == 2
+    assert results[1].notes["calls"] == 0
+    assert results[1].notes["pages"] == 0

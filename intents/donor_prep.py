@@ -10,6 +10,8 @@ NEW in v1.3 — Survey priority: Muhi, Shazeen, Ola, Nora
 
 import logging
 import re
+
+from clients import mirror_read
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -186,25 +188,51 @@ def _gather_hubspot_data(name: str, hubspot) -> dict:
         except Exception as e:
             logger.error(f"Error fetching engagements for {contact_id}: {e}")
 
-        # Open tickets
+        # Open tickets associated with THIS contact.
+        #
+        # What used to be here was hubspot.get_open_tickets() — every open
+        # ticket in the portal — sliced to the first five and printed under
+        # "Open Items" on this donor's brief. The comment said "best
+        # effort"; there was no filter at all. Someone preparing for a call
+        # was shown five strangers' tickets as this donor's open issues,
+        # and Claude was handed them as context to build talking points
+        # from. No association lookup is worse than none here, so tickets
+        # are only listed when they are genuinely this contact's.
         try:
-            tickets = hubspot.get_open_tickets()
-            if 'results' in tickets:
-                # Filter for tickets associated with this contact (best effort)
-                data["tickets"] = [
-                    {
-                        "subject": t.get('properties', {}).get('subject', 'No subject'),
-                        "status": t.get('properties', {}).get('hs_pipeline_stage', 'Unknown'),
-                    }
-                    for t in tickets['results'][:5]
-                ]
+            data["tickets"] = _contact_tickets(contact_id, hubspot)
         except Exception as e:
-            logger.error(f"Error fetching tickets: {e}")
+            logger.error(f"Error fetching tickets for {contact_id}: {e}")
 
     except Exception as e:
         logger.error(f"Error searching HubSpot for '{name}': {e}")
 
     return data
+
+
+def _contact_tickets(contact_id, hubspot) -> list:
+    """Open tickets associated with one contact, or an empty list.
+
+    Returns [] rather than falling back to unassociated tickets: an empty
+    "Open Items" section is correct, and a populated one about someone else
+    is not.
+    """
+    fetcher = getattr(hubspot, "get_contact_tickets", None)
+    if not callable(fetcher):
+        logger.info(
+            "HubSpot client exposes no per-contact ticket lookup — omitting "
+            "the Open Items section rather than listing unrelated tickets")
+        return []
+
+    response = fetcher(contact_id)
+    results = response.get("results", []) if isinstance(response, dict) else []
+    return [
+        {
+            "subject": t.get("properties", {}).get("subject", "No subject"),
+            "status": t.get("properties", {}).get("hs_pipeline_stage",
+                                                  "Unknown"),
+        }
+        for t in results[:5]
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +250,13 @@ def _gather_csuite_data(name: str, csuite) -> dict:
         "donations": [],
         "grants": [],
         "lifetime_giving": 0,
+        "donation_count": None,
         "last_donation": None,
+        "first_donation": None,
+        "greatest_donation": None,
+        "greatest_donation_date": None,
+        "mirror_as_of": None,
+        "giving_note": None,
         "csuite_link": None,
     }
 
@@ -246,32 +280,16 @@ def _gather_csuite_data(name: str, csuite) -> dict:
             "csuite_link": Config.CSUITE_PROFILE_URL.format(profile_id=profile_id),
         })
 
-        # Donations by profile
-        try:
-            donations = csuite.get_donations_by_profile(profile_id, limit=20)
-            if donations.get('success') and donations.get('data'):
-                results = donations['data'].get('results', [])
-                total = 0
-                last_date = None
-                for d in results:
-                    amt = float(d.get('donation_amount', 0) or 0)
-                    total += amt
-                    d_date = d.get('donation_date', '')
-                    if d_date and (last_date is None or d_date > last_date):
-                        last_date = d_date
-
-                data["donations"] = [
-                    {
-                        "amount": d.get('donation_amount', '0'),
-                        "fund": d.get('fund_name', 'Unknown'),
-                        "date": d.get('donation_date', 'N/A'),
-                    }
-                    for d in results[:10]
-                ]
-                data["lifetime_giving"] = total
-                data["last_donation"] = last_date
-        except Exception as e:
-            logger.error(f"Error fetching donations for profile {profile_id}: {e}")
+        # Giving history, from the mirror's donation_agg row.
+        #
+        # This used to call get_donations_by_profile(profile_id, limit=20).
+        # That method takes no `limit` (clients/csuite.py), so every call
+        # raised TypeError, the except below swallowed it, and lifetime
+        # giving stayed at its initial 0 — every brief printed
+        # "Lifetime giving: $0.00" for every donor, including ones who had
+        # given for years. The aggregate also covers all 26,500 donations
+        # rather than one page of twenty.
+        data.update(_giving_from_mirror(profile_id))
 
         # Grants by profile
         try:
@@ -293,6 +311,64 @@ def _gather_csuite_data(name: str, csuite) -> dict:
         logger.error(f"Error searching CSuite for '{name}': {e}")
 
     return data
+
+
+def _giving_from_mirror(profile_id) -> dict:
+    """Lifetime giving for one profile, from donation_agg.
+
+    Returns only the keys it can fill, so the caller's defaults survive
+    when the mirror has nothing. `giving_note` carries the reason when
+    there are no figures, so the brief can say so rather than printing a
+    confident $0.00.
+    """
+    empty = {"giving_note": "No recorded donations in CSuite mirror."}
+
+    try:
+        agg = mirror_read.get("donation_agg", profile_id)
+    except Exception as e:
+        logger.error(f"Mirror lookup failed for profile {profile_id}: {e}")
+        return {"giving_note": "CSuite mirror unavailable — giving history "
+                               "not shown."}
+
+    if not agg:
+        return empty
+
+    def money(value) -> float:
+        try:
+            return float(str(value).replace(",", "").replace("$", "").strip())
+        except (TypeError, ValueError):
+            return 0.0
+
+    gathered = {
+        "lifetime_giving": money(agg.get("lifetime_total")),
+        "donation_count": agg.get("count"),
+        "last_donation": agg.get("latest_date"),
+        "first_donation": agg.get("first_date"),
+        "greatest_donation": agg.get("greatest_amount"),
+        "greatest_donation_date": agg.get("greatest_date"),
+        "mirror_as_of": agg.get("synced_at"),
+        "giving_note": None,
+    }
+
+    # The aggregate holds no individual gifts by design, but it does name
+    # the first and latest, which is what a brief actually quotes.
+    highlights = []
+    if agg.get("latest_date"):
+        highlights.append({
+            "amount": agg.get("latest_amount") or "0",
+            "fund": agg.get("latest_fund") or "Unknown",
+            "date": agg.get("latest_date"),
+            "label": "Most recent",
+        })
+    if agg.get("first_date") and agg.get("first_date") != agg.get("latest_date"):
+        highlights.append({
+            "amount": agg.get("first_amount") or "0",
+            "fund": agg.get("first_fund") or "Unknown",
+            "date": agg.get("first_date"),
+            "label": "First",
+        })
+    gathered["donations"] = highlights
+    return gathered
 
 
 # ---------------------------------------------------------------------------
@@ -326,15 +402,35 @@ def _build_context_block(name: str, hs: dict, cs: dict) -> str:
 
     # CSuite basics
     if cs["found"]:
-        sections.append(
-            f"CSuite Profile ID: {cs['profile_id']}, "
-            f"Status: {cs['status'] or 'unknown'}, "
-            f"Lifetime giving: ${cs['lifetime_giving']:,.2f}, "
-            f"Last donation: {cs['last_donation'] or 'unknown'}"
-        )
+        if cs.get("giving_note"):
+            # Never a bare "$0.00": the model will build a talking point
+            # around a donor having never given, which may simply be a
+            # mirror that has not been loaded.
+            sections.append(
+                f"CSuite Profile ID: {cs['profile_id']}, "
+                f"Status: {cs['status'] or 'unknown'}, "
+                f"Giving history: {cs['giving_note']}"
+            )
+        else:
+            count = cs.get("donation_count")
+            sections.append(
+                f"CSuite Profile ID: {cs['profile_id']}, "
+                f"Status: {cs['status'] or 'unknown'}, "
+                f"Lifetime giving: ${cs['lifetime_giving']:,.2f}"
+                + (f" across {count} donations" if count else "") + ", "
+                f"First donation: {cs.get('first_donation') or 'unknown'}, "
+                f"Last donation: {cs['last_donation'] or 'unknown'}, "
+                f"Largest donation: "
+                f"${_money(cs.get('greatest_donation')):,.2f} on "
+                f"{cs.get('greatest_donation_date') or 'unknown date'}"
+            )
         if cs["donations"]:
-            don_lines = [f"  - ${d['amount']} to {d['fund']} ({d['date']})" for d in cs["donations"][:5]]
-            sections.append("Recent Donations:\n" + "\n".join(don_lines))
+            don_lines = [
+                f"  - {d.get('label', 'Donation')}: ${d['amount']} to "
+                f"{d['fund']} ({d['date']})"
+                for d in cs["donations"][:5]
+            ]
+            sections.append("Donation Highlights:\n" + "\n".join(don_lines))
         if cs["grants"]:
             grant_lines = [f"  - ${g['amount']} to {g['vendor']} ({g['date']})" for g in cs["grants"][:5]]
             sections.append("Recent Grants:\n" + "\n".join(grant_lines))
@@ -395,9 +491,21 @@ def _format_brief(name: str, hs: dict, cs: dict, talking_points: str) -> str:
     # Quick facts
     lines.append("**Quick Facts:**")
     if cs["found"]:
-        lines.append(f"• Lifetime giving: ${cs['lifetime_giving']:,.2f}")
-        if cs["last_donation"]:
-            lines.append(f"• Last donation: {cs['last_donation']}")
+        if cs.get("giving_note"):
+            lines.append(f"• Giving history: {cs['giving_note']}")
+        else:
+            count = cs.get("donation_count")
+            suffix = f" across {count} donations" if count else ""
+            lines.append(
+                f"• Lifetime giving: ${cs['lifetime_giving']:,.2f}{suffix}")
+            if cs["last_donation"]:
+                lines.append(f"• Last donation: {cs['last_donation']}")
+            if cs.get("greatest_donation"):
+                lines.append(
+                    f"• Largest donation: "
+                    f"${_money(cs['greatest_donation']):,.2f}"
+                    + (f" ({cs['greatest_donation_date']})"
+                       if cs.get("greatest_donation_date") else ""))
     if hs["found"]:
         lines.append(f"• Email: {hs['email'] or 'N/A'}")
         if hs["last_activity"]:
@@ -408,7 +516,8 @@ def _format_brief(name: str, hs: dict, cs: dict, talking_points: str) -> str:
     activity_items = []
     if cs["donations"]:
         d = cs["donations"][0]
-        activity_items.append(f"Latest donation: ${d['amount']} to {d['fund']} ({d['date']})")
+        activity_items.append(
+            f"Latest donation: ${d['amount']} to {d['fund']} ({d['date']})")
     if cs["grants"]:
         g = cs["grants"][0]
         activity_items.append(f"Latest grant: ${g['amount']} to {g['vendor']} ({g['date']})")
@@ -434,4 +543,18 @@ def _format_brief(name: str, hs: dict, cs: dict, talking_points: str) -> str:
             lines.append(f"• 🎫 {t['subject']} ({t['status']})")
         lines.append("")
 
+    # Giving figures are mirrored, not live — say when they were taken.
+    if cs["found"] and not cs.get("giving_note"):
+        lines.append(mirror_read.as_of_line("donation_agg"))
+
     return "\n".join(lines)
+
+
+def _money(value) -> float:
+    """A stored money string as a float for formatting."""
+    if value in (None, ""):
+        return 0.0
+    try:
+        return float(str(value).replace(",", "").replace("$", "").strip())
+    except (TypeError, ValueError):
+        return 0.0
