@@ -175,6 +175,100 @@ body {
     font-size: 0.85rem;
 }
 
+/* Rendered markdown (assistant replies only - user messages are plain text) */
+
+/* The global `* { margin: 0 }` reset would otherwise run every generated
+   block element together with no spacing. */
+.message.assistant .message-content p,
+.message.assistant .message-content ul,
+.message.assistant .message-content ol,
+.message.assistant .message-content blockquote {
+    margin: 0 0 10px;
+}
+
+.message.assistant .message-content > *:last-child {
+    margin-bottom: 0;
+}
+
+.message.assistant .message-content ul,
+.message.assistant .message-content ol {
+    padding-left: 22px;
+}
+
+.message.assistant .message-content li {
+    margin-bottom: 4px;
+}
+
+.message.assistant .message-content h1,
+.message.assistant .message-content h2,
+.message.assistant .message-content h3,
+.message.assistant .message-content h4 {
+    margin: 14px 0 8px;
+    font-size: 1rem;
+    color: var(--amcf-navy);
+}
+
+.message.assistant .message-content h1:first-child,
+.message.assistant .message-content h2:first-child,
+.message.assistant .message-content h3:first-child,
+.message.assistant .message-content h4:first-child {
+    margin-top: 0;
+}
+
+.message.assistant .message-content blockquote {
+    border-left: 3px solid var(--amcf-light-green);
+    padding-left: 12px;
+    color: var(--amcf-gray);
+}
+
+.message.assistant .message-content hr {
+    border: none;
+    border-top: 1px solid #e6e6e6;
+    margin: 12px 0;
+}
+
+/* Links */
+.message.assistant .message-content a {
+    color: var(--amcf-green);
+    font-weight: 500;
+    text-decoration: none;
+}
+
+.message.assistant .message-content a:hover {
+    text-decoration: underline;
+}
+
+/* Tables */
+.message.assistant .message-content table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 8px 0;
+    font-size: 0.9rem;
+}
+
+.message.assistant .message-content th,
+.message.assistant .message-content td {
+    padding: 8px 12px;
+    text-align: left;
+    vertical-align: top;
+}
+
+.message.assistant .message-content thead th {
+    background: var(--amcf-navy);
+    color: white;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.message.assistant .message-content tbody tr:nth-child(even) {
+    background: rgba(39, 174, 96, 0.05);
+}
+
+/* Wide tables scroll inside the bubble rather than blowing out its width. */
+.message.assistant .message-content {
+    overflow-x: auto;
+}
+
 /* Typing Indicator */
 .typing-indicator {
     display: flex;

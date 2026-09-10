@@ -5,6 +5,16 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Jidhr | AMCF Operations Assistant</title>
     <link rel="stylesheet" href="/static/style.css">
+    <!--
+      marked.js - markdown -> HTML for assistant replies.
+      Pinned + SRI so a compromised or drifting CDN build can't execute here.
+      As of marked v18 the published bundle is lib/marked.umd.js; the old
+      top-level marked.min.js path is gone and 404s.
+    -->
+    <script
+        src="https://cdn.jsdelivr.net/npm/marked@18.0.12/lib/marked.umd.js"
+        integrity="sha384-TuL/7aNYXEDWjlcHi2CR+Een2A5pigrtJ97Tmx3WG69mx5kCSp8yKHRISW9xSmgq"
+        crossorigin="anonymous"></script>
     <style>
         /* User menu styles */
         .header-actions {
@@ -142,7 +152,34 @@
         const chatArea = document.getElementById('chat-area');
         const messageInput = document.getElementById('message-input');
         const sendBtn = document.getElementById('send-btn');
-        
+
+        // breaks:true keeps the single-newline -> <br> behaviour the
+        // assistant's replies already rely on; gfm:true is what gives us
+        // pipe tables and bare-URL autolinking.
+        const markdownReady = typeof window.marked !== 'undefined'
+            && typeof window.marked.parse === 'function';
+        if (markdownReady) {
+            window.marked.setOptions({ gfm: true, breaks: true });
+        }
+
+        // Only reached if the CDN is unreachable or blocked. Escapes rather
+        // than formatting, so a failed script load degrades to readable text
+        // instead of breaking every reply.
+        function plainFallback(text) {
+            const holder = document.createElement('div');
+            holder.textContent = text;
+            return holder.innerHTML.replace(/\n/g, '<br>');
+        }
+
+        function renderAssistantMarkdown(text) {
+            if (!markdownReady) return plainFallback(text);
+            try {
+                return window.marked.parse(text);
+            } catch (e) {
+                return plainFallback(text);
+            }
+        }
+
         // Auto-resize textarea
         messageInput.addEventListener('input', function() {
             this.style.height = 'auto';
@@ -208,20 +245,23 @@
         function addMessage(content, type) {
             const messageDiv = document.createElement('div');
             messageDiv.className = 'message ' + type;
-            
-            const avatar = type === 'assistant' ? '🌳' : '👤';
-            
-            // Simple markdown-like formatting
-            let formattedContent = content
-                .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-                .replace(/\*(.*?)\*/g, '<em>$1</em>')
-                .replace(/`([^`]+)`/g, '<code>$1</code>')
-                .replace(/\n/g, '<br>');
-            
-            messageDiv.innerHTML = 
-                '<div class="message-avatar">' + avatar + '</div>' +
-                '<div class="message-content">' + formattedContent + '</div>';
-            
+
+            const avatarDiv = document.createElement('div');
+            avatarDiv.className = 'message-avatar';
+            avatarDiv.textContent = type === 'assistant' ? '🌳' : '👤';
+
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'message-content';
+            if (type === 'assistant') {
+                contentDiv.innerHTML = renderAssistantMarkdown(content);
+            } else {
+                // User text is never parsed or interpolated - textContent only.
+                contentDiv.textContent = content;
+            }
+
+            messageDiv.appendChild(avatarDiv);
+            messageDiv.appendChild(contentDiv);
+
             chatArea.appendChild(messageDiv);
             chatArea.scrollTop = chatArea.scrollHeight;
         }
