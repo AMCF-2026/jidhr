@@ -22,21 +22,32 @@ purely because the sweep stopped early.
 
 Surviving the rate limit
 ------------------------
-On 2026-09-10 a fund refresh made 666 cumulative calls over a few minutes
-and CSuite started refusing everything. 261 funit/display results — 261
-calls already paid for — were thrown away, because they were held in
-memory until the whole sweep finished.
+Two measurements, both 2026-09-10:
 
-They are now staged as they arrive. Each display is written to
-`sync_staging` the moment it comes back, and the next fund run reuses any
-staged row less than 24 hours old instead of calling for it again. A run
-that stops halfway therefore costs nothing: the next one picks up where
-it left off. The staging rows are deleted once a complete fund fetch has
-been written to the mirror, and the 96h expiry sweep catches any orphans.
+    399 calls at a 150ms pace  ->  REFUSED, and refused everything for
+                                   the next 15s+. 261 funit/display
+                                   results already paid for were lost.
+    960 calls at a 400ms pace  ->  0 refusals, ran clean.
 
-The other half of the answer is not making the calls at all: `refresh`
-takes a CallBudget shared across every record type, so a run can stop at
-a number we chose rather than the number CSuite chose.
+The ceiling is therefore a RATE, not a total. A full 960-call refresh is
+not too big; it is only too fast. Those two runs bracket the limit at
+somewhere between roughly 110 and 250 calls per minute, which is why
+CSUITE_PACE_MS defaults to 400 (clients/csuite_fetch.py) rather than to
+the 150 that tripped it.
+
+Two mechanisms remain for when it is tripped anyway, since the bracket is
+wide and CSuite may not be the only thing calling it:
+
+Staging. Each funit/display is written to `sync_staging` the moment it
+comes back, and the next fund run reuses any staged row less than 24
+hours old instead of calling for it again — so a run that stops halfway
+costs nothing, and the 261 lost displays would not be lost today. The
+staging rows are deleted once a complete fund fetch has reached the
+mirror; the 96h expiry sweep catches any orphans.
+
+Budget. `refresh` takes a CallBudget shared across every record type, so
+a run can stop at a number we chose rather than the number CSuite chose —
+cleanly, keeping what it has.
 
 Freshness
 ---------

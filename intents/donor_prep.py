@@ -196,8 +196,8 @@ def _gather_hubspot_data(name: str, hubspot) -> dict:
         # effort"; there was no filter at all. Someone preparing for a call
         # was shown five strangers' tickets as this donor's open issues,
         # and Claude was handed them as context to build talking points
-        # from. No association lookup is worse than none here, so tickets
-        # are only listed when they are genuinely this contact's.
+        # from. get_contact_tickets goes through the v4 associations
+        # endpoint, so what appears here belongs to this contact.
         try:
             data["tickets"] = _contact_tickets(contact_id, hubspot)
         except Exception as e:
@@ -209,30 +209,39 @@ def _gather_hubspot_data(name: str, hubspot) -> dict:
     return data
 
 
+# HubSpot's default ticket pipeline uses "4" for Closed (see
+# clients/hubspot.py close_ticket). Anything else is treated as open.
+CLOSED_PIPELINE_STAGE = "4"
+
+_TICKETS_SHOWN = 5
+
+
 def _contact_tickets(contact_id, hubspot) -> list:
     """Open tickets associated with one contact, or an empty list.
 
-    Returns [] rather than falling back to unassociated tickets: an empty
-    "Open Items" section is correct, and a populated one about someone else
-    is not.
+    Never falls back to unassociated tickets: an empty "Open Items"
+    section is correct, and a populated one about someone else is not.
     """
-    fetcher = getattr(hubspot, "get_contact_tickets", None)
-    if not callable(fetcher):
-        logger.info(
-            "HubSpot client exposes no per-contact ticket lookup — omitting "
-            "the Open Items section rather than listing unrelated tickets")
+    tickets = hubspot.get_contact_tickets(contact_id)
+    if not tickets:
         return []
 
-    response = fetcher(contact_id)
-    results = response.get("results", []) if isinstance(response, dict) else []
-    return [
-        {
-            "subject": t.get("properties", {}).get("subject", "No subject"),
-            "status": t.get("properties", {}).get("hs_pipeline_stage",
-                                                  "Unknown"),
-        }
-        for t in results[:5]
-    ]
+    open_tickets = []
+    for ticket in tickets:
+        props = ticket.get("properties") or {}
+        stage = str(props.get("hs_pipeline_stage") or "").strip()
+        if stage == CLOSED_PIPELINE_STAGE:
+            continue
+        open_tickets.append({
+            "subject": props.get("subject") or "No subject",
+            "status": props.get("hs_pipeline_stage") or "Unknown",
+            "created": (props.get("createdate") or "")[:10],
+        })
+
+    # Newest first: a brief has room for a few, and the recent ones are
+    # what a call is likely to touch on.
+    open_tickets.sort(key=lambda t: t["created"], reverse=True)
+    return open_tickets[:_TICKETS_SHOWN]
 
 
 # ---------------------------------------------------------------------------
@@ -296,11 +305,15 @@ def _gather_csuite_data(name: str, csuite) -> dict:
             grants = csuite.get_grants_by_profile(profile_id, limit=10)
             if grants.get('success') and grants.get('data'):
                 results = grants['data'].get('results', [])
+                # `name` is the grantee (probe #2, C2). The grant list
+                # endpoint carries no vendor field, so the old read
+                # printed "to Unknown" for every grant a donor had
+                # ever recommended.
                 data["grants"] = [
                     {
                         "amount": g.get('grant_amount', '0'),
-                        "vendor": g.get('vendor_name', 'Unknown'),
-                        "date": g.get('grant_date', 'N/A'),
+                        "vendor": g.get('name') or 'Unknown grantee',
+                        "date": g.get('grant_date') or 'N/A',
                     }
                     for g in results[:10]
                 ]
@@ -397,8 +410,14 @@ def _build_context_block(name: str, hs: dict, cs: dict) -> str:
             eng_lines = [f"  - {eg['timestamp']}: {eg['type']}" for eg in hs["engagements"]]
             sections.append("Recent Engagements:\n" + "\n".join(eng_lines))
         if hs["tickets"]:
-            ticket_lines = [f"  - {t['subject']} ({t['status']})" for t in hs["tickets"]]
-            sections.append("Open Tickets:\n" + "\n".join(ticket_lines))
+            ticket_lines = [
+                f"  - {t['subject']} (stage {t['status']}"
+                + (f", opened {t['created']}" if t.get("created") else "") + ")"
+                for t in hs["tickets"]
+            ]
+            sections.append(
+                "Open Tickets associated with this contact:\n"
+                + "\n".join(ticket_lines))
 
     # CSuite basics
     if cs["found"]:
@@ -540,7 +559,8 @@ def _format_brief(name: str, hs: dict, cs: dict, talking_points: str) -> str:
     if hs["tickets"]:
         lines.append("**Open Items:**")
         for t in hs["tickets"]:
-            lines.append(f"• 🎫 {t['subject']} ({t['status']})")
+            opened = f", opened {t['created']}" if t.get("created") else ""
+            lines.append(f"• 🎫 {t['subject']} (stage {t['status']}{opened})")
         lines.append("")
 
     # Giving figures are mirrored, not live — say when they were taken.

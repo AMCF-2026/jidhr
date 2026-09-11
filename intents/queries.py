@@ -348,7 +348,7 @@ def gather_context(query: str, hubspot, csuite,
     # ------------------------------------------------------------------
     if any(w in query_lower for w in ['check', 'cashed', 'uncashed', 'cleared']):
         context_parts += _run_gatherer(
-            "check", _gather_check_context, query_lower, csuite)
+            "check", _gather_check_context, query_lower)
 
     # ------------------------------------------------------------------
     # NEW v1.3: FEE → CSuite (Muhi)
@@ -503,6 +503,16 @@ def _format_currency(value) -> str:
         return f"${float(str(value).replace(',', '').strip()):,.2f}"
     except (TypeError, ValueError):
         return str(value)
+
+
+def _amount(value) -> float:
+    """A CSuite money string as a float, for totalling. Junk reads as zero."""
+    if value in (None, ""):
+        return 0.0
+    try:
+        return float(str(value).replace("$", "").replace(",", "").strip())
+    except (TypeError, ValueError):
+        return 0.0
 
 
 # Lead-ins a fund question opens with. Stripping these leaves the fund name
@@ -885,8 +895,14 @@ def _gather_fund_context(query: str, query_lower: str, csuite,
             grants_data = csuite.get_grants_by_fund(fund_id, limit=10)
             if grants_data.get('success') and grants_data.get('data'):
                 results = grants_data['data'].get('results', [])
+                # `name` is the grantee (probe #2, C2). The grant list
+                # endpoint carries no vendor field, so the old read
+                # printed "to Unknown" on every line — the recipient,
+                # the only thing this list is for, was never shown.
                 grant_list = [
-                    f"${g.get('grant_amount', '0')} to {g.get('vendor_name', 'Unknown')} ({g.get('grant_date', 'No date')})"
+                    f"{_format_currency(g.get('grant_amount'))} to "
+                    f"{g.get('name') or 'Unknown grantee'} "
+                    f"({g.get('grant_date') or 'no date'})"
                     for g in results[:10]
                 ]
                 parts.append(f"Grants for Fund {fund_id}:\n" + "\n".join(grant_list))
@@ -1268,39 +1284,79 @@ def _gather_task_context(hubspot) -> list:
 # NEW v1.3 gatherers
 # ---------------------------------------------------------------------------
 
-def _gather_check_context(query_lower: str, csuite) -> list:
-    """Check/uncashed queries → CSuite (Muhi)."""
-    parts = []
+# Same value as intents/reports.py's GRANT_STATUS_ISSUED, deliberately
+# duplicated rather than imported: reports.py imports from this module, so
+# importing back would be a cycle. grant_status values across the sample
+# (probe #2, C2) are paid (60), voucher (35), new (4), complete (1) —
+# 'paid' is issued-but-not-cleared, 'complete' has cleared.
+GRANT_STATUS_ISSUED = "paid"
 
-    if 'uncashed' in query_lower or "haven't cashed" in query_lower or 'not cashed' in query_lower:
-        logger.info("Fetching uncashed checks...")
-        try:
-            checks = csuite.get_uncashed_checks()
-            if checks:
-                check_list = [
-                    f"Check #{c.get('check_num', '?')}: ${c.get('amount', '0')} to {c.get('vendor_name', 'Unknown')} ({c.get('check_date', 'No date')})"
-                    for c in checks[:10]
-                ]
-                parts.append(f"Uncashed Checks:\n" + "\n".join(check_list))
-                logger.info(f"Found {len(check_list)} uncashed checks")
-        except Exception as e:
-            logger.error(f"Error fetching uncashed checks: {e}")
-    else:
-        logger.info("Fetching CSuite checks...")
-        try:
-            checks_data = csuite.get_checks(limit=10)
-            if checks_data.get('success') and checks_data.get('data'):
-                results = checks_data['data'].get('results', [])
-                check_list = [
-                    f"Check #{c.get('check_number', '?')}: ${c.get('amount', '0')} ({c.get('status', 'Unknown')})"
-                    for c in results[:10]
-                ]
-                parts.append(f"CSuite Checks:\n" + "\n".join(check_list))
-                logger.info(f"Found {len(check_list)} checks")
-        except Exception as e:
-            logger.error(f"Error fetching checks: {e}")
+_CHECK_CONTEXT_LIMIT = 15
 
-    return parts
+
+def _gather_check_context(query_lower: str) -> list:
+    """Uncleared-grant queries → the mirror. No live CSuite call.
+
+    This used to scan the check list endpoint live and render each row as
+    "Check #x: $y to {vendor}". That endpoint has no vendor field at all
+    (its columns are account_name, check_num, amount, check_date, cleared,
+    voided, is_electronic, ...), so every line said "to Unknown" — the
+    grantee, the only thing anyone asks this question to learn, was never
+    in the data. The other branch read check_number and status, neither of
+    which exists either.
+
+    grant/list carries no check_id or check_num (probe #2, C2), so a grant
+    cannot be joined to the check that paid it at all. What CAN be
+    answered is which grants are still at status 'paid' — issued, not yet
+    cleared — with the grantee's name on each. That is what this returns,
+    matching the report in intents/reports.py.
+    """
+    missing = mirror_read.require("grant")
+    if missing:
+        return [f"{missing} Do not answer from memory or estimate — say "
+                f"the mirror needs loading."]
+
+    grants = mirror_read.rows(
+        "grant",
+        "AND data->>'grant_status' = %s",
+        (GRANT_STATUS_ISSUED,),
+    )
+
+    if not grants:
+        return [
+            f"No grants are at status '{GRANT_STATUS_ISSUED}' — nothing is "
+            f"issued and awaiting clearance.\n"
+            f"{mirror_read.as_of_line('grant')}"
+        ]
+
+    grants.sort(key=lambda g: g.get("grant_date") or "9999-99-99")
+    total = sum(_amount(g.get("grant_amount")) for g in grants)
+
+    lines = [
+        f"Grants issued but not yet cleared (CSuite grant_status = "
+        f"'{GRANT_STATUS_ISSUED}'):",
+        f"{len(grants)} grants totalling {_format_currency(total)}, "
+        f"oldest first.",
+    ]
+    for grant in grants[:_CHECK_CONTEXT_LIMIT]:
+        lines.append(
+            f"{grant.get('grant_date') or 'no date'}: "
+            f"{_format_currency(grant.get('grant_amount'))} to "
+            f"{grant.get('name') or 'Unknown grantee'} "
+            f"(grant {grant.get('csuite_id')}, "
+            f"fund {grant.get('fund_name') or 'Unknown'})")
+
+    if len(grants) > _CHECK_CONTEXT_LIMIT:
+        lines.append(
+            f"... and {len(grants) - _CHECK_CONTEXT_LIMIT} more "
+            f"({len(grants)} in total).")
+
+    lines.append(
+        "Note: CSuite exposes no link from a grant to the check that paid "
+        "it, so this is grant status, not bank clearance. Say so.")
+    lines.append(mirror_read.as_of_line("grant"))
+
+    return ["\n".join(lines)]
 
 
 def _gather_fee_context(csuite) -> list:

@@ -18,15 +18,25 @@ READ-ONLY against CSuite. Writes only to csuite_mirror and sync_runs.
     python scripts/mirror_refresh.py --budget 500
 
 A full run is roughly 960 CSuite calls — 399 of them the funit/display
-sweep and 267 the pages of donation/list. At the default 150ms pace and
-CSuite's measured latency that is about 7-11 minutes. Run it from
-the Railway shell, where DATABASE_URL and the CSuite credentials are
-already in the environment.
+sweep and 267 the pages of donation/list.
 
-Probe #3 completed 440 calls at this pace without a rate limit, so a full
-run is roughly twice as long a stretch as anything measured. If it comes
-back "rate limited", raise --pace-ms or refresh in two passes with
---types rather than retrying immediately.
+What is actually known about the rate limit (two measurements, both on
+2026-09-10):
+
+    399 calls at a 150ms pace  ->  REFUSED
+    960 calls at a 400ms pace  ->  0 refusals, ran clean
+
+So the ceiling is a rate, not a total: 960 calls is fine if they are
+spread out, and 399 is not if they are not. Those two runs put the limit
+somewhere between roughly 110 and 250 calls per minute. The 400ms default
+sits under that with margin, and a full run at it takes about 11-14
+minutes.
+
+If a run does come back "rate limited", raise --pace-ms rather than
+retrying straight away — the limiter stays shut for at least 15 seconds
+once tripped. --budget is the other lever: it stops the run at a number
+you chose, keeps everything it fetched, and staged fund displays are
+reused for 24h so the next run continues rather than starting over.
 
 Exit codes: 0 every type completed, 1 at least one type failed.
 """
@@ -46,7 +56,8 @@ from sync.mirror import RECORD_TYPES, refresh  # noqa: E402
 # Column widths for the summary table. Fixed rather than computed: the
 # point is that two runs line up when you scroll back through a log.
 COLUMNS = (
-    ("type", 13, "<"),
+    # Wide enough for "donation_fund_quarter", the longest record type.
+    ("type", 22, "<"),
     ("expected", 9, ">"),
     ("fetched", 8, ">"),
     ("complete", 9, ">"),

@@ -845,3 +845,304 @@ def test_no_fallback_when_the_mirror_has_no_such_fund(loaded):
 
     assert out == "CSuite fund lookup for id 424242 failed: no such fund"
     assert "mirror balance" not in out
+
+
+# ---------------------------------------------------------------------------
+# 3c-fix: the check gatherer reads the mirror, not check/list
+# ---------------------------------------------------------------------------
+
+def test_check_context_lists_uncleared_grants_with_the_grantee(loaded):
+    parts = queries._gather_check_context("any uncashed checks?")
+
+    assert len(parts) == 1
+    text = parts[0]
+    assert "Books For All" in text
+    assert "Helping Hands" in text
+    assert "Unknown" not in text, "the grantee was never in the old data"
+    assert "$625.00" in text
+    assert "(CSuite mirror)" in text
+
+
+def test_check_context_is_paid_only(loaded):
+    text = queries._gather_check_context("uncashed")[0]
+
+    assert "2 grants" in text
+    assert "$250.00" not in text, "the 'complete' grant has cleared"
+
+
+def test_check_context_is_oldest_first(loaded):
+    text = queries._gather_check_context("uncashed")[0]
+    assert text.index("Books For All") < text.index("Helping Hands")
+
+
+def test_check_context_says_it_is_not_bank_clearance(loaded):
+    text = queries._gather_check_context("uncashed")[0]
+    assert "no link from a grant to the check that paid it" in text
+
+
+def test_check_context_makes_no_live_call(loaded):
+    """The signature no longer takes a client, so it cannot make one."""
+    import inspect
+
+    params = inspect.signature(queries._gather_check_context).parameters
+    assert list(params) == ["query_lower"]
+
+
+def test_check_context_on_an_empty_mirror_refuses_to_guess(mirror):
+    mirror.load({})
+
+    parts = queries._gather_check_context("uncashed")
+
+    assert len(parts) == 1
+    assert "CSuite mirror not loaded for grant" in parts[0]
+    assert "Do not answer from memory" in parts[0]
+
+
+def test_check_context_when_nothing_is_outstanding(mirror):
+    mirror.load({"grant": [GRANTS[1]]})  # the 'complete' one only
+    text = queries._gather_check_context("uncashed")[0]
+
+    assert "No grants are at status 'paid'" in text
+    assert "(CSuite mirror)" in text
+
+
+def test_check_context_names_the_total_when_the_list_is_capped(mirror):
+    grants = [
+        {"_id": 5000 + i, "grant_id": 5000 + i, "funit_id": 1000,
+         "fund_name": "Alpha", "grant_amount": "10.00",
+         "grant_date": f"2026-01-{i + 1:02d}", "grant_status": "paid",
+         "name": f"Grantee {i:02d}"}
+        for i in range(20)
+    ]
+    mirror.load({"grant": grants})
+
+    text = queries._gather_check_context("uncashed")[0]
+
+    assert "20 grants totalling $200.00" in text
+    assert "and 5 more (20 in total)" in text
+
+
+def test_grants_by_fund_names_the_grantee_not_unknown():
+    """grant/list has no vendor_name; the grantee is `name`."""
+    class Csuite:
+        def get_grants_by_fund(self, fund_id, limit=10):
+            return {"success": True, "data": {"results": [
+                {"grant_amount": "750.00", "name": "Helping Hands",
+                 "grant_date": "2026-04-01"}]}}
+
+        def get_fund(self, fund_id):
+            return {"success": True, "data": {
+                "funit_id": fund_id, "fund_name": "Alpha Fund-(DAF0001)"}}
+
+        def __getattr__(self, name):
+            raise AssertionError(f"unexpected csuite.{name}()")
+
+    parts = queries._gather_fund_context(
+        "grants for fund 1000", "grants for fund 1000", Csuite())
+    text = "\n".join(parts)
+
+    assert "Helping Hands" in text
+    assert "$750.00" in text
+    assert "to Unknown" not in text
+
+
+# ---------------------------------------------------------------------------
+# 3c-fix: contact-scoped tickets
+# ---------------------------------------------------------------------------
+
+TICKETS = {
+    "301": {"id": "301", "properties": {
+        "subject": "DAF paperwork question", "hs_pipeline_stage": "1",
+        "createdate": "2026-08-01T10:00:00Z"}},
+    "302": {"id": "302", "properties": {
+        "subject": "Grant recommendation follow-up",
+        "hs_pipeline_stage": "2", "createdate": "2026-09-01T10:00:00Z"}},
+    "303": {"id": "303", "properties": {
+        "subject": "Resolved months ago", "hs_pipeline_stage": "4",
+        "createdate": "2026-01-01T10:00:00Z"}},
+}
+
+
+class TicketHubSpot:
+    """A HubSpot client stubbed at the HTTP seam, not the method seam."""
+
+    def __init__(self, associations=None, assoc_error=None,
+                 batch_error=None, paging=None):
+        from clients.hubspot import HubSpotClient
+
+        self.client = HubSpotClient.__new__(HubSpotClient)
+        self.client.access_token = "test-token"
+        self.client.base_url = "https://api.example.invalid"
+        self.client.headers = {}
+        self.client._social_channels_cache = None
+
+        self.associations = associations if associations is not None else \
+            [{"toObjectId": 301}, {"toObjectId": 302}, {"toObjectId": 303}]
+        self.assoc_error = assoc_error
+        self.batch_error = batch_error
+        self.paging = paging or {}
+        self.gets = []
+        self.posts = []
+
+        self.client._get = self._get
+        self.client._post = self._post
+
+    def _get(self, endpoint, params=None):
+        self.gets.append((endpoint, params))
+        if self.assoc_error:
+            return {"error": self.assoc_error}
+        after = (params or {}).get("after")
+        page = self.paging.get(after or "first")
+        if page is not None:
+            return page
+        return {"results": list(self.associations)}
+
+    def _post(self, endpoint, data=None):
+        self.posts.append((endpoint, data))
+        if self.batch_error:
+            return {"error": self.batch_error}
+        wanted = [i["id"] for i in data["inputs"]]
+        return {"results": [TICKETS[i] for i in wanted if i in TICKETS]}
+
+
+def test_get_contact_tickets_reads_associations_then_batch_read():
+    hub = TicketHubSpot()
+
+    tickets = hub.client.get_contact_tickets("701")
+
+    assert [t["id"] for t in tickets] == ["301", "302", "303"]
+
+    endpoint, params = hub.gets[0]
+    assert endpoint == "crm/v4/objects/contacts/701/associations/tickets"
+    assert params["limit"] == 500
+
+    endpoint, data = hub.posts[0]
+    assert endpoint == "crm/v3/objects/tickets/batch/read"
+    assert data["inputs"] == [{"id": "301"}, {"id": "302"}, {"id": "303"}]
+    assert data["properties"] == ["subject", "hs_pipeline_stage", "createdate"]
+
+
+def test_batch_read_is_not_audited_as_a_write():
+    from clients.hubspot import is_hubspot_write
+
+    assert is_hubspot_write(
+        "POST", "crm/v3/objects/tickets/batch/read") is False
+    assert is_hubspot_write(
+        "GET", "crm/v4/objects/contacts/701/associations/tickets") is False
+
+
+def test_get_contact_tickets_is_empty_for_a_contact_with_none():
+    hub = TicketHubSpot(associations=[])
+
+    assert hub.client.get_contact_tickets("701") == []
+    assert hub.posts == [], "no batch read when there is nothing to read"
+
+
+def test_get_contact_tickets_never_falls_back_on_an_error():
+    hub = TicketHubSpot(assoc_error="HubSpot returned 500")
+    assert hub.client.get_contact_tickets("701") == []
+
+    hub = TicketHubSpot(batch_error="HubSpot returned 500")
+    assert hub.client.get_contact_tickets("701") == []
+
+
+def test_get_contact_tickets_needs_a_contact_id():
+    hub = TicketHubSpot()
+    assert hub.client.get_contact_tickets(None) == []
+    assert hub.client.get_contact_tickets("") == []
+    assert hub.gets == []
+
+
+def test_get_contact_tickets_follows_paging():
+    hub = TicketHubSpot(paging={
+        "first": {"results": [{"toObjectId": 301}],
+                  "paging": {"next": {"after": "p2"}}},
+        "p2": {"results": [{"toObjectId": 302}]},
+    })
+
+    tickets = hub.client.get_contact_tickets("701")
+
+    assert [t["id"] for t in tickets] == ["301", "302"]
+    assert len(hub.gets) == 2
+    assert hub.gets[1][1]["after"] == "p2"
+
+
+def test_get_contact_tickets_deduplicates_multi_label_associations():
+    """One ticket associated under two labels comes back twice."""
+    hub = TicketHubSpot(associations=[{"toObjectId": 301},
+                                      {"toObjectId": 301},
+                                      {"toObjectId": 302}])
+
+    tickets = hub.client.get_contact_tickets("701")
+
+    assert [t["id"] for t in tickets] == ["301", "302"]
+
+
+def test_get_contact_tickets_accepts_a_v3_shaped_row():
+    """`id` instead of `toObjectId` must not read as zero associations."""
+    hub = TicketHubSpot(associations=[{"id": 301}])
+
+    assert [t["id"] for t in hub.client.get_contact_tickets("701")] == ["301"]
+
+
+def test_donor_prep_shows_only_this_contacts_open_tickets():
+    hub = TicketHubSpot()
+
+    tickets = donor_prep._contact_tickets("701", hub.client)
+
+    subjects = [t["subject"] for t in tickets]
+    assert "Grant recommendation follow-up" in subjects
+    assert "DAF paperwork question" in subjects
+    assert "Resolved months ago" not in subjects, "stage 4 is closed"
+
+
+def test_donor_prep_orders_tickets_newest_first():
+    hub = TicketHubSpot()
+
+    tickets = donor_prep._contact_tickets("701", hub.client)
+
+    assert tickets[0]["subject"] == "Grant recommendation follow-up"
+    assert tickets[0]["created"] == "2026-09-01"
+
+
+def test_donor_prep_open_items_section_is_back(loaded):
+    class HubSpot(TicketHubSpot):
+        def __init__(self):
+            super().__init__()
+            client = self.client
+            client.search_contacts = lambda name: {
+                "results": [{"id": "701", "properties": {
+                    "email": "aisha@example.invalid"}}]}
+            client.get_contact_notes = lambda cid, limit=5: {"results": []}
+            client.get_contact_emails = lambda cid, limit=5: {"results": []}
+            client.get_contact_engagements = lambda cid, limit=5: {
+                "results": []}
+            client.get_open_tickets = _explode_open_tickets
+
+    hub = HubSpot()
+    hs = donor_prep._gather_hubspot_data("Aisha", hub.client)
+    cs = donor_prep._gather_csuite_data("Aisha", StubCSuite(7001))
+
+    brief = donor_prep._format_brief("Aisha", hs, cs, "• point")
+
+    assert "**Open Items:**" in brief
+    assert "Grant recommendation follow-up" in brief
+    assert "opened 2026-09-01" in brief
+
+
+def _explode_open_tickets(*args, **kwargs):
+    raise AssertionError("the portal-wide ticket list must not be fetched")
+
+
+def test_donor_prep_never_fetches_portal_wide_tickets():
+    hub = TicketHubSpot()
+    hub.client.search_contacts = lambda name: {
+        "results": [{"id": "701", "properties": {}}]}
+    hub.client.get_contact_notes = lambda cid, limit=5: {"results": []}
+    hub.client.get_contact_emails = lambda cid, limit=5: {"results": []}
+    hub.client.get_contact_engagements = lambda cid, limit=5: {"results": []}
+    hub.client.get_open_tickets = _explode_open_tickets
+
+    data = donor_prep._gather_hubspot_data("Aisha", hub.client)
+
+    assert len(data["tickets"]) == 2

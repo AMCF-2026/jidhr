@@ -1513,6 +1513,116 @@ class HubSpotClient:
         """
         return self.update_ticket(ticket_id, {"hs_pipeline_stage": "4"})
     
+    # Properties a call-prep brief needs from a ticket. Deliberately short:
+    # `content` is the full ticket body, which does not belong in a
+    # talking-points summary.
+    TICKET_BRIEF_PROPERTIES = ("subject", "hs_pipeline_stage", "createdate")
+
+    # HubSpot caps batch/read at 100 inputs.
+    BATCH_READ_MAX = 100
+
+    # A contact with more than this many associated tickets is not a case
+    # worth paging further for; the cap exists so a bad `paging` cursor
+    # cannot spin.
+    MAX_ASSOCIATION_PAGES = 5
+
+    def get_contact_tickets(self, contact_id, properties=None) -> list:
+        """Tickets associated with ONE contact. Returns a list, never None.
+
+        Two calls: v4 associations to learn which ticket ids belong to this
+        contact, then a v3 batch/read for their properties. Both are reads —
+        batch/read is a read-shaped POST (see HUBSPOT_READ_SHAPED_POST_SUFFIXES
+        at the top of this file), so neither is audited as a write.
+
+        Why this exists: donor_prep used to call get_open_tickets(), which
+        returns every open ticket in the portal, slice it [:5], and print
+        the result under a specific donor's "Open Items". Five strangers'
+        tickets were shown as that donor's, and handed to Claude as context
+        for talking points. Association-scoped or nothing.
+
+        An empty list means "no tickets found for this contact" OR "the
+        lookup failed" — both are logged, and both render as no Open Items
+        section, which is the safe reading. It never falls back to
+        unassociated tickets.
+        """
+        if not contact_id:
+            return []
+
+        ticket_ids = self._associated_ticket_ids(contact_id)
+        if not ticket_ids:
+            return []
+
+        props = list(properties or self.TICKET_BRIEF_PROPERTIES)
+        tickets = []
+
+        for start in range(0, len(ticket_ids), self.BATCH_READ_MAX):
+            batch = ticket_ids[start:start + self.BATCH_READ_MAX]
+            result = self._post("crm/v3/objects/tickets/batch/read", {
+                "inputs": [{"id": ticket_id} for ticket_id in batch],
+                "properties": props,
+            })
+            if not isinstance(result, dict) or result.get("error"):
+                logger.error(
+                    "HubSpot ticket batch/read failed for contact %s: %s",
+                    contact_id,
+                    (result or {}).get("error") if isinstance(result, dict)
+                    else result)
+                break
+            tickets.extend(result.get("results") or [])
+
+        logger.info("Contact %s has %d associated ticket(s)",
+                    contact_id, len(tickets))
+        return tickets
+
+    def _associated_ticket_ids(self, contact_id) -> list:
+        """Ticket ids associated with a contact, following v4 paging."""
+        endpoint = f"crm/v4/objects/contacts/{contact_id}/associations/tickets"
+        ticket_ids = []
+        after = None
+
+        for _ in range(self.MAX_ASSOCIATION_PAGES):
+            params = {"limit": 500}
+            if after:
+                params["after"] = after
+
+            response = self._get(endpoint, params)
+            if not isinstance(response, dict) or response.get("error"):
+                logger.error(
+                    "HubSpot ticket associations failed for contact %s: %s",
+                    contact_id,
+                    (response or {}).get("error")
+                    if isinstance(response, dict) else response)
+                return []
+
+            for row in response.get("results") or []:
+                if not isinstance(row, dict):
+                    continue
+                # v4 returns toObjectId; `id` is accepted so a v3-shaped
+                # response is not silently read as zero associations.
+                ticket_id = row.get("toObjectId", row.get("id"))
+                if ticket_id not in (None, ""):
+                    ticket_ids.append(str(ticket_id))
+
+            after = ((response.get("paging") or {}).get("next") or {}).get(
+                "after")
+            if not after:
+                break
+        else:
+            logger.warning(
+                "Stopped paging ticket associations for contact %s at %d "
+                "pages", contact_id, self.MAX_ASSOCIATION_PAGES)
+
+        # One ticket can be associated by more than one label, so the same
+        # id can appear twice. Order is preserved so the newest-first
+        # ordering HubSpot returns survives.
+        seen = set()
+        unique = []
+        for ticket_id in ticket_ids:
+            if ticket_id not in seen:
+                seen.add(ticket_id)
+                unique.append(ticket_id)
+        return unique
+
     def get_ticket_associations(self, ticket_id: str, to_type: str = "contacts") -> dict:
         """Get objects associated with a ticket (e.g., the contact who submitted it).
         
