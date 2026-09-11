@@ -9,7 +9,7 @@ Every fixture is invented. No live donor data is used as a test fixture.
 """
 
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -363,7 +363,7 @@ def test_dormant_when_everything_is_active(mirror, ctx):
         "grant": [GRANTS[0]],
     })
     out = reports.handle("dormant funds", ctx)
-    assert "All 1 funds have had grant activity" in out
+    assert "All 1 established funds have had grant activity" in out
     assert "(CSuite mirror)" in out
 
 
@@ -615,12 +615,13 @@ def test_as_of_line_uses_the_oldest_input(mirror):
     stale = datetime(2026, 9, 3, 6, 30)
     mirror.load(FULL, synced={"fund": fresh, "grant": stale})
 
+    # Stamps are UTC (naive = UTC); rendered in Eastern time.
     assert mirror_read.as_of_line("fund") == \
-        "📅 Data as of 2026-09-10 09:00 UTC (CSuite mirror)"
+        "📅 Data as of Sep 10, 2026, 5:00 AM ET (CSuite mirror)"
     assert mirror_read.as_of_line("fund", "grant") == \
-        "📅 Data as of 2026-09-03 06:30 UTC (CSuite mirror)"
+        "📅 Data as of Sep 3, 2026, 2:30 AM ET (CSuite mirror)"
     assert mirror_read.as_of_line("grant", "fund") == \
-        "📅 Data as of 2026-09-03 06:30 UTC (CSuite mirror)"
+        "📅 Data as of Sep 3, 2026, 2:30 AM ET (CSuite mirror)"
 
 
 def test_as_of_line_with_nothing_loaded(mirror):
@@ -633,7 +634,7 @@ def test_dormant_report_stamps_the_older_of_its_two_inputs(mirror, ctx):
     mirror.load(FULL, synced={"fund": datetime(2026, 9, 10, 9, 0),
                               "grant": datetime(2026, 9, 1, 8, 0)})
     out = reports.handle("dormant funds", ctx)
-    assert "2026-09-01 08:00 UTC" in out
+    assert "Sep 1, 2026, 4:00 AM ET" in out
 
 
 # ---------------------------------------------------------------------------
@@ -1146,3 +1147,577 @@ def test_donor_prep_never_fetches_portal_wide_tickets():
     data = donor_prep._gather_hubspot_data("Aisha", hub.client)
 
     assert len(data["tickets"]) == 2
+
+
+# ===========================================================================
+# 3c-polish
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 1. Test funds are excluded from every report
+# ---------------------------------------------------------------------------
+
+TEST_FUNDS = [
+    {"_id": 1900, "_group": DAF, "funit_id": 1900,
+     "fund_name": "Testing Fund-(DAF9001)", "current_fundbalance": "1.00",
+     "fgroup_id": DAF, "fund_open_date": "2020-01-01"},
+    {"_id": 1901, "_group": DAF, "funit_id": 1901,
+     "fund_name": "TEST_API_FUND", "current_fundbalance": "1.00",
+     "fgroup_id": DAF, "fund_open_date": "2020-01-01"},
+    {"_id": 1902, "_group": ENDOW, "funit_id": 1902,
+     "fund_name": "Carl's Test DAF", "current_fundbalance": "1.00",
+     "fgroup_id": ENDOW, "fund_open_date": "2020-01-01"},
+]
+
+TEST_GRANTS = [
+    {"_id": 9900, "grant_id": 9900, "funit_id": 1900,
+     "fund_name": "Testing Fund-(DAF9001)", "grant_amount": "99999.00",
+     "grant_date": RECENT, "grant_status": "paid", "name": "Test Grantee"},
+]
+
+TEST_QUARTERS = [
+    {"_id": f"1900:{THIS_YEAR}Q{QUARTER}", "funit_id": "1900",
+     "fund_name": "Testing Fund-(DAF9001)", "year": THIS_YEAR,
+     "quarter": QUARTER, "total": "99999.00", "count": 1},
+]
+
+WITH_TEST_DATA = {
+    **FULL,
+    "fund": FUNDS + TEST_FUNDS,
+    "grant": GRANTS + TEST_GRANTS,
+    "donation_fund_quarter": FUND_QUARTERS + TEST_QUARTERS,
+}
+
+
+@pytest.fixture
+def with_test_data(mirror):
+    mirror.load(WITH_TEST_DATA)
+    return mirror
+
+
+@pytest.mark.parametrize("name, expected", [
+    ("Testing Fund-(DAF9001)", True),
+    ("TEST_API_FUND", True),
+    ("test_daf_fund", True),
+    ("Carl's Test DAF", True),
+    ("Alpha Family Fund-(DAF0001)", False),
+    ("Contest Winners Fund", False),      # "test" alone is not a pattern
+    ("Attestation Endowment", False),
+    (None, False),
+    ("", False),
+])
+def test_test_fund_name_patterns(name, expected):
+    assert mirror_read.is_test_fund_name(name) is expected
+
+
+def test_rows_drops_test_funds_by_default(with_test_data):
+    ids = {f["csuite_id"] for f in mirror_read.rows("fund")}
+    assert ids == {"1000", "1001", "1002", "1003"}
+
+
+def test_rows_drops_grants_belonging_to_test_funds(with_test_data):
+    ids = {g["csuite_id"] for g in mirror_read.rows("grant")}
+    assert "9900" not in ids
+    assert ids == {"9001", "9002", "9003"}
+
+
+def test_rows_drops_quarter_rows_belonging_to_test_funds(with_test_data):
+    keys = {r["csuite_id"] for r in mirror_read.rows("donation_fund_quarter")}
+    assert not any(k.startswith("1900:") for k in keys)
+
+
+def test_rows_keeps_test_funds_when_asked(with_test_data):
+    ids = {f["csuite_id"] for f in mirror_read.rows("fund", exclude_test=False)}
+    assert {"1900", "1901", "1902"} <= ids
+    grants = mirror_read.rows("grant", exclude_test=False)
+    assert "9900" in {g["csuite_id"] for g in grants}
+
+
+def test_exclusion_survives_a_where_clause(with_test_data):
+    paid = mirror_read.rows("grant", "AND data->>'grant_status' = %s",
+                            ("paid",))
+    assert "9900" not in {g["csuite_id"] for g in paid}
+
+
+def test_types_not_linked_to_funds_are_untouched(with_test_data):
+    assert len(mirror_read.rows("profile")) == len(PROFILES)
+
+
+def test_dormant_report_never_lists_a_test_fund(with_test_data, ctx):
+    out = reports.handle("dormant funds", ctx)
+
+    assert "Testing Fund" not in out
+    assert "TEST_API_FUND" not in out
+    assert "Carl's Test DAF" not in out
+    assert "of 4 funds" in out, "the denominator excludes test funds too"
+
+
+def test_quarterly_report_never_counts_test_donations(with_test_data, ctx):
+    out = reports.handle("quarterly summary", ctx)
+    assert "$99,999.00" not in out
+    assert "$14,000.00" in out
+
+
+def test_uncleared_report_never_lists_a_test_grant(with_test_data, ctx):
+    out = reports.handle("uncashed checks", ctx)
+    assert "Test Grantee" not in out
+    assert "$99,999.00" not in out
+
+
+def test_excluded_ids_are_logged_once_per_report(with_test_data, ctx, caplog):
+    """The dormant report reads funds AND grants; the same test ids must
+    be announced once, not once per rows() call."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="clients.mirror_read"):
+        reports.handle("dormant funds", ctx)
+
+    exclusion_lines = [r for r in caplog.records
+                       if "excluded" in r.getMessage()
+                       and "test fund" in r.getMessage()]
+    assert len(exclusion_lines) == 1, [r.getMessage() for r in exclusion_lines]
+    message = exclusion_lines[0].getMessage()
+    assert "1900" in message and "1901" in message and "1902" in message
+
+
+def test_excluded_ids_are_logged_at_info(with_test_data, caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="clients.mirror_read"):
+        mirror_read.rows("fund")
+
+    records = [r for r in caplog.records if "excluded" in r.getMessage()]
+    assert records and records[0].levelno == logging.INFO
+
+
+def test_nothing_is_logged_when_there_is_nothing_to_exclude(loaded, caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="clients.mirror_read"):
+        mirror_read.rows("fund")
+        mirror_read.rows("grant")
+
+    assert not [r for r in caplog.records if "excluded" in r.getMessage()]
+
+
+# ---------------------------------------------------------------------------
+# 2. Dormant funds: new funds, caps, ordering
+# ---------------------------------------------------------------------------
+
+NEW_FUND = {"_id": 1050, "_group": DAF, "funit_id": 1050,
+            "fund_name": "Brand New Fund-(DAF0050)",
+            "current_fundbalance": "100.00", "fgroup_id": DAF,
+            "fund_open_date": (NOW - timedelta(days=60)).strftime("%Y-%m-%d")}
+
+
+def test_dormant_counts_new_funds_instead_of_listing_them(mirror, ctx):
+    mirror.load({**FULL, "fund": FUNDS + [NEW_FUND]})
+
+    out = reports.handle("dormant funds", ctx)
+
+    assert "Brand New Fund" not in out
+    assert "New funds (<12 months, not yet granting): 1" in out
+    assert "**3** of 5 funds" in out
+
+
+def test_dormant_uses_fund_open_date(mirror, ctx):
+    """A fund opened 13 months ago with no grants IS dormant."""
+    old_fund = dict(NEW_FUND, fund_open_date=(
+        NOW - timedelta(days=400)).strftime("%Y-%m-%d"))
+    mirror.load({**FULL, "fund": FUNDS + [old_fund]})
+
+    out = reports.handle("dormant funds", ctx)
+
+    assert "Brand New Fund" in out
+    assert "New funds" not in out
+
+
+def test_dormant_with_no_open_date_is_treated_as_established(mirror, ctx):
+    """A missing open date must not hide a fund from the list."""
+    mirror.load({**FULL, "fund": FUNDS})  # none of FUNDS carry an open date
+    out = reports.handle("dormant funds", ctx)
+    assert "**3** of 4 funds" in out
+    assert "New funds" not in out
+
+
+def test_dormant_new_fund_line_when_everything_else_is_active(mirror, ctx):
+    mirror.load({"fund": [FUNDS[0], NEW_FUND], "grant": [GRANTS[0]]})
+
+    out = reports.handle("dormant funds", ctx)
+
+    assert "All 1 established funds" in out
+    assert "New funds (<12 months, not yet granting): 1" in out
+
+
+def test_dormant_orders_real_dates_oldest_first_then_never(mirror, ctx):
+    funds = [
+        {"_id": 2001, "_group": DAF, "funit_id": 2001, "fgroup_id": DAF,
+         "fund_name": "Never Granted Fund-(DAF2001)"},
+        {"_id": 2002, "_group": DAF, "funit_id": 2002, "fgroup_id": DAF,
+         "fund_name": "Granted 2022 Fund-(DAF2002)"},
+        {"_id": 2003, "_group": DAF, "funit_id": 2003, "fgroup_id": DAF,
+         "fund_name": "Granted 2023 Fund-(DAF2003)"},
+    ]
+    grants = [
+        {"_id": 8002, "grant_id": 8002, "funit_id": 2002,
+         "grant_amount": "1.00", "grant_date": "2022-05-01",
+         "grant_status": "complete", "name": "X"},
+        {"_id": 8003, "grant_id": 8003, "funit_id": 2003,
+         "grant_amount": "1.00", "grant_date": "2023-05-01",
+         "grant_status": "complete", "name": "X"},
+    ]
+    mirror.load({"fund": funds, "grant": grants})
+
+    out = reports.handle("dormant funds", ctx)
+
+    i2022 = out.index("Granted 2022 Fund")
+    i2023 = out.index("Granted 2023 Fund")
+    never = out.index("Never Granted Fund")
+    assert i2022 < i2023 < never
+
+
+def test_dormant_caps_each_group_at_25(mirror, ctx):
+    funds = [
+        {"_id": 3000 + i, "_group": DAF, "funit_id": 3000 + i,
+         "fgroup_id": DAF, "fund_name": f"Dormant {i:02d} Fund-(DAF3{i:03d})"}
+        for i in range(30)
+    ]
+    mirror.load({"fund": funds, "grant": [GRANTS[1]]})
+
+    out = reports.handle("dormant funds", ctx)
+
+    assert "**DAF** (30)" in out
+    assert out.count("• **Dormant") == 25
+    assert "• ... and 5 more" in out
+
+
+def test_dormant_cap_is_per_group(mirror, ctx):
+    dafs = [
+        {"_id": 3000 + i, "_group": DAF, "funit_id": 3000 + i,
+         "fgroup_id": DAF, "fund_name": f"DAF {i:02d}-(DAF3{i:03d})"}
+        for i in range(27)
+    ]
+    endows = [
+        {"_id": 4000 + i, "_group": ENDOW, "funit_id": 4000 + i,
+         "fgroup_id": ENDOW, "fund_name": f"Endow {i:02d}-(END4{i:03d})"}
+        for i in range(3)
+    ]
+    mirror.load({"fund": dafs + endows, "grant": [GRANTS[1]]})
+
+    out = reports.handle("dormant funds", ctx)
+
+    assert "• ... and 2 more" in out
+    assert out.count("• **Endow") == 3
+    assert out.count("... and") == 1
+
+
+# ---------------------------------------------------------------------------
+# 3. Uncleared grants: how often 'complete' is ever used
+# ---------------------------------------------------------------------------
+
+def test_uncleared_report_states_how_many_grants_ever_completed(loaded, ctx):
+    out = reports.handle("uncashed checks", ctx)
+    # GRANTS: 9002 is 'complete'; three grants in all.
+    assert ("Note: only 1 of 3 grants in the mirror have ever been marked "
+            "'complete' — confirm with Shazeen whether that status is "
+            "maintained.") in out
+
+
+def test_uncleared_status_note_sits_under_the_header(loaded, ctx):
+    out = reports.handle("uncashed checks", ctx)
+    header = out.index("Grants issued but not yet cleared")
+    note = out.index("Note: only")
+    count = out.index("grants across")
+    assert header < note < count
+
+
+def test_uncleared_status_note_appears_even_when_nothing_is_paid(mirror, ctx):
+    mirror.load({"grant": [GRANTS[1]]})
+    out = reports.handle("uncashed checks", ctx)
+    assert "only 1 of 1 grants" in out
+
+
+def test_uncleared_status_note_ignores_test_funds(with_test_data, ctx):
+    out = reports.handle("uncashed checks", ctx)
+    assert "only 1 of 3 grants" in out, "the test grant is not counted"
+
+
+def test_uncleared_grantee_cap_is_kept(mirror, ctx):
+    grants = [
+        {"_id": 5000 + i, "grant_id": 5000 + i, "funit_id": 1000,
+         "fund_name": "Alpha", "grant_amount": "10.00",
+         "grant_date": f"2026-01-{i + 1:02d}", "grant_status": "paid",
+         "name": f"Grantee {i:02d}"}
+        for i in range(23)
+    ]
+    mirror.load({"grant": grants})
+
+    out = reports.handle("uncashed checks", ctx)
+
+    assert out.count("• **Grantee") == 20
+    assert "... and 3 more grantees" in out
+
+
+# ---------------------------------------------------------------------------
+# 4. Quarterly: group labels
+# ---------------------------------------------------------------------------
+
+def test_quarterly_uses_fgroup_name_when_the_fund_row_carries_one(mirror, ctx):
+    named = dict(FUNDS[0], fgroup_name="Donor Advised")
+    mirror.load({**FULL, "fund": [named] + FUNDS[1:]})
+
+    out = reports.handle("quarterly summary", ctx)
+
+    assert "**Alpha Family Fund** [Donor Advised]" in out
+
+
+def test_quarterly_labels_other_groups_operating_or_other(mirror, ctx):
+    giving_circle = {"_id": 1060, "_group": Config.FUND_GROUP_GIVING_CIRCLE,
+                     "funit_id": 1060, "fgroup_id":
+                     Config.FUND_GROUP_GIVING_CIRCLE,
+                     "fund_name": "Women's Giving Circle-(GC0002)"}
+    quarter = {"_id": f"1060:{THIS_YEAR}Q{QUARTER}", "funit_id": "1060",
+               "fund_name": "Women's Giving Circle-(GC0002)",
+               "year": THIS_YEAR, "quarter": QUARTER, "total": "300.00",
+               "count": 3}
+    mirror.load({**FULL, "fund": FUNDS + [giving_circle],
+                 "donation_fund_quarter": FUND_QUARTERS + [quarter]})
+
+    out = reports.handle("quarterly summary", ctx)
+
+    assert "**Operating / Other** (1 funds): In $300.00" in out
+    assert "[Operating / Other]" in out
+    assert "Other groups" not in out
+
+
+def test_quarterly_daf_and_endowment_labels_are_unchanged(loaded, ctx):
+    out = reports.handle("quarterly summary", ctx)
+    assert "[DAF]" in out and "[Endowment]" in out
+
+
+# ---------------------------------------------------------------------------
+# 5. Staff guard
+# ---------------------------------------------------------------------------
+
+class RecordingServices:
+    """Every lookup beyond the two searches is recorded, so a test can
+    prove the guard stopped before any of them ran."""
+
+    def __init__(self, hubspot_email=None, csuite_email=None,
+                 hubspot_found=True, csuite_found=True):
+        self.calls = []
+        outer = self
+
+        class HubSpot:
+            def search_contacts(self, name):
+                outer.calls.append("hubspot.search_contacts")
+                if not hubspot_found:
+                    return {"results": []}
+                return {"results": [{"id": "701", "properties": {
+                    "email": hubspot_email, "phone": None, "company": None,
+                    "hs_last_activity_date": "2026-09-10T17:04:00.000Z"}}]}
+
+            def __getattr__(self, name):
+                def recorder(*args, **kwargs):
+                    outer.calls.append(f"hubspot.{name}")
+                    return {"results": []}
+                return recorder
+
+        class CSuite:
+            def search_profiles(self, name):
+                outer.calls.append("csuite.search_profiles")
+                if not csuite_found:
+                    return {"success": True, "data": {"results": []}}
+                return {"success": True, "data": {"results": [
+                    {"profile_id": 7001, "primary_email": csuite_email}]}}
+
+            def __getattr__(self, name):
+                def recorder(*args, **kwargs):
+                    outer.calls.append(f"csuite.{name}")
+                    return {"success": True, "data": {"results": []}}
+                return recorder
+
+        class Claude:
+            def chat(self, **kwargs):
+                outer.calls.append("claude.chat")
+                return "• a talking point"
+
+        self.hubspot = HubSpot()
+        self.csuite = CSuite()
+        self.claude = Claude()
+
+    @property
+    def data_lookups(self):
+        return [c for c in self.calls
+                if c not in ("hubspot.search_contacts",
+                             "csuite.search_profiles")]
+
+
+class Ctx:
+    def __init__(self, services):
+        self.services = services
+
+
+@pytest.fixture
+def no_users_table(monkeypatch):
+    """users lookups find nobody unless a test says otherwise."""
+    monkeypatch.setattr(donor_prep, "get_user_by_email", lambda email: None)
+
+
+def test_staff_by_domain_gets_the_refusal_and_nothing_else_runs(
+        loaded, no_users_table):
+    services = RecordingServices(hubspot_email="ola@amuslimcf.org",
+                                 csuite_email="ola@amuslimcf.org")
+
+    out = donor_prep.handle("talking points for Ola Mohamed", Ctx(services))
+
+    assert out == ("ℹ️ Ola Mohamed is an AMCF staff member, not a donor — "
+                   "no call prep generated.")
+    assert services.data_lookups == [], services.calls
+    assert "claude.chat" not in services.calls
+
+
+def test_staff_by_users_row_gets_the_refusal(loaded, monkeypatch):
+    services = RecordingServices(hubspot_email="carl.personal@gmail.invalid",
+                                 csuite_email=None)
+    monkeypatch.setattr(
+        donor_prep, "get_user_by_email",
+        lambda email: {"id": 3, "email": email}
+        if email == "carl.personal@gmail.invalid" else None)
+
+    out = donor_prep.handle("call prep for Carl", Ctx(services))
+
+    assert "is an AMCF staff member" in out
+    assert services.data_lookups == []
+
+
+def test_staff_guard_reads_the_csuite_email_too(loaded, no_users_table):
+    """A HubSpot record with no email must not wave a colleague through."""
+    services = RecordingServices(hubspot_email=None,
+                                 csuite_email="lisa@amuslimcf.org")
+
+    out = donor_prep.handle("brief me on Lisa", Ctx(services))
+
+    assert "is an AMCF staff member" in out
+    assert services.data_lookups == []
+
+
+def test_a_donor_gets_a_full_brief(loaded, no_users_table):
+    services = RecordingServices(hubspot_email="aisha@example.invalid",
+                                 csuite_email="aisha@example.invalid")
+
+    out = donor_prep.handle("talking points for Aisha", Ctx(services))
+
+    assert "Call Prep: Aisha" in out
+    assert "staff member" not in out
+    assert "claude.chat" in services.calls
+    assert "hubspot.get_contact_notes" in services.calls
+
+
+def test_the_guard_does_not_search_twice(loaded, no_users_table):
+    services = RecordingServices(hubspot_email="aisha@example.invalid",
+                                 csuite_email="aisha@example.invalid")
+
+    donor_prep.handle("talking points for Aisha", Ctx(services))
+
+    assert services.calls.count("hubspot.search_contacts") == 1
+    assert services.calls.count("csuite.search_profiles") == 1
+
+
+@pytest.mark.parametrize("email, expected", [
+    ("ola@amuslimcf.org", True),
+    ("OLA@AMUSLIMCF.ORG", True),
+    (" ola@amuslimcf.org ", True),
+    ("donor@example.invalid", False),
+    ("amuslimcf.org", False),
+    ("", False),
+    (None, False),
+])
+def test_is_staff_email_by_domain(no_users_table, email, expected):
+    assert donor_prep.is_staff_email(email) is expected
+
+
+def test_is_staff_email_survives_a_broken_users_table(monkeypatch):
+    def broken(email):
+        raise RuntimeError("relation users does not exist")
+
+    monkeypatch.setattr(donor_prep, "get_user_by_email", broken)
+
+    assert donor_prep.is_staff_email("donor@example.invalid") is False
+    assert donor_prep.is_staff_email("ola@amuslimcf.org") is True
+
+
+def test_allowed_login_domains_come_from_config():
+    assert Config.ALLOWED_LOGIN_DOMAINS == ("amuslimcf.org",)
+
+
+# ---------------------------------------------------------------------------
+# 6. One timestamp format everywhere
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", [
+    "2026-09-10T17:04:00.000Z",
+    "2026-09-10T17:04:00Z",
+    "2026-09-10T13:04:00-04:00",
+    "2026-09-10 17:04:00",
+    1789059840000,
+    "1789059840000",
+    1789059840,
+    datetime(2026, 9, 10, 17, 4),
+    datetime(2026, 9, 10, 17, 4, tzinfo=timezone.utc),
+])
+def test_fmt_ts_reads_every_shape_the_app_meets(value):
+    assert mirror_read.fmt_ts(value) == "Sep 10, 2026, 1:04 PM ET"
+
+
+def test_fmt_ts_is_in_eastern_time_across_dst():
+    assert mirror_read.fmt_ts("2026-01-15T17:04:00Z") == \
+        "Jan 15, 2026, 12:04 PM ET"
+    assert mirror_read.fmt_ts("2026-07-15T17:04:00Z") == \
+        "Jul 15, 2026, 1:04 PM ET"
+
+
+def test_fmt_ts_midnight_and_noon():
+    assert mirror_read.fmt_ts("2026-09-10T04:00:00Z") == \
+        "Sep 10, 2026, 12:00 AM ET"
+    assert mirror_read.fmt_ts("2026-09-10T16:00:00Z") == \
+        "Sep 10, 2026, 12:00 PM ET"
+
+
+@pytest.mark.parametrize("value", [None, "", "soon", "2026-13-45", True,
+                                   object()])
+def test_fmt_ts_never_raises(value):
+    assert mirror_read.fmt_ts(value) == "unknown"
+
+
+def test_as_of_line_uses_fmt_ts(mirror):
+    mirror.load(FULL, synced={"fund": datetime(2026, 9, 10, 17, 4)})
+    assert mirror_read.as_of_line("fund") == \
+        "📅 Data as of Sep 10, 2026, 1:04 PM ET (CSuite mirror)"
+
+
+def test_as_of_line_copes_with_mixed_naive_and_aware_stamps(mirror):
+    mirror.load(FULL, synced={
+        "fund": datetime(2026, 9, 10, 17, 4, tzinfo=timezone.utc),
+        "grant": datetime(2026, 9, 3, 6, 30),
+    })
+    assert "Sep 3, 2026, 2:30 AM ET" in mirror_read.as_of_line("fund", "grant")
+
+
+def test_donor_prep_last_contacted_uses_fmt_ts(loaded, no_users_table):
+    services = RecordingServices(hubspot_email="aisha@example.invalid",
+                                 csuite_email="aisha@example.invalid")
+
+    out = donor_prep.handle("talking points for Aisha", Ctx(services))
+
+    assert "Last contacted: Sep 10, 2026, 1:04 PM ET" in out
+    assert "2026-09-10T17:04" not in out, "no raw ISO strings in a brief"
+
+
+def test_donor_prep_context_block_uses_fmt_ts():
+    hs = {"found": True, "email": "a@example.invalid", "phone": None,
+          "company": None, "last_activity": "1789059840000",
+          "notes": [], "emails": [], "engagements": [], "tickets": []}
+    cs = {"found": False}
+    block = donor_prep._build_context_block("A", hs, cs)
+    assert "Last activity: Sep 10, 2026, 1:04 PM ET" in block

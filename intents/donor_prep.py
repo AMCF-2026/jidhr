@@ -12,6 +12,7 @@ import logging
 import re
 
 from clients import mirror_read
+from clients.users import get_user_by_email, normalize_email
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -65,9 +66,30 @@ def handle(query: str, ctx) -> str:
 
     logger.info(f"Preparing call prep for: {name}")
 
+    hubspot = ctx.services.hubspot
+    csuite = ctx.services.csuite
+
+    # ----- Resolve the person, and stop if they work here -----
+    #
+    # The guard runs BEFORE any data is gathered. A staff member's name
+    # matches a HubSpot contact like anyone else's (everyone at AMCF is in
+    # the CRM), so without this the brief would pull a colleague's notes,
+    # emails, tickets and giving history and hand them to Claude to write
+    # talking points about.
+    contact = _resolve_hubspot_contact(name, hubspot)
+    profile = _resolve_csuite_profile(name, csuite)
+
+    staff_email = _staff_email_of(contact, profile)
+    if staff_email:
+        logger.info(
+            "Call prep refused: %s resolves to staff address %s",
+            name, staff_email)
+        return (f"ℹ️ {name} is an AMCF staff member, not a donor — "
+                "no call prep generated.")
+
     # ----- Gather data from both systems -----
-    hs_data = _gather_hubspot_data(name, ctx.services.hubspot)
-    cs_data = _gather_csuite_data(name, ctx.services.csuite)
+    hs_data = _gather_hubspot_data(name, hubspot, contact=contact)
+    cs_data = _gather_csuite_data(name, csuite, profile=profile)
 
     if not hs_data["found"] and not cs_data["found"]:
         return (
@@ -106,11 +128,100 @@ def _extract_donor_name(query: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Resolution and the staff guard
+# ---------------------------------------------------------------------------
+
+def _resolve_hubspot_contact(name: str, hubspot) -> dict | None:
+    """The first HubSpot contact matching the name, or None."""
+    try:
+        search = hubspot.search_contacts(name)
+        results = search.get('results', []) if isinstance(search, dict) else []
+        return results[0] if results else None
+    except Exception as e:
+        logger.error(f"Error searching HubSpot for '{name}': {e}")
+        return None
+
+
+def _resolve_csuite_profile(name: str, csuite) -> dict | None:
+    """The first CSuite profile matching the name, or None."""
+    try:
+        search = csuite.search_profiles(name)
+        if not search.get('success') or not search.get('data'):
+            return None
+        results = search['data'].get('results', [])
+        return results[0] if results else None
+    except Exception as e:
+        logger.error(f"Error searching CSuite for '{name}': {e}")
+        return None
+
+
+def is_staff_email(email) -> bool:
+    """True if this address belongs to someone who works here.
+
+    Two tests, either is enough: the domain is one staff log in from
+    (Config.ALLOWED_LOGIN_DOMAINS), or the exact address has a row in
+    `users` — which catches a colleague who signs in with a personal
+    address the domain rule would miss.
+
+    A users lookup that fails is treated as "not staff" and logged: the
+    domain check has already run, and refusing every brief because the
+    users table hiccupped would be the wrong trade.
+    """
+    email = normalize_email(email)
+    if not email or "@" not in email:
+        return False
+
+    domain = email.rsplit("@", 1)[1]
+    if domain in Config.ALLOWED_LOGIN_DOMAINS:
+        return True
+
+    try:
+        return get_user_by_email(email) is not None
+    except Exception as e:
+        logger.warning(f"users lookup failed for staff check ({email}): {e}")
+        return False
+
+
+def _staff_email_of(contact, profile) -> str | None:
+    """The first staff address among the resolved records, or None.
+
+    Both records are checked. A colleague is usually in both systems; a
+    guard that only read HubSpot would wave through anyone whose HubSpot
+    record has no email but whose CSuite profile does.
+    """
+    candidates = []
+    if isinstance(contact, dict):
+        candidates.append((contact.get('properties') or {}).get('email'))
+    if isinstance(profile, dict):
+        candidates.append(profile.get('primary_email'))
+        # The search endpoint's row shape is unmeasured (probe #3 skipped
+        # profile/list/search); the mirrored profile carries the address
+        # for certain, so it is consulted when the search row does not.
+        if not profile.get('primary_email') and profile.get('profile_id'):
+            try:
+                mirrored = mirror_read.get("profile", profile.get('profile_id'))
+            except Exception as e:
+                logger.warning(f"mirror profile lookup failed: {e}")
+                mirrored = None
+            if mirrored:
+                candidates.append(mirrored.get('primary_email'))
+
+    for email in candidates:
+        if is_staff_email(email):
+            return normalize_email(email)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # HubSpot data gathering
 # ---------------------------------------------------------------------------
 
-def _gather_hubspot_data(name: str, hubspot) -> dict:
-    """Search HubSpot and pull contact details + engagement history."""
+def _gather_hubspot_data(name: str, hubspot, contact=None) -> dict:
+    """Pull contact details + engagement history.
+
+    `contact` is the record handle() already resolved; passing it avoids a
+    second search. Left None, this searches itself (older callers).
+    """
     data = {
         "found": False,
         "contact_id": None,
@@ -125,14 +236,12 @@ def _gather_hubspot_data(name: str, hubspot) -> dict:
         "hubspot_link": None,
     }
 
-    # Search for contact
     try:
-        search = hubspot.search_contacts(name)
-        results = search.get('results', [])
-        if not results:
+        if contact is None:
+            contact = _resolve_hubspot_contact(name, hubspot)
+        if not contact:
             return data
 
-        contact = results[0]
         props = contact.get('properties', {})
         contact_id = contact.get('id')
 
@@ -248,8 +357,12 @@ def _contact_tickets(contact_id, hubspot) -> list:
 # CSuite data gathering
 # ---------------------------------------------------------------------------
 
-def _gather_csuite_data(name: str, csuite) -> dict:
-    """Search CSuite and pull profile, donations, grants."""
+def _gather_csuite_data(name: str, csuite, profile=None) -> dict:
+    """Pull profile, giving and grants.
+
+    `profile` is the record handle() already resolved; passing it avoids a
+    second search. Left None, this searches itself (older callers).
+    """
     data = {
         "found": False,
         "profile_id": None,
@@ -270,15 +383,11 @@ def _gather_csuite_data(name: str, csuite) -> dict:
     }
 
     try:
-        search = csuite.search_profiles(name)
-        if not search.get('success') or not search.get('data'):
+        if profile is None:
+            profile = _resolve_csuite_profile(name, csuite)
+        if not profile:
             return data
 
-        results = search['data'].get('results', [])
-        if not results:
-            return data
-
-        profile = results[0]
         profile_id = profile.get('profile_id')
 
         data.update({
@@ -398,7 +507,7 @@ def _build_context_block(name: str, hs: dict, cs: dict) -> str:
             f"HubSpot Contact: {hs['email'] or 'no email'}, "
             f"Phone: {hs['phone'] or 'none'}, "
             f"Company: {hs['company'] or 'none'}, "
-            f"Last activity: {hs['last_activity'] or 'unknown'}"
+            f"Last activity: {mirror_read.fmt_ts(hs['last_activity'])}"
         )
         if hs["notes"]:
             note_lines = [f"  - {n['timestamp']}: {n['body'][:120]}" for n in hs["notes"]]
@@ -528,7 +637,8 @@ def _format_brief(name: str, hs: dict, cs: dict, talking_points: str) -> str:
     if hs["found"]:
         lines.append(f"• Email: {hs['email'] or 'N/A'}")
         if hs["last_activity"]:
-            lines.append(f"• Last contacted: {hs['last_activity']}")
+            lines.append(
+                f"• Last contacted: {mirror_read.fmt_ts(hs['last_activity'])}")
     lines.append("")
 
     # Recent activity (condensed)

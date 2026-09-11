@@ -147,7 +147,17 @@ def can_handle(query: str, **kwargs) -> bool:
 
 
 def handle(query: str, ctx) -> str:
-    """Route to the appropriate report sub-handler."""
+    """Route to the appropriate report sub-handler.
+
+    The whole dispatch runs inside one mirror_read.exclusion_log_scope, so
+    the test funds a report drops are logged once for that report — not
+    once for every rows() call it makes.
+    """
+    with mirror_read.exclusion_log_scope():
+        return _dispatch(query, ctx)
+
+
+def _dispatch(query: str, ctx) -> str:
     q = query.lower().strip()
     hubspot = ctx.services.hubspot
     csuite = ctx.services.csuite
@@ -245,6 +255,33 @@ def _fund_group_label(fund: dict) -> str:
     if group_id is None:
         return "Ungrouped"
     return FUND_GROUP_LABELS.get(group_id, f"Group {group_id}")
+
+
+# What the quarterly summary calls a fund that is neither DAF nor Endowment.
+OTHER_GROUP_LABEL = "Operating / Other"
+
+# Field names a fund payload might carry its group's NAME under. CSuite's
+# funit/display returns only fgroup_id (probe #3, 70-field inventory), so
+# in practice these are absent and the id map below decides — but a name
+# from the source wins if one ever appears.
+_FUND_GROUP_NAME_FIELDS = ("fgroup_name", "fund_group_name")
+
+
+def _fund_group_name(fund: dict) -> str:
+    """The quarterly summary's label for a fund's group.
+
+    The group's own name if the fund row carries one; else DAF / Endowment
+    by id, since those two are what the summary splits on; else
+    OTHER_GROUP_LABEL.
+    """
+    for key in _FUND_GROUP_NAME_FIELDS:
+        value = fund.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    group_id = _fund_group_id(fund)
+    if group_id in (DAF_GROUP_ID, ENDOWMENT_GROUP_ID):
+        return FUND_GROUP_LABELS[group_id]
+    return OTHER_GROUP_LABEL
 
 
 def _amount(value) -> float:
@@ -545,6 +582,14 @@ def _report_lapsed_donors(query: str) -> str:
 # C. INACTIVE FUNDS
 # =========================================================================
 
+# The date a fund was opened, as funit/display returns it. Confirmed in
+# scripts/probe_output/csuite_fields.md: `fund_open_date`, str(date),
+# populated on every sampled fund. (`fund_open` beside it is the boolean.)
+FUND_OPEN_DATE_FIELD = "fund_open_date"
+
+_DORMANT_GROUP_SHOWN = 25
+
+
 def _report_inactive_funds() -> str:
     """Every fund with no grant in the last 12 months.
 
@@ -552,6 +597,10 @@ def _report_inactive_funds() -> str:
     the fund list capped at 200 against 397 real funds, and paged grants
     10 deep,
     so "dormant" meant "dormant among the half of the funds I read".
+
+    A fund opened inside the window is not dormant — it has not had twelve
+    months in which to grant. Those are counted separately rather than
+    listed, so a burst of new DAFs does not read as a burst of neglect.
     """
     missing = mirror_read.require("fund", "grant")
     if missing:
@@ -573,11 +622,18 @@ def _report_inactive_funds() -> str:
             last_grant[key] = grant_date
 
     dormant = []
+    new_funds = 0
     for fund in funds:
         key = str(fund.get("csuite_id"))
         latest = last_grant.get(key)
         if latest is not None and latest >= cutoff:
             continue
+
+        opened = fund.get(FUND_OPEN_DATE_FIELD)
+        if opened and str(opened)[:10] >= cutoff:
+            new_funds += 1
+            continue
+
         name, code = split_fund_name(fund.get("fund_name"))
         dormant.append({
             "name": name or fund.get("fund_name") or "Unknown",
@@ -590,11 +646,19 @@ def _report_inactive_funds() -> str:
     footer = mirror_read.as_of_line("fund", "grant")
 
     if not dormant:
-        return (f"✅ **All {len(funds)} funds have had grant activity in the "
-                f"last 12 months.**\n\n{footer}")
+        lines = [f"✅ **All {len(funds) - new_funds} established funds have "
+                 "had grant activity in the last 12 months.**"]
+        if new_funds:
+            lines += ["", f"New funds (<12 months, not yet granting): "
+                          f"{new_funds}"]
+        lines += ["", footer]
+        return "\n".join(lines)
 
-    # Never-granted funds first, then oldest last-grant date.
-    dormant.sort(key=lambda f: (f["last"] if f["last"] != "Never" else "0000",
+    # Real last-grant dates oldest first, then the never-granted funds.
+    # "Never" sorts last on purpose: a fund that granted once and stopped
+    # is a relationship that lapsed; one that never granted may simply not
+    # have started, and the former is the more actionable of the two.
+    dormant.sort(key=lambda f: (f["last"] == "Never", f["last"],
                                 f["name"].lower()))
 
     by_group = {}
@@ -605,16 +669,23 @@ def _report_inactive_funds() -> str:
         "📊 **Dormant Funds** (no grants in 12+ months)",
         "",
         f"**{len(dormant)}** of {len(funds)} funds, grouped by fund type:",
-        "",
     ]
+    if new_funds:
+        lines.append(
+            f"New funds (<12 months, not yet granting): {new_funds}")
+    lines.append("")
+
     for group in sorted(by_group, key=lambda g: (-len(by_group[g]), g)):
         group_funds = by_group[group]
         lines.append(f"**{group}** ({len(group_funds)})")
-        for fund in group_funds:
+        for fund in group_funds[:_DORMANT_GROUP_SHOWN]:
             suffix = f" ({fund['code']})" if fund["code"] else ""
             lines.append(
                 f"• **{fund['name']}**{suffix} — id {fund['fund_id']}, "
                 f"last grant: {fund['last']}")
+        if len(group_funds) > _DORMANT_GROUP_SHOWN:
+            lines.append(
+                f"• ... and {len(group_funds) - _DORMANT_GROUP_SHOWN} more")
         lines.append("")
 
     lines += [
@@ -824,6 +895,28 @@ def _report_fees(query: str) -> str:
 
 _UNCLEARED_GRANTEES_SHOWN = 20
 
+GRANT_STATUS_CLEARED = "complete"
+
+
+def _status_maintenance_note() -> str:
+    """How many grants have EVER reached 'complete', out of all of them.
+
+    Across the probe sample only 1 grant in 100 was 'complete' against 60
+    'paid'. If that ratio holds over 6,700 grants, 'paid' is not "awaiting
+    clearance" — it is simply where grants stop being updated, and this
+    whole report is counting the wrong thing. The number is printed so the
+    reader can judge that rather than trust the headline.
+    """
+    all_grants = mirror_read.rows("grant")
+    total = len(all_grants)
+    cleared = sum(
+        1 for g in all_grants
+        if str(g.get("grant_status") or "").strip().lower()
+        == GRANT_STATUS_CLEARED)
+    return (f"Note: only {cleared} of {total} grants in the mirror have ever "
+            f"been marked '{GRANT_STATUS_CLEARED}' — confirm with Shazeen "
+            "whether that status is maintained.")
+
 
 def _report_uncleared_grants() -> str:
     """Grants at status 'paid' — issued, not yet cleared.
@@ -849,10 +942,11 @@ def _report_uncleared_grants() -> str:
     )
 
     footer = mirror_read.as_of_line("grant")
+    status_note = _status_maintenance_note()
 
     if not grants:
         return ("✅ **No grants are sitting at status "
-                f"'{GRANT_STATUS_ISSUED}'.**\n\n{footer}")
+                f"'{GRANT_STATUS_ISSUED}'.**\n\n{status_note}\n\n{footer}")
 
     by_grantee = {}
     total = 0.0
@@ -877,6 +971,7 @@ def _report_uncleared_grants() -> str:
     lines = [
         f"📊 **Grants issued but not yet cleared (status "
         f"'{GRANT_STATUS_ISSUED}')**",
+        status_note,
         "",
         f"**{len(grants)}** grants across **{len(by_grantee)}** grantees, "
         f"totalling **${total:,.2f}**",
@@ -960,6 +1055,7 @@ def _report_quarterly_summary(query: str) -> str:
             entry = per_fund[key] = {
                 "name": name or fund_name or "Unknown",
                 "group_id": _fund_group_id(fund),
+                "group_label": _fund_group_name(fund),
                 "donations": 0.0,
                 "grants": 0.0,
             }
@@ -1007,7 +1103,7 @@ def _report_quarterly_summary(query: str) -> str:
     if other["funds"]:
         net = other["in"] - other["out"]
         lines.append(
-            f"• **Other groups** ({other['funds']} funds): "
+            f"• **{OTHER_GROUP_LABEL}** ({other['funds']} funds): "
             f"In ${other['in']:,.2f} / Out ${other['out']:,.2f} / "
             f"Net ${net:,.2f}")
 
@@ -1018,8 +1114,7 @@ def _report_quarterly_summary(query: str) -> str:
     for entry in ordered[:15]:
         net = entry["donations"] - entry["grants"]
         net_str = f"+${net:,.2f}" if net >= 0 else f"-${abs(net):,.2f}"
-        label = FUND_GROUP_LABELS.get(entry["group_id"])
-        tag = f" [{label}]" if label else ""
+        tag = f" [{entry['group_label']}]"
         lines.append(
             f"• **{entry['name']}**{tag}: In ${entry['donations']:,.2f} / "
             f"Out ${entry['grants']:,.2f} / Net {net_str}")

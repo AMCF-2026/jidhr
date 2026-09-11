@@ -1790,3 +1790,75 @@ def test_the_reused_sweep_is_not_billed_twice(db):
     assert sum(r.calls for r in results) == 2
     assert results[1].notes["calls"] == 0
     assert results[1].notes["pages"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 3c-polish: unchanged rows are re-stamped, not re-written
+# ---------------------------------------------------------------------------
+
+def touches(db):
+    return db.matching("UPDATE csuite_mirror SET synced_at = NOW()")
+
+
+def test_unchanged_rows_get_a_fresh_synced_at(db):
+    rows = [{"grant_id": 1, "grant_amount": "100.00"},
+            {"grant_id": 2, "grant_amount": "250.00"},
+            {"grant_id": 3, "grant_amount": "5.00"}]
+    client = StubClient({"grant/list": [ok(rows, count=3), ok([])]})
+    db.stored[("grant", "1")] = mirror._hash(rows[0])
+    db.stored[("grant", "2")] = mirror._hash(rows[1])
+
+    result = mirror.refresh_type("grant", client=client, pace_ms=0)
+
+    assert result.unchanged == 2
+    assert result.written == 1
+
+    assert len(touches(db)) == 1
+    sql, params = touches(db)[0]
+    assert params[0] == "grant"
+    assert set(params[1]) == {"1", "2"}
+    assert "data_hash" not in sql and "SET synced_at = NOW()" in sql
+    assert result.notes["touched"] == 2
+
+
+def test_written_rows_are_not_touched_twice(db):
+    rows = [{"grant_id": 1, "grant_amount": "100.00"}]
+    client = StubClient({"grant/list": [ok(rows, count=1), ok([])]})
+    db.stored[("grant", "1")] = "an-older-hash"
+
+    mirror.refresh_type("grant", client=client, pace_ms=0)
+
+    assert touches(db) == [], "a re-written row already has NOW()"
+
+
+def test_nothing_is_touched_on_a_dry_run(db):
+    rows = [{"grant_id": 1, "grant_amount": "100.00"}]
+    client = StubClient({"grant/list": [ok(rows, count=1), ok([])]})
+    db.stored[("grant", "1")] = mirror._hash(rows[0])
+
+    mirror.refresh_type("grant", client=client, pace_ms=0, dry_run=True)
+
+    assert touches(db) == []
+
+
+def test_nothing_is_touched_on_a_failed_fetch(db):
+    client = StubClient({"grant/list": [fail("boom")]})
+    db.stored[("grant", "1")] = "whatever"
+
+    mirror.refresh_type("grant", client=client, pace_ms=0)
+
+    assert touches(db) == []
+
+
+def test_touch_is_batched(db):
+    ids = [str(i) for i in range(2500)]
+    touched = mirror._touch("grant", ids)
+
+    assert touched == 2500
+    assert len(touches(db)) == 3  # 1000 + 1000 + 500
+    assert sum(len(p[1]) for _, p in touches(db)) == 2500
+
+
+def test_touch_with_nothing_to_touch_issues_no_statement(db):
+    assert mirror._touch("grant", []) == 0
+    assert touches(db) == []

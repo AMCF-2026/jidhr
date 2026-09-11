@@ -108,6 +108,28 @@ class Config:
     GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', '')
     GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET', '')
     ALLOWED_DOMAIN = os.environ.get('ALLOWED_DOMAIN', 'amuslimcf.org')
+
+    # Every domain a staff login may come from. ALLOWED_DOMAIN is what
+    # auth.py checks and stays a single value; this is the same setting
+    # read as a list (comma-separated, if it ever grows), for code that
+    # needs to ask "is this address one of ours?" — donor call prep, which
+    # must not build a donor brief about a colleague.
+    ALLOWED_LOGIN_DOMAINS = tuple(
+        d.strip().lower().lstrip('@')
+        for d in (os.environ.get('ALLOWED_DOMAIN', 'amuslimcf.org') or '')
+                 .split(',')
+        if d.strip()
+    )
+
+    # =========================================================================
+    # TEST DATA IN CSUITE
+    # =========================================================================
+    # CSuite holds funds that exist only to exercise the API. They have
+    # balances and grants like any other, so without this list a dormant
+    # fund report lists "Testing Fund" as a dormant DAF and a quarterly
+    # summary counts test donations as income. Matched case-insensitively
+    # as substrings of the fund name by clients/mirror_read.rows().
+    TEST_FUND_PATTERNS = ("testing", "test_", "_api_fund", "test daf")
     
     # =========================================================================
     # REPORTING HELPERS

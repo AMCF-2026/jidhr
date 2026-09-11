@@ -32,11 +32,29 @@ returned, because "here is the answer, taken four days ago" is useful and
 who sees a date from last week knows to run mirror_refresh.
 """
 
+import contextvars
+import json
 import logging
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from clients import database
+from config import Config
 
 logger = logging.getLogger(__name__)
+
+# Every timestamp a person reads in this app is shown in this zone. AMCF is
+# an East Coast organisation; a mirror stamp in UTC reads as "four hours
+# ago" to the people who use it.
+DISPLAY_TZ = ZoneInfo("America/New_York")
+DISPLAY_TZ_LABEL = "ET"
+
+# Record types whose rows belong to a fund, and the field that says which.
+_FUND_LINKED_TYPES = {
+    "grant": "funit_id",
+    "donation_fund_quarter": "funit_id",
+}
 
 
 _ROWS_SQL = """
@@ -92,7 +110,6 @@ def _merge(row) -> dict:
     """
     data = _cell(row, "data", 2)
     if isinstance(data, str):
-        import json
         try:
             data = json.loads(data)
         except ValueError:  # pragma: no cover - jsonb never round-trips badly
@@ -104,7 +121,8 @@ def _merge(row) -> dict:
     return merged
 
 
-def rows(record_type: str, where_sql: str = "", params=()) -> list:
+def rows(record_type: str, where_sql: str = "", params=(),
+         exclude_test: bool = True) -> list:
     """Every mirrored record of one type, as flat dicts.
 
     `where_sql` is appended to the WHERE clause and must be written by the
@@ -115,7 +133,19 @@ def rows(record_type: str, where_sql: str = "", params=()) -> list:
     Filtering in SQL rather than in Python matters for grants and
     donations, where the alternative is pulling 6,700 or 26,500 jsonb
     documents across the wire to throw most of them away.
+
+    `exclude_test` (the default) drops CSuite's test funds — fund rows
+    whose name matches Config.TEST_FUND_PATTERNS, and grant / quarter rows
+    that belong to one. Pass False only when the test funds are the point,
+    e.g. a diagnostic.
     """
+    found = _raw_rows(record_type, where_sql, params)
+    if not exclude_test:
+        return found
+    return _without_test_funds(record_type, found)
+
+
+def _raw_rows(record_type: str, where_sql: str = "", params=()) -> list:
     sql = _ROWS_SQL + (f" {where_sql}" if where_sql else "")
     found = database.execute_query(sql, (record_type,) + tuple(params),
                                    fetch=True)
@@ -124,6 +154,92 @@ def rows(record_type: str, where_sql: str = "", params=()) -> list:
                      record_type, type(found).__name__)
         return []
     return [_merge(row) for row in found]
+
+
+# ---------------------------------------------------------------------------
+# Test funds
+# ---------------------------------------------------------------------------
+
+def is_test_fund_name(name) -> bool:
+    """True if a fund name matches any Config.TEST_FUND_PATTERNS entry."""
+    if not name:
+        return False
+    lowered = str(name).lower()
+    return any(pattern and pattern.lower() in lowered
+               for pattern in Config.TEST_FUND_PATTERNS)
+
+
+def test_fund_ids() -> set:
+    """csuite_ids (as text) of every mirrored fund that is a test fund."""
+    return {
+        str(fund.get("csuite_id"))
+        for fund in _raw_rows("fund")
+        if is_test_fund_name(fund.get("fund_name"))
+    }
+
+
+# Excluded ids are logged once per report rather than once per query — a
+# dormant-fund report reads funds AND grants, and the same three test ids
+# do not need announcing twice. reports.handle() opens the scope; outside
+# one, every rows() call logs on its own.
+_exclusion_scope: contextvars.ContextVar = contextvars.ContextVar(
+    "jidhr_mirror_exclusion_scope", default=None)
+
+
+@contextmanager
+def exclusion_log_scope():
+    """Within this block, each excluded fund id is logged at most once."""
+    token = _exclusion_scope.set(set())
+    try:
+        yield
+    finally:
+        _exclusion_scope.reset(token)
+
+
+def _log_exclusions(record_type: str, excluded_ids) -> None:
+    ids = sorted(str(i) for i in excluded_ids)
+    if not ids:
+        return
+    scope = _exclusion_scope.get()
+    if scope is not None:
+        fresh = [i for i in ids if i not in scope]
+        if not fresh:
+            return
+        scope.update(fresh)
+        ids = fresh
+    logger.info("excluded %d test fund(s) from %s rows: %s",
+                len(ids), record_type, ", ".join(ids))
+
+
+def _without_test_funds(record_type: str, found: list) -> list:
+    if record_type == "fund":
+        kept, excluded = [], []
+        for fund in found:
+            if is_test_fund_name(fund.get("fund_name")):
+                excluded.append(fund.get("csuite_id"))
+            else:
+                kept.append(fund)
+        _log_exclusions(record_type, excluded)
+        return kept
+
+    link_field = _FUND_LINKED_TYPES.get(record_type)
+    if link_field is None:
+        return found
+
+    test_ids = test_fund_ids()
+    if not test_ids:
+        return found
+
+    kept, excluded = [], set()
+    for row in found:
+        fund_id = str(row.get(link_field)) if row.get(link_field) not in (
+            None, "") else None
+        if fund_id in test_ids:
+            excluded.add(fund_id)
+        else:
+            kept.append(row)
+    _log_exclusions(record_type, excluded)
+    return kept
 
 
 def get(record_type: str, csuite_id) -> dict | None:
@@ -186,14 +302,66 @@ def require(*record_types) -> str | None:
 # Provenance
 # ---------------------------------------------------------------------------
 
-def _format_stamp(value) -> str:
-    """A synced_at as something a person can read."""
-    if value is None:
+def _to_datetime(value):
+    """A datetime (tz-aware, UTC-anchored if it was naive) from any of the
+    timestamp shapes this app meets, or None.
+
+    Accepted: datetime; ISO 8601 text (with Z, an offset, or naive); epoch
+    milliseconds as int, float or numeric text (what HubSpot puts in
+    hs_last_activity_date); epoch seconds if the number is too small to be
+    milliseconds.
+    """
+    if value is None or value == "":
+        return None
+
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, bool):
+        return None
+    elif isinstance(value, (int, float)) or (
+            isinstance(value, str) and value.strip().lstrip("-").isdigit()):
+        number = float(value)
+        # Anything under 10^11 is seconds, not milliseconds: 10^11 ms is
+        # 1973, 10^11 s is the year 5138.
+        seconds = number / 1000.0 if abs(number) >= 1e11 else number
+        try:
+            dt = datetime.fromtimestamp(seconds, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    elif isinstance(value, str):
+        text = value.strip()
+        if text.endswith("Z") or text.endswith("z"):
+            text = text[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    else:
+        return None
+
+    if dt.tzinfo is None:
+        # Postgres NOW() on Railway is UTC; a naive stamp from the mirror
+        # is a UTC stamp that lost its label, not a local one.
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def fmt_ts(value) -> str:
+    """A timestamp as a person reads it: "Sep 10, 2026, 1:04 PM ET".
+
+    One function for every timestamp the app shows — mirror provenance,
+    "last contacted", anything else — so they all read the same way and
+    all sit in the same zone. Takes an ISO string, epoch milliseconds, or
+    a datetime; returns "unknown" for anything it cannot read rather than
+    raising inside a report.
+    """
+    dt = _to_datetime(value)
+    if dt is None:
         return "unknown"
-    formatter = getattr(value, "strftime", None)
-    if formatter is not None:
-        return formatter("%Y-%m-%d %H:%M UTC")
-    return str(value)
+    local = dt.astimezone(DISPLAY_TZ)
+    hour = local.hour % 12 or 12
+    return (f"{local:%b} {local.day}, {local.year}, "
+            f"{hour}:{local:%M} {local:%p} {DISPLAY_TZ_LABEL}")
 
 
 def as_of_line(*record_types) -> str:
@@ -216,8 +384,8 @@ def as_of_line(*record_types) -> str:
     if not stamps:
         return "📅 Data as of unknown (CSuite mirror)"
 
-    try:
-        oldest = min(stamps)
-    except TypeError:  # pragma: no cover - mixed tz-aware and naive stamps
-        oldest = stamps[0]
-    return f"📅 Data as of {_format_stamp(oldest)} (CSuite mirror)"
+    # Normalised before comparison so a tz-aware stamp and a naive one
+    # (the driver can hand back either) do not raise on min().
+    normalised = [dt for dt in (_to_datetime(s) for s in stamps) if dt]
+    oldest = min(normalised) if normalised else None
+    return f"📅 Data as of {fmt_ts(oldest)} (CSuite mirror)"

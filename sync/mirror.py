@@ -969,6 +969,19 @@ _UPSERT_TAIL = """
         expires_at    = EXCLUDED.expires_at
 """
 
+# Rows this run compared and found identical are as fresh as the ones it
+# wrote: CSuite was asked and gave the same answer. Without this, a fund
+# that has not changed in a month shows a month-old synced_at, and every
+# as_of_line built on it reports the mirror as a month stale when it was
+# verified this morning. Only the stamp moves — data and data_hash stay
+# exactly as they were.
+_TOUCH_SQL = """
+    UPDATE csuite_mirror
+       SET synced_at = NOW()
+     WHERE record_type = %s
+       AND csuite_id IN %s
+"""
+
 _DELETE_SQL = """
     DELETE FROM csuite_mirror
      WHERE record_type = %s
@@ -1163,6 +1176,19 @@ def _upsert(record_type: str, rows, run_id, expires) -> int:
     return written
 
 
+def _touch(record_type: str, keys) -> int:
+    """Move synced_at to now on rows verified unchanged. Returns how many."""
+    keys = list(keys)
+    touched = 0
+    for start in range(0, len(keys), DELETE_BATCH):
+        batch = tuple(keys[start:start + DELETE_BATCH])
+        if not batch:
+            continue
+        database.execute_query(_TOUCH_SQL, (record_type, batch), fetch=False)
+        touched += len(batch)
+    return touched
+
+
 def _delete(record_type: str, keys) -> int:
     """Remove mirror rows CSuite no longer has. Returns how many."""
     keys = list(keys)
@@ -1327,10 +1353,12 @@ def refresh_type(record_type: str, client=None, pace_ms=None,
     existing = _existing_hashes(record_type)
     seen = set()
     to_write = []
+    unchanged_ids = []
     for row in rows:
         seen.add(row.csuite_id)
         if existing.get(row.csuite_id) == _hash(row.data):
             result.unchanged += 1
+            unchanged_ids.append(row.csuite_id)
         else:
             to_write.append(row)
 
@@ -1368,6 +1396,7 @@ def refresh_type(record_type: str, client=None, pace_ms=None,
     try:
         result.written = _upsert(record_type, to_write, run_id, expires)
         result.deleted = _delete(record_type, stale)
+        result.notes["touched"] = _touch(record_type, unchanged_ids)
     except Exception as e:
         # The database went away mid-write. Re-raised, because a mirror
         # that cannot write has nothing to fall back on — but the run row
