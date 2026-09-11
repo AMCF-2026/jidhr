@@ -79,6 +79,15 @@ def handle(query: str, ctx) -> str:
     contact = _resolve_hubspot_contact(name, hubspot)
     profile = _resolve_csuite_profile(name, csuite)
 
+    if not contact and not profile:
+        # Nothing to prep FROM. The old flow carried on to gather (which
+        # found nothing), and an earlier version still asked Claude for
+        # talking points about a person neither system knows — which it
+        # would happily write.
+        logger.info("Call prep: no contact named %r in either system", name)
+        return (f"ℹ️ No contact named {name} found in HubSpot or CSuite — "
+                "nothing to prep.")
+
     staff_email = _staff_email_of(contact, profile)
     if staff_email:
         logger.info(
@@ -92,10 +101,8 @@ def handle(query: str, ctx) -> str:
     cs_data = _gather_csuite_data(name, csuite, profile=profile)
 
     if not hs_data["found"] and not cs_data["found"]:
-        return (
-            f"❓ I couldn't find **{name}** in HubSpot or CSuite. "
-            "Double-check the spelling, or try a last name only."
-        )
+        return (f"ℹ️ No contact named {name} found in HubSpot or CSuite — "
+                "nothing to prep.")
 
     # ----- Build context for Claude -----
     context = _build_context_block(name, hs_data, cs_data)
@@ -125,6 +132,37 @@ def _extract_donor_name(query: str) -> str | None:
     # Remove trailing punctuation
     cleaned = cleaned.rstrip('?!.')
     return cleaned if cleaned else None
+
+
+# ---------------------------------------------------------------------------
+# Deep links
+# ---------------------------------------------------------------------------
+
+def _real_id(value) -> bool:
+    """True for an id worth putting in a URL.
+
+    None, "", "None" and whitespace are what a missing id looks like after
+    it has been through a dict.get and an f-string. A link built from one
+    of those — .../contact/None — reads exactly like a real link and 404s.
+    """
+    if value is None or isinstance(value, bool):
+        return False
+    text = str(value).strip()
+    return bool(text) and text.lower() != "none"
+
+
+def _hubspot_contact_link(contact_id) -> str | None:
+    """The HubSpot UI link for a contact, or None if there is no id."""
+    if not _real_id(contact_id):
+        return None
+    return Config.HUBSPOT_CONTACT_URL.format(contact_id=str(contact_id).strip())
+
+
+def _csuite_profile_link(profile_id) -> str | None:
+    """The CSuite UI link for a profile, or None if there is no id."""
+    if not _real_id(profile_id):
+        return None
+    return Config.CSUITE_PROFILE_URL.format(profile_id=str(profile_id).strip())
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +290,7 @@ def _gather_hubspot_data(name: str, hubspot, contact=None) -> dict:
             "phone": props.get('phone'),
             "company": props.get('company'),
             "last_activity": props.get('hs_last_activity_date') or props.get('lastmodifieddate'),
-            "hubspot_link": f"https://app-na2.hubspot.com/contacts/243832852/contact/{contact_id}",
+            "hubspot_link": _hubspot_contact_link(contact_id),
         })
 
         # Recent notes
@@ -395,7 +433,7 @@ def _gather_csuite_data(name: str, csuite, profile=None) -> dict:
             "profile_id": profile_id,
             "address": profile.get('address'),
             "status": profile.get('status'),
-            "csuite_link": Config.CSUITE_PROFILE_URL.format(profile_id=profile_id),
+            "csuite_link": _csuite_profile_link(profile_id),
         })
 
         # Giving history, from the mirror's donation_agg row.

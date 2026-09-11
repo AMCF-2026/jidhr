@@ -1721,3 +1721,321 @@ def test_donor_prep_context_block_uses_fmt_ts():
     cs = {"found": False}
     block = donor_prep._build_context_block("A", hs, cs)
     assert "Last activity: Sep 10, 2026, 1:04 PM ET" in block
+
+
+# ===========================================================================
+# 3c-polish-2
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 1. Nobody matched: say so and stop
+# ---------------------------------------------------------------------------
+
+def test_no_match_anywhere_stops_before_anything_else(loaded, no_users_table):
+    services = RecordingServices(hubspot_found=False, csuite_found=False)
+
+    out = donor_prep.handle("talking points for Nobody Realname",
+                            Ctx(services))
+
+    assert out == ("ℹ️ No contact named Nobody Realname found in HubSpot or "
+                   "CSuite — nothing to prep.")
+    assert "claude.chat" not in services.calls
+    assert services.data_lookups == []
+    assert services.calls == ["hubspot.search_contacts",
+                              "csuite.search_profiles"]
+
+
+def test_a_match_in_only_one_system_still_preps(loaded, no_users_table):
+    services = RecordingServices(hubspot_found=False,
+                                 csuite_email="aisha@example.invalid")
+
+    out = donor_prep.handle("talking points for Aisha", Ctx(services))
+
+    assert "Call Prep: Aisha" in out
+    assert "claude.chat" in services.calls
+
+    services = RecordingServices(hubspot_email="aisha@example.invalid",
+                                 csuite_found=False)
+    out = donor_prep.handle("talking points for Aisha", Ctx(services))
+    assert "Call Prep: Aisha" in out
+
+
+def test_no_match_message_is_not_the_old_question(loaded, no_users_table):
+    services = RecordingServices(hubspot_found=False, csuite_found=False)
+    out = donor_prep.handle("brief me on Ghost", Ctx(services))
+    assert "couldn't find" not in out
+    assert out.startswith("ℹ️")
+
+
+# ---------------------------------------------------------------------------
+# 2. Links only for real ids
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad", [None, "", "  ", "None", "none", False])
+def test_no_link_is_built_from_a_missing_id(bad):
+    assert donor_prep._hubspot_contact_link(bad) is None
+    assert donor_prep._csuite_profile_link(bad) is None
+
+
+def test_links_are_built_from_real_ids():
+    assert donor_prep._hubspot_contact_link("701") == \
+        Config.HUBSPOT_CONTACT_URL.format(contact_id="701")
+    assert donor_prep._hubspot_contact_link(701) == \
+        Config.HUBSPOT_CONTACT_URL.format(contact_id="701")
+    assert donor_prep._csuite_profile_link(7001) == \
+        Config.CSUITE_PROFILE_URL.format(profile_id="7001")
+    assert "None" not in donor_prep._csuite_profile_link(" 7001 ")
+
+
+def test_hubspot_link_comes_from_config_not_a_hardcoded_portal():
+    link = donor_prep._hubspot_contact_link("701")
+    assert Config.HUBSPOT_PORTAL_ID in link
+    assert link.endswith("/contact/701")
+
+
+def test_brief_omits_the_link_line_when_neither_id_is_real(loaded):
+    hs = {"found": True, "contact_id": None, "email": "a@example.invalid",
+          "last_activity": None, "hubspot_link":
+          donor_prep._hubspot_contact_link(None),
+          "notes": [], "tickets": []}
+    cs = {"found": True, "profile_id": None, "csuite_link":
+          donor_prep._csuite_profile_link(None), "donations": [],
+          "grants": [], "lifetime_giving": 0, "last_donation": None,
+          "giving_note": "No recorded donations in CSuite mirror."}
+
+    brief = donor_prep._format_brief("A", hs, cs, "• point")
+
+    assert "🔗" not in brief
+    assert "/contact/None" not in brief
+    assert "profile_id=None" not in brief
+
+
+def test_gathered_hubspot_data_has_no_link_without_an_id():
+    class HubSpot:
+        def search_contacts(self, name):
+            return {"results": [{"properties": {"email": "a@example.invalid"}}]}
+
+        def __getattr__(self, name):
+            return lambda *a, **k: {"results": []}
+
+    data = donor_prep._gather_hubspot_data("A", HubSpot())
+
+    assert data["found"] is True
+    assert data["hubspot_link"] is None
+
+
+def test_gathered_csuite_data_has_no_link_without_an_id(loaded):
+    class CSuite:
+        def search_profiles(self, name):
+            return {"success": True, "data": {"results": [{"name": "A"}]}}
+
+        def get_grants_by_profile(self, profile_id, limit=100, offset=0):
+            return {"success": True, "data": {"results": []}}
+
+    data = donor_prep._gather_csuite_data("A", CSuite())
+
+    assert data["found"] is True
+    assert data["csuite_link"] is None
+
+
+def test_no_link_builder_in_donor_prep_is_unguarded():
+    """Each link template is formatted in exactly one place — its guarded
+    helper — and the portal URL is not hardcoded anywhere in the module."""
+    import inspect
+
+    source = inspect.getsource(donor_prep)
+    assert source.count("CSUITE_PROFILE_URL.format") == 1
+    assert source.count("HUBSPOT_CONTACT_URL.format") == 1
+    assert "app-na2.hubspot.com" not in source
+
+    helper = inspect.getsource(donor_prep._hubspot_contact_link)
+    assert "_real_id" in helper and "HUBSPOT_CONTACT_URL.format" in helper
+    helper = inspect.getsource(donor_prep._csuite_profile_link)
+    assert "_real_id" in helper and "CSUITE_PROFILE_URL.format" in helper
+
+
+# ---------------------------------------------------------------------------
+# 3. The System fund group is excluded
+# ---------------------------------------------------------------------------
+
+SYSTEM = Config.FUND_GROUP_SYSTEM
+
+SYSTEM_FUNDS = [
+    {"_id": 1000, "_group": SYSTEM, "funit_id": 1000, "fgroup_id": SYSTEM,
+     "fund_name": "Z_Agency Contra-(SYS0001)", "current_fundbalance": "0.00",
+     "fund_open_date": "2015-01-01"},
+    {"_id": 1001, "_group": SYSTEM, "funit_id": 1001, "fgroup_id": SYSTEM,
+     "fund_name": "Z_Cash Balancing-(SYS0002)", "current_fundbalance": "0.00",
+     "fund_open_date": "2015-01-01"},
+    {"_id": 1002, "_group": SYSTEM, "funit_id": 1002, "fgroup_id": SYSTEM,
+     "fund_name": "Z_Revenue Share Holding-(SYS0003)",
+     "current_fundbalance": "0.00", "fund_open_date": "2015-01-01"},
+]
+
+# Real funds renumbered so ids do not collide with the system funds.
+REAL_FUNDS = [dict(f, _id=f["_id"] + 100, funit_id=f["funit_id"] + 100)
+              for f in FUNDS]
+REAL_GRANTS = [dict(g, funit_id=g["funit_id"] + 100) for g in GRANTS]
+REAL_QUARTERS = [
+    dict(q, _id=f"{int(q['funit_id']) + 100}:{q['year']}Q{q['quarter']}",
+         funit_id=str(int(q["funit_id"]) + 100))
+    for q in FUND_QUARTERS
+]
+
+SYSTEM_GRANT = {"_id": 9800, "grant_id": 9800, "funit_id": 1001,
+                "fund_name": "Z_Cash Balancing-(SYS0002)",
+                "grant_amount": "1000000.00", "grant_date": RECENT,
+                "grant_status": "paid", "name": "Internal transfer"}
+
+SYSTEM_QUARTER = {"_id": f"1001:{THIS_YEAR}Q{QUARTER}", "funit_id": "1001",
+                  "fund_name": "Z_Cash Balancing-(SYS0002)",
+                  "year": THIS_YEAR, "quarter": QUARTER,
+                  "total": "1000000.00", "count": 1}
+
+WITH_SYSTEM = {
+    **FULL,
+    "fund": REAL_FUNDS + SYSTEM_FUNDS,
+    "grant": REAL_GRANTS + [SYSTEM_GRANT],
+    "donation_fund_quarter": REAL_QUARTERS + [SYSTEM_QUARTER],
+}
+
+
+@pytest.fixture
+def with_system(mirror):
+    mirror.load(WITH_SYSTEM)
+    return mirror
+
+
+def test_system_group_id_is_read_from_the_mirror(with_system):
+    assert mirror_read.system_fund_group_id() == SYSTEM
+
+
+def test_system_group_id_comes_from_the_rows_not_the_config(mirror, caplog):
+    """If the three system funds sit in group 1099, that is the System
+    group, whatever config.py says — and the disagreement is logged."""
+    import logging
+
+    relabelled = [dict(f, _group=1099, fgroup_id=1099) for f in SYSTEM_FUNDS]
+    mirror.load({"fund": REAL_FUNDS + relabelled})
+
+    with caplog.at_level(logging.WARNING, logger="clients.mirror_read"):
+        assert mirror_read.system_fund_group_id() == 1099
+
+    assert any("Config.FUND_GROUP_SYSTEM" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_system_group_falls_back_to_config_when_the_funds_are_absent(mirror):
+    mirror.load({"fund": REAL_FUNDS})
+    assert mirror_read.system_fund_group_id() == Config.FUND_GROUP_SYSTEM
+
+
+def test_system_group_falls_back_when_the_funds_disagree(mirror, caplog):
+    import logging
+
+    split = [dict(SYSTEM_FUNDS[0], _group=1000, fgroup_id=1000),
+             dict(SYSTEM_FUNDS[1], _group=1050, fgroup_id=1050)]
+    mirror.load({"fund": REAL_FUNDS + split})
+
+    with caplog.at_level(logging.WARNING, logger="clients.mirror_read"):
+        assert mirror_read.system_fund_group_id() == Config.FUND_GROUP_SYSTEM
+    assert any("more than one group" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("name, expected", [
+    ("Z_Agency Contra-(SYS0001)", True),
+    ("z_cash balancing", True),
+    ("Z_Revenue Share Holding", True),
+    ("Alpha Family Fund-(DAF0001)", False),
+    ("Zakat Fund", False),
+    (None, False),
+])
+def test_system_fund_names(name, expected):
+    assert mirror_read.is_system_fund_name(name) is expected
+
+
+def test_rows_drops_the_system_funds_by_default(with_system):
+    ids = {f["csuite_id"] for f in mirror_read.rows("fund")}
+    assert ids == {"1100", "1101", "1102", "1103"}
+
+
+def test_rows_drops_every_fund_in_the_system_group_not_only_the_named_three(
+        mirror):
+    """The named funds identify the GROUP; anything else in it goes too."""
+    extra = {"_id": 1003, "_group": SYSTEM, "funit_id": 1003,
+             "fgroup_id": SYSTEM, "fund_name": "Z_Some New Plumbing"}
+    mirror.load({"fund": REAL_FUNDS + SYSTEM_FUNDS + [extra]})
+
+    ids = {f["csuite_id"] for f in mirror_read.rows("fund")}
+    assert "1003" not in ids
+
+
+def test_rows_drops_grants_and_quarters_of_system_funds(with_system):
+    assert "9800" not in {g["csuite_id"] for g in mirror_read.rows("grant")}
+    quarters = {r["csuite_id"] for r in mirror_read.rows("donation_fund_quarter")}
+    assert not any(k.startswith("1001:") for k in quarters)
+
+
+def test_rows_keeps_system_funds_when_asked(with_system):
+    ids = {f["csuite_id"] for f in mirror_read.rows("fund", exclude_system=False)}
+    assert {"1000", "1001", "1002"} <= ids
+
+
+def test_the_two_exclusions_are_independent(mirror):
+    mirror.load({"fund": REAL_FUNDS + SYSTEM_FUNDS + TEST_FUNDS})
+
+    only_system_dropped = {f["csuite_id"] for f in mirror_read.rows(
+        "fund", exclude_test=False, exclude_system=True)}
+    assert {"1900", "1901", "1902"} <= only_system_dropped
+    assert not {"1000", "1001", "1002"} & only_system_dropped
+
+    only_test_dropped = {f["csuite_id"] for f in mirror_read.rows(
+        "fund", exclude_test=True, exclude_system=False)}
+    assert {"1000", "1001", "1002"} <= only_test_dropped
+    assert not {"1900", "1901", "1902"} & only_test_dropped
+
+
+def test_dormant_report_never_lists_system_funds(with_system, ctx):
+    out = reports.handle("dormant funds", ctx)
+
+    assert "Z_" not in out
+    assert "of 4 funds" in out
+
+
+def test_quarterly_never_counts_system_fund_movements(with_system, ctx):
+    out = reports.handle("quarterly summary", ctx)
+    assert "$1,000,000.00" not in out
+    assert "$14,000.00" in out
+
+
+def test_uncleared_never_lists_system_grants(with_system, ctx):
+    out = reports.handle("uncashed checks", ctx)
+    assert "Internal transfer" not in out
+    assert "only 1 of 3 grants" in out
+
+
+def test_exclusion_log_names_the_reason(with_system, caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="clients.mirror_read"):
+        mirror_read.rows("fund")
+
+    message = next(r.getMessage() for r in caplog.records
+                   if "excluded" in r.getMessage())
+    assert "3 system fund(s): 1000, 1001, 1002" in message
+
+
+def test_exclusion_log_lists_both_reasons_once_per_report(mirror, ctx,
+                                                          caplog):
+    import logging
+
+    mirror.load({**WITH_SYSTEM,
+                 "fund": REAL_FUNDS + SYSTEM_FUNDS + TEST_FUNDS})
+
+    with caplog.at_level(logging.INFO, logger="clients.mirror_read"):
+        reports.handle("dormant funds", ctx)
+
+    lines = [r.getMessage() for r in caplog.records
+             if "excluded" in r.getMessage()]
+    assert len(lines) == 1
+    assert "system fund(s)" in lines[0] and "test fund(s)" in lines[0]

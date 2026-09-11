@@ -122,7 +122,7 @@ def _merge(row) -> dict:
 
 
 def rows(record_type: str, where_sql: str = "", params=(),
-         exclude_test: bool = True) -> list:
+         exclude_test: bool = True, exclude_system: bool = True) -> list:
     """Every mirrored record of one type, as flat dicts.
 
     `where_sql` is appended to the WHERE clause and must be written by the
@@ -134,15 +134,23 @@ def rows(record_type: str, where_sql: str = "", params=(),
     donations, where the alternative is pulling 6,700 or 26,500 jsonb
     documents across the wire to throw most of them away.
 
-    `exclude_test` (the default) drops CSuite's test funds — fund rows
-    whose name matches Config.TEST_FUND_PATTERNS, and grant / quarter rows
-    that belong to one. Pass False only when the test funds are the point,
-    e.g. a diagnostic.
+    Two kinds of fund are dropped by default, along with the grant and
+    quarter rows that belong to them:
+
+    `exclude_test`    CSuite's test funds — names matching
+                      Config.TEST_FUND_PATTERNS.
+    `exclude_system`  the System fund group: Z_Agency Contra, Z_Cash
+                      Balancing, Z_Revenue Share Holding. Accounting
+                      plumbing, not funds anyone advises — a dormant-fund
+                      list that names "Z_Cash Balancing" is noise.
+
+    Pass False only when those funds are the point, e.g. a diagnostic.
     """
     found = _raw_rows(record_type, where_sql, params)
-    if not exclude_test:
+    if not exclude_test and not exclude_system:
         return found
-    return _without_test_funds(record_type, found)
+    return _without_excluded_funds(record_type, found, exclude_test,
+                                   exclude_system)
 
 
 def _raw_rows(record_type: str, where_sql: str = "", params=()) -> list:
@@ -157,7 +165,7 @@ def _raw_rows(record_type: str, where_sql: str = "", params=()) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Test funds
+# Funds that no report should count
 # ---------------------------------------------------------------------------
 
 def is_test_fund_name(name) -> bool:
@@ -169,19 +177,102 @@ def is_test_fund_name(name) -> bool:
                for pattern in Config.TEST_FUND_PATTERNS)
 
 
+# The three funds that make up CSuite's System group. Used to READ the
+# group's id from the mirror rather than trusting a constant: whichever
+# fgroup_id these three carry is the System group, whatever the config
+# says. Matched case-insensitively on the name's leading text so the code
+# suffix ("-(SYS0001)" or similar) does not matter.
+SYSTEM_FUND_NAMES = (
+    "z_agency contra",
+    "z_cash balancing",
+    "z_revenue share holding",
+)
+
+
+def is_system_fund_name(name) -> bool:
+    if not name:
+        return False
+    lowered = str(name).lower().strip()
+    return any(lowered.startswith(known) for known in SYSTEM_FUND_NAMES)
+
+
+def _fund_group_of(fund: dict):
+    for key in ("fund_group_id", "fgroup_id"):
+        value = fund.get(key)
+        if value not in (None, ""):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return value
+    return None
+
+
+def system_fund_group_id(funds=None):
+    """The System group's fgroup_id, read from the mirror.
+
+    Whatever group the three named system funds sit in is the answer. If
+    they are not in the mirror (or disagree with each other), the value
+    falls back to Config.FUND_GROUP_SYSTEM, and the disagreement is logged
+    rather than silently resolved: a config constant that no longer
+    matches the accounting system is exactly the kind of drift a report
+    should not paper over.
+    """
+    if funds is None:
+        funds = _raw_rows("fund")
+
+    observed = {
+        _fund_group_of(fund)
+        for fund in funds
+        if is_system_fund_name(fund.get("fund_name"))
+    }
+    observed.discard(None)
+
+    configured = Config.FUND_GROUP_SYSTEM
+
+    if not observed:
+        return configured
+    if len(observed) > 1:
+        logger.warning(
+            "the system funds sit in more than one group %s — using the "
+            "configured %s", sorted(observed), configured)
+        return configured
+
+    found = observed.pop()
+    if found != configured:
+        logger.warning(
+            "System fund group read from the mirror is %s but "
+            "Config.FUND_GROUP_SYSTEM says %s — using the mirror's %s",
+            found, configured, found)
+    return found
+
+
+def excluded_fund_ids(exclude_test: bool = True,
+                      exclude_system: bool = True) -> dict:
+    """{csuite_id: reason} for every mirrored fund a report should skip."""
+    funds = _raw_rows("fund")
+    excluded = {}
+
+    system_group = system_fund_group_id(funds) if exclude_system else None
+
+    for fund in funds:
+        fund_id = str(fund.get("csuite_id"))
+        if exclude_test and is_test_fund_name(fund.get("fund_name")):
+            excluded[fund_id] = "test"
+        elif exclude_system and _fund_group_of(fund) == system_group:
+            excluded[fund_id] = "system"
+    return excluded
+
+
 def test_fund_ids() -> set:
     """csuite_ids (as text) of every mirrored fund that is a test fund."""
-    return {
-        str(fund.get("csuite_id"))
-        for fund in _raw_rows("fund")
-        if is_test_fund_name(fund.get("fund_name"))
-    }
+    return {fund_id for fund_id, reason
+            in excluded_fund_ids(True, False).items() if reason == "test"}
 
 
 # Excluded ids are logged once per report rather than once per query — a
-# dormant-fund report reads funds AND grants, and the same three test ids
-# do not need announcing twice. reports.handle() opens the scope; outside
-# one, every rows() call logs on its own.
+# dormant-fund report reads funds AND grants, and the same test ids do not
+# need announcing twice. reports.handle() opens the scope; outside one,
+# every rows() call logs on its own.
 _exclusion_scope: contextvars.ContextVar = contextvars.ContextVar(
     "jidhr_mirror_exclusion_scope", default=None)
 
@@ -196,27 +287,37 @@ def exclusion_log_scope():
         _exclusion_scope.reset(token)
 
 
-def _log_exclusions(record_type: str, excluded_ids) -> None:
-    ids = sorted(str(i) for i in excluded_ids)
-    if not ids:
+def _log_exclusions(record_type: str, excluded: dict) -> None:
+    """excluded: {fund_id: reason}."""
+    if not excluded:
         return
     scope = _exclusion_scope.get()
     if scope is not None:
-        fresh = [i for i in ids if i not in scope]
-        if not fresh:
+        excluded = {i: r for i, r in excluded.items() if i not in scope}
+        if not excluded:
             return
-        scope.update(fresh)
-        ids = fresh
-    logger.info("excluded %d test fund(s) from %s rows: %s",
-                len(ids), record_type, ", ".join(ids))
+        scope.update(excluded)
+
+    by_reason = {}
+    for fund_id, reason in excluded.items():
+        by_reason.setdefault(reason, []).append(str(fund_id))
+    described = "; ".join(
+        f"{len(ids)} {reason} fund(s): {', '.join(sorted(ids))}"
+        for reason, ids in sorted(by_reason.items()))
+    logger.info("excluded from %s rows — %s", record_type, described)
 
 
-def _without_test_funds(record_type: str, found: list) -> list:
+def _without_excluded_funds(record_type: str, found: list,
+                            exclude_test: bool, exclude_system: bool) -> list:
     if record_type == "fund":
-        kept, excluded = [], []
+        system_group = system_fund_group_id(found) if exclude_system else None
+        kept, excluded = [], {}
         for fund in found:
-            if is_test_fund_name(fund.get("fund_name")):
-                excluded.append(fund.get("csuite_id"))
+            fund_id = str(fund.get("csuite_id"))
+            if exclude_test and is_test_fund_name(fund.get("fund_name")):
+                excluded[fund_id] = "test"
+            elif exclude_system and _fund_group_of(fund) == system_group:
+                excluded[fund_id] = "system"
             else:
                 kept.append(fund)
         _log_exclusions(record_type, excluded)
@@ -226,16 +327,16 @@ def _without_test_funds(record_type: str, found: list) -> list:
     if link_field is None:
         return found
 
-    test_ids = test_fund_ids()
-    if not test_ids:
+    skip = excluded_fund_ids(exclude_test, exclude_system)
+    if not skip:
         return found
 
-    kept, excluded = [], set()
+    kept, excluded = [], {}
     for row in found:
-        fund_id = str(row.get(link_field)) if row.get(link_field) not in (
-            None, "") else None
-        if fund_id in test_ids:
-            excluded.add(fund_id)
+        value = row.get(link_field)
+        fund_id = str(value) if value not in (None, "") else None
+        if fund_id in skip:
+            excluded[fund_id] = skip[fund_id]
         else:
             kept.append(row)
     _log_exclusions(record_type, excluded)
