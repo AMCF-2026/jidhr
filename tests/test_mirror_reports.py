@@ -1138,7 +1138,8 @@ def _explode_open_tickets(*args, **kwargs):
 def test_donor_prep_never_fetches_portal_wide_tickets():
     hub = TicketHubSpot()
     hub.client.search_contacts = lambda name: {
-        "results": [{"id": "701", "properties": {}}]}
+        "results": [{"id": "701", "properties": {"firstname": "Aisha",
+                                                 "lastname": "Testcase"}}]}
     hub.client.get_contact_notes = lambda cid, limit=5: {"results": []}
     hub.client.get_contact_emails = lambda cid, limit=5: {"results": []}
     hub.client.get_contact_engagements = lambda cid, limit=5: {"results": []}
@@ -1504,7 +1505,8 @@ class RecordingServices:
     prove the guard stopped before any of them ran."""
 
     def __init__(self, hubspot_email=None, csuite_email=None,
-                 hubspot_found=True, csuite_found=True):
+                 hubspot_found=True, csuite_found=True,
+                 first="Aisha", last="Testcase"):
         self.calls = []
         outer = self
 
@@ -1514,6 +1516,7 @@ class RecordingServices:
                 if not hubspot_found:
                     return {"results": []}
                 return {"results": [{"id": "701", "properties": {
+                    "firstname": first, "lastname": last,
                     "email": hubspot_email, "phone": None, "company": None,
                     "hs_last_activity_date": "2026-09-10T17:04:00.000Z"}}]}
 
@@ -1529,7 +1532,8 @@ class RecordingServices:
                 if not csuite_found:
                     return {"success": True, "data": {"results": []}}
                 return {"success": True, "data": {"results": [
-                    {"profile_id": 7001, "primary_email": csuite_email}]}}
+                    {"profile_id": 7001, "name": f"{last}, {first}",
+                     "primary_email": csuite_email}]}}
 
             def __getattr__(self, name):
                 def recorder(*args, **kwargs):
@@ -1554,8 +1558,10 @@ class RecordingServices:
 
 
 class Ctx:
-    def __init__(self, services):
+    def __init__(self, services, workflow_state=None):
         self.services = services
+        self.workflow_state = workflow_state if workflow_state is not None \
+            else {}
 
 
 @pytest.fixture
@@ -1567,7 +1573,8 @@ def no_users_table(monkeypatch):
 def test_staff_by_domain_gets_the_refusal_and_nothing_else_runs(
         loaded, no_users_table):
     services = RecordingServices(hubspot_email="ola@amuslimcf.org",
-                                 csuite_email="ola@amuslimcf.org")
+                                 csuite_email="ola@amuslimcf.org",
+                                 first="Ola", last="Mohamed")
 
     out = donor_prep.handle("talking points for Ola Mohamed", Ctx(services))
 
@@ -1579,7 +1586,7 @@ def test_staff_by_domain_gets_the_refusal_and_nothing_else_runs(
 
 def test_staff_by_users_row_gets_the_refusal(loaded, monkeypatch):
     services = RecordingServices(hubspot_email="carl.personal@gmail.invalid",
-                                 csuite_email=None)
+                                 csuite_email=None, first="Carl", last="Carl")
     monkeypatch.setattr(
         donor_prep, "get_user_by_email",
         lambda email: {"id": 3, "email": email}
@@ -1594,7 +1601,8 @@ def test_staff_by_users_row_gets_the_refusal(loaded, monkeypatch):
 def test_staff_guard_reads_the_csuite_email_too(loaded, no_users_table):
     """A HubSpot record with no email must not wave a colleague through."""
     services = RecordingServices(hubspot_email=None,
-                                 csuite_email="lisa@amuslimcf.org")
+                                 csuite_email="lisa@amuslimcf.org",
+                                 first="Lisa", last="Lisa")
 
     out = donor_prep.handle("brief me on Lisa", Ctx(services))
 
@@ -1812,27 +1820,33 @@ def test_brief_omits_the_link_line_when_neither_id_is_real(loaded):
 
 def test_gathered_hubspot_data_has_no_link_without_an_id():
     class HubSpot:
-        def search_contacts(self, name):
-            return {"results": [{"properties": {"email": "a@example.invalid"}}]}
-
         def __getattr__(self, name):
             return lambda *a, **k: {"results": []}
 
-    data = donor_prep._gather_hubspot_data("A", HubSpot())
+    contact = {"properties": {"email": "a@example.invalid"}}
+    data = donor_prep._gather_hubspot_data("A", HubSpot(), contact=contact)
 
     assert data["found"] is True
     assert data["hubspot_link"] is None
 
 
+def test_a_hubspot_row_without_an_id_is_not_a_match():
+    class HubSpot:
+        def search_contacts(self, name):
+            return {"results": [{"properties": {"firstname": "A",
+                                                "lastname": "Jones",
+                                                "email": "a@example.invalid"}}]}
+
+    assert donor_prep._usable_hubspot_matches("Jones", HubSpot()) == []
+
+
 def test_gathered_csuite_data_has_no_link_without_an_id(loaded):
     class CSuite:
-        def search_profiles(self, name):
-            return {"success": True, "data": {"results": [{"name": "A"}]}}
-
         def get_grants_by_profile(self, profile_id, limit=100, offset=0):
             return {"success": True, "data": {"results": []}}
 
-    data = donor_prep._gather_csuite_data("A", CSuite())
+    data = donor_prep._gather_csuite_data("A", CSuite(),
+                                          profile={"name": "A"})
 
     assert data["found"] is True
     assert data["csuite_link"] is None
@@ -2039,3 +2053,322 @@ def test_exclusion_log_lists_both_reasons_once_per_report(mirror, ctx,
              if "excluded" in r.getMessage()]
     assert len(lines) == 1
     assert "system fund(s)" in lines[0] and "test fund(s)" in lines[0]
+
+
+# ===========================================================================
+# 3c-polish-4: a useless match is a miss
+# ===========================================================================
+
+class MatchServices:
+    """HubSpot and CSuite search results set per test, everything else
+    recorded and empty."""
+
+    def __init__(self, hubspot_rows=None, csuite_rows=None):
+        self.calls = []
+        outer = self
+
+        class HubSpot:
+            def search_contacts(self, name):
+                outer.calls.append("hubspot.search_contacts")
+                return {"results": list(hubspot_rows or [])}
+
+            def __getattr__(self, name):
+                def recorder(*args, **kwargs):
+                    outer.calls.append(f"hubspot.{name}")
+                    return {"results": []}
+                return recorder
+
+        class CSuite:
+            def search_profiles(self, name):
+                outer.calls.append("csuite.search_profiles")
+                return {"success": True,
+                        "data": {"results": list(csuite_rows or [])}}
+
+            def __getattr__(self, name):
+                def recorder(*args, **kwargs):
+                    outer.calls.append(f"csuite.{name}")
+                    return {"success": True, "data": {"results": []}}
+                return recorder
+
+        class Claude:
+            def chat(self, **kwargs):
+                outer.calls.append("claude.chat")
+                return "• a talking point"
+
+        self.hubspot = HubSpot()
+        self.csuite = CSuite()
+        self.claude = Claude()
+
+
+def hs_row(contact_id, first, last, email=None):
+    return {"id": contact_id, "properties": {
+        "firstname": first, "lastname": last, "email": email}}
+
+
+def cs_row(profile_id, name, email=None):
+    return {"profile_id": profile_id, "name": name, "primary_email": email}
+
+
+REFUSAL = ("ℹ️ No contact named Jones, Taisha Mumtazi found in HubSpot or "
+           "CSuite — nothing to prep.")
+
+
+# --- the live bug ----------------------------------------------------------
+
+def test_csuite_row_with_no_id_is_a_miss(loaded, no_users_table):
+    """2026-09-11: CSuite's search returned a fund row — no profile_id, no
+    email — and a brief was written with nothing in it."""
+    services = MatchServices(
+        hubspot_rows=[],
+        csuite_rows=[{"profile_id": None, "name": "Jones, Taisha Mumtazi"}])
+
+    out = donor_prep.handle("talking points for Jones, Taisha Mumtazi",
+                            Ctx(services))
+
+    assert out == REFUSAL
+    assert "claude.chat" not in services.calls
+
+
+def test_csuite_row_that_is_a_fund_not_a_person_is_a_miss(loaded,
+                                                         no_users_table):
+    """search_profiles returns funds too; a fund row has no profile_id."""
+    services = MatchServices(csuite_rows=[
+        {"id": 1234, "fund_name": "Jones Family Fund-(DAF0099)"}])
+
+    out = donor_prep.handle("talking points for Jones, Taisha Mumtazi",
+                            Ctx(services))
+
+    assert out == REFUSAL
+
+
+def test_a_row_for_a_different_person_is_a_miss(loaded, no_users_table):
+    services = MatchServices(csuite_rows=[cs_row(5, "Smith, John")])
+
+    out = donor_prep.handle("talking points for Jones", Ctx(services))
+
+    assert out == ("ℹ️ No contact named Jones found in HubSpot or CSuite — "
+                   "nothing to prep.")
+    assert "claude.chat" not in services.calls
+
+
+def test_a_hubspot_row_for_a_different_person_is_a_miss(loaded,
+                                                        no_users_table):
+    services = MatchServices(hubspot_rows=[hs_row("9", "John", "Smith")])
+    out = donor_prep.handle("talking points for Jones", Ctx(services))
+    assert "nothing to prep" in out
+
+
+# --- one real match --------------------------------------------------------
+
+def test_one_real_csuite_match_preps_and_says_hubspot_is_missing(
+        loaded, no_users_table):
+    services = MatchServices(
+        hubspot_rows=[],
+        csuite_rows=[cs_row(7001, "Jones, Taisha Mumtazi",
+                            "taisha@example.invalid")])
+
+    out = donor_prep.handle("talking points for Jones, Taisha Mumtazi",
+                            Ctx(services))
+
+    assert "Call Prep: Jones, Taisha Mumtazi" in out
+    assert "• Not found in HubSpot" in out
+    assert "• Not found in CSuite" not in out
+    assert "claude.chat" in services.calls
+
+
+def test_one_real_hubspot_match_says_csuite_is_missing(loaded,
+                                                       no_users_table):
+    services = MatchServices(
+        hubspot_rows=[hs_row("701", "Taisha", "Jones",
+                             "taisha@example.invalid")],
+        csuite_rows=[])
+
+    out = donor_prep.handle("talking points for Taisha Jones", Ctx(services))
+
+    assert "• Not found in CSuite" in out
+    assert "• Not found in HubSpot" not in out
+
+
+def test_a_match_in_both_systems_has_no_missing_line(loaded, no_users_table):
+    services = MatchServices(
+        hubspot_rows=[hs_row("701", "Taisha", "Jones")],
+        csuite_rows=[cs_row(7001, "Jones, Taisha")])
+
+    out = donor_prep.handle("talking points for Taisha Jones", Ctx(services))
+
+    assert "Not found in" not in out
+
+
+def test_a_useless_row_beside_a_real_one_is_ignored(loaded, no_users_table):
+    """One fund row and one real profile: the profile wins, quietly."""
+    services = MatchServices(csuite_rows=[
+        {"id": 1234, "fund_name": "Jones Family Fund"},
+        cs_row(7001, "Jones, Taisha"),
+    ])
+
+    out = donor_prep.handle("talking points for Taisha Jones", Ctx(services))
+
+    assert "Call Prep" in out
+    assert "records match" not in out, "one usable match is not ambiguous"
+
+
+# --- two real matches ------------------------------------------------------
+
+def test_two_real_matches_produce_a_pick_list_and_no_claude_call(
+        loaded, no_users_table):
+    services = MatchServices(
+        hubspot_rows=[hs_row("701", "Taisha", "Jones", "t1@example.invalid"),
+                      hs_row("702", "Tariq", "Jones", "t2@example.invalid")],
+        csuite_rows=[])
+    state = {}
+
+    out = donor_prep.handle("talking points for Jones", Ctx(services, state))
+
+    assert out.startswith("❓ **2 HubSpot records match 'Jones'**")
+    assert "1. [HubSpot] Taisha Jones — t1@example.invalid" in out
+    assert "2. [HubSpot] Tariq Jones — t2@example.invalid" in out
+    assert "haven't prepared anything" in out
+    assert "claude.chat" not in services.calls
+    assert state[donor_prep.PENDING_PICK_KEY]["system"] == "hubspot"
+
+
+def test_picking_a_number_completes_the_prep(loaded, no_users_table):
+    services = MatchServices(
+        hubspot_rows=[hs_row("701", "Taisha", "Jones", "t1@example.invalid"),
+                      hs_row("702", "Tariq", "Jones", "t2@example.invalid")],
+        csuite_rows=[cs_row(7001, "Jones, Tariq")])
+    state = {}
+    ctx = Ctx(services, state)
+
+    donor_prep.handle("talking points for Jones", ctx)
+    assert donor_prep.can_handle("2", workflow_state=state)
+
+    out = donor_prep.handle("2", ctx)
+
+    assert "Call Prep: Jones" in out
+    assert "t2@example.invalid" in out, "the second candidate was chosen"
+    assert "claude.chat" in services.calls
+    assert donor_prep.PENDING_PICK_KEY not in state
+    assert services.calls.count("hubspot.search_contacts") == 1, \
+        "the pick must not search again"
+
+
+def test_two_ambiguous_systems_ask_twice(loaded, no_users_table):
+    services = MatchServices(
+        hubspot_rows=[hs_row("701", "Taisha", "Jones"),
+                      hs_row("702", "Tariq", "Jones")],
+        csuite_rows=[cs_row(7001, "Jones, Taisha"),
+                     cs_row(7002, "Jones, Tariq")])
+    state = {}
+    ctx = Ctx(services, state)
+
+    first = donor_prep.handle("talking points for Jones", ctx)
+    assert "2 HubSpot records match" in first
+
+    second = donor_prep.handle("1", ctx)
+    assert "2 CSuite records match" in second
+    assert "[CSuite] Jones, Taisha — profile 7001" in second
+    assert "claude.chat" not in services.calls
+
+    out = donor_prep.handle("2", ctx)
+    assert "Call Prep" in out
+    assert "claude.chat" in services.calls
+
+
+def test_a_non_digit_reply_clears_the_pending_list(loaded, no_users_table):
+    services = MatchServices(
+        hubspot_rows=[hs_row("701", "Taisha", "Jones"),
+                      hs_row("702", "Tariq", "Jones")])
+    state = {}
+    donor_prep.handle("talking points for Jones", Ctx(services, state))
+
+    assert not donor_prep.can_handle("something else", workflow_state=state)
+    assert donor_prep.take_pending_pick("something else", state) is None
+    assert donor_prep.PENDING_PICK_KEY not in state
+
+
+def test_an_out_of_range_pick_is_refused(loaded, no_users_table):
+    services = MatchServices(
+        hubspot_rows=[hs_row("701", "Taisha", "Jones"),
+                      hs_row("702", "Tariq", "Jones")])
+    state = {}
+    ctx = Ctx(services, state)
+    donor_prep.handle("talking points for Jones", ctx)
+
+    out = donor_prep.handle("7", ctx)
+
+    assert "no option 7" in out
+    assert "claude.chat" not in services.calls
+
+
+def test_too_many_matches_asks_for_a_fuller_name(loaded, no_users_table):
+    services = MatchServices(hubspot_rows=[
+        hs_row(str(700 + i), f"Person{i}", "Jones") for i in range(12)])
+
+    out = donor_prep.handle("talking points for Jones", Ctx(services))
+
+    assert "12 HubSpot records match" in out
+    assert "too many to list" in out
+    assert "claude.chat" not in services.calls
+
+
+def test_can_handle_does_not_claim_digits_without_a_pending_pick():
+    assert not donor_prep.can_handle("2", workflow_state={})
+    assert not donor_prep.can_handle("2", workflow_state=None)
+    assert not donor_prep.can_handle(
+        "2", workflow_state={"pending_contact_pick": {}}), \
+        "notes.py's pending list is not ours"
+
+
+# --- name matching ---------------------------------------------------------
+
+@pytest.mark.parametrize("query, candidate, expected", [
+    ("Jones, Taisha Mumtazi", "Jones, Taisha Mumtazi", True),
+    ("Jones, Taisha Mumtazi", "Taisha Jones", True),
+    ("Taisha Jones", "Jones, Taisha", True),
+    ("jones", "JONES, T", True),
+    ("Jones", "Smith, John", False),
+    ("Jones", "Jonesboro Community Trust", False),
+    ("van der Berg, Anna", "Anna van der Berg", True),
+    ("van der Berg, Anna", "Anna Berg", False),
+    ("Aisha", "Testcase, Aisha", True),
+    ("Aisha", "Aisha Testcase", True),
+    ("Aisha", "Aishah Khan", False),
+    ("O'Brien, Sean", "Sean O'Brien", True),
+    ("Jones", "", False),
+    ("Jones", None, False),
+    ("", "Jones", False),
+])
+def test_name_matches(query, candidate, expected):
+    assert donor_prep.name_matches(query, candidate) is expected
+
+
+@pytest.mark.parametrize("name, expected", [
+    ("Jones, Taisha Mumtazi", "jones"),
+    ("Taisha Jones", "jones"),
+    ("van der Berg, Anna", "van der berg"),
+    ("Aisha", "aisha"),
+    ("", ""),
+])
+def test_query_last_name(name, expected):
+    assert donor_prep.query_last_name(name) == expected
+
+
+# --- logging ---------------------------------------------------------------
+
+def test_raw_and_usable_counts_are_logged(loaded, no_users_table, caplog):
+    import logging
+
+    services = MatchServices(
+        hubspot_rows=[hs_row("701", "Taisha", "Jones"),
+                      hs_row(None, "Ghost", "Jones"),
+                      hs_row("703", "John", "Smith")],
+        csuite_rows=[cs_row(7001, "Jones, Taisha"),
+                     {"id": 1, "fund_name": "Jones Family Fund"}])
+
+    with caplog.at_level(logging.INFO, logger="intents.donor_prep"):
+        donor_prep.handle("talking points for Jones", Ctx(services))
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("HubSpot 3 raw -> 1 usable" in m for m in messages), messages
+    assert any("CSuite 2 raw -> 1 usable" in m for m in messages), messages

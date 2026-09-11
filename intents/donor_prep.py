@@ -41,8 +41,16 @@ TRIGGER_PHRASES = [
 # Nothing is donor-facing yet; every handler is staff-and-above.
 ALLOWED_ROLES = frozenset({"admin", "staff"})
 
-def can_handle(query: str, **kwargs) -> bool:
+def can_handle(query: str, workflow_state: dict = None, **kwargs) -> bool:
     q = query.lower().strip()
+
+    # A bare "2" answering a numbered candidate list. Narrow on purpose:
+    # while a pick is pending this claims digits only, and only its own
+    # pending key — notes.py has a separate one.
+    if workflow_state and workflow_state.get(PENDING_PICK_KEY):
+        if _PICK_RE.match(query or ""):
+            return True
+
     return any(p in q for p in TRIGGER_PHRASES)
 
 
@@ -52,11 +60,23 @@ def handle(query: str, ctx) -> str:
 
     Flow:
       1. Extract donor name from query
-      2. Search HubSpot + CSuite for the person
-      3. Gather engagement history, donations, grants, tickets
-      4. Send everything to Claude to generate talking points
-      5. Return formatted brief with deep links
+      2. Search HubSpot + CSuite, and keep only USABLE matches — rows with
+         a real id whose name actually contains the name asked for
+      3. Nobody usable in either system: say so and stop
+      4. More than one usable match in a system: numbered list, stop
+      5. Staff guard; then gather, Claude, brief
     """
+    state = ctx.workflow_state
+
+    # A pending numbered list takes priority: "2" means that candidate.
+    if state and state.get(PENDING_PICK_KEY):
+        picked = take_pending_pick(query, state)
+        if picked is not None:
+            name, contact, profile, message = picked
+            if message:
+                return message
+            return _prep(name, contact, profile, ctx)
+
     name = _extract_donor_name(query)
     if not name:
         return (
@@ -66,28 +86,39 @@ def handle(query: str, ctx) -> str:
 
     logger.info(f"Preparing call prep for: {name}")
 
-    hubspot = ctx.services.hubspot
-    csuite = ctx.services.csuite
+    hs_matches = _usable_hubspot_matches(name, ctx.services.hubspot)
+    cs_matches = _usable_csuite_matches(name, ctx.services.csuite)
 
-    # ----- Resolve the person, and stop if they work here -----
-    #
-    # The guard runs BEFORE any data is gathered. A staff member's name
-    # matches a HubSpot contact like anyone else's (everyone at AMCF is in
-    # the CRM), so without this the brief would pull a colleague's notes,
-    # emails, tickets and giving history and hand them to Claude to write
-    # talking points about.
-    contact = _resolve_hubspot_contact(name, hubspot)
-    profile = _resolve_csuite_profile(name, csuite)
-
-    if not contact and not profile:
-        # Nothing to prep FROM. The old flow carried on to gather (which
-        # found nothing), and an earlier version still asked Claude for
-        # talking points about a person neither system knows — which it
-        # would happily write.
-        logger.info("Call prep: no contact named %r in either system", name)
+    if not hs_matches and not cs_matches:
+        # Nothing to prep FROM. On 2026-09-11 this path produced talking
+        # points for "Jones, Taisha Mumtazi": HubSpot found nothing, and
+        # CSuite's search — which returns funds as well as profiles —
+        # handed back a row with no profile_id and no email. It counted as
+        # "found", and Claude wrote a brief with no facts in it.
+        logger.info("Call prep: no usable match for %r in either system",
+                    name)
         return (f"ℹ️ No contact named {name} found in HubSpot or CSuite — "
                 "nothing to prep.")
 
+    contact, profile, message = _choose(name, hs_matches, cs_matches, state)
+    if message:
+        return message
+
+    return _prep(name, contact, profile, ctx)
+
+
+def _prep(name: str, contact, profile, ctx) -> str:
+    """Everything after the person is settled: guard, gather, write."""
+    hubspot = ctx.services.hubspot
+    csuite = ctx.services.csuite
+
+    # ----- Stop if they work here -----
+    #
+    # BEFORE any data is gathered. A staff member's name matches a HubSpot
+    # contact like anyone else's (everyone at AMCF is in the CRM), so
+    # without this the brief would pull a colleague's notes, emails,
+    # tickets and giving history and hand them to Claude to write talking
+    # points about.
     staff_email = _staff_email_of(contact, profile)
     if staff_email:
         logger.info(
@@ -103,6 +134,13 @@ def handle(query: str, ctx) -> str:
     if not hs_data["found"] and not cs_data["found"]:
         return (f"ℹ️ No contact named {name} found in HubSpot or CSuite — "
                 "nothing to prep.")
+
+    # A match in only one system is a fact the brief should state, not
+    # something the reader infers from a missing section.
+    hs_data["missing_note"] = None if hs_data["found"] else \
+        "Not found in HubSpot"
+    cs_data["missing_note"] = None if cs_data["found"] else \
+        "Not found in CSuite"
 
     # ----- Build context for Claude -----
     context = _build_context_block(name, hs_data, cs_data)
@@ -170,27 +208,247 @@ def _csuite_profile_link(profile_id) -> str | None:
 # ---------------------------------------------------------------------------
 
 def _resolve_hubspot_contact(name: str, hubspot) -> dict | None:
-    """The first HubSpot contact matching the name, or None."""
-    try:
-        search = hubspot.search_contacts(name)
-        results = search.get('results', []) if isinstance(search, dict) else []
-        return results[0] if results else None
-    except Exception as e:
-        logger.error(f"Error searching HubSpot for '{name}': {e}")
-        return None
+    """The single usable HubSpot match, or None. Older callers only."""
+    matches = _usable_hubspot_matches(name, hubspot)
+    return matches[0] if len(matches) == 1 else None
 
 
 def _resolve_csuite_profile(name: str, csuite) -> dict | None:
-    """The first CSuite profile matching the name, or None."""
+    """The single usable CSuite match, or None. Older callers only."""
+    matches = _usable_csuite_matches(name, csuite)
+    return matches[0] if len(matches) == 1 else None
+
+
+# ---------------------------------------------------------------------------
+# What counts as a match
+# ---------------------------------------------------------------------------
+
+_NAME_PUNCTUATION = re.compile(r"[^\w\s]", re.UNICODE)
+
+
+def _name_tokens(text) -> list:
+    """Lowercased word tokens of a name, punctuation stripped."""
+    if not text:
+        return []
+    cleaned = _NAME_PUNCTUATION.sub(" ", str(text)).lower()
+    return cleaned.split()
+
+
+def query_last_name(name: str) -> str:
+    """The surname the user typed, as tokens joined by spaces.
+
+    "Jones, Taisha Mumtazi" -> "jones"  (before the comma)
+    "Taisha Jones"          -> "jones"  (final word)
+    "van der Berg, Anna"    -> "van der berg"
+    "Aisha"                 -> "aisha"  (one word: it is what we have)
+    """
+    if not name:
+        return ""
+    if "," in name:
+        head = name.split(",", 1)[0]
+        return " ".join(_name_tokens(head))
+    tokens = _name_tokens(name)
+    return tokens[-1] if tokens else ""
+
+
+def name_matches(query_name: str, candidate_name) -> bool:
+    """True if the candidate's name contains the query's surname.
+
+    Whole-word and case-insensitive, in either order — "Jones, Taisha"
+    and "Taisha Jones" both match a query for Jones; "Jonesboro Trust"
+    does not. A multi-word surname must appear as a phrase.
+    """
+    wanted = query_last_name(query_name)
+    if not wanted:
+        return False
+    have = _name_tokens(candidate_name)
+    if not have:
+        return False
+    needle = wanted.split()
+    width = len(needle)
+    return any(have[i:i + width] == needle
+               for i in range(len(have) - width + 1))
+
+
+def _hubspot_display_name(contact: dict) -> str:
+    props = contact.get("properties") or {}
+    parts = [props.get("firstname"), props.get("lastname")]
+    name = " ".join(p for p in parts if p).strip()
+    return name or props.get("email") or ""
+
+
+def _csuite_display_name(profile: dict) -> str:
+    name = profile.get("name")
+    if name:
+        return str(name)
+    parts = [profile.get("first_name"), profile.get("last_name")]
+    return " ".join(p for p in parts if p).strip()
+
+
+def _usable_hubspot_matches(name: str, hubspot) -> list:
+    """HubSpot contacts that have an id AND are actually this person."""
+    try:
+        search = hubspot.search_contacts(name)
+        raw = search.get("results", []) if isinstance(search, dict) else []
+    except Exception as e:
+        logger.error(f"Error searching HubSpot for '{name}': {e}")
+        return []
+
+    usable = [
+        c for c in raw
+        if isinstance(c, dict)
+        and _real_id(c.get("id"))
+        and name_matches(name, _hubspot_display_name(c))
+    ]
+    logger.info("call prep search %r: HubSpot %d raw -> %d usable",
+                name, len(raw), len(usable))
+    return usable
+
+
+def _usable_csuite_matches(name: str, csuite) -> list:
+    """CSuite profiles that have a profile_id AND are actually this person.
+
+    profile/list/search returns FUNDS as well as profiles (clients/csuite.py
+    says so, and 2026-09-11 proved it): a fund row has no profile_id and
+    no email, and used to count as "found".
+    """
     try:
         search = csuite.search_profiles(name)
-        if not search.get('success') or not search.get('data'):
-            return None
-        results = search['data'].get('results', [])
-        return results[0] if results else None
+        if not isinstance(search, dict) or not search.get("success"):
+            raw = []
+        else:
+            raw = (search.get("data") or {}).get("results", []) or []
     except Exception as e:
         logger.error(f"Error searching CSuite for '{name}': {e}")
+        return []
+
+    usable = [
+        p for p in raw
+        if isinstance(p, dict)
+        and _real_id(p.get("profile_id"))
+        and name_matches(name, _csuite_display_name(p))
+    ]
+    logger.info("call prep search %r: CSuite %d raw -> %d usable",
+                name, len(raw), len(usable))
+    return usable
+
+
+# ---------------------------------------------------------------------------
+# Choosing between several usable matches
+# ---------------------------------------------------------------------------
+
+PENDING_PICK_KEY = "pending_donor_pick"
+
+# Picks are single digits, matching the contact / fund / event picks.
+MAX_CHOICES = 9
+
+_PICK_RE = re.compile(r"^\s*([1-9])\s*$")
+
+
+def _candidate_label(system: str, record: dict) -> str:
+    if system == "hubspot":
+        props = record.get("properties") or {}
+        who = _hubspot_display_name(record) or "Unnamed contact"
+        detail = props.get("email") or "no email"
+        return f"[HubSpot] {who} — {detail}"
+    who = _csuite_display_name(record) or "Unnamed profile"
+    detail = record.get("primary_email") or f"profile {record.get('profile_id')}"
+    return f"[CSuite] {who} — {detail}"
+
+
+def _choose(name: str, hs_matches: list, cs_matches: list, state,
+            pinned: dict = None) -> tuple:
+    """(contact, profile, message). A message means: stop and show it.
+
+    A system with exactly one usable match is settled. A system with more
+    than one is put to the user as a numbered list, and nothing is
+    gathered or written until they answer. If both systems are ambiguous
+    the user picks for one, then is asked about the other.
+    """
+    pinned = dict(pinned or {})
+
+    ambiguous = []
+    if "hubspot" not in pinned and len(hs_matches) > 1:
+        ambiguous.append(("hubspot", hs_matches))
+    if "csuite" not in pinned and len(cs_matches) > 1:
+        ambiguous.append(("csuite", cs_matches))
+
+    if ambiguous:
+        system, candidates = ambiguous[0]
+        if len(candidates) > MAX_CHOICES:
+            return None, None, (
+                f"❓ **{len(candidates)} {_system_label(system)} records "
+                f"match '{name}'** — too many to list, and I haven't "
+                "prepared anything. Give me a fuller name.")
+        return None, None, _format_pick_list(
+            name, system, candidates, state,
+            hs_matches, cs_matches, pinned)
+
+    contact = pinned.get("hubspot") or (hs_matches[0] if hs_matches else None)
+    profile = pinned.get("csuite") or (cs_matches[0] if cs_matches else None)
+    return contact, profile, None
+
+
+def _system_label(system: str) -> str:
+    return "HubSpot" if system == "hubspot" else "CSuite"
+
+
+def _format_pick_list(name, system, candidates, state,
+                      hs_matches, cs_matches, pinned) -> str:
+    lines = [
+        f"❓ **{len(candidates)} {_system_label(system)} records match "
+        f"'{name}'** — I haven't prepared anything yet. Which one?",
+        "",
+    ]
+    for index, record in enumerate(candidates, 1):
+        lines.append(f"{index}. {_candidate_label(system, record)}")
+    lines.append("")
+    lines.append("Reply with the number, or give me a fuller name.")
+
+    if state is not None:
+        state[PENDING_PICK_KEY] = {
+            "name": name,
+            "system": system,
+            "candidates": candidates,
+            "hubspot": hs_matches,
+            "csuite": cs_matches,
+            "pinned": pinned,
+        }
+    return "\n".join(lines)
+
+
+def take_pending_pick(query: str, state):
+    """Resolve a bare 1-9 against the stored candidate list.
+
+    Returns (name, contact, profile, message) on a pick — `message` set
+    means a second list (the other system was ambiguous too) or an error.
+    Returns None if the reply was not a pick. The pending list is cleared
+    either way, so a non-digit reply falls through to normal routing.
+    """
+    pending = (state or {}).get(PENDING_PICK_KEY)
+    if not pending:
         return None
+
+    match = _PICK_RE.match(query or "")
+    state.pop(PENDING_PICK_KEY, None)
+    if not match:
+        return None
+
+    index = int(match.group(1)) - 1
+    candidates = pending.get("candidates") or []
+    if not 0 <= index < len(candidates):
+        return (pending.get("name"), None, None,
+                f"❓ There is no option {index + 1}. Ask again with a "
+                "fuller name.")
+
+    pinned = dict(pending.get("pinned") or {})
+    pinned[pending["system"]] = candidates[index]
+
+    name = pending.get("name")
+    contact, profile, message = _choose(
+        name, pending.get("hubspot") or [], pending.get("csuite") or [],
+        state, pinned)
+    return name, contact, profile, message
 
 
 def is_staff_email(email) -> bool:
@@ -656,6 +914,9 @@ def _format_brief(name: str, hs: dict, cs: dict, talking_points: str) -> str:
 
     # Quick facts
     lines.append("**Quick Facts:**")
+    for note in (hs.get("missing_note"), cs.get("missing_note")):
+        if note:
+            lines.append(f"• {note}")
     if cs["found"]:
         if cs.get("giving_note"):
             lines.append(f"• Giving history: {cs['giving_note']}")
