@@ -66,7 +66,11 @@ class Config:
     
     # HubSpot URL templates (for linking from Jidhr responses)
     HUBSPOT_CONTACT_URL = f"https://app-na2.hubspot.com/contacts/{HUBSPOT_PORTAL_ID}/contact/{{contact_id}}"
-    HUBSPOT_TICKET_URL = f"https://app-na2.hubspot.com/contacts/{HUBSPOT_PORTAL_ID}/ticket/{{ticket_id}}"
+    # Tickets are object type 0-5 in HubSpot's record URLs. The older
+    # /ticket/{id} path redirects here; this is the one the UI itself uses.
+    # The placeholder stays {ticket_id} so existing .format(ticket_id=...)
+    # callers (intents/daf_workflow.py, clients/hubspot.py) keep working.
+    HUBSPOT_TICKET_URL = f"https://app-na2.hubspot.com/contacts/{HUBSPOT_PORTAL_ID}/record/0-5/{{ticket_id}}"
     HUBSPOT_TASK_URL = f"https://app-na2.hubspot.com/tasks/{HUBSPOT_PORTAL_ID}/view/all"
     HUBSPOT_FORM_SUBMISSIONS_URL = f"https://app-na2.hubspot.com/forms/{HUBSPOT_PORTAL_ID}/submissions/{{form_id}}"
     

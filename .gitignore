@@ -5,3 +5,5 @@ venv/
 .env
 .DS_Store
 .pytest_cache/
+tickets_open_*.csv
+tickets_summary_*.csv

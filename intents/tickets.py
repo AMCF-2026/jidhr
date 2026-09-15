@@ -48,6 +48,13 @@ TRIGGER_PHRASES = [
     "tickets for ",
 ]
 
+# The personal view: the signed-in person's own tickets, resolved from
+# their login email — never from anything they type.
+PERSONAL_PHRASES = [
+    "my tickets", "my open tickets", "how many tickets do i have",
+    "tickets assigned to me", "what am i waiting on",
+]
+
 # "tickets older than 30 days" / "tickets older than 2 weeks"
 _OLDER_THAN_RE = re.compile(
     r"tickets\s+older\s+than\s+(\d+)\s*(day|days|week|weeks|month|months)?",
@@ -70,24 +77,46 @@ OLDEST_SHOWN = 10
 ALLOWED_ROLES = frozenset({"admin", "staff"})
 
 
+def is_personal(query: str) -> bool:
+    q = (query or "").lower().strip()
+    return any(phrase in q for phrase in PERSONAL_PHRASES)
+
+
 def can_handle(query: str, **kwargs) -> bool:
     q = query.lower().strip()
-    return any(phrase in q for phrase in TRIGGER_PHRASES)
+    return is_personal(q) or any(phrase in q for phrase in TRIGGER_PHRASES)
 
 
 def handle(query: str, ctx) -> str:
     hubspot = ctx.services.hubspot
     q = query.strip()
 
+    personal = is_personal(q)
     min_age = parse_min_age_days(q)
-    owner_filter = parse_owner_filter(q)
+    owner_filter = None if personal else parse_owner_filter(q)
+
+    owners = hubspot.get_owners() or {}
+
+    own_id = None
+    if personal:
+        actor_email = getattr(getattr(ctx, "actor", None), "email", None)
+        own_id = owner_id_for_email(actor_email, owners)
+        if own_id is None:
+            # The person asking is not a HubSpot owner. Say so and stop:
+            # guessing which owner they "probably" are, or asking them,
+            # would turn a login identity into a typed one.
+            logger.info("personal ticket view: %r matches no HubSpot owner",
+                        actor_email)
+            return (f"ℹ️ {actor_email or 'Your login'} isn't a HubSpot ticket "
+                    "owner — nothing assigned to you.")
 
     tickets, complete = hubspot.fetch_open_tickets()
-    owners = hubspot.get_owners() or {}
 
     rows = [describe(t, owners) for t in tickets]
     rows = [r for r in rows if r is not None]
 
+    if own_id is not None:
+        rows = [r for r in rows if r["owner_id"] == own_id]
     if min_age is not None:
         rows = [r for r in rows if r["age_days"] is not None
                 and r["age_days"] >= min_age]
@@ -95,7 +124,38 @@ def handle(query: str, ctx) -> str:
         rows = [r for r in rows if owner_matches(r, owner_filter)]
 
     return render(rows, complete=complete, min_age=min_age,
-                  owner_filter=owner_filter)
+                  owner_filter=owner_filter, personal=personal)
+
+
+# ---------------------------------------------------------------------------
+# Who is asking
+# ---------------------------------------------------------------------------
+
+# get_owners() labels are "First Last (email)", or the bare email when
+# there is no name. The address is the only part that can be matched to a
+# login, and it is matched whole, case-insensitively.
+_LABEL_EMAIL_RE = re.compile(r"\(([^()\s]+@[^()\s]+)\)\s*$")
+
+
+def owner_email_from_label(label) -> str | None:
+    text = (label or "").strip()
+    match = _LABEL_EMAIL_RE.search(text)
+    if match:
+        return match.group(1).lower()
+    if "@" in text and " " not in text:
+        return text.lower()
+    return None
+
+
+def owner_id_for_email(email, owners: dict) -> str | None:
+    """The HubSpot owner id whose address equals `email`, or None."""
+    wanted = (email or "").strip().lower()
+    if not wanted or "@" not in wanted:
+        return None
+    for owner_id, label in (owners or {}).items():
+        if owner_email_from_label(label) == wanted:
+            return str(owner_id)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -170,25 +230,94 @@ def describe(ticket: dict, owners: dict, now=None) -> dict | None:
     if owner_id not in (None, ""):
         owner = owners.get(str(owner_id)) or f"owner {owner_id}"
 
+    pipeline_label = Config.TICKET_PIPELINE_LABELS.get(
+        pipeline, f"pipeline {pipeline}" if pipeline else "no pipeline")
+
+    age_days = _days_since(created, now)
+    idle_days = _days_since(last_activity, now) if touched else None
+
+    # hs_lastactivitydate EARLIER than createdate: an engagement logged
+    # against the contact before the ticket existed and associated later.
+    # "Idle 400 days" on a 40-day-old ticket is not a fact about the
+    # ticket, so idle is capped at the ticket's age and the line says why.
+    predates = (touched and age_days is not None and idle_days is not None
+                and idle_days > age_days)
+    if predates:
+        idle_days = age_days
+
+    subject, nameless = clean_subject(props.get("subject"), pipeline_label)
+
     return {
         "id": str(ticket_id),
         "pipeline": pipeline,
-        "pipeline_label": Config.TICKET_PIPELINE_LABELS.get(
-            pipeline, f"pipeline {pipeline}" if pipeline else "no pipeline"),
+        "pipeline_label": pipeline_label,
         "stage": stage,
         "stage_label": Config.TICKET_STAGE_LABELS.get(
             stage, f"stage {stage}" if stage else "no stage"),
-        "subject": (props.get("subject") or "").strip() or "(no subject)",
+        "subject": subject,
+        "nameless": nameless,
         "created": created,
-        "age_days": _days_since(created, now),
+        "age_days": age_days,
         "last_activity": last_activity if touched else None,
         "touched": touched,
-        "idle_days": _days_since(last_activity, now) if touched else None,
+        "idle_days": idle_days,
+        "activity_predates_ticket": predates,
         "owner": owner,
         "owner_id": str(owner_id) if owner_id not in (None, "") else None,
         "source": props.get("source_type"),
         "daf_name": props.get("daf_name"),
     }
+
+
+# Subjects HubSpot writes when a form creates a ticket and nobody has
+# renamed it. Neither says who wrote in, so a list of them is a list of
+# "DAF Form Submission - " twenty times over.
+_FORM_SUBJECT_PREFIX_RE = re.compile(
+    r"^(?:daf|endowment|ach|investment)?\s*form\s+submission\s*-?\s*$",
+    re.IGNORECASE)
+_GENERIC_SUBJECTS = {
+    "new ticket created from form submission",
+}
+
+
+def clean_subject(raw, pipeline_label: str) -> tuple:
+    """(subject to show, is_nameless).
+
+    Blank, "DAF Form Submission - " with nothing after the dash, and the
+    generic "New ticket created from form submission" all become
+    "<pipeline> (no name on ticket)" so the reader knows the ticket has
+    to be opened to learn who it is about.
+    """
+    text = (raw or "").strip()
+    if (not text
+            or _FORM_SUBJECT_PREFIX_RE.match(text)
+            or text.lower() in _GENERIC_SUBJECTS):
+        return f"{pipeline_label} (no name on ticket)", True
+    return text, False
+
+
+# ---------------------------------------------------------------------------
+# Links
+# ---------------------------------------------------------------------------
+
+def real_id(value) -> bool:
+    """True for an id worth putting in a URL.
+
+    None, "", "None" and whitespace are what a missing id looks like after
+    it has been through a dict.get and an f-string; a link built from one
+    reads exactly like a real link and 404s.
+    """
+    if value is None or isinstance(value, bool):
+        return False
+    text = str(value).strip()
+    return bool(text) and text.lower() != "none"
+
+
+def ticket_url(ticket_id) -> str | None:
+    """The HubSpot record link for a ticket, or None without a real id."""
+    if not real_id(ticket_id):
+        return None
+    return Config.HUBSPOT_TICKET_URL.format(ticket_id=str(ticket_id).strip())
 
 
 # ---------------------------------------------------------------------------
@@ -205,15 +334,23 @@ def _age(days) -> str:
 
 def ticket_line(row: dict) -> str:
     """"#id · subject · 41d old · 3d idle · Nora Moorefield"."""
-    idle = (f"{row['idle_days']}d idle" if row["touched"]
-            else "never touched")
+    if not row["touched"]:
+        idle = "never touched"
+    elif row.get("activity_predates_ticket"):
+        idle = f"≥ {row['idle_days']}d idle (activity predates ticket)"
+    else:
+        idle = f"{row['idle_days']}d idle"
     owner = row["owner"] or "unassigned"
-    return (f"#{row['id']} · {row['subject']} · {_age(row['age_days'])} old · "
+    line = (f"#{row['id']} · {row['subject']} · {_age(row['age_days'])} old · "
             f"{idle} · {owner}")
+    link = ticket_url(row["id"])
+    if link:
+        line += f" · [open]({link})"
+    return line
 
 
 def render(rows: list, complete: bool = True, min_age=None,
-           owner_filter=None) -> str:
+           owner_filter=None, personal: bool = False) -> str:
     lines = []
 
     if not complete:
@@ -229,7 +366,10 @@ def render(rows: list, complete: bool = True, min_age=None,
 
     total = len(rows)
     if not total:
-        lines.append(f"✅ No open tickets{scope_text}.")
+        if personal:
+            lines.append(f"✅ You have no open tickets{scope_text}.")
+        else:
+            lines.append(f"✅ No open tickets{scope_text}.")
         if owner_filter:
             lines.append(f"(No owner label contains '{owner_filter}' — try a "
                          "first name as it appears in HubSpot.)")
@@ -240,10 +380,20 @@ def render(rows: list, complete: bool = True, min_age=None,
         by_pipeline.setdefault(row["pipeline"], []).append(row)
 
     never = sum(1 for r in rows if not r["touched"])
-    lines.append(
-        f"🎫 **{total} open tickets across {len(by_pipeline)} "
-        f"pipeline{'s' if len(by_pipeline) != 1 else ''}{scope_text} — "
-        f"{never} never touched ({_pct(never, total)}%)**")
+    if personal:
+        lines.append(
+            f"🎫 **You have {total} open ticket{'s' if total != 1 else ''}"
+            f"{scope_text} — {never} never touched**")
+    else:
+        lines.append(
+            f"🎫 **{total} open tickets across {len(by_pipeline)} "
+            f"pipeline{'s' if len(by_pipeline) != 1 else ''}{scope_text} — "
+            f"{never} never touched ({_pct(never, total)}%)**")
+    nameless = sum(1 for r in rows if r.get("nameless"))
+    if nameless:
+        lines.append(f"{nameless} ticket{'s' if nameless != 1 else ''} "
+                     f"{'have' if nameless != 1 else 'has'} no name in the "
+                     "subject")
     lines.append("")
 
     # Most open first; ties by label so the order is stable.

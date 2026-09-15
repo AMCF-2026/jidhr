@@ -8,7 +8,8 @@ HubSpot READ only. Same fetch as the chat report (intents/tickets.py), so
 the two never disagree about what "open" means.
 
     python scripts/tickets_export.py                  # -> tickets_open_<date>.csv
-    python scripts/tickets_export.py --out /tmp/t.csv
+                                                      #    + tickets_summary_<date>.csv
+    python scripts/tickets_export.py --out /tmp/t.csv # summary lands beside it
 
 The file carries the ticket subject — which is whatever the requester
 typed — and nothing else about a person beyond an owner's name. Treat it
@@ -28,19 +29,16 @@ from datetime import date
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from clients.hubspot import HubSpotClient  # noqa: E402
-from config import Config  # noqa: E402
-from intents.tickets import describe  # noqa: E402
+from intents.tickets import describe, ticket_url  # noqa: E402
 
 COLUMNS = (
     "id", "pipeline", "stage", "subject", "created", "age_days",
-    "last_activity", "idle_days", "never_touched", "owner", "source",
-    "daf_name", "url",
+    "last_activity", "idle_days", "never_touched", "activity_predates_ticket",
+    "owner", "source", "daf_name", "url",
 )
 
-
-def ticket_url(ticket_id) -> str:
-    """The HubSpot UI link. Portal id comes from Config, not a literal."""
-    return Config.HUBSPOT_TICKET_URL.format(ticket_id=ticket_id)
+SUMMARY_COLUMNS = ("pipeline", "stage", "count", "never_touched",
+                   "oldest_days")
 
 
 def export_rows(tickets: list, owners: dict, now=None) -> list:
@@ -62,18 +60,60 @@ def export_rows(tickets: list, owners: dict, now=None) -> list:
             "idle_days": facts["idle_days"] if facts["idle_days"] is not None
             else "",
             "never_touched": "yes" if not facts["touched"] else "no",
+            # idle_days is already capped at age_days when the activity
+            # predates the ticket (intents/tickets.py); this column says so.
+            "activity_predates_ticket":
+                "true" if facts["activity_predates_ticket"] else "false",
             "owner": facts["owner"] or "",
             "source": facts["source"] or "",
             "daf_name": facts["daf_name"] or "",
-            "url": ticket_url(facts["id"]),
+            # Same builder as the chat report, so the two never disagree.
+            "url": ticket_url(facts["id"]) or "",
         })
-    # Oldest first, same as the report.
-    rows.sort(key=lambda r: (-(r["age_days"] if r["age_days"] != "" else -1),
+    # By pipeline, then oldest first within it — the order someone works
+    # a queue in.
+    rows.sort(key=lambda r: (r["pipeline"],
+                             -(r["age_days"] if r["age_days"] != "" else -1),
                              r["id"]))
     return rows
 
 
-def write_csv(path: str, rows: list, complete: bool) -> None:
+def summary_rows(rows: list) -> list:
+    """One row per pipeline+stage: count, never touched, oldest."""
+    buckets = {}
+    for row in rows:
+        key = (row["pipeline"], row["stage"])
+        bucket = buckets.setdefault(key, {"count": 0, "never": 0,
+                                          "oldest": None})
+        bucket["count"] += 1
+        if row["never_touched"] == "yes":
+            bucket["never"] += 1
+        age = row["age_days"]
+        if age != "" and (bucket["oldest"] is None or age > bucket["oldest"]):
+            bucket["oldest"] = age
+    return [
+        {"pipeline": pipeline, "stage": stage, "count": b["count"],
+         "never_touched": b["never"],
+         "oldest_days": b["oldest"] if b["oldest"] is not None else ""}
+        for (pipeline, stage), b in sorted(
+            buckets.items(), key=lambda kv: (kv[0][0], -kv[1]["count"],
+                                             kv[0][1]))
+    ]
+
+
+def summary_path_for(path: str) -> str:
+    """tickets_open_X.csv -> tickets_summary_X.csv, beside it."""
+    directory, name = os.path.split(path)
+    if name.startswith("tickets_open_"):
+        name = "tickets_summary_" + name[len("tickets_open_"):]
+    else:
+        stem, ext = os.path.splitext(name)
+        name = f"{stem}_summary{ext or '.csv'}"
+    return os.path.join(directory, name)
+
+
+def write_csv(path: str, rows: list, complete: bool,
+              columns=COLUMNS) -> None:
     with open(path, "w", newline="", encoding="utf-8") as handle:
         if not complete:
             # A comment line a spreadsheet will show as its first row —
@@ -81,7 +121,7 @@ def write_csv(path: str, rows: list, complete: bool) -> None:
             # terminal that produced it.
             handle.write("# PARTIAL: HubSpot returned an incomplete list; "
                          "counts derived from this file are incomplete\n")
-        writer = csv.DictWriter(handle, fieldnames=COLUMNS)
+        writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -116,8 +156,13 @@ def main(argv=None) -> int:
     rows = export_rows(tickets, owners)
     write_csv(path, rows, complete)
 
+    summary = summary_rows(rows)
+    summary_path = summary_path_for(path)
+    write_csv(summary_path, summary, complete, columns=SUMMARY_COLUMNS)
+
     print(header_line(rows, complete))
     print(f"Wrote {len(rows)} rows to {path}")
+    print(f"Wrote {len(summary)} pipeline/stage rows to {summary_path}")
     return 0 if complete else 1
 
 
