@@ -101,6 +101,59 @@ class Config:
     
     # Default event owner
     DEFAULT_EVENT_OWNER_ID = "159996166"  # carl@amuslimcf.org
+
+    # =========================================================================
+    # HUBSPOT TICKET PIPELINES (probe #4, H14 — crm/v3/pipelines/tickets)
+    # =========================================================================
+    # Stage ids whose metadata.ticketState is OPEN, per pipeline. Read from
+    # the API on 2026-09-15, not guessed: every pipeline has exactly one
+    # CLOSED stage and it is not in these sets. If a stage is added in the
+    # HubSpot UI it will not be counted until this is updated — re-run
+    # scripts/probe_apis.py and compare against H14.
+    TICKET_OPEN_STAGES = {
+        "0":          {"1", "2216593113", "2216593114", "3"},
+        "1398895318": {"2256118463", "2256118464", "2256118465", "2256118466"},
+        "1395576547": {"2250175191", "2250175192", "2250175193"},
+        "1637348066": {"2611947255", "2611947256"},
+        "2510066372": {"4179239673", "4179240634", "4179240635"},
+    }
+
+    TICKET_PIPELINE_LABELS = {
+        "0":          "DAF Pipeline",
+        "1398895318": "Investment Form",
+        "1395576547": "Endowment Inquiry",
+        "1637348066": "ACH Setup",
+        "2510066372": "Open Inquiries",
+    }
+
+    TICKET_STAGE_LABELS = {
+        # DAF Pipeline
+        "1": "New", "2216593113": "Contacted/Emailed",
+        "2216593114": "Meeting Set", "3": "Waiting on us", "4": "Closed",
+        # Investment Form
+        "2256118463": "New", "2256118464": "Contacted/Emailed",
+        "2256118465": "Meeting Set", "2256118466": "Waiting on us",
+        "2256118467": "Closed",
+        # Endowment Inquiry
+        "2250175191": "New", "2250175192": "Waiting on contact",
+        "2250175193": "Waiting on us", "2250175194": "Closed",
+        # ACH Setup
+        "2611947255": "Information Submitted",
+        "2611947256": "Waiting on Kods",
+        "2611948218": "Entered Into CSuite",
+        # Open Inquiries
+        "4179239673": "New", "4179240634": "In Progress",
+        "4179240635": "Waiting on Requester", "4179240636": "Closed",
+    }
+
+    # Where "closed" does not mean "resolved". ACH Setup's only CLOSED stage
+    # is "Entered Into CSuite": a ticket leaves the open count when the data
+    # entry is done, which says nothing about whether the requester was
+    # ever answered. Any report over that pipeline carries this note.
+    TICKET_PIPELINE_NOTES = {
+        "1637348066": ("closed here means 'Entered Into CSuite' — data entry "
+                       "done, not the request resolved"),
+    }
     
     # =========================================================================
     # GOOGLE OAUTH

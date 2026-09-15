@@ -28,6 +28,7 @@ from intents import daf_workflow
 from intents import events
 from intents import notes
 from intents import donor_prep
+from intents import tickets
 from intents import reports
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,9 @@ HANDLER_CHAIN = [
     ("events",         events),
     ("notes",          notes),
     ("donor_prep",     donor_prep),
+    # tickets before reports: "open tickets" must not fall through to the
+    # generic context path, which only ever sampled ten of them.
+    ("tickets",        tickets),
     ("reports",        reports),
 ]
 

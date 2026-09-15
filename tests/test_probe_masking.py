@@ -562,3 +562,193 @@ def test_field_stats_without_a_mask_still_uses_the_name_driven_rules():
     by_field = {s["field"]: s["example"] for s in stats}
     assert by_field["profile_id"] == 19879
     assert by_field["name"] == REDACTED
+
+
+# ===========================================================================
+# Probe #4 shapes: ticket digest properties, owners, opportunities, forms
+# ===========================================================================
+
+from scripts.probe_apis import (  # noqa: E402
+    _form_definition_summary,
+    _not_found_shaped,
+    _owner_map,
+    _pipelines_with_state,
+    field_stats,
+)
+
+
+def test_h12_ticket_properties_keep_wiring_and_drop_content():
+    ticket = {"id": "4410", "properties": {
+        "subject": "Question about my DAF statement",
+        "hs_pipeline": "0", "hs_pipeline_stage": "2",
+        "createdate": "2026-09-01T14:00:00.000Z",
+        "hs_lastmodifieddate": "2026-09-10T09:30:00.000Z",
+        "hs_lastactivitydate": None,
+        "hubspot_owner_id": "159996166",
+        "source_type": "FORM",
+        "daf_name": "Testcase Family Fund",
+        "daf_number": "DAF0123",
+    }}
+    props = mask_value("ticket", ticket)["properties"]
+
+    assert props["subject"].startswith("<text len=")
+    assert props["daf_name"] == REDACTED, "a fund name names a family"
+    assert props["daf_number"] == "DAF0123", "a fund code is an identifier"
+    assert props["hs_pipeline"] == "0"
+    assert props["hs_pipeline_stage"] == "2"
+    assert props["hs_lastactivitydate"] is None, "null survives as null"
+    assert props["hs_lastmodifieddate"] == "2026-09-10T09:30:00.000Z"
+    assert props["hubspot_owner_id"] == "159996166"
+    assert props["source_type"] == "FORM"
+
+
+def test_h12_ticket_field_stats_never_carry_a_subject_or_fund_name():
+    rows = [{"id": "1", "properties": {
+        "subject": "Call me about Bilqis's endowment", "daf_name": "Bilqis Fund",
+        "hs_pipeline_stage": "1"}}]
+    stats = field_stats(rows)
+    dumped = str(stats)
+    assert "Bilqis" not in dumped
+    assert any(f["field"] == "properties.hs_pipeline_stage" and
+               f["example"] == "1" for f in stats)
+
+
+def test_h15_owner_map_keeps_staff_names_and_masks_emails():
+    payload = {"results": [
+        {"id": "159996166", "email": "carl@amuslimcf.org",
+         "firstName": "Carl", "lastName": "Dodge", "archived": False,
+         "userId": 42},
+        {"id": "7", "email": "gone@amuslimcf.org", "firstName": "Former",
+         "lastName": "Staff", "archived": True},
+        {"email": "noid@amuslimcf.org"},
+    ]}
+    owners = _owner_map(payload)
+
+    assert owners["159996166"]["name"] == "Carl Dodge"
+    assert owners["159996166"]["email"] == "c*@amuslimcf.org"
+    assert "carl@" not in str(owners)
+    assert owners["7"]["archived"] is True
+    assert len(owners) == 2, "a row with no id is not an owner"
+
+
+def test_h15_owner_map_is_the_one_place_names_survive():
+    """The receipt still masks owner rows; only the explicit map keeps
+    names, because owners are staff and the brief says so."""
+    row = {"id": "1", "firstName": "Carl", "lastName": "Dodge",
+           "email": "carl@amuslimcf.org"}
+    masked = mask_value("owner", row)
+    assert masked["firstName"] == REDACTED
+    assert masked["lastName"] == REDACTED
+    assert masked["email"] == "c*@amuslimcf.org"
+
+
+def test_h14_pipeline_state_is_read_from_metadata():
+    payload = {"results": [{
+        "id": "0", "label": "Support Pipeline", "displayOrder": 0,
+        "stages": [
+            {"id": "4", "label": "Closed", "displayOrder": 3,
+             "metadata": {"ticketState": "CLOSED"}},
+            {"id": "1", "label": "New", "displayOrder": 0,
+             "metadata": {"ticketState": "OPEN"}},
+            {"id": "2", "label": "Waiting on contact", "displayOrder": 1,
+             "metadata": {"ticketState": "OPEN"}},
+            {"id": "9", "label": "Odd", "displayOrder": 2},
+        ]}]}
+    pipelines = _pipelines_with_state(payload)
+
+    assert len(pipelines) == 1
+    assert [s["id"] for s in pipelines[0]["stages"]] == ["1", "2", "9", "4"]
+    assert pipelines[0]["open_stage_ids"] == ["1", "2"]
+    assert pipelines[0]["closed_stage_ids"] == ["4"]
+    assert pipelines[0]["stages"][2]["ticketState"] is None
+
+
+def test_c14_opportunity_row_masks_the_person_and_keeps_the_pipeline():
+    row = {"opportunity_id": 501, "profile_id": 7001,
+           "opportunity_type": "Major Gift", "opportunity_stage": "Cultivate",
+           "name": "Testcase, Aisha", "amount": "25000.00",
+           "description": "Met at the summit, interested in an endowment",
+           "created_ts": "2026-09-01 10:00:00", "owner_name": "Carl Dodge"}
+    masked = mask_value("opportunity", row)
+
+    assert masked["opportunity_id"] == 501
+    assert masked["profile_id"] == 7001
+    assert masked["opportunity_type"] == "Major Gift"
+    assert masked["opportunity_stage"] == "Cultivate"
+    assert masked["name"] == REDACTED
+    assert masked["owner_name"] == REDACTED
+    assert masked["amount"] == "$10k-100k"
+    assert masked["description"].startswith("<text len=")
+    assert masked["created_ts"] == "2026-09-01 10:00:00"
+    assert "Aisha" not in str(masked) and "summit" not in str(masked)
+
+
+@pytest.mark.parametrize("record, expected", [
+    ({"http_status": 404, "error": "HTTP 404: "}, True),
+    ({"http_status": 200, "error": "Invalid endpoint"}, True),
+    ({"http_status": 200, "error": "Unknown method opportunity/list"}, True),
+    ({"http_status": 200, "error": "Not Found"}, True),
+    ({"http_status": 200, "error": None}, False),
+    ({"http_status": 429, "error": "Invalid JSON response: ..."}, False),
+    ({"http_status": 500, "error": "Internal Server Error"}, False),
+    ({"http_status": 200, "error": "Access denied"}, False),
+    ({"skipped": True, "error": "skipped (not found)"}, False),
+])
+def test_c14_not_found_shape(record, expected):
+    assert _not_found_shaped(record) is expected
+
+
+def test_h16_form_definition_keeps_settings_and_masks_people():
+    payload = {
+        "id": "abc", "name": "DAF Inquiry Form", "formType": "hubspot",
+        "archived": False,
+        "configuration": {
+            "postSubmitAction": {"type": "redirect_url",
+                                 "value": "https://amuslimcf.org/thanks?u=carl"},
+            "notifyRecipients": ["nora@amuslimcf.org", "kods@amuslimcf.org"],
+            "notifyContactOwner": True,
+            "language": "en",
+        },
+        "fieldGroups": [],
+    }
+    summary = _form_definition_summary(payload)
+
+    assert summary["readable"] is True
+    assert summary["name"] == "DAF Inquiry Form", "a form name is schema"
+    assert summary["postSubmitAction_type"] == "redirect_url"
+    assert summary["postSubmitAction_value"] == REDACTED
+    assert summary["notifyRecipients_count"] == 2
+    assert summary["notifyRecipients"] == ["n*@amuslimcf.org",
+                                           "k*@amuslimcf.org"]
+    assert "nora@" not in str(summary) and "?u=carl" not in str(summary)
+    assert summary["notifyContactOwner"] is True
+    assert summary["followup_keys"] == []
+
+
+def test_h16_thank_you_copy_is_length_only():
+    payload = {"name": "F", "configuration": {
+        "postSubmitAction": {"type": "thank_you",
+                             "value": "Thanks Aisha, Carl will call you"}}}
+    summary = _form_definition_summary(payload)
+    assert summary["postSubmitAction_value"] == "<text len=32>"
+    assert "Aisha" not in str(summary)
+
+
+def test_h16_unconfigured_form_reads_as_unconfigured():
+    summary = _form_definition_summary({"name": "Bare", "configuration": {}})
+    assert summary["postSubmitAction_type"] is None
+    assert summary["postSubmitAction_value"] is None
+    assert summary["notifyRecipients_count"] == 0
+    assert summary["notifyContactOwner"] is None
+
+
+def test_h16_follow_up_keys_are_surfaced_when_present():
+    payload = {"name": "F", "configuration": {},
+               "legacy": {"followUpEmailId": "123"}}
+    summary = _form_definition_summary(payload)
+    assert summary["followup_keys"] == ["legacy.followUpEmailId"]
+
+
+def test_h16_non_dict_definition_is_unreadable_not_a_crash():
+    assert _form_definition_summary(None) == {"readable": False}
+    assert _form_definition_summary("<html>") == {"readable": False}

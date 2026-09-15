@@ -1636,9 +1636,121 @@ class HubSpotClient:
     # OWNERS
     # =========================================================================
     
+    # Cached for the life of the process: owners change when someone joins
+    # or leaves, and a ticket report should not spend a call per run on a
+    # list of twelve names.
+    _owners_cache = None
+
     def get_owners(self) -> dict:
-        """Get list of owners (staff members with HubSpot access)"""
-        return self._get("crm/v3/owners")
+        """{owner id: "First Last (email)"} for every HubSpot owner.
+
+        Read once per process. Returns {} if the call fails — a report
+        then shows owner ids rather than names, which is worse but honest;
+        it does not fail the report.
+        """
+        if HubSpotClient._owners_cache is not None:
+            return HubSpotClient._owners_cache
+
+        result = self._get("crm/v3/owners", {"limit": 100})
+        if not isinstance(result, dict) or result.get("error"):
+            logger.error("HubSpot owners lookup failed: %s",
+                         (result or {}).get("error") if isinstance(result, dict)
+                         else result)
+            return {}
+
+        owners = {}
+        for owner in result.get("results") or []:
+            owner_id = owner.get("id")
+            if owner_id in (None, ""):
+                continue
+            name = " ".join(part for part in (owner.get("firstName"),
+                                              owner.get("lastName")) if part)
+            email = owner.get("email")
+            label = name or email or f"owner {owner_id}"
+            if name and email:
+                label = f"{name} ({email})"
+            owners[str(owner_id)] = label
+
+        HubSpotClient._owners_cache = owners
+        return owners
+
+    # The properties an open-tickets report needs. Chosen from probe #4
+    # (H12): hs_lastactivitydate is the only "has anyone replied" signal on
+    # the ticket itself; hs_last_contacted does not exist on tickets.
+    OPEN_TICKET_PROPERTIES = (
+        "subject", "hs_pipeline", "hs_pipeline_stage", "createdate",
+        "hs_lastmodifieddate", "hs_lastactivitydate", "hubspot_owner_id",
+        "source_type", "daf_name",
+    )
+
+    # HubSpot's search page size cap, and a page cap of our own so a paging
+    # cursor that never ends cannot loop forever (search tops out at 10,000
+    # results = 100 pages anyway).
+    SEARCH_PAGE_SIZE = 100
+    SEARCH_MAX_PAGES = 100
+
+    def fetch_open_tickets(self, open_stages=None) -> tuple:
+        """Every ticket in an OPEN pipeline stage. Returns (tickets, complete).
+
+        One POST-as-read search (`crm/v3/objects/tickets/search`, which
+        is_hubspot_write() classifies as a read, so it is not audited),
+        filtered to hs_pipeline_stage IN the open-stage ids from
+        Config.TICKET_OPEN_STAGES, paged by `after` until HubSpot stops
+        handing one back.
+
+        `complete` is False if any page failed. The tickets fetched before
+        the failure are still returned so a report can show them, but the
+        report must say the list is partial — see intents/tickets.py.
+        """
+        from config import Config
+
+        if open_stages is None:
+            open_stages = sorted({
+                stage for stages in Config.TICKET_OPEN_STAGES.values()
+                for stage in stages})
+        open_stages = sorted(str(s) for s in open_stages)
+        if not open_stages:
+            return [], True
+
+        tickets = []
+        after = None
+        for _ in range(self.SEARCH_MAX_PAGES):
+            body = {
+                "filterGroups": [{"filters": [
+                    {"propertyName": "hs_pipeline_stage",
+                     "operator": "IN", "values": open_stages},
+                ]}],
+                "properties": list(self.OPEN_TICKET_PROPERTIES),
+                "sorts": [{"propertyName": "createdate",
+                           "direction": "ASCENDING"}],
+                "limit": self.SEARCH_PAGE_SIZE,
+            }
+            if after:
+                body["after"] = after
+
+            result = self._post("crm/v3/objects/tickets/search", body)
+            if not isinstance(result, dict) or result.get("error"):
+                logger.error(
+                    "open-ticket search failed after %d tickets: %s",
+                    len(tickets),
+                    (result or {}).get("error") if isinstance(result, dict)
+                    else result)
+                return tickets, False
+
+            page = result.get("results") or []
+            tickets.extend(t for t in page if isinstance(t, dict))
+
+            after = ((result.get("paging") or {}).get("next") or {}).get(
+                "after")
+            if not after:
+                logger.info("open-ticket search: %d tickets, complete",
+                            len(tickets))
+                return tickets, True
+
+        logger.error("open-ticket search stopped at %d pages with a paging "
+                     "cursor still pending — treating as incomplete",
+                     self.SEARCH_MAX_PAGES)
+        return tickets, False
     
     def get_owner_by_email(self, email: str) -> dict:
         """Get owner by email address.

@@ -926,6 +926,9 @@ def probe_csuite(limit, recorder, probe):
         "dated_event_ids": dated_event_ids,
         "registrant_shaped_events": registrant_events,
     }
+    # Probe #4's eight cheap calls go BEFORE probe #3, whose fund sweep is
+    # the one part of this script large enough to trip the rate limit.
+    extras.update(probe_csuite_p4(client, recorder, probe, post_note))
     extras.update(probe_csuite_p3(client, recorder, probe, post_note))
     return extras
 
@@ -1100,6 +1103,245 @@ def probe_csuite_p3(client, recorder, probe, post_note):
     extras["c10_group_pairs"] = _count_group_pairs(fund_by_profile)
 
     return extras
+
+
+# =============================================================================
+# CSUITE — PROBE #4: the "Communications and Opportunities" module
+# =============================================================================
+
+# The endpoint families tried for C14, in order. A family stops after two
+# consecutive "not found"-shaped answers: CSuite gives no catalogue of its
+# endpoints, so absence can only be inferred, and two refusals in a row is
+# the point past which a third call tells us nothing new.
+C14_FAMILIES = OrderedDict([
+    ("opportunity", ["opportunity/list", "opportunity/list/type",
+                     "opportunity/list/stage"]),
+    ("opportunity_lookup", ["opportunity_type/list", "opportunity_stage/list"]),
+    ("communication", ["communication/list", "communication/list/type"]),
+])
+
+# What a "this endpoint does not exist" answer looks like. HTTP 404 is the
+# clean case; CSuite also answers 200 with success=0 and an error string,
+# so the string is matched too. A 429 or 500 matches neither — those say
+# nothing about whether the endpoint exists and do not count toward the
+# stop.
+_NOT_FOUND_RE = re.compile(
+    r"not found|invalid (?:endpoint|method|request|api|action|route)"
+    r"|unknown (?:endpoint|method|action|command)|does not exist|no such"
+    r"|unrecognized|unrecognised|not (?:a )?valid|bad request",
+    re.IGNORECASE)
+
+C13_PATTERN = re.compile(r"opportun|communication|stage|pipeline",
+                         re.IGNORECASE)
+C13_SOURCES = ("clients/csuite.py", "README.md", "docs")
+
+# Field names on grant/donation/fund rows that would link to the module.
+C15_LINK_RE = re.compile(r"opportunit|communicat", re.IGNORECASE)
+
+
+def _not_found_shaped(record):
+    """True if this receipt says the endpoint is not there."""
+    if record.get("skipped"):
+        return False
+    if record.get("http_status") == 404:
+        return True
+    return bool(_NOT_FOUND_RE.search(str(record.get("error") or "")))
+
+
+def _grep_repo(pattern, sources, root):
+    """file:line hits for a pattern across source files. Never raises.
+
+    Only source text is read — no .env, no probe output. The hit is the
+    matching line, trimmed; source lines are not donor data.
+    """
+    hits = []
+    for source in sources:
+        path = os.path.join(root, source)
+        paths = []
+        if os.path.isdir(path):
+            for dirpath, _dirs, files in os.walk(path):
+                paths += [os.path.join(dirpath, f) for f in files
+                          if f.endswith((".py", ".md", ".txt", ".rst"))]
+        elif os.path.isfile(path):
+            paths = [path]
+        for file_path in sorted(paths):
+            try:
+                with open(file_path, encoding="utf-8", errors="replace") as fh:
+                    for number, line in enumerate(fh, 1):
+                        if pattern.search(line):
+                            hits.append({
+                                "file": os.path.relpath(file_path, root),
+                                "line": number,
+                                "text": line.strip()[:120],
+                            })
+            except OSError as exc:
+                hits.append({"file": source, "line": 0,
+                             "text": "unreadable: {}".format(exc)})
+    return hits
+
+
+def probe_csuite_p4(client, recorder, probe, post_note):
+    """C13-C15: does CSuite expose an opportunities module by API?
+
+    All reads. Every endpoint tried is a list or a display; no create,
+    edit or delete NAME is ever called, even to see whether it exists.
+    """
+    extras = {}
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    # ---- C13: what the codebase already knows ---------------------------
+    extras["c13_hits"] = _grep_repo(C13_PATTERN, C13_SOURCES, root)
+    extras["c13_sources_present"] = {
+        source: os.path.exists(os.path.join(root, source))
+        for source in C13_SOURCES}
+
+    # ---- C14: try the read endpoints, family by family ------------------
+    extras["c14"] = OrderedDict()
+    extras["c14_calls"] = 0
+    first_opportunity_id = None
+
+    for family, endpoints in C14_FAMILIES.items():
+        consecutive_missing = 0
+        for endpoint in endpoints:
+            if consecutive_missing >= 2:
+                probe.results.append(_skipped_record(
+                    "csuite", endpoint,
+                    "family '{}' stopped after two consecutive not-found "
+                    "answers".format(family)))
+                extras["c14"][endpoint] = {"skipped": True, "family": family}
+                continue
+
+            params = {"view_limit": 3}
+            record = probe.run(
+                "csuite", endpoint,
+                lambda ep=endpoint, pr=dict(params): client._request(ep, pr),
+                params, post_transport=True,
+                note=post_note + " C14 — does the opportunities module "
+                     "answer by API?")
+            extras["c14_calls"] += 1
+            extras["c14"][endpoint] = {
+                "family": family,
+                "http_status": record["http_status"],
+                "ok": record["ok"],
+                "error": record["error"],
+                "not_found_shaped": _not_found_shaped(record),
+                "top_level_keys": record["top_level_keys"],
+                "raw_top_level_keys": record["raw_top_level_keys"],
+                "record_count": record["record_count"],
+                "field_count": record["field_count"],
+                "success_flag": _csuite_success_flag(recorder.raw),
+            }
+            if record["ok"]:
+                consecutive_missing = 0
+                if endpoint == "opportunity/list":
+                    first_opportunity_id = _first_id(
+                        recorder.raw, "opportunity_id", "id")
+            elif _not_found_shaped(record):
+                consecutive_missing += 1
+            else:
+                consecutive_missing = 0
+
+    # opportunity/display only when the list produced an id to display.
+    if first_opportunity_id is not None:
+        params = {"opportunity_id": first_opportunity_id}
+        record = probe.run(
+            "csuite", "opportunity/display",
+            lambda pr=dict(params): client._request("opportunity/display", pr),
+            params, post_transport=True,
+            note=post_note + " C14 — one opportunity in full.")
+        extras["c14_calls"] += 1
+        extras["c14"]["opportunity/display"] = {
+            "family": "opportunity",
+            "http_status": record["http_status"],
+            "ok": record["ok"],
+            "error": record["error"],
+            "not_found_shaped": _not_found_shaped(record),
+            "top_level_keys": record["top_level_keys"],
+            "raw_top_level_keys": record["raw_top_level_keys"],
+            "record_count": record["record_count"],
+            "field_count": record["field_count"],
+            "success_flag": _csuite_success_flag(recorder.raw),
+        }
+    else:
+        probe.results.append(_skipped_record(
+            "csuite", "opportunity/display",
+            "opportunity/list returned no id to display"))
+        extras["c14"]["opportunity/display"] = {
+            "skipped": True, "family": "opportunity"}
+    extras["c14_first_opportunity_id"] = first_opportunity_id
+
+    # profile/display was fetched in probe #1; scan its keys, no new call.
+    profile_display = probe.raw_payloads.get("profile/display")
+    extras["c14_profile_display_fields"] = sorted(
+        key for key in _payload_field_names(profile_display)
+        if C15_LINK_RE.search(key))
+    extras["c14_profile_display_available"] = profile_display is not None
+
+    # Every field name any C14 endpoint returned, for the types/stages and
+    # profile_id questions.
+    extras["c14_fields_by_endpoint"] = {
+        r["endpoint"]: [f["field"] for f in r.get("fields") or []]
+        for r in probe.results
+        if r["system"] == "csuite" and r["endpoint"] in extras["c14"]
+        and not r.get("skipped")}
+
+    # Distinct values of any type/stage-looking field, from the raw rows.
+    extras["c14_type_stage_values"] = {}
+    for endpoint in extras["c14_fields_by_endpoint"]:
+        payload = probe.raw_payloads.get(endpoint)
+        rows = find_records(payload)[0]
+        for field in extras["c14_fields_by_endpoint"][endpoint]:
+            leaf = field.split(".")[-1].lower()
+            if any(tok in leaf for tok in ("type", "stage", "status")) \
+                    and not leaf.endswith("_id"):
+                values = _count_values(rows, field, limit=15)
+                if values:
+                    extras["c14_type_stage_values"][
+                        "{}.{}".format(endpoint, field)] = [
+                        {"value": mask_value(field, v["value"]),
+                         "count": v["count"]} for v in values]
+
+    # Any create/edit/delete NAME visible in the codebase for this module.
+    # Looked for, never called.
+    extras["c14_write_names_in_code"] = [
+        h for h in extras["c13_hits"]
+        if re.search(r"(opportunit|communication)\w*/(create|edit|update|"
+                     r"delete)", h["text"], re.IGNORECASE)]
+
+    # ---- C15: do grant/donation/fund rows link to the module? -----------
+    extras["c15"] = {}
+    for endpoint in ("grant/list", "donation/list", "funit/display",
+                     "funit/list"):
+        record = next((r for r in probe.results
+                       if r["system"] == "csuite" and r["endpoint"] == endpoint
+                       and not r.get("skipped")), None)
+        if record is None:
+            extras["c15"][endpoint] = {"checked": False, "fields": []}
+            continue
+        names = [f["field"] for f in record.get("fields") or []]
+        extras["c15"][endpoint] = {
+            "checked": True,
+            "field_count": len(names),
+            "fields": [n for n in names if C15_LINK_RE.search(n)],
+        }
+
+    return extras
+
+
+def _csuite_success_flag(payload):
+    """The `success` value CSuite put in the body, or None."""
+    if isinstance(payload, dict) and "success" in payload:
+        return payload.get("success")
+    return None
+
+
+def _payload_field_names(payload):
+    """Every flattened field name across the records of a payload."""
+    names = set()
+    for record in find_records(payload)[0]:
+        if isinstance(record, dict):
+            names.update(flatten(record).keys())
+    return names
 
 
 def _csuite_data_keys(payload):
@@ -1655,6 +1897,7 @@ def _probe_hubspot_inner(limit, recorder, probe, client):
     extras["social_channels"] = _summarise_channels(recorder.raw)
 
     extras.update(probe_hubspot_p3(probe, recorder, client, extras))
+    extras.update(probe_hubspot_p4(probe, recorder, client, extras))
     return extras
 
 
@@ -1818,6 +2061,284 @@ def probe_hubspot_p3(probe, recorder, client, extras):
         if any(tok in "{} {}".format(p.get("name") or "",
                                      p.get("label") or "").lower()
                for tok in ("url", "link"))]
+    return out
+
+
+# =============================================================================
+# HUBSPOT — PROBE #4: what an open-tickets report and a 48h digest need
+# =============================================================================
+
+H12_PROPERTIES = [
+    "subject", "hs_pipeline", "hs_pipeline_stage", "createdate",
+    "hs_lastmodifieddate", "hs_lastactivitydate", "hubspot_owner_id",
+    "source_type", "daf_name", "daf_number",
+]
+# Requested only if the ticket schema says it exists.
+H12_OPTIONAL_PROPERTIES = ["hs_last_contacted"]
+
+H13_ASSOCIATION_TYPES = ("contacts", "emails", "notes", "calls")
+H13_SAMPLE = 5
+
+# HubSpot's own state marker on a pipeline stage.
+_TICKET_STATE_OPEN = "OPEN"
+
+
+def _ticket_property_names(probe):
+    """Every ticket property name, from the schema H9 already fetched."""
+    payload = probe.raw_payloads.get("crm/v3/properties/tickets")
+    return {p.get("name") for p in _records_of(payload) if p.get("name")}
+
+
+def _pipelines_with_state(payload):
+    """Pipelines and stages, keeping metadata.ticketState."""
+    out = []
+    for pipeline in find_records(payload)[0]:
+        stages = sorted((pipeline.get("stages") or []),
+                        key=lambda st: st.get("displayOrder", 0))
+        rows = []
+        for stage in stages:
+            meta = stage.get("metadata") or {}
+            rows.append({
+                "id": stage.get("id"),
+                "label": stage.get("label"),
+                "displayOrder": stage.get("displayOrder"),
+                "ticketState": meta.get("ticketState"),
+            })
+        out.append({
+            "id": pipeline.get("id"),
+            "label": pipeline.get("label"),
+            "displayOrder": pipeline.get("displayOrder"),
+            "stages": rows,
+            "open_stage_ids": [r["id"] for r in rows
+                               if r["ticketState"] == _TICKET_STATE_OPEN],
+            "closed_stage_ids": [r["id"] for r in rows
+                                 if r["ticketState"] and
+                                 r["ticketState"] != _TICKET_STATE_OPEN],
+        })
+    return out
+
+
+def _owner_map(payload):
+    """owner id -> name/email. Staff, so names stay; emails follow the rule."""
+    owners = {}
+    for owner in _records_of(payload):
+        owner_id = owner.get("id")
+        if owner_id in (None, ""):
+            continue
+        name = " ".join(part for part in (owner.get("firstName"),
+                                          owner.get("lastName")) if part)
+        owners[str(owner_id)] = {
+            "name": name or "(no name)",
+            "email": mask_email(owner.get("email")) if owner.get("email")
+            else None,
+            "archived": owner.get("archived"),
+            "userId": owner.get("userId"),
+        }
+    return owners
+
+
+def _form_definition_summary(payload):
+    """The parts of a marketing/v3 form definition an auto-reply audit needs.
+
+    Values that could carry a person (a redirect URL, a notification
+    address, thank-you copy) are masked; the form's name is schema, like a
+    pipeline stage label, and is kept.
+    """
+    if not isinstance(payload, dict):
+        return {"readable": False}
+    configuration = payload.get("configuration") or {}
+    post = configuration.get("postSubmitAction") or {}
+    post_type = post.get("type")
+    post_value = post.get("value")
+    if post_type == "redirect_url":
+        post_value_masked = REDACTED if post_value else None
+    elif post_value:
+        post_value_masked = "<text len={}>".format(len(str(post_value)))
+    else:
+        post_value_masked = None
+
+    recipients = configuration.get("notifyRecipients") or []
+    followup_keys = sorted(
+        key for key in flatten(payload).keys()
+        if re.search(r"follow.?up", key, re.IGNORECASE))
+
+    return {
+        "readable": True,
+        "name": payload.get("name"),
+        "formType": payload.get("formType"),
+        "archived": payload.get("archived"),
+        "postSubmitAction_type": post_type,
+        "postSubmitAction_value": post_value_masked,
+        "notifyRecipients_count": len(recipients)
+        if isinstance(recipients, list) else None,
+        "notifyRecipients": [mask_email(r) for r in recipients
+                             if isinstance(r, str)]
+        if isinstance(recipients, list) else [],
+        "notifyContactOwner": configuration.get("notifyContactOwner"),
+        "followup_keys": followup_keys,
+        "configuration_keys": sorted(configuration.keys()),
+    }
+
+
+def probe_hubspot_p4(probe, recorder, client, extras):
+    """H12-H16. All reads; the two POSTs are searches and are flagged."""
+    out = {}
+
+    # ---- H14 first: which stages mean "open" ---------------------------
+    payload = probe.raw_payloads.get("crm/v3/pipelines/tickets")
+    if payload is None:
+        rec = probe.run(
+            "hubspot", "crm/v3/pipelines/tickets (H14)",
+            lambda: client._get("crm/v3/pipelines/tickets"), {},
+            note="H14 — every pipeline and stage, with ticketState.")
+        payload = recorder.raw if rec["ok"] else None
+    out["h14_pipelines"] = _pipelines_with_state(payload)
+    out["h14_ok"] = bool(out["h14_pipelines"])
+    open_by_pipeline = {p["id"]: p["open_stage_ids"]
+                        for p in out["h14_pipelines"]}
+    all_open_stage_ids = {sid for ids in open_by_pipeline.values()
+                          for sid in ids}
+
+    # ---- H15: owners ------------------------------------------------------
+    rec = probe.run(
+        "hubspot", "crm/v3/owners",
+        lambda: client._get("crm/v3/owners", {"limit": 100}),
+        {"limit": 100},
+        note="H15 — staff owners. Names kept (staff, not donors); emails "
+             "masked per the rule.")
+    out["h15_owners"] = _owner_map(recorder.raw) if rec["ok"] else {}
+    out["h15_ok"] = rec["ok"]
+
+    # ---- H12: a 100-ticket sample ----------------------------------------
+    schema = _ticket_property_names(probe)
+    properties = list(H12_PROPERTIES)
+    optional_present = {}
+    for name in H12_OPTIONAL_PROPERTIES:
+        present = name in schema if schema else None
+        optional_present[name] = present
+        if present:
+            properties.append(name)
+    out["h12_optional_properties"] = optional_present
+
+    rec = probe.run(
+        "hubspot", "crm/v3/objects/tickets (H12 properties)",
+        lambda: client._get("crm/v3/objects/tickets", {
+            "limit": 100, "properties": ",".join(properties)}),
+        {"limit": 100, "properties": properties},
+        note="H12 — field stats for the open-tickets report.")
+    tickets = find_records(recorder.raw)[0] if rec["ok"] else []
+    out["h12_sample_ok"] = rec["ok"]
+    out["h12_sample_size"] = len(tickets)
+
+    def prop(ticket, name):
+        return (ticket.get("properties") or {}).get(name)
+
+    out["h12_lastactivity_null_pct"] = (
+        round(100.0 * sum(1 for t in tickets
+                          if prop(t, "hs_lastactivitydate") in (None, ""))
+              / len(tickets), 1) if tickets else None)
+    out["h12_sample_open"] = sum(
+        1 for t in tickets if prop(t, "hs_pipeline_stage") in all_open_stage_ids)
+    out["h12_sample_by_pipeline"] = _count_values(
+        [t.get("properties") or {} for t in tickets], "hs_pipeline", limit=10)
+    out["h12_owner_populated_pct"] = _populated_pct(
+        [t.get("properties") or {} for t in tickets], "hubspot_owner_id") \
+        if tickets else None
+
+    # Totals: one search per pipeline, filtered to its open stages. HubSpot
+    # only counts through search, so these are POST-as-read and flagged.
+    out["h12_open_totals"] = {}
+    for pipeline in out["h14_pipelines"]:
+        open_ids = pipeline["open_stage_ids"]
+        label = "crm/v3/objects/tickets/search (H12 open, pipeline {})".format(
+            pipeline["id"])
+        if not open_ids:
+            probe.results.append(_skipped_record(
+                "hubspot", label, "pipeline has no OPEN stages"))
+            out["h12_open_totals"][pipeline["id"]] = {
+                "label": pipeline["label"], "total": None,
+                "reason": "no OPEN stages"}
+            continue
+        body = {
+            "filterGroups": [{"filters": [
+                {"propertyName": "hs_pipeline", "operator": "EQ",
+                 "value": pipeline["id"]},
+                {"propertyName": "hs_pipeline_stage", "operator": "IN",
+                 "values": open_ids},
+            ]}],
+            "limit": 1,
+        }
+        srec = probe.run(
+            "hubspot", label,
+            lambda b=body: client._post("crm/v3/objects/tickets/search", b),
+            {"pipeline": pipeline["id"], "open_stage_ids": open_ids,
+             "limit": 1},
+            post_transport=True,
+            note="H12 — POST-as-read: only `total` is kept.")
+        raw = recorder.raw if isinstance(recorder.raw, dict) else {}
+        out["h12_open_totals"][pipeline["id"]] = {
+            "label": pipeline["label"],
+            "total": raw.get("total") if srec["ok"] else None,
+            "reason": None if srec["ok"] else (srec["error"] or "failed"),
+        }
+
+    # ---- H13: associations on five open tickets ---------------------------
+    open_sample = [t for t in tickets
+                   if prop(t, "hs_pipeline_stage") in all_open_stage_ids
+                   and t.get("id")][:H13_SAMPLE]
+    if not open_sample and tickets:
+        # No open ticket in the sample: use any five, and say so.
+        open_sample = [t for t in tickets if t.get("id")][:H13_SAMPLE]
+        out["h13_note"] = ("no ticket in the 100-row sample sits in an OPEN "
+                           "stage; associations read on the first five of "
+                           "any state")
+    out["h13_tickets"] = []
+    for ticket in open_sample:
+        ticket_id = ticket.get("id")
+        row = {"ticket_id": ticket_id,
+               "stage": prop(ticket, "hs_pipeline_stage"),
+               "hs_lastactivitydate": prop(ticket, "hs_lastactivitydate"),
+               "counts": {}}
+        for kind in H13_ASSOCIATION_TYPES:
+            endpoint = "crm/v4/objects/tickets/{}/associations/{}".format(
+                ticket_id, kind)
+            arec = probe.run(
+                "hubspot", endpoint,
+                lambda ep=endpoint: client._get(ep, {"limit": 100}),
+                {"limit": 100},
+                note="H13 — association count only; no engagement body is "
+                     "read.", store_fields=False)
+            raw = recorder.raw if isinstance(recorder.raw, dict) else {}
+            row["counts"][kind] = (
+                len(raw.get("results") or []) if arec["ok"] else None)
+            row.setdefault("errors", {})
+            if not arec["ok"]:
+                row["errors"][kind] = arec["error"]
+        out["h13_tickets"].append(row)
+
+    # ---- H16: every form's definition -------------------------------------
+    forms = extras.get("forms") or []
+    out["h16_forms"] = []
+    for form in forms:
+        form_id = form.get("id")
+        if not form_id:
+            continue
+        endpoint = "marketing/v3/forms/{}".format(form_id)
+        frec = probe.run(
+            "hubspot", endpoint,
+            lambda fid=form_id: client._get(
+                "marketing/v3/forms/{}".format(fid)), {},
+            note="H16 — form definition: post-submit action and "
+                 "notification settings.", store_fields=False)
+        summary = _form_definition_summary(recorder.raw) if frec["ok"] else {
+            "readable": False, "error": frec["error"],
+            "http_status": frec["http_status"]}
+        summary["id"] = form_id
+        summary["listed_name"] = form.get("name")
+        summary["listed_formType"] = form.get("formType")
+        out["h16_forms"].append(summary)
+    out["h16_forms_listed"] = len(forms)
+
     return out
 
 
@@ -4223,6 +4744,440 @@ def discover_o1(extras):
             "answer": answer}
 
 
+# ---------------------------------------------------------------------------
+# Probe #4 discovery
+# ---------------------------------------------------------------------------
+
+def discover_c13(extras):
+    hits = extras.get("c13_hits") or []
+    present = extras.get("c13_sources_present") or {}
+    lines = [
+        "Sources grepped for `opportun|communication|stage|pipeline` "
+        "(case-insensitive): " + ", ".join(
+            "`{}`{}".format(src, "" if ok else " (absent)")
+            for src, ok in present.items()),
+        "",
+    ]
+    if hits:
+        lines += _table(["File", "Line", "Text"],
+                        [("`%s`" % h["file"], h["line"],
+                          _cell(h["text"]).replace("|", "\\|")) for h in hits])
+    else:
+        lines.append("_No hits._")
+
+    csuite_hits = [h for h in hits if h["file"].endswith("csuite.py")]
+    opp_hits = [h for h in hits
+                if re.search(r"opportun|communication", h["text"], re.I)]
+    answer = ("{} hit(s) — {} in clients/csuite.py, {} mentioning "
+              "opportunit/communication; {}".format(
+                  len(hits), len(csuite_hits), len(opp_hits),
+                  "the client has NO opportunity or communication endpoint"
+                  if not any(h["file"].endswith("csuite.py") for h in opp_hits)
+                  else "the client already names the module"))
+    return {"id": "C13", "title": "Opportunities in the codebase",
+            "lines": lines, "answer": answer}
+
+
+def discover_c14(probe, extras):
+    tried = extras.get("c14") or {}
+    if not tried:
+        return {"id": "C14", "title": "CSuite opportunities module by API",
+                "lines": ["Not attempted."],
+                "answer": "undetermined: C14 did not run"}
+
+    lines = ["**Endpoints tried** ({} calls)".format(
+        extras.get("c14_calls", 0)), ""]
+    rows = []
+    for endpoint, info in tried.items():
+        if info.get("skipped"):
+            rows.append(("`%s`" % endpoint, info["family"], "skipped", "—",
+                         "—", "—", "—"))
+            continue
+        rows.append((
+            "`%s`" % endpoint, info["family"],
+            _cell(info["http_status"]),
+            _cell(info["success_flag"]),
+            ", ".join("`%s`" % k for k in info["raw_top_level_keys"]) or "—",
+            info["record_count"],
+            "**not found**" if info["not_found_shaped"]
+            else ("ok" if info["ok"] else _cell(info["error"])[:60]),
+        ))
+    lines += _table(["Endpoint", "Family", "HTTP", "success", "Top keys",
+                     "Records", "Verdict"], rows)
+
+    # Field tables for anything that answered with records.
+    for record in probe.results:
+        if record["system"] != "csuite" or record["endpoint"] not in tried:
+            continue
+        if record.get("skipped") or not record.get("fields"):
+            continue
+        lines += ["", "**`{}` fields** ({} records)".format(
+            record["endpoint"], record["record_count"]), ""]
+        lines += _table(FIELD_HEADERS, _field_rows(record["fields"]))
+
+    values = extras.get("c14_type_stage_values") or {}
+    if values:
+        lines += ["", "**Type / stage / status values observed**", ""]
+        for key, counts in values.items():
+            lines.append("- `{}`: {}".format(key, ", ".join(
+                "{} ({})".format(_cell(v["value"]), v["count"])
+                for v in counts)))
+
+    profile_fields = extras.get("c14_profile_display_fields") or []
+    lines += ["", "**profile/display fields mentioning "
+                  "opportunit/communicat:** {}".format(
+                      ", ".join("`%s`" % f for f in profile_fields) or
+                      ("_none_" if extras.get("c14_profile_display_available")
+                       else "_undetermined — profile/display not sampled_"))]
+
+    write_names = extras.get("c14_write_names_in_code") or []
+    lines += ["", "**create/edit endpoint NAMES seen in code (not called):** "
+                  + (", ".join("`{}:{}`".format(h["file"], h["line"])
+                               for h in write_names) or "_none_")]
+
+    answered = [ep for ep, i in tried.items()
+                if not i.get("skipped") and i.get("ok")]
+    with_rows = [ep for ep in answered if tried[ep].get("record_count")]
+    fields_by = extras.get("c14_fields_by_endpoint") or {}
+    carries_profile = [
+        ep for ep, names in fields_by.items()
+        if any(n.split(".")[-1] == "profile_id" for n in names)]
+    types = [k for k in values if "type" in k.split(".")[-1].lower()]
+    stages = [k for k in values if "stage" in k.split(".")[-1].lower()]
+
+    # CSuite's 404 bodies name the internal object they could not find
+    # (e.g. "erp::object::opportunity::list::type_api not available"). That
+    # is evidence about the namespace even when the call failed.
+    internal_names = sorted({
+        m.group(0) for i in tried.values() if not i.get("skipped")
+        for m in [re.search(r"erp::[\w:]+", str(i.get("error") or ""))] if m})
+    if internal_names:
+        lines += ["", "**Internal object names CSuite revealed in its 404 "
+                      "bodies:** " + ", ".join("`%s`" % n for n in internal_names)]
+
+    if answered:
+        exists = "YES — {} answered (HTTP 200, success=1){}".format(
+            ", ".join("`%s`" % e for e in answered),
+            "" if with_rows else " with data.count=0: the module is there "
+                                 "and holds no opportunities")
+    else:
+        all_missing = all(
+            i.get("skipped") or i.get("not_found_shaped")
+            for i in tried.values())
+        exists = ("NO — every endpoint tried came back not-found-shaped"
+                  if all_missing else
+                  "undetermined: no endpoint answered, but not every "
+                  "failure was a clean not-found")
+
+    if with_rows:
+        types_text = (", ".join("`%s`" % t for t in types)
+                      if types else "none observed on the rows returned")
+        stages_text = (", ".join("`%s`" % st for st in stages)
+                       if stages else "none observed on the rows returned")
+        profile_text = _tri(bool(carries_profile))
+    elif answered:
+        empty = "undetermined: 0 opportunities to inspect"
+        types_text = stages_text = profile_text = empty
+        if internal_names:
+            types_text += (" (opportunity/list/type and /stage exist as "
+                           "internal names but are 'not available')")
+    else:
+        types_text = stages_text = profile_text = "n/a"
+
+    answer = ("module via API: {}; types: {}; stages: {}; opportunity "
+              "carries profile_id: {}; create/edit name visible in code: {}"
+              .format(exists, types_text, stages_text, profile_text,
+                      "yes ({})".format(len(write_names)) if write_names
+                      else "no"))
+    return {"id": "C14", "title": "CSuite opportunities module by API",
+            "lines": lines, "answer": answer}
+
+
+def discover_c15(extras):
+    checks = extras.get("c15") or {}
+    lines = []
+    rows = []
+    for endpoint, info in checks.items():
+        rows.append(("`%s`" % endpoint,
+                     _tri(info["checked"], "yes", "not sampled", "—"),
+                     _cell(info.get("field_count")),
+                     ", ".join("`%s`" % f for f in info["fields"]) or "none"))
+    lines += _table(["Endpoint", "Inventory read", "Fields", "opportunity_id /"
+                     " communication_id-like"], rows) if rows else \
+        ["_No inventory to check._"]
+
+    linked = {ep: info["fields"] for ep, info in checks.items()
+              if info.get("fields")}
+    unchecked = [ep for ep, info in checks.items() if not info.get("checked")]
+    if linked:
+        answer = "YES — " + "; ".join(
+            "{}: {}".format(ep, ", ".join(fs)) for ep, fs in linked.items())
+    elif checks and not unchecked:
+        answer = ("NO — none of grant/list, donation/list, funit/display, "
+                  "funit/list carries an opportunity_id or communication_id")
+    elif checks:
+        answer = ("NO on the rows sampled; undetermined for {}".format(
+            ", ".join(unchecked)))
+    else:
+        answer = "undetermined: no field inventory available"
+    return {"id": "C15", "title": "Opportunity links on grant/donation/fund",
+            "lines": lines, "answer": answer}
+
+
+def discover_h12(probe, extras):
+    if not extras.get("h12_sample_ok"):
+        return {"id": "H12", "title": "Open tickets: fields and counts",
+                "lines": ["The ticket sample did not return."],
+                "answer": "undetermined: GET crm/v3/objects/tickets failed"}
+
+    record = next((r for r in probe.results
+                   if r["endpoint"] == "crm/v3/objects/tickets (H12 properties)"),
+                  None)
+    lines = ["Sample: {} tickets, properties requested: {}".format(
+        extras.get("h12_sample_size"),
+        ", ".join("`%s`" % p for p in H12_PROPERTIES)), ""]
+    optional = extras.get("h12_optional_properties") or {}
+    for name, present in optional.items():
+        lines.append("- `{}` in the ticket schema: {}".format(
+            name, _tri(present)))
+    lines.append("")
+    if record and record.get("fields"):
+        lines += _table(FIELD_HEADERS, _field_rows(record["fields"]))
+
+    totals = extras.get("h12_open_totals") or {}
+    lines += ["", "**Open tickets per pipeline** (POST-as-read via "
+                  "`crm/v3/objects/tickets/search`, `limit: 1`, `total` only)",
+              ""]
+    lines += _table(["Pipeline", "Label", "Open total"],
+                    [("`%s`" % pid, _cell(t["label"]),
+                      _cell(t["total"]) if t["total"] is not None
+                      else "undetermined: {}".format(t.get("reason")))
+                     for pid, t in totals.items()]) if totals else \
+        ["_No pipelines to count._"]
+
+    null_pct = extras.get("h12_lastactivity_null_pct")
+    lines += ["", "- `hs_lastactivitydate` null in the sample: {}".format(
+        "{}%".format(null_pct) if null_pct is not None else "undetermined"),
+        "- `hubspot_owner_id` populated: {}".format(
+            "{}%".format(extras.get("h12_owner_populated_pct"))
+            if extras.get("h12_owner_populated_pct") is not None
+            else "undetermined")]
+
+    counts = "; ".join(
+        "{} ({}): {}".format(t["label"], pid,
+                             t["total"] if t["total"] is not None
+                             else "undetermined")
+        for pid, t in totals.items()) or "undetermined: no pipelines"
+    answer = "open tickets — {}; hs_lastactivitydate null: {}".format(
+        counts, "{}% of the {}-ticket sample".format(
+            null_pct, extras.get("h12_sample_size"))
+        if null_pct is not None else "undetermined")
+    return {"id": "H12", "title": "Open tickets: fields and counts",
+            "lines": lines, "answer": answer}
+
+
+def discover_h13(extras):
+    tickets = extras.get("h13_tickets") or []
+    if not tickets:
+        return {"id": "H13", "title": "Ticket activity via associations",
+                "lines": ["No tickets were available to read associations "
+                          "for."],
+                "answer": "undetermined: no ticket sample"}
+    lines = []
+    if extras.get("h13_note"):
+        lines += ["_{}_".format(extras["h13_note"]), ""]
+    lines += _table(
+        ["Ticket", "Stage", "hs_lastactivitydate", "contacts", "emails",
+         "notes", "calls"],
+        [("`%s`" % t["ticket_id"], _cell(t["stage"]),
+          _cell(t["hs_lastactivitydate"]),
+          *[_cell(t["counts"].get(k)) for k in H13_ASSOCIATION_TYPES])
+         for t in tickets])
+    errors = {t["ticket_id"]: t.get("errors") for t in tickets
+              if t.get("errors")}
+    if errors:
+        lines += ["", "Association reads that failed: " + "; ".join(
+            "{} — {}".format(tid, ", ".join(
+                "{}: {}".format(k, _cell(v)[:60]) for k, v in errs.items()))
+            for tid, errs in errors.items())]
+
+    readable = all(all(v is not None for v in t["counts"].values())
+                   for t in tickets)
+    with_engagements = sum(
+        1 for t in tickets
+        if any((t["counts"].get(k) or 0) > 0 for k in ("emails", "notes",
+                                                         "calls")))
+    with_activity = sum(1 for t in tickets if t["hs_lastactivitydate"])
+    lines += ["", "- association endpoints readable for all {}: {}".format(
+        len(tickets), _tri(readable)),
+        "- tickets with at least one email/note/call association: {} of {}"
+        .format(with_engagements, len(tickets)),
+        "- tickets with hs_lastactivitydate set: {} of {}".format(
+            with_activity, len(tickets)),
+        "",
+        "Associations give COUNTS and ids only. A \"days since anyone "
+        "replied\" needs each engagement's own timestamp, which means one "
+        "more read per engagement (batch/read on emails/notes/calls) — the "
+        "association endpoint alone cannot date anything."]
+
+    if not readable:
+        answer = ("undetermined: association reads failed on some tickets; "
+                  "hs_lastactivitydate is the only signal that came back")
+    elif with_engagements == 0:
+        answer = ("only from hs_lastactivitydate — none of the {} tickets has "
+                  "an email/note/call association to date, and the "
+                  "association endpoints return ids without timestamps"
+                  .format(len(tickets)))
+    else:
+        untouched = len(tickets) - with_engagements
+        answer = ("both agree and neither is enough alone: {} of {} tickets "
+                  "have an email/note/call association and hs_lastactivitydate "
+                  "is set on {} of {} — the same tickets. Associations give "
+                  "ids only, so dating a reply needs a further batch/read per "
+                  "engagement; hs_lastactivitydate gives the date in one "
+                  "field. The other {} have NEVER been touched — no "
+                  "association, no activity date — so \"days since anyone "
+                  "replied\" is undefined for them and the honest metric is "
+                  "days since createdate".format(
+                      with_engagements, len(tickets), with_activity,
+                      len(tickets), untouched))
+    return {"id": "H13", "title": "Ticket activity via associations",
+            "lines": lines, "answer": answer}
+
+
+def discover_h14(extras):
+    pipelines = extras.get("h14_pipelines") or []
+    if not pipelines:
+        return {"id": "H14", "title": "Ticket pipeline stages",
+                "lines": ["crm/v3/pipelines/tickets returned nothing."],
+                "answer": "undetermined: pipelines not readable"}
+    lines = []
+    for pipeline in pipelines:
+        lines += ["**{} (`{}`)** — displayOrder {}".format(
+            _cell(pipeline["label"]), pipeline["id"],
+            _cell(pipeline["displayOrder"])), ""]
+        lines += _table(["Stage id", "Label", "displayOrder", "ticketState"],
+                        [("`%s`" % st["id"], _cell(st["label"]),
+                          _cell(st["displayOrder"]), _cell(st["ticketState"]))
+                         for st in pipeline["stages"]])
+        lines.append("")
+    answer = "; ".join(
+        "{} ({}): open = {}".format(
+            p["label"], p["id"],
+            "{" + ", ".join(p["open_stage_ids"]) + "}"
+            if p["open_stage_ids"] else "none marked OPEN")
+        for p in pipelines)
+    return {"id": "H14", "title": "Ticket pipeline stages",
+            "lines": lines, "answer": answer}
+
+
+def discover_h15(extras):
+    owners = extras.get("h15_owners") or {}
+    if not extras.get("h15_ok"):
+        return {"id": "H15", "title": "Owner id -> name",
+                "lines": ["crm/v3/owners did not return."],
+                "answer": "undetermined: owners not readable"}
+    lines = _table(["Owner id", "Name", "Email (masked)", "Archived"],
+                   [("`%s`" % oid, o["name"], _cell(o["email"]),
+                     _cell(o["archived"]))
+                    for oid, o in sorted(owners.items())]) if owners else \
+        ["_No owners returned._"]
+    active = {oid: o for oid, o in owners.items() if not o.get("archived")}
+    from config import Config
+    staff_domains = tuple(Config.ALLOWED_LOGIN_DOMAINS)
+    external = {oid: o for oid, o in active.items()
+                if o.get("email") and not any(
+                    o["email"].endswith("@" + d) for d in staff_domains)}
+    if external:
+        lines += ["", "- owners whose address is NOT on a staff domain: "
+                      + ", ".join("{} ({})".format(o["name"], o["email"])
+                                  for o in external.values())
+                      + " — an agency or contractor login; a \"days since "
+                        "staff replied\" digest has to decide whether their "
+                        "activity counts"]
+    answer = "{} owner(s), {} active — ".format(len(owners), len(active)) + \
+        "; ".join("{} = {}".format(oid, o["name"])
+                  for oid, o in sorted(active.items())) \
+        if owners else "no owners returned"
+    if external:
+        answer += "; {} of them on a non-staff domain ({})".format(
+            len(external), ", ".join(sorted({
+                o["email"].rsplit("@", 1)[1] for o in external.values()})))
+    return {"id": "H15", "title": "Owner id -> name", "lines": lines,
+            "answer": answer}
+
+
+def discover_h16(extras):
+    forms = extras.get("h16_forms") or []
+    listed = extras.get("h16_forms_listed") or 0
+    if not forms:
+        return {"id": "H16", "title": "Forms without an auto-reply",
+                "lines": ["No form definitions were read."],
+                "answer": "undetermined: {} forms listed, none readable"
+                .format(listed)}
+    rows = []
+    for f in forms:
+        if not f.get("readable"):
+            rows.append(("`%s`" % f["id"], _cell(f.get("listed_name")),
+                         _cell(f.get("listed_formType")),
+                         "undetermined: HTTP {} {}".format(
+                             _cell(f.get("http_status")),
+                             _cell(f.get("error"))[:50]), "—", "—", "—"))
+            continue
+        rows.append((
+            "`%s`" % f["id"], _cell(f.get("name")), _cell(f.get("formType")),
+            _cell(f.get("postSubmitAction_type")),
+            _cell(f.get("postSubmitAction_value")),
+            "{} ({})".format(f.get("notifyRecipients_count"),
+                             ", ".join(f.get("notifyRecipients") or []))
+            if f.get("notifyRecipients_count") else "0",
+            _cell(f.get("notifyContactOwner")),
+        ))
+    lines = _table(["Form id", "Name", "Type", "Post-submit", "Value",
+                    "Notify recipients", "Notify owner"], rows)
+
+    followup_seen = sorted({k for f in forms for k in f.get("followup_keys")
+                            or []})
+    lines += ["", "- keys mentioning follow-up anywhere in a definition: {}"
+              .format(", ".join("`%s`" % k for k in followup_seen)
+                      or "**none** — a follow-up EMAIL is not part of the "
+                         "marketing/v3 form definition; only the on-screen "
+                         "thank-you / redirect and the internal notification "
+                         "list are")]
+
+    readable = [f for f in forms if f.get("readable")]
+    unreadable = [f for f in forms if not f.get("readable")]
+    no_reply = [f for f in readable
+                if not f.get("postSubmitAction_type")
+                or (f.get("postSubmitAction_type") == "thank_you"
+                    and not f.get("postSubmitAction_value"))]
+    no_notify = [f for f in readable if not f.get("notifyRecipients_count")
+                 and not f.get("notifyContactOwner")]
+
+    def name_list(subset):
+        if not subset:
+            return "none"
+        if len(subset) == len(readable):
+            return "ALL {}".format(len(subset))
+        return ", ".join(_cell(f.get("name")) for f in subset)
+
+    redirects = [f for f in readable
+                 if f.get("postSubmitAction_type") == "redirect_url"]
+    answer = ("{} of {} listed forms read; no redirect and no thank-you copy "
+              "in postSubmitAction: {}; redirect configured: {}; no internal "
+              "notification recipient: {}; follow-up EMAIL: {}".format(
+                  len(readable), listed, name_list(no_reply),
+                  name_list(redirects), name_list(no_notify),
+                  "not exposed by marketing/v3/forms — undetermined from "
+                  "the API" if not followup_seen else "see keys above"))
+    if unreadable:
+        answer += "; {} form(s) unreadable: {}".format(
+            len(unreadable), ", ".join(
+                _cell(f.get("listed_name")) for f in unreadable))
+    return {"id": "H16", "title": "Forms without an auto-reply",
+            "lines": lines, "answer": answer}
+
+
 def build_discovery(probe, csuite_extras, hubspot_extras,
                     openrouter_extras=None):
     openrouter_extras = openrouter_extras or {}
@@ -4251,12 +5206,23 @@ def build_discovery(probe, csuite_extras, hubspot_extras,
         discover_h10(hubspot_extras),
         discover_h11(hubspot_extras),
         discover_o1(openrouter_extras),
+        discover_c13(csuite_extras),
+        discover_c14(probe, csuite_extras),
+        discover_c15(csuite_extras),
+        discover_h12(probe, hubspot_extras),
+        discover_h13(hubspot_extras),
+        discover_h14(hubspot_extras),
+        discover_h15(hubspot_extras),
+        discover_h16(hubspot_extras),
     ]
 
 
 # Items added by probe extension #3.
 P3_IDS = {"C7", "C8", "C9", "C10", "C11", "C12",
           "H6", "H7", "H8", "H9", "H10", "H11", "O1"}
+
+# Items added by probe #4.
+P4_IDS = {"C13", "C14", "C15", "H12", "H13", "H14", "H15", "H16"}
 
 
 def write_mapping_discovery(sections, path):
@@ -4281,8 +5247,10 @@ def write_mapping_discovery(sections, path):
                       s["answer"].replace("|", "\\|")) for s in sections])
     lines.append("")
 
-    earlier = [s for s in sections if s["id"] not in P3_IDS]
+    earlier = [s for s in sections
+               if s["id"] not in P3_IDS and s["id"] not in P4_IDS]
     probe3 = [s for s in sections if s["id"] in P3_IDS]
+    probe4 = [s for s in sections if s["id"] in P4_IDS]
 
     def emit(group):
         out = []
@@ -4303,6 +5271,13 @@ def write_mapping_discovery(sections, path):
               "relationships, pagination contract, ticket linkage, and the "
               "HubSpot and OpenRouter reads that the build depends on.", ""]
     lines += emit(probe3)
+    lines += ["", "# Probe #4 — CSuite Opportunities + HubSpot ticket "
+              "activity", "",
+              "Whether CSuite's Communications and Opportunities module "
+              "answers by API, and what an open-tickets report and a 48h "
+              "digest can read from HubSpot: pipeline stage states, owners, "
+              "per-ticket activity, and form auto-reply settings.", ""]
+    lines += emit(probe4)
     _write(path, "\n".join(lines))
 
 
