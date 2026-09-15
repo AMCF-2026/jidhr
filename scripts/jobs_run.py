@@ -52,6 +52,20 @@ _INSERT_SQL = """
     RETURNING id
 """
 
+# A mirror that is already due or already running makes --now a second
+# concurrent mirror, which is exactly what drew 429s on 2026-09-15.
+_MIRROR_BUSY_SQL = """
+    SELECT id, status, run_after
+      FROM jobs
+     WHERE job_type = %s
+       AND (
+             status IN ('claimed', 'running')
+          OR (status = 'queued' AND run_after <= NOW())
+       )
+     ORDER BY status, run_after
+     LIMIT 1
+"""
+
 _QUEUED_DAILY_SQL = """
     SELECT id, run_after
       FROM jobs
@@ -97,8 +111,26 @@ def seed(now=None) -> str:
             f"for {when.isoformat()}")
 
 
+class Refused(Exception):
+    """--now would start a second mirror; the message says which one."""
+
+
 def queue_now(now=None) -> str:
-    """Queue a one-off mirror_refresh to run immediately. No recurrence."""
+    """Queue a one-off mirror_refresh to run immediately. No recurrence.
+
+    Raises Refused if a mirror_refresh is already due (queued with
+    run_after in the past) or in flight.
+    """
+    busy = _first(database.execute_query(
+        _MIRROR_BUSY_SQL, (MIRROR_JOB_TYPE,), fetch=True))
+    if busy is not None:
+        status = _get(busy, "status", 1)
+        raise Refused(
+            f"refused: {MIRROR_JOB_TYPE} job {_get(busy, 'id', 0)} is already "
+            f"{'running' if status in ('claimed', 'running') else 'due'} "
+            f"(status {status}, run_after {_get(busy, 'run_after', 2)}) — "
+            "one mirror at a time")
+
     payload = {k: v for k, v in MIRROR_SEED["payload"].items()
                if k not in ("recurring", "at")}
     when = now or datetime.now(timezone.utc)
@@ -176,7 +208,11 @@ def main(argv=None) -> int:
         print(seed())
         return EXIT_OK
     if args.now:
-        print(queue_now())
+        try:
+            print(queue_now())
+        except Refused as why:
+            print(str(why), file=sys.stderr)
+            return EXIT_FAILED
         return EXIT_OK
     return run_once()
 

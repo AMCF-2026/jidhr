@@ -25,10 +25,18 @@ NOW = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
 class FakeJobs:
     """Records statements; answers the claim, count and insert shapes."""
 
-    def __init__(self, claimable=None, queued_recurring=0):
+    def __init__(self, claimable=None, queued_recurring=0, in_flight=None,
+                 blocked_types=None, mirror_busy=None):
         self.statements = []
         self.claimable = list(claimable or [])
         self.queued_recurring = queued_recurring
+        # Rows at 'running'/'claimed' the reaper will see.
+        self.in_flight = list(in_flight or [])
+        # What the mutex is holding back, as the blocked-types query
+        # would report it.
+        self.blocked_types = list(blocked_types or [])
+        # What --now's busy check finds.
+        self.mirror_busy = mirror_busy
         self.next_id = 500
 
     def __call__(self, sql, params=None, fetch=True):
@@ -39,6 +47,16 @@ class FakeJobs:
             if not self.claimable:
                 return []
             return [self.claimable.pop(0)]
+
+        if collapsed.startswith("SELECT id, job_type, payload") and \
+                "WHERE status IN ('claimed', 'running')" in collapsed:
+            return list(self.in_flight)
+
+        if collapsed.startswith("SELECT DISTINCT q.job_type"):
+            return [{"job_type": t} for t in self.blocked_types]
+
+        if collapsed.startswith("SELECT id, status, run_after FROM jobs"):
+            return [self.mirror_busy] if self.mirror_busy else []
 
         if collapsed.startswith("SELECT COUNT(*) AS n FROM jobs"):
             return [{"n": self.queued_recurring}]
@@ -130,13 +148,7 @@ def handlers(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def frozen_now(monkeypatch):
-    monkeypatch.setattr(runner, "datetime", _FixedDatetime)
-
-
-class _FixedDatetime(datetime):
-    @classmethod
-    def now(cls, tz=None):
-        return NOW if tz else NOW.replace(tzinfo=None)
+    monkeypatch.setattr(runner, "_utcnow", lambda: NOW)
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +175,8 @@ def test_claim_is_one_statement_with_skip_locked(db):
     sql, _ = db.claims[0]
     assert "FOR UPDATE SKIP LOCKED" in sql
     assert "LIMIT 1" in sql
-    assert "status = 'queued'" in sql and "run_after <= NOW()" in sql
-    assert "ORDER BY priority, run_after" in sql
+    assert "q.status = 'queued'" in sql and "q.run_after <= NOW()" in sql
+    assert "ORDER BY q.priority, q.run_after" in sql
     assert "RETURNING id, job_type, payload" in sql
     assert len(db.statements) == 1, "claim must be a single round trip"
 
@@ -405,6 +417,8 @@ def test_run_until_empty_drains_the_queue(db, handlers):
     assert [s["status"] for s in summaries] == ["complete", "failed",
                                                  "complete"]
     assert len(db.claims) == 4, "three claims plus the empty one"
+    assert db.matching("SELECT id, job_type, payload"), "reaper ran first"
+    assert db.statements[0][0].startswith("SELECT id, job_type, payload")
 
 
 def test_run_until_empty_has_a_ceiling(db, handlers, monkeypatch):
@@ -609,3 +623,237 @@ def test_cli_requires_exactly_one_mode(configured):
         jobs_run.main([])
     with pytest.raises(SystemExit):
         jobs_run.main(["--once", "--seed"])
+
+
+# ===========================================================================
+# 3b-fix: stale jobs + no concurrent mirror
+# ===========================================================================
+
+def running(job_id, job_type="mirror_refresh", minutes_ago=120, payload=None,
+            attempts=0, max_attempts=3, status="running"):
+    row = job(job_id=job_id, job_type=job_type, payload=payload,
+              attempts=attempts, max_attempts=max_attempts)
+    row["status"] = status
+    row["started_at"] = NOW - timedelta(minutes=minutes_ago)
+    row["claimed_at"] = row["started_at"]
+    return row
+
+
+# --- 1. reaper -------------------------------------------------------------
+
+def test_is_stale_uses_payload_max_runtime_with_a_90_minute_default():
+    assert runner.is_stale(running(1, minutes_ago=91), NOW) is True
+    assert runner.is_stale(running(1, minutes_ago=89), NOW) is False
+    assert runner.is_stale(
+        running(1, minutes_ago=31, payload={"max_runtime": 30}), NOW) is True
+    assert runner.is_stale(
+        running(1, minutes_ago=200, payload={"max_runtime": 240}), NOW) is False
+    assert runner.is_stale(
+        running(1, minutes_ago=91, payload={"max_runtime": "junk"}), NOW) is True
+
+
+def test_is_stale_only_applies_to_in_flight_rows():
+    finished = running(1, minutes_ago=500)
+    finished["status"] = "complete"
+    assert runner.is_stale(finished, NOW) is False
+    assert runner.is_stale(running(1, minutes_ago=500, status="claimed"),
+                           NOW) is True
+
+
+def test_in_flight_with_no_start_time_is_stale():
+    row = running(1)
+    row["started_at"] = None
+    row["claimed_at"] = None
+    assert runner.is_stale(row, NOW) is True
+
+
+def test_reaper_fails_stale_jobs_with_the_stale_error(db):
+    db.in_flight = [running(11, minutes_ago=120, payload=DAILY),
+                    running(12, minutes_ago=10)]
+
+    reaped = runner.reap_stale(now=NOW)
+
+    assert [r["job_id"] for r in reaped] == [11], "only the old one"
+    sql, params = db.fails[0]
+    error, result, job_id = params
+    assert error == "stale: no finish recorded"
+    assert job_id == 11
+    assert "finished_at = NOW()" in sql and "attempts = attempts + 1" in sql
+    stored = json.loads(result)
+    assert stored["_run"]["error"] == "stale: no finish recorded"
+    assert stored["max_runtime_minutes"] == 90
+
+
+def test_reaped_job_gets_the_normal_retry(db):
+    db.in_flight = [running(11, minutes_ago=120, attempts=0, max_attempts=3)]
+
+    reaped = runner.reap_stale(now=NOW)
+
+    assert reaped[0]["attempt"] == 1
+    assert len(db.retries) == 1
+    _, params = db.retries[0]
+    assert params[3] == "15 minutes"
+    assert db.occurrences == []
+
+
+def test_reaped_job_on_its_last_attempt_queues_recurrence_not_retry(db):
+    db.in_flight = [running(11, minutes_ago=120, payload=DAILY,
+                            attempts=2, max_attempts=3)]
+
+    reaped = runner.reap_stale(now=NOW)
+
+    assert reaped[0]["retry_queued"] is None
+    assert db.retries == []
+    assert len(db.occurrences) == 1
+    _, params = db.occurrences[0]
+    assert json.loads(params[1]) == DAILY
+
+
+def test_the_two_killed_mirrors_are_both_reaped(db):
+    """The 2026-09-15 shape: two mirror_refresh rows stuck at running."""
+    db.in_flight = [running(21, minutes_ago=300, payload=DAILY),
+                    running(22, minutes_ago=290, payload=DAILY)]
+
+    reaped = runner.reap_stale(now=NOW)
+
+    assert [r["job_id"] for r in reaped] == [21, 22]
+    assert len(db.fails) == 2
+    assert len(db.retries) == 2, "each gets its own retry row"
+
+
+def test_once_reaps_before_claiming(db, handlers, monkeypatch):
+    monkeypatch.setattr(runner, "reap_stale",
+                        lambda now=None: [{"job_id": 99, "job_type": "boom",
+                                           "status": "failed", "seconds": None,
+                                           "error": "stale: no finish recorded"}])
+    db.claimable = [job(job_id=1, job_type="demo")]
+
+    summaries = runner.run_until_empty("w")
+
+    assert [s["job_id"] for s in summaries] == [99, 1]
+    assert summaries[0]["error"] == "stale: no finish recorded"
+
+
+def test_reaper_and_run_failure_share_one_code_path(db, handlers):
+    """A killed job and a crashed job must leave the same trail."""
+    db.in_flight = [running(11, minutes_ago=120, attempts=1, max_attempts=3)]
+    runner.reap_stale(now=NOW)
+    runner.run(job(job_id=12, job_type="boom", attempts=1, max_attempts=3))
+
+    reaped_sql, reaped_params = db.fails[0]
+    crashed_sql, crashed_params = db.fails[1]
+    assert reaped_sql == crashed_sql
+    assert json.loads(reaped_params[1])["_run"]["attempt"] == 2
+    assert json.loads(crashed_params[1])["_run"]["attempt"] == 2
+    assert [p[3] for _, p in db.retries] == ["30 minutes", "30 minutes"]
+
+
+# --- 2. mutex --------------------------------------------------------------
+
+def test_claim_skips_a_type_that_is_already_running(db):
+    db.claimable = [job()]
+    runner.claim_next("w")
+
+    sql, _ = db.claims[0]
+    assert "NOT EXISTS" in sql
+    assert "r.job_type = q.job_type" in sql
+    assert "r.status IN ('claimed', 'running')" in sql
+    # A stale sibling does not block: only one younger than its max_runtime.
+    assert "r.started_at > NOW() -" in sql
+    assert "max_runtime" in sql
+    assert "ELSE 90 END" in sql
+
+
+def test_blocked_types_are_logged_once_per_once(db, handlers, caplog):
+    import logging
+
+    db.blocked_types = ["mirror_refresh"]
+    with caplog.at_level(logging.INFO, logger="jobs.runner"):
+        runner.run_until_empty("w")
+
+    lines = [r.getMessage() for r in caplog.records
+             if "held back" in r.getMessage()]
+    assert len(lines) == 1
+    assert "mirror_refresh" in lines[0]
+    assert "another of the same type is running" in lines[0]
+
+
+def test_no_mutex_line_when_nothing_is_blocked(db, handlers, caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="jobs.runner"):
+        runner.run_until_empty("w")
+    assert not [r for r in caplog.records if "held back" in r.getMessage()]
+
+
+def test_blocked_job_types_reads_the_query(db):
+    db.blocked_types = ["b", "a", "a"]
+    assert runner.blocked_job_types() == ["a", "b"]
+
+
+# --- 3. --now refuses a second mirror --------------------------------------
+
+def test_now_refuses_when_a_mirror_is_running(db, configured):
+    db.mirror_busy = {"id": 31, "status": "running",
+                      "run_after": "2026-09-15T06:00:00+00:00"}
+
+    with pytest.raises(jobs_run.Refused, match="job 31 is already running"):
+        jobs_run.queue_now(now=NOW)
+    assert db.inserts == []
+
+
+def test_now_refuses_when_a_mirror_is_already_due(db, configured):
+    db.mirror_busy = {"id": 32, "status": "queued",
+                      "run_after": "2026-09-15T06:00:00+00:00"}
+
+    with pytest.raises(jobs_run.Refused, match="job 32 is already due"):
+        jobs_run.queue_now(now=NOW)
+    assert db.inserts == []
+
+
+def test_now_busy_check_covers_running_and_due_only(db, configured):
+    jobs_run.queue_now(now=NOW)
+    sql, params = db.matching("SELECT id, status, run_after FROM jobs")[0]
+    assert "status IN ('claimed', 'running')" in sql
+    assert "status = 'queued' AND run_after <= NOW()" in sql
+    assert params == ("mirror_refresh",)
+
+
+def test_now_still_queues_when_the_only_mirror_is_tomorrows(db, configured):
+    # The busy query would not return a future-dated queued row.
+    db.mirror_busy = None
+    assert jobs_run.queue_now(now=NOW).startswith("queued one-off")
+
+
+def test_cli_now_exits_1_with_one_line_when_refused(db, configured, capsys):
+    db.mirror_busy = {"id": 31, "status": "running", "run_after": None}
+
+    assert jobs_run.main(["--now"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.err.strip().count("\n") == 0, "one line"
+    assert "refused: mirror_refresh job 31 is already running" in captured.err
+    assert captured.out == ""
+
+
+# --- 4. "started" is logged on claim, before the handler -------------------
+
+def test_once_logs_started_before_the_handler_runs(db, monkeypatch, caplog):
+    import logging
+
+    registry = {}
+    monkeypatch.setattr(runner, "HANDLERS", registry)
+    seen = []
+
+    @runner.register("slow")
+    def slow(job):
+        seen.append([r.getMessage() for r in caplog.records
+                     if "started" in r.getMessage()])
+        return {}
+
+    db.claimable = [job(job_id=7, job_type="slow")]
+    with caplog.at_level(logging.INFO, logger="jobs.runner"):
+        runner.run_until_empty("w")
+
+    assert seen and any("job 7: started (slow)" in l for l in seen[0]), \
+        "the started line must exist while the handler is still running"
