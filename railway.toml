@@ -7,3 +7,36 @@ healthcheckPath = "/health"
 healthcheckTimeout = 100
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
+# =============================================================================
+# SECOND SERVICE: nightly jobs runner (cron)
+# =============================================================================
+# This file configures the web service above and is left as-is. The jobs
+# runner is a SEPARATE Railway service on the SAME repo, created in the
+# Railway dashboard rather than here, because Railway reads one railway.toml
+# per service and the two need different start commands:
+#
+#   Service name    jidhr-jobs
+#   Source          this repository, branch main (same as the web service)
+#   Start command   /opt/venv/bin/python scripts/jobs_run.py --once
+#                   (if that interpreter path is wrong on the image,
+#                    `python scripts/jobs_run.py --once` — find the right
+#                    one with `which gunicorn` in the web service's shell)
+#   Cron schedule   15 6 * * *      (06:15 UTC = 2:15 AM ET; the queued
+#                                    mirror_refresh is dated 06:00 UTC, so
+#                                    it is already claimable when this fires)
+#   Variables       share the web service's DATABASE_URL, CSUITE_API_KEY,
+#                   CSUITE_API_SECRET, CSUITE_BASE_URL and SECRET_KEY
+#                   (Railway: "Shared Variables" or reference ${{jidhr.X}})
+#   Replicas        1 — two runners are safe (FOR UPDATE SKIP LOCKED), but
+#                   one is enough and halves the CSuite call rate
+#   Restart policy  never — `--once` exits 0 when the queue is empty, 1 if
+#                   a job failed, 2 if the database is unreachable; a
+#                   restart would just run an empty queue again
+#
+# After the service exists, seed the recurring job once from either
+# service's shell:
+#
+#   /opt/venv/bin/python scripts/jobs_run.py --seed
+#
+# The runner re-queues the next 06:00 UTC occurrence itself after every
+# run, so --seed is a one-time step (and is idempotent if run again).

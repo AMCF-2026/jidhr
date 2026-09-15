@@ -26,27 +26,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_content_external
     ON content_history (content_type, external_id);
 
 -- ===========================================================================
--- TODO: reconcile with live schema
+-- Reconciling with the live schema
 -- ===========================================================================
--- Step 1c asked for "the nine v2 tables exactly as they exist in the live
--- database". Only two are reachable from this repository:
+-- Only `content_history` and `users` were ever transcribed from DDL. The
+-- other v2 tables this code writes to — csuite_mirror, sync_runs,
+-- sync_staging, write_audit — are still known only by the column lists
+-- their briefs carried (see clients/audit.py, sync/mirror.py). They are
+-- not reproduced here because a guessed CREATE TABLE in a file that calls
+-- itself the source of truth is worse than an absent one.
 --
---     content_history   -- defined above
---     users             -- defined below, from clients/users.py's docstring
---
--- Those are the only table names any code here references (every call site
--- goes through clients.database.execute_query; see clients/users.py,
--- content/content_memory.py, content/social_capture.py,
--- content/content_analysis.py — all of which touch only those two).
---
--- The remaining seven table names are NOT in this repository, and nothing was
--- run against the database to discover them. They are deliberately left blank
--- rather than guessed: an invented column list here would be worse than an
--- absent one, because this file claims to be the source of truth.
---
--- To finish this section, paste the output of:
+-- To finish, paste the output of:
 --     pg_dump --schema-only --no-owner --no-privileges "$DATABASE_URL"
--- and drop in the CREATE TABLE blocks for the seven missing tables.
 -- ===========================================================================
 
 
@@ -75,3 +65,47 @@ CREATE TABLE IF NOT EXISTS users (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+
+-- ---------------------------------------------------------------------------
+-- jobs — the queue behind scripts/jobs_run.py and jobs/runner.py.
+--
+-- RECONSTRUCTED FROM information_schema (Step 3b brief, 2026-09-15): the
+-- column names and defaults are exact; the types are best-effort where the
+-- brief gave only a family ("timestamptz", "int"). NOT verified against a
+-- pg_dump. If the two ever disagree, the live database wins and this block
+-- is the thing to fix.
+--
+-- There is deliberately NO schedule column. Recurrence is in payload:
+--     {"recurring": "daily", "at": "06:00"}      (UTC)
+-- and jobs/runner.py queues the next occurrence after each finish.
+--
+-- Status values the runner uses: 'queued', 'running', 'complete', 'failed'.
+-- If the live table carries a CHECK constraint with a different vocabulary,
+-- jobs/runner.py's STATUS_* constants are what to change.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS jobs (
+    id              BIGSERIAL PRIMARY KEY,
+    job_type        TEXT NOT NULL,
+    payload         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status          TEXT NOT NULL DEFAULT 'queued',
+    priority        INTEGER NOT NULL DEFAULT 100,
+    run_after       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    max_attempts    INTEGER NOT NULL DEFAULT 3,
+    requested_by    BIGINT REFERENCES users(id),
+    sync_run_id     BIGINT,
+    claimed_by      TEXT,
+    claimed_at      TIMESTAMPTZ,
+    started_at      TIMESTAMPTZ,
+    finished_at     TIMESTAMPTZ,
+    result          JSONB,
+    error           TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- The claim query's access path: status + run_after, ordered by priority.
+-- Not confirmed to exist live; harmless if it already does.
+CREATE INDEX IF NOT EXISTS idx_jobs_claimable
+    ON jobs (status, run_after, priority);
