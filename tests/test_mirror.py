@@ -607,28 +607,110 @@ def test_money_parsing_survives_formatting_and_junk():
     assert mirror._money("not a number") == mirror._money("0")
 
 
-def test_donation_agg_stores_one_row_per_profile_and_no_raw_donations(db):
+# Every field a donation/list row actually carries (probe #3), plus one
+# invented one so the whitelist is proven to be a whitelist.
+FULL_DONATION_ROW = {
+    "donation_id": 28462, "donation_guid": None, "profile_id": 7001,
+    "funit_id": 1000, "donation_date": "2026-09-15",
+    "donation_amount": "75.50", "donation_status": "closed",
+    "anonymous_donation": 1, "payment_method_id": 1003,
+    # Must never reach the mirror:
+    "name": "Testcase, Aisha", "payment_method_name": "Credit Card",
+    "name_link_id": 7001, "fund_name": "Alpha Fund-(DAF0001)",
+    "fund_name_link_id": 1000, "cf_donation_1000": "a custom value",
+    "cf_donation_1003": None, "brand_new_field": "something sensitive",
+}
+
+DONATION_FORBIDDEN = ("name", "payment_method_name", "name_link_id",
+                      "fund_name", "fund_name_link_id", "cf_donation_1000",
+                      "cf_donation_1003", "brand_new_field")
+
+
+def test_donation_rows_carry_only_whitelisted_fields(db):
+    """The 2026-09-17 reversal: individual gifts ARE stored — with
+    DONATION_FIELDS as the privacy boundary."""
     client = StubClient({
-        "donation/list": [ok(DONATIONS, count=6), ok([])]
+        "donation/list": [ok([FULL_DONATION_ROW], count=1), ok([])]
     })
 
-    result = mirror.refresh_type("donation_agg", client=client, pace_ms=0)
+    result = mirror.refresh_type("donation", client=client, pace_ms=0)
 
     assert result.status == "complete"
-    assert result.fetched == 2
-    assert result.written == 2
-
+    assert result.fetched == 1
     rows = db.upserted_rows()
-    assert {row["csuite_id"] for row in rows} == {"7001", "7002"}
-    for row in rows:
-        assert "donation_id" not in row["data"], (
-            "an individual donation must never reach the mirror")
-        assert set(row["data"]) == {
-            "profile_id", "lifetime_total", "count",
-            "first_date", "first_amount", "first_fund",
-            "latest_date", "latest_amount", "latest_fund",
-            "greatest_amount", "greatest_date", "ramadan_years",
-        }
+    assert [r["record_type"] for r in rows] == ["donation"]
+    assert rows[0]["csuite_id"] == "28462"
+
+    stored = rows[0]["data"]
+    assert set(stored) == set(mirror.DONATION_FIELDS)
+    assert stored["profile_id"] == 7001
+    assert stored["donation_amount"] == "75.50"
+    for field_name in DONATION_FORBIDDEN:
+        assert field_name not in stored, f"{field_name} leaked into the mirror"
+
+    # Not merely absent from the parsed dict — absent from the JSON.
+    raw = db.upserts[0][1][3]
+    assert "Aisha" not in raw and "Credit Card" not in raw
+    assert "sensitive" not in raw
+
+
+# ---- the whitelist trio ------------------------------------------------------
+
+def test_donation_record_keeps_exactly_the_whitelist():
+    record = mirror.donation_record(FULL_DONATION_ROW)
+    assert set(record) == set(mirror.DONATION_FIELDS)
+    assert set(mirror.DONATION_FIELDS) == {
+        "donation_id", "donation_guid", "profile_id", "funit_id",
+        "donation_date", "donation_amount", "donation_status",
+        "anonymous_donation", "payment_method_id",
+    }
+
+
+def test_donation_record_never_carries_the_donor_name():
+    record = mirror.donation_record(FULL_DONATION_ROW)
+    for field_name in DONATION_FORBIDDEN:
+        assert field_name not in record
+    assert "Aisha" not in str(record)
+
+
+def test_a_new_csuite_donation_field_is_not_mirrored_by_default():
+    """Whitelist, not blacklist: a field CSuite adds tomorrow is dropped
+    until someone chooses to store it."""
+    record = mirror.donation_record(
+        dict(FULL_DONATION_ROW, donor_email="a@example.invalid"))
+    assert "donor_email" not in record
+    # And a missing whitelisted field is present as null, so the row
+    # shape is stable whatever the source row carried.
+    record = mirror.donation_record({"donation_id": 1})
+    assert record["donation_guid"] is None and record["profile_id"] is None
+
+
+# ---- the TTL pair -------------------------------------------------------------
+
+def test_donation_rows_expire_like_other_donor_data():
+    assert mirror.TTL_HOURS["donation"] == 96
+    assert mirror._expires_clause("donation") == "96 hours"
+
+
+def test_donation_upsert_binds_the_96_hour_interval(db):
+    client = StubClient({
+        "donation/list": [ok([FULL_DONATION_ROW], count=1), ok([])]
+    })
+    mirror.refresh_type("donation", client=client, pace_ms=0)
+    sql, params = db.upserts[0]
+    assert "NOW() + %s::interval" in sql
+    assert params[-1] == "96 hours"
+
+
+def test_donation_rows_without_an_id_are_counted_not_stored(db):
+    client = StubClient({
+        "donation/list": [ok([FULL_DONATION_ROW,
+                              {"profile_id": 1, "donation_amount": "1.00"}],
+                             count=2), ok([])]
+    })
+    result = mirror.refresh_type("donation", client=client, pace_ms=0)
+    assert result.fetched == 1
+    assert result.notes["unkeyed_rows"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1720,28 +1802,33 @@ def test_fund_quarter_drops_rows_it_cannot_bucket():
     assert dropped == 2
 
 
-def test_asking_for_donation_agg_produces_both_aggregates(db):
+def test_asking_for_donation_agg_produces_all_three_shapes(db):
     client = StubClient({"donation/list": [ok(DONATIONS, count=6), ok([])]})
 
     results = mirror.refresh(record_types=["donation_agg"], client=client,
                              pace_ms=0)
 
-    assert [r.record_type for r in results] == ["donation_agg",
-                                                "donation_fund_quarter"]
+    assert [r.record_type for r in results] == [
+        "donation_agg", "donation_fund_quarter", "donation"]
     assert all(r.status == "complete" for r in results)
 
     written = {row["record_type"] for row in db.upserted_rows()}
-    assert written == {"donation_agg", "donation_fund_quarter"}
+    assert written == {"donation_agg", "donation_fund_quarter", "donation"}
+    # Six gifts in, six gift rows out — one per donation_id.
+    assert len([r for r in db.upserted_rows()
+                if r["record_type"] == "donation"]) == 6
 
 
-def test_the_second_aggregate_costs_no_extra_csuite_calls(db):
+def test_the_second_and_third_shapes_cost_no_extra_csuite_calls(db):
     client = StubClient({"donation/list": [ok(DONATIONS, count=6), ok([])]})
 
     results = mirror.refresh(record_types=["donation_agg"], client=client,
                              pace_ms=0)
 
     assert results[0].calls == 2, "one page plus the empty terminator"
-    assert results[1].calls == 0, "the second roll-up reuses the same sweep"
+    assert results[1].calls == 0, "the quarter roll-up reuses the sweep"
+    assert results[2].calls == 0, "the gift rows reuse the sweep"
+    assert sum(r.calls for r in results) == 2
     assert len([c for c in client.calls if c[0] == "donation/list"]) == 2
 
 
@@ -1756,7 +1843,7 @@ def test_a_partial_donation_sweep_is_not_cached_for_the_companion(db):
                              pace_ms=0)
 
     assert results[0].status == "failed"
-    assert results[1].status == "skipped"
+    assert [r.status for r in results[1:]] == ["skipped", "skipped"]
     assert db.upserts == []
 
 
@@ -1766,17 +1853,23 @@ def test_fund_quarter_rows_never_expire():
 
 def test_expand_types_keeps_order_and_does_not_duplicate():
     assert mirror.expand_types(["fund", "donation_agg"]) == [
-        "fund", "donation_agg", "donation_fund_quarter"]
+        "fund", "donation_agg", "donation_fund_quarter", "donation"]
     assert mirror.expand_types(["donation_agg", "donation_fund_quarter"]) == [
-        "donation_agg", "donation_fund_quarter"]
+        "donation_agg", "donation_fund_quarter", "donation"]
+    assert mirror.expand_types(["donation", "donation_agg"]) == [
+        "donation", "donation_agg", "donation_fund_quarter"]
     assert mirror.expand_types(["donation_fund_quarter"]) == [
         "donation_fund_quarter"]
+    assert mirror.expand_types(["donation"]) == ["donation"]
     assert mirror.expand_types() == list(mirror.RECORD_TYPES)
 
 
-def test_donation_fund_quarter_is_a_record_type():
-    assert "donation_fund_quarter" in mirror.RECORD_TYPES
-    assert "donation_fund_quarter" in mirror.GATHERERS
+def test_donation_shapes_are_record_types():
+    for record_type in ("donation_fund_quarter", "donation"):
+        assert record_type in mirror.RECORD_TYPES
+        assert record_type in mirror.GATHERERS
+    assert mirror.COMPANION_TYPES["donation_agg"] == (
+        "donation_fund_quarter", "donation")
 
 
 def test_the_reused_sweep_is_not_billed_twice(db):
@@ -1788,8 +1881,9 @@ def test_the_reused_sweep_is_not_billed_twice(db):
                              pace_ms=0)
 
     assert sum(r.calls for r in results) == 2
-    assert results[1].notes["calls"] == 0
-    assert results[1].notes["pages"] == 0
+    for companion in results[1:]:
+        assert companion.notes["calls"] == 0
+        assert companion.notes["pages"] == 0
 
 
 # ---------------------------------------------------------------------------

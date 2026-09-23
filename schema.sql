@@ -109,3 +109,36 @@ CREATE TABLE IF NOT EXISTS jobs (
 -- Not confirmed to exist live; harmless if it already does.
 CREATE INDEX IF NOT EXISTS idx_jobs_claimable
     ON jobs (status, run_after, priority);
+
+
+-- ---------------------------------------------------------------------------
+-- csuite_donations — PROPOSED, NOT APPLIED.
+--
+-- Since 2026-09-17 individual gifts are mirrored as jsonb rows in
+-- csuite_mirror (record_type = 'donation', see sync/mirror.py
+-- DONATION_FIELDS). That needs no DDL and is the live shape. This typed
+-- table is the upgrade path ONLY if date-range or lapsed-donor queries over
+-- ~27k jsonb rows prove too slow. Do not create it on speculation; if it is
+-- created, sync/mirror.py's donation gatherer is what changes to fill it.
+--
+-- No donor name, email, address, card or bank column: none exists on the
+-- CSuite record, and the name lives on the profile row already.
+-- ---------------------------------------------------------------------------
+--
+-- CREATE TABLE csuite_donations (
+--     donation_id        BIGINT PRIMARY KEY,
+--     donation_guid      UUID,
+--     profile_id         BIGINT NOT NULL,          -- joins csuite_mirror 'profile'
+--     funit_id           BIGINT NOT NULL,          -- joins csuite_mirror 'fund'
+--     donation_date      DATE NOT NULL,
+--     donation_amount    NUMERIC(14,2) NOT NULL,
+--     donation_status    TEXT,
+--     anonymous_donation BOOLEAN NOT NULL DEFAULT FALSE,
+--     payment_method_id  INTEGER,
+--     synced_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+--     run_id             BIGINT REFERENCES sync_runs(id),
+--     expires_at         TIMESTAMPTZ                -- NOW() + 96h, donor-derived
+-- );
+-- CREATE INDEX idx_csuite_donations_date    ON csuite_donations (donation_date);
+-- CREATE INDEX idx_csuite_donations_profile ON csuite_donations (profile_id);
+-- CREATE INDEX idx_csuite_donations_fund    ON csuite_donations (funit_id, donation_date);

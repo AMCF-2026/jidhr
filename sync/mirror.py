@@ -53,9 +53,28 @@ Freshness
 ---------
 Reference data (fund, fee_type, event, grant, check) has no expiry — it
 changes rarely and a stale row is still a true row. Anything derived from
-donors (profile, donation_agg) expires 96 hours after it is written, so a
-mirror that stops refreshing stops being trusted rather than quietly
-ageing.
+donors (profile, donation_agg, donation) expires 96 hours after it is
+written, so a mirror that stops refreshing stops being trusted rather
+than quietly ageing.
+
+Individual gifts — the 2026-09-17 reversal
+-----------------------------------------
+Step 3a (2026-09-10) ruled that the mirror never stores individual
+donation rows: donation/list was fetched, aggregated per profile and per
+fund-quarter, and the rows were discarded. On 2026-09-17 Carl reversed
+that, because the questions being asked — gifts in a date window, median
+gift, first-time versus repeat, who gave then and not since — cannot be
+answered from aggregates, and the nightly job was already paying for all
+267 pages and throwing them away. The `donation` record type now keeps
+one row per gift from the same shared fetch (zero extra CSuite calls),
+with DONATION_FIELDS as the privacy boundary: id, guid, profile_id,
+funit_id, date, amount, status, anonymous flag, payment_method_id. No
+donor name, no payment_method_name, no cf_ custom fields. The donor is
+reachable through profile_id, which is the point — a gift row that named
+its donor would be a second copy of the profile table. Rows are jsonb
+in csuite_mirror like every other type; the typed csuite_donations table
+sketched in schema.sql is the upgrade path if range queries prove slow,
+and is not applied.
 
 Run ledger
 ----------
@@ -128,19 +147,39 @@ RECORD_TYPES = (
     "profile",
     "donation_agg",
     "donation_fund_quarter",
+    "donation",
 )
 
-# donation_agg and donation_fund_quarter are two shapes of the same 267-page
-# donation/list sweep, so asking for one always produces the other. The
-# fetch itself is cached per refresh() call, which is what makes the second
-# one free.
-COMPANION_TYPES = {"donation_agg": "donation_fund_quarter"}
+# donation_agg, donation_fund_quarter and donation are three shapes of the
+# same 267-page donation/list sweep, so asking for the first always
+# produces the other two. The fetch itself is cached per refresh() call,
+# which is what makes the second and third free.
+COMPANION_TYPES = {"donation_agg": ("donation_fund_quarter", "donation")}
 
 # Hours until a row stops being trusted. Absent = never expires.
 TTL_HOURS = {
     "profile": 96,
     "donation_agg": 96,
+    "donation": 96,
 }
+
+# Every field a mirrored gift row may carry — the privacy boundary of the
+# 2026-09-17 reversal (see the module docstring). Whitelist, never
+# blacklist: a field CSuite adds tomorrow is dropped until someone chooses
+# to keep it. donation_guid is on donation/display only, so it is null on
+# rows built from donation/list; it is kept so a future display-based
+# refresh fills it without a schema change.
+DONATION_FIELDS = (
+    "donation_id",
+    "donation_guid",
+    "profile_id",
+    "funit_id",
+    "donation_date",
+    "donation_amount",
+    "donation_status",
+    "anonymous_donation",
+    "payment_method_id",
+)
 
 # Every field a mirrored profile row may carry. Everything else CSuite
 # returns — phone numbers, work details, website, custom fields — is
@@ -795,6 +834,56 @@ def aggregate_donations_by_fund_quarter(rows) -> tuple[dict, int]:
     )
 
 
+def donation_record(row: dict) -> dict:
+    """A gift reduced to DONATION_FIELDS and nothing else.
+
+    Built by naming what is kept. The donor's `name` and the
+    `payment_method_name` on the source row never make it in.
+    """
+    return {name: row.get(name) for name in DONATION_FIELDS}
+
+
+def _gather_donation(ctx: GatherContext) -> Gathered:
+    """One mirror row per gift, from the shared donation/list sweep.
+
+    The third consumer of ctx.fetch_shared("donation/list"): after
+    donation_agg and donation_fund_quarter have rolled the rows up, this
+    keeps the rows themselves — whitelisted — so date-window questions
+    can be answered without re-reading CSuite.
+    """
+    result = ctx.fetch_shared("donation/list")
+
+    gathered = Gathered(
+        complete=result.complete,
+        expected=result.expected,
+        pages=result.pages,
+        error=result.error,
+        notes={"endpoint": "donation/list"},
+    )
+    gathered.absorb(result)
+    if not result.complete:
+        return gathered
+
+    unkeyed = 0
+    for row in result.records:
+        if not isinstance(row, dict):
+            unkeyed += 1
+            continue
+        key = _key(row.get("donation_id"))
+        if key is None:
+            unkeyed += 1
+            continue
+        gathered.rows.append(MirrorRow(csuite_id=key,
+                                       data=donation_record(row)))
+
+    if unkeyed:
+        gathered.notes["unkeyed_rows"] = unkeyed
+        logger.warning("donation/list: %d rows had no donation_id and were "
+                       "not mirrored", unkeyed)
+    gathered.notes["stored_fields"] = list(DONATION_FIELDS)
+    return gathered
+
+
 # How each record type is gathered. Keyed lookups use the first id field
 # present, so an endpoint that returns `id` instead of `<thing>_id` still
 # mirrors — funit/list/search already does exactly that.
@@ -811,6 +900,7 @@ GATHERERS = {
     "profile": _gather_profile,
     "donation_agg": _gather_donation_agg,
     "donation_fund_quarter": _gather_donation_fund_quarter,
+    "donation": _gather_donation,
 }
 
 
@@ -1454,10 +1544,10 @@ def refresh_type(record_type: str, client=None, pace_ms=None,
 def expand_types(record_types=None) -> list:
     """The types to run, with companions added and original order kept.
 
-    Asking for donation_agg gets donation_fund_quarter too: they are two
-    roll-ups of one sweep, and refreshing one without the other leaves the
-    quarterly report reading numbers from a different day than the lapsed
-    donor report.
+    Asking for donation_agg gets donation_fund_quarter and donation too:
+    they are three shapes of one sweep, and refreshing one without the
+    others leaves the quarterly report reading numbers from a different
+    day than the lapsed donor report.
     """
     types = list(record_types) if record_types else list(RECORD_TYPES)
 
@@ -1465,9 +1555,12 @@ def expand_types(record_types=None) -> list:
     for record_type in types:
         if record_type not in expanded:
             expanded.append(record_type)
-        companion = COMPANION_TYPES.get(record_type)
-        if companion and companion not in expanded:
-            expanded.append(companion)
+        companions = COMPANION_TYPES.get(record_type) or ()
+        if isinstance(companions, str):
+            companions = (companions,)
+        for companion in companions:
+            if companion not in expanded:
+                expanded.append(companion)
     return expanded
 
 

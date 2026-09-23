@@ -2372,3 +2372,51 @@ def test_raw_and_usable_counts_are_logged(loaded, no_users_table, caplog):
     messages = [r.getMessage() for r in caplog.records]
     assert any("HubSpot 3 raw -> 1 usable" in m for m in messages), messages
     assert any("CSuite 2 raw -> 1 usable" in m for m in messages), messages
+
+
+# ===========================================================================
+# 2026-09-17: donation rows are fund-linked, so the exclusions apply
+# ===========================================================================
+
+GIFTS = [
+    {"_id": 90001, "donation_id": 90001, "profile_id": 7001, "funit_id": 1100,
+     "donation_date": "2026-09-01", "donation_amount": "100.00",
+     "donation_status": "closed", "anonymous_donation": 0,
+     "payment_method_id": 1003},
+    # A gift to a TEST fund.
+    {"_id": 90002, "donation_id": 90002, "profile_id": 7001, "funit_id": 1900,
+     "donation_date": "2026-09-02", "donation_amount": "99999.00",
+     "donation_status": "closed", "anonymous_donation": 0,
+     "payment_method_id": 1003},
+    # A gift to a SYSTEM fund.
+    {"_id": 90003, "donation_id": 90003, "profile_id": 7002, "funit_id": 1001,
+     "donation_date": "2026-09-03", "donation_amount": "1000000.00",
+     "donation_status": "closed", "anonymous_donation": 0,
+     "payment_method_id": 1003},
+]
+
+
+def test_donation_is_a_fund_linked_type():
+    assert mirror_read._FUND_LINKED_TYPES["donation"] == "funit_id"
+
+
+def test_gifts_to_test_and_system_funds_are_excluded_by_default(mirror):
+    mirror.load({"fund": REAL_FUNDS + SYSTEM_FUNDS + TEST_FUNDS,
+                 "donation": GIFTS})
+
+    kept = {g["csuite_id"] for g in mirror_read.rows("donation")}
+    assert kept == {"90001"}
+
+    everything = {g["csuite_id"] for g in mirror_read.rows(
+        "donation", exclude_test=False, exclude_system=False)}
+    assert everything == {"90001", "90002", "90003"}
+
+
+def test_gift_exclusion_survives_a_date_filter(mirror):
+    mirror.load({"fund": REAL_FUNDS + SYSTEM_FUNDS + TEST_FUNDS,
+                 "donation": GIFTS})
+    kept = mirror_read.rows(
+        "donation",
+        "AND data->>'donation_date' >= %s AND data->>'donation_date' <= %s",
+        ("2026-09-01", "2026-09-30"))
+    assert [g["csuite_id"] for g in kept] == ["90001"]

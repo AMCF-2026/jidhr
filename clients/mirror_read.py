@@ -54,6 +54,7 @@ DISPLAY_TZ_LABEL = "ET"
 _FUND_LINKED_TYPES = {
     "grant": "funit_id",
     "donation_fund_quarter": "funit_id",
+    "donation": "funit_id",
 }
 
 
