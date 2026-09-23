@@ -253,3 +253,21 @@ acceptable the moment staff can paste HTML into a draft: a pasted token
 is then an expression someone else wrote, rendering inside AMCF's
 templates against AMCF's contact data. Revisit before any paste path
 ships.
+
+## 2026-09-23 — First production draft, and why `attempted` is a valid status
+
+HubSpot marketing email **400071396088** is the first draft Jidhr created
+through the coded-template path, audited as `write_audit` row **10**. It
+took two attempts. The first was refused before the request left the
+process, because `write_audit_status_check` allowed only `success`,
+`failed` and `skipped`, and `reserve_write` inserts `attempted`. The
+constraint was widened to include it rather than the reserve being
+downgraded to an allowed value: `attempted` is the entire point of the
+reserve/complete pair, and reusing `failed` would make a process killed
+between sending a request and recording its outcome — the state two
+`mirror_refresh` runs were left in on 2026-09-15 — indistinguishable
+from a request the API rejected. That refusal also exposed a second
+defect and fixed it: the clients returned `AuditUnavailable` as an
+ordinary error dict, so the reply read "Failed to save email" and named
+HubSpot when the cause was a Postgres constraint. Refusals now raise, and
+the reply carries the constraint's own name.

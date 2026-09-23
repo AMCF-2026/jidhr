@@ -112,6 +112,7 @@ import hashlib
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 
@@ -148,6 +149,7 @@ RECORD_TYPES = (
     "donation_agg",
     "donation_fund_quarter",
     "donation",
+    "event_registration",
 )
 
 # donation_agg, donation_fund_quarter and donation are three shapes of the
@@ -204,6 +206,53 @@ PROFILE_FIELDS = (
 )
 PROFILE_CREATED_SOURCES = ("created_date", "created_ts")
 
+# Every field a mirrored event registration may carry. The privacy
+# boundary for registrant data, same discipline as PROFILE_FIELDS and
+# DONATION_FIELDS.
+#
+# What CSuite does NOT provide, and which is therefore absent rather than
+# stubbed null (verified live 2026-09-23 across every registrant row):
+#   registration_id  a registrant row has no id of any kind
+#   first_name/last_name   only the combined `event_profile_name`
+#   ticket_type      tickets[] is event-level, not per-registrant
+#   registered_at    no registration timestamp exists
+#
+# `attended` exists AND IS USED, though rarely: across 363 registrants on
+# 20 event dates (2026-09-23) it was set on 44 — all of them on one event
+# date, 1231, where 44 of 80 registrants were checked in against 69
+# rsvps. Every other date sampled had none. It is stored exactly as
+# CSuite gives it and never inferred from rsvp: an rsvp is an intention,
+# and on 1231 the two numbers differ, so deriving one from the other
+# would overwrite a real check-in record with a guess.
+#
+# guests[] is reduced to guest_count. Guest names and emails are people
+# who never gave us their address; a count is the useful part.
+EVENT_REGISTRATION_FIELDS = (
+    "event_date_id",
+    "event_id",
+    "profile_id",
+    "event_profile_email",
+    "event_profile_name",
+    "rsvp",
+    "attended",
+    "guest_count",
+    "pulled_at",
+)
+
+# Fields excluded from the change-detection hash. pulled_at moves on every
+# pull, so hashing it would make every registration row "changed" every
+# night and defeat the unchanged-skip the whole mirror is built on. The
+# mirror's own synced_at column records the last verification; pulled_at
+# records when the CONTENT we hold was first seen.
+HASH_EXCLUDED_FIELDS = {
+    "event_registration": ("pulled_at",),
+}
+
+# An event date whose registrant list is frozen. CSuite returns archived
+# as 0 or 1; 1 means the list will not change again, so nightly runs skip
+# it and the backfill is the only thing that ever reads it.
+ARCHIVED = 1
+
 # Rows are upserted in batches rather than one statement per record —
 # 18,600 profiles is 38 statements at this size instead of 18,600.
 UPSERT_BATCH = 500
@@ -227,8 +276,21 @@ STAGED_MAX_AGE = "24 hours"
 # Small helpers
 # ---------------------------------------------------------------------------
 
-def _hash(payload) -> str:
-    """sha256 of the canonical JSON form of a record."""
+def _utc_stamp() -> str:
+    """Now, as an ISO-8601 UTC string — what pulled_at records."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _hash(payload, record_type: str = None) -> str:
+    """sha256 of the canonical JSON form of a record.
+
+    Volatile fields (HASH_EXCLUDED_FIELDS) are left out so a value that
+    changes on every pull does not make an otherwise identical record
+    look changed.
+    """
+    excluded = HASH_EXCLUDED_FIELDS.get(record_type) if record_type else None
+    if excluded and isinstance(payload, dict):
+        payload = {k: v for k, v in payload.items() if k not in excluded}
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
@@ -376,6 +438,12 @@ class Gathered:
     # prose meant for a human reading the ledger and gets wrapped with
     # context ("...after 136 of 397 funds"); this stays comparable.
     stop_reason: str | None = None
+    # Key prefixes (the part before ':') this run actually refreshed. When
+    # set, ONLY keys under these prefixes may be deleted as stale. Without
+    # it a nightly registration run — which reads 14 of 179 event dates —
+    # would treat the other 165 events' registrants as vanished and delete
+    # the entire backfill on its first night.
+    refreshed_prefixes: set | None = None
 
     def absorb(self, result) -> None:
         """Fold one FetchResult's call and rate-limit counters in."""
@@ -404,6 +472,12 @@ class GatherContext:
     # record types built from the same sweep pay for it once. Keyed by
     # endpoint; lives only as long as the refresh call that made it.
     cache: dict = field(default_factory=dict)
+    # Per-run gatherer options, e.g. {"backfill": True, "force": False}.
+    # Kept generic so a new mode does not mean a new ctx field.
+    options: dict = field(default_factory=dict)
+
+    def option(self, name, default=None):
+        return (self.options or {}).get(name, default)
 
     def fetch_shared(self, endpoint: str):
         """fetch_all for an endpoint, reusing this run's result if there is one.
@@ -884,6 +958,211 @@ def _gather_donation(ctx: GatherContext) -> Gathered:
     return gathered
 
 
+# SQL for backfill resumability: which event dates already have rows.
+_REGISTERED_EVENT_DATES_SQL = """
+    SELECT DISTINCT split_part(csuite_id, ':', 1) AS event_date_id
+      FROM csuite_mirror
+     WHERE record_type = 'event_registration'
+"""
+
+
+def registration_key(event_date_id, profile_id) -> str | None:
+    """The synthetic key: "{event_date_id}:{profile_id}".
+
+    CSuite gives a registrant row no id of its own, so the pair that
+    identifies it becomes the key — the same approach
+    donation_fund_quarter uses for "{funit_id}:{year}Q{n}".
+    """
+    event_key = _key(event_date_id)
+    profile_key = _key(profile_id)
+    if event_key is None or profile_key is None:
+        return None
+    return f"{event_key}:{profile_key}"
+
+
+def registration_record(profile_row: dict, event_row: dict,
+                        pulled_at: str) -> dict:
+    """One registrant reduced to EVENT_REGISTRATION_FIELDS.
+
+    Built by naming what is kept. guests[] becomes a count; the guest
+    names and emails inside it never enter the mirror.
+    """
+    guests = profile_row.get("guests")
+    return {
+        "event_date_id": _key(event_row.get("event_date_id")),
+        "event_id": event_row.get("event_id"),
+        "profile_id": profile_row.get("profile_id"),
+        "event_profile_email": profile_row.get("event_profile_email"),
+        "event_profile_name": profile_row.get("event_profile_name"),
+        "rsvp": profile_row.get("rsvp"),
+        "attended": profile_row.get("attended"),
+        "guest_count": len(guests) if isinstance(guests, list) else 0,
+        "pulled_at": pulled_at,
+    }
+
+
+def _already_backfilled() -> set:
+    """event_date_ids that already have registration rows in the mirror."""
+    try:
+        found = database.execute_query(_REGISTERED_EVENT_DATES_SQL, (),
+                                       fetch=True)
+    except Exception as e:
+        logger.warning("could not read backfill progress: %s", e)
+        return set()
+    if not isinstance(found, (list, tuple)):
+        return set()
+    done = set()
+    for row in found:
+        value = row.get("event_date_id") if isinstance(row, dict) else row[0]
+        key = _key(value)
+        if key is not None:
+            done.add(key)
+    return done
+
+
+def select_event_dates(events, backfill: bool, done: set = None,
+                       force: bool = False, max_events=None) -> tuple:
+    """(event dates to read, why the rest were skipped).
+
+    nightly   only archived != 1. An archived list is final; re-reading it
+              every night would spend 165 calls to learn nothing.
+    backfill  every event date, no date filter — 98 of 179 carry no
+              event_date at all, so a date window would silently drop
+              more than half the catalogue. Resumable: an event date that
+              already has rows is skipped unless --force.
+    """
+    done = done or set()
+    chosen, skipped = [], {"archived": 0, "already_done": 0, "unkeyed": 0}
+
+    for event in events:
+        event_date_id = _key(event.get("event_date_id"))
+        if event_date_id is None:
+            skipped["unkeyed"] += 1
+            continue
+        if not backfill and event.get("archived") == ARCHIVED:
+            skipped["archived"] += 1
+            continue
+        if backfill and not force and event_date_id in done:
+            skipped["already_done"] += 1
+            continue
+        chosen.append(event)
+
+    if max_events is not None:
+        chosen = chosen[:max_events]
+    return chosen, skipped
+
+
+def _gather_event_registration(ctx: GatherContext) -> Gathered:
+    """Registrants for each qualifying event date.
+
+    One event/display/eventdate call per event date — CSuite exposes no
+    bulk registration endpoint (event/list/registrants and
+    registration/list both 404, verified 2026-09-23), so this is the only
+    way to read them.
+
+    Nightly reads the ~14 non-archived dates. --backfill reads all 179
+    and is resumable across invocations.
+    """
+    backfill = bool(ctx.option("backfill"))
+    force = bool(ctx.option("force"))
+    max_events = ctx.option("max_events")
+
+    listing = fetch_all(ctx.client, "event/list/dates", pace_ms=ctx.pace_ms,
+                        budget=ctx.budget)
+
+    gathered = Gathered(
+        complete=False,
+        expected=listing.expected,
+        pages=listing.pages,
+        error=listing.error,
+        notes={"endpoint": "event/list/dates + event/display/eventdate",
+               "mode": "backfill" if backfill else "nightly"},
+    )
+    gathered.absorb(listing)
+    if not listing.complete:
+        return gathered
+
+    done = _already_backfilled() if backfill and not force else set()
+    chosen, skipped = select_event_dates(
+        listing.records, backfill, done, force, max_events)
+
+    gathered.notes["event_dates_listed"] = len(listing.records)
+    gathered.notes["event_dates_selected"] = len(chosen)
+    gathered.notes["skipped_archived"] = skipped["archived"]
+    gathered.notes["skipped_already_backfilled"] = skipped["already_done"]
+    if skipped["unkeyed"]:
+        gathered.notes["skipped_unkeyed"] = skipped["unkeyed"]
+
+    logger.info(
+        "event registrations (%s): %d of %d event dates qualify "
+        "(%d archived, %d already backfilled)",
+        gathered.notes["mode"], len(chosen), len(listing.records),
+        skipped["archived"], skipped["already_done"])
+
+    # Only the dates actually read may have their registrants deleted as
+    # stale — see Gathered.refreshed_prefixes.
+    refreshed = set()
+    pulled_at = _utc_stamp()
+    pause = pace_seconds(ctx.pace_ms)
+    no_email = 0
+
+    for index, event in enumerate(chosen):
+        if index:
+            pace_sleep(pause)
+
+        event_date_id = _key(event.get("event_date_id"))
+        display = fetch_one(ctx.client, "event/display/eventdate",
+                            {"event_date_id": _display_id(event_date_id)},
+                            pace_ms=ctx.pace_ms, budget=ctx.budget)
+        gathered.absorb(display)
+
+        if not display.complete or not display.records:
+            gathered.failed += 1
+            reason = display.error or "empty response"
+            gathered.error = (
+                f"event/display/eventdate failed for event date "
+                f"{event_date_id} after {len(refreshed)} of {len(chosen)} "
+                f"dates: {reason}")
+            logger.warning("registration sweep stopped: %s", gathered.error)
+            gathered.refreshed_prefixes = refreshed
+            return gathered
+
+        payload = display.records[0]
+        refreshed.add(event_date_id)
+
+        for registrant in payload.get("profiles") or []:
+            if not isinstance(registrant, dict):
+                continue
+            key = registration_key(event_date_id, registrant.get("profile_id"))
+            if key is None:
+                gathered.notes["unkeyed_registrants"] = \
+                    gathered.notes.get("unkeyed_registrants", 0) + 1
+                continue
+            record = registration_record(registrant, payload, pulled_at)
+            if not record["event_profile_email"]:
+                # Kept, not dropped: a registrant with no address still
+                # attended, and the profile_id may resolve one later.
+                no_email += 1
+                logger.info(
+                    "registrant profile %s on event date %s has no email — "
+                    "row kept without one",
+                    registrant.get("profile_id"), event_date_id)
+            gathered.rows.append(MirrorRow(csuite_id=key, data=record))
+
+    gathered.refreshed_prefixes = refreshed
+    gathered.notes["event_dates_read"] = len(refreshed)
+    gathered.notes["registrants"] = len(gathered.rows)
+    gathered.notes["registrants_without_email"] = no_email
+    gathered.notes["stored_fields"] = list(EVENT_REGISTRATION_FIELDS)
+    gathered.complete = True
+
+    logger.info(
+        "event registrations: %d registrant row(s) from %d event date(s), "
+        "%d without an email",
+        len(gathered.rows), len(refreshed), no_email)
+    return gathered
+
+
 # How each record type is gathered. Keyed lookups use the first id field
 # present, so an endpoint that returns `id` instead of `<thing>_id` still
 # mirrors — funit/list/search already does exactly that.
@@ -901,6 +1180,7 @@ GATHERERS = {
     "donation_agg": _gather_donation_agg,
     "donation_fund_quarter": _gather_donation_fund_quarter,
     "donation": _gather_donation,
+    "event_registration": _gather_event_registration,
 }
 
 
@@ -1253,7 +1533,7 @@ def _upsert(record_type: str, rows, run_id, expires) -> int:
                 row.csuite_id,
                 row.fund_group_id,
                 canonical_json(row.data),
-                _hash(row.data),
+                _hash(row.data, record_type),
                 run_id,
             ))
             if expires:
@@ -1325,7 +1605,7 @@ def refresh_type(record_type: str, client=None, pace_ms=None,
                  dry_run: bool = False, triggered_by=None,
                  trigger_source: str = "cli",
                  triggered_by_user_id=None, budget=None,
-                 cache=None) -> TypeResult:
+                 cache=None, options=None) -> TypeResult:
     """Fetch one record type and mirror it. Never raises for API failures.
 
     Database failures DO propagate: a mirror that cannot reach its own
@@ -1365,7 +1645,8 @@ def refresh_type(record_type: str, client=None, pace_ms=None,
 
     gathered = GATHERERS[record_type](GatherContext(
         client=client, pace_ms=pace_ms, budget=budget, run_id=run_id,
-        cache=cache if cache is not None else {}))
+        cache=cache if cache is not None else {},
+        options=dict(options or {})))
 
     result.expected = gathered.expected
     result.fetched = len(gathered.rows)
@@ -1446,13 +1727,25 @@ def refresh_type(record_type: str, client=None, pace_ms=None,
     unchanged_ids = []
     for row in rows:
         seen.add(row.csuite_id)
-        if existing.get(row.csuite_id) == _hash(row.data):
+        if existing.get(row.csuite_id) == _hash(row.data, record_type):
             result.unchanged += 1
             unchanged_ids.append(row.csuite_id)
         else:
             to_write.append(row)
 
     stale = [key for key in existing if key not in seen]
+
+    # A gatherer that refreshed only part of its type says so, and only
+    # that part is eligible for deletion. Without this a nightly
+    # registration run — 14 of 179 event dates — would see the other 165
+    # events' registrants as vanished and delete the whole backfill.
+    if gathered.refreshed_prefixes is not None:
+        scope = gathered.refreshed_prefixes
+        before = len(stale)
+        stale = [k for k in stale if k.split(":")[0] in scope]
+        result.notes["delete_scope_prefixes"] = len(scope)
+        result.notes["protected_from_delete"] = before - len(stale)
+
     result.notes["deleted"] = len(stale)
     if stale:
         result.notes["deleted_ids"] = sorted(stale)[:MAX_NOTED_IDS]
@@ -1567,7 +1860,7 @@ def expand_types(record_types=None) -> list:
 def refresh(record_types=None, pace_ms=None, dry_run: bool = False,
             client=None, triggered_by=None,
             trigger_source: str = "cli", triggered_by_user_id=None,
-            budget=None) -> list:
+            budget=None, options=None) -> list:
     """Refresh each record type in turn. Returns one TypeResult per type.
 
     A type that fails does not stop the ones after it — each is its own
@@ -1607,7 +1900,7 @@ def refresh(record_types=None, pace_ms=None, dry_run: bool = False,
             record_type, client=client, pace_ms=pace_ms, dry_run=dry_run,
             triggered_by=triggered_by, trigger_source=trigger_source,
             triggered_by_user_id=triggered_by_user_id, budget=budget,
-            cache=cache)
+            cache=cache, options=options)
         results.append(result)
 
         if result.stop_reason in (RATE_LIMITED_ERROR, BUDGET_ERROR):

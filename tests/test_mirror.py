@@ -77,10 +77,14 @@ class FakeDB:
     already exists.
     """
 
-    def __init__(self, stored=None, next_run_id=1000, staged=None):
+    def __init__(self, stored=None, next_run_id=1000, staged=None,
+                 registered_event_dates=None):
         self.statements = []
         self.stored = dict(stored or {})
         self.next_run_id = next_run_id
+        # event_date_ids that already have event_registration rows, as the
+        # backfill-progress query would report them.
+        self.registered_event_dates = set(registered_event_dates or ())
         # {(record_type, source_id): payload dict} — sync_staging rows that
         # are already there and young enough to reuse.
         self.staged = dict(staged or {})
@@ -93,6 +97,10 @@ class FakeDB:
             run_id = self.next_run_id
             self.next_run_id += 1
             return [{"id": run_id}]
+
+        if collapsed.startswith("SELECT DISTINCT split_part(csuite_id"):
+            return [{"event_date_id": e}
+                    for e in sorted(self.registered_event_dates)]
 
         if collapsed.startswith("SELECT csuite_id, data_hash"):
             record_type = params[0]

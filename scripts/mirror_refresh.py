@@ -8,6 +8,10 @@ READ-ONLY against CSuite. Writes only to csuite_mirror and sync_runs.
     # Everything, at the default 400ms pace:
     python scripts/mirror_refresh.py
 
+    # Backfill every event date's registrants, 20 at a time, resumable:
+    python scripts/mirror_refresh.py --types event_registration \
+        --backfill --max-events 20
+
     # See what would change without writing a mirror row:
     python scripts/mirror_refresh.py --dry-run
 
@@ -139,6 +143,26 @@ def main() -> int:
              "run, across all types. Default: no budget.",
     )
     parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="event_registration only: read ALL event dates, not just the "
+             "non-archived ones. Resumable — event dates that already have "
+             "rows are skipped. May span several invocations.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="With --backfill, re-read event dates that already have rows.",
+    )
+    parser.add_argument(
+        "--max-events",
+        type=int,
+        default=None,
+        metavar="N",
+        help="With --backfill, stop after N event dates. For a measured "
+             "first pass.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Fetch, hash and compare, but write no mirror rows. "
@@ -165,6 +189,8 @@ def main() -> int:
     print()
 
     budget = CallBudget(args.budget) if args.budget else None
+    options = {"backfill": args.backfill, "force": args.force,
+               "max_events": args.max_events}
 
     results = refresh(
         record_types=args.types,
@@ -173,6 +199,7 @@ def main() -> int:
         trigger_source="cli",
         triggered_by="cli:mirror_refresh",
         budget=budget,
+        options=options,
     )
 
     print(_header())

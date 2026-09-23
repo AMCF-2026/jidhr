@@ -385,7 +385,81 @@ class HubSpotClient:
         
         contact_id = results[0]["id"]
         return self.update_contact(contact_id, properties)
-    
+
+    # =========================================================================
+    # CONTACT BATCHES
+    # =========================================================================
+
+    # HubSpot's cap on inputs per batch call, for both read and upsert.
+    CONTACT_BATCH_SIZE = 100
+
+    def batch_read_contacts_by_email(self, emails, properties=None) -> dict:
+        """READ. Look up many contacts at once by email address.
+
+        `crm/v3/objects/contacts/batch/read` with idProperty=email. It is
+        a POST that carries a query, so is_hubspot_write() classifies it
+        as a read and it is not audited — see
+        HUBSPOT_READ_SHAPED_POST_SUFFIXES.
+
+        An address the portal does not hold comes back under "errors"
+        rather than failing the call, which is precisely the
+        already-here / would-be-created split an enrichment plan needs.
+
+        Takes at most CONTACT_BATCH_SIZE addresses; the caller batches.
+        """
+        body = {"idProperty": "email",
+                "inputs": [{"id": email} for email in emails]}
+        if properties:
+            body["properties"] = list(properties)
+        return self._post("crm/v3/objects/contacts/batch/read", body)
+
+    def batch_upsert_contacts(self, inputs) -> dict:
+        """WRITE — creates contacts that do not exist yet.
+
+        `crm/v3/objects/contacts/batch/upsert` with idProperty=email:
+        each input is {"id": "<email>", "properties": {...}}, and an
+        address the portal does not hold becomes a NEW contact. Only the
+        properties named in the payload are touched; anything absent is
+        left alone.
+
+        Audited like every other write. Nothing in this repository calls
+        it outside an explicit --apply.
+        """
+        return self._post("crm/v3/objects/contacts/batch/upsert",
+                          {"idProperty": "email", "inputs": list(inputs)})
+
+    # =========================================================================
+    # CONTACT PROPERTIES (the portal's schema)
+    # =========================================================================
+
+    def get_contact_properties(self, archived: bool = False) -> dict:
+        """READ. Every contact property the portal defines.
+
+        One GET; HubSpot returns the whole schema without paging.
+        """
+        return self._get("crm/v3/properties/contacts",
+                         {"archived": "true" if archived else "false"})
+
+    def get_contact_property_groups(self) -> dict:
+        """READ. Every contact property group the portal defines."""
+        return self._get("crm/v3/properties/contacts/groups")
+
+    def create_contact_property_group(self, name: str, label: str,
+                                      display_order: int = -1) -> dict:
+        """WRITE. Create a contact property group."""
+        return self._post("crm/v3/properties/contacts/groups",
+                          {"name": name, "label": label,
+                           "displayOrder": display_order})
+
+    def create_contact_property(self, definition: dict) -> dict:
+        """WRITE. Create one contact property from a full definition.
+
+        `definition` is HubSpot's own shape — name, label, groupName,
+        type, fieldType, and options for an enumeration — passed through
+        unchanged so the caller owns the schema, not this client.
+        """
+        return self._post("crm/v3/properties/contacts", definition)
+
     # =========================================================================
     # CONTACT ACTIVITY & ENGAGEMENTS
     # =========================================================================
