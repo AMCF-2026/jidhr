@@ -265,7 +265,7 @@ def test_an_unreachable_audit_store_says_not_saved_and_makes_no_call():
         patch.setattr(ed, "create_draft_email", refuse)
         reply = content._save_email_draft("save this", ctx, apply=True)
 
-    assert "Draft not saved: audit store unreachable" in reply
+    assert "Draft not saved: audit row could not be reserved" in reply
     assert "NO BUTTON" in reply, "the payload summary is still shown"
     assert "Dry run" not in reply
     # The draft survives, so nothing the person wrote is lost.
@@ -288,3 +288,45 @@ def test_an_empty_body_is_refused_before_any_call():
     ctx = make_ctx(hubspot=ExplodingHubSpot(), body="<div></div>")
     reply = content._save_email_draft("save this", ctx, apply=True)
     assert "empty" in reply.lower()
+
+
+def test_the_step_6_constraint_failure_names_its_own_cause():
+    """The 2026-09-23 first-save attempt, reproduced.
+
+    write_audit had CHECK (status IN ('success','failed','skipped')), so
+    reserving a row with status 'attempted' raised. The write was
+    correctly refused — but the reply said "Failed to save email",
+    because the client returned an error dict and create_draft_email
+    then raised RuntimeError about a missing id. The cause has to be
+    named: that message sent someone looking at HubSpot when the problem
+    was a Postgres constraint.
+    """
+    import psycopg2
+    from clients.hubspot import HubSpotClient
+
+    sent = []
+
+    def constrained_store(sql, params=None, fetch=True):
+        raise psycopg2.errors.CheckViolation(
+            'new row for relation "write_audit" violates check constraint '
+            '"write_audit_status_check"')
+
+    def sender(url, **kwargs):
+        sent.append(url)
+        return None
+
+    client = HubSpotClient()
+    client.access_token = "test-token"
+    ctx = make_ctx(hubspot=client)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("clients.database.execute_query", constrained_store)
+        patch.setattr("clients.database.is_configured", lambda: True)
+        patch.setattr("clients.hubspot.requests.post", sender)
+        reply = content._save_email_draft("save this", ctx, apply=True)
+
+    assert "Draft not saved: audit row could not be reserved" in reply
+    assert "write_audit_status_check" in reply, "the constraint is named"
+    assert "Failed to save email" not in reply, "the generic branch fired"
+    assert sent == [], "the request went out despite having no audit row"
+    assert ctx.draft_state["active"] is True

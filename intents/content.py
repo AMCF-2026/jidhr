@@ -758,11 +758,13 @@ def _save_email_draft(query: str, ctx, apply: bool = False) -> str:
                                      client=ctx.services.hubspot)
     except AuditUnavailable as e:
         # Never quietly downgrade to a dry run: the person asked for a
-        # save, and "nothing happened" has to say so.
-        logger.error("email draft not saved, audit store unreachable: %s", e)
-        return (f"❌ **Draft not saved: audit store unreachable**\n\n{summary}"
-                f"\n\nNothing was written to HubSpot. Jidhr refuses a write "
-                f"it cannot record.\n\n> {e}")
+        # save, and "nothing happened" has to say so. The cause is named
+        # exactly, because "failed to save" sent someone looking at
+        # HubSpot when the problem was a Postgres CHECK constraint.
+        logger.error("email draft not saved, audit row not reserved: %s", e)
+        return (f"❌ **Draft not saved: audit row could not be reserved** — "
+                f"{e}\n\n{summary}\n\nNothing was written to HubSpot. "
+                "Jidhr refuses a write it cannot record.")
     except TemplateDidNotAttach as e:
         # The draft was archived before this was raised, so there is
         # nothing half-made sitting in the portal.

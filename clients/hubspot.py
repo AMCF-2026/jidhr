@@ -207,8 +207,13 @@ class HubSpotClient:
                 reservation = reserve_write(
                     "hubspot", method, endpoint, payload=data)
             except AuditUnavailable as e:
+                # Raised, not returned. A refusal that comes back as an
+                # ordinary error dict is indistinguishable from HubSpot
+                # rejecting the request, and the caller then reports the
+                # wrong cause — which is exactly what happened on the
+                # 2026-09-23 first-save attempt.
                 logger.error("HubSpot %s %s REFUSED: %s", method, endpoint, e)
-                return {"error": f"write refused, not audited: {e}"}, None
+                raise
 
         logger.info(f"HubSpot {method}: {endpoint}")
         started = time.perf_counter()

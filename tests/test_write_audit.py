@@ -467,23 +467,28 @@ class TestAuditFailureRefusesTheWrite:
         return rec
 
     def test_a_hubspot_write_is_refused_and_never_sent(self, monkeypatch):
+        """Raised, not returned.
+
+        A refusal that comes back as an ordinary error dict is
+        indistinguishable from HubSpot rejecting the request, and the
+        caller then reports the wrong cause.
+        """
         self._failing(monkeypatch)
         client, calls = hubspot_client(
             monkeypatch, response=Response(200, {"id": "701"}))
 
-        result = client._post("crm/v3/objects/contacts", {})
+        with pytest.raises(audit.AuditUnavailable):
+            client._post("crm/v3/objects/contacts", {})
 
-        assert "not audited" in result["error"]
         assert calls == [], "the request went out despite having no audit row"
 
     def test_a_csuite_write_is_refused_and_never_sent(self, monkeypatch):
         self._failing(monkeypatch)
         client, calls = csuite_client(monkeypatch)
 
-        result = client._request("profile/create/individual",
-                                 {"first_name": "A"})
+        with pytest.raises(audit.AuditUnavailable):
+            client._request("profile/create/individual", {"first_name": "A"})
 
-        assert "not audited" in result["error"]
         assert calls == [], "the request went out despite having no audit row"
 
     def test_a_read_is_not_refused(self, monkeypatch):

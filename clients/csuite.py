@@ -121,8 +121,10 @@ class CSuiteClient:
                 reservation = reserve_write(
                     "csuite", "POST", endpoint, payload=data)
             except AuditUnavailable as e:
+                # Raised, not returned — see the matching note in
+                # clients/hubspot._send_with_status.
                 logger.error("CSuite POST %s REFUSED: %s", endpoint, e)
-                return {"error": f"write refused, not audited: {e}"}
+                raise
 
         logger.info(f"CSuite POST: {endpoint} | data keys: {list((data or {}).keys())}")
 
