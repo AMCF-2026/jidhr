@@ -412,3 +412,102 @@ def test_a_styled_heading_still_arrives_as_body_text():
         '<strong>Round one opens</strong></span></p>')
     assert "<h2" not in clean
     assert clean == "<p><strong>Round one opens</strong></p>"
+
+
+# ---------------------------------------------------------------------------
+# Scope: a brief with sections keeps all of them
+# ---------------------------------------------------------------------------
+
+# Seven sections, the shape a real AMCF newsletter arrives in. The
+# 2026-09-23 dry run compressed a 27-line brief to two sections, which is
+# faithful to the links and not to the scope: a newsletter with eight
+# items is an email with eight sections, and the person who wrote the
+# missing one does not find out until it has gone out.
+SECTION_TITLES = [
+    "Round one opens Saturday",
+    "Meet the nominees",
+    "Greater Giving Summit",
+    "Directory webinar",
+    "AFP Muslim Affinity Group",
+    "AmeriCorps openings",
+    "SAID Fellowship",
+]
+SECTION_URLS = [
+    "https://amuslimcf.org/donors/giving-circles/nominees/",
+    "https://amuslimcf.org/events/grow-your-nonprofits-reach-directory-webinar/",
+    "https://amuslimcf.org/events/afp-muslim-affinity-group-fall-2026/",
+    "https://www.americorps.gov/",
+    "https://www.saidfellowship.com/",
+]
+
+MANY_SECTIONS = "\n".join(
+    ["SUBJECT: A full week at AMCF",
+     "PREVIEW: Voting, nominees, and five more things",
+     "BUTTON_LABEL: Cast your vote",
+     "BUTTON_URL: https://www.grapevine.org/giving-circle/zjrhaGG",
+     "", "BODY:"]
+    + [f"<h2>{title}</h2><p>Something about it.</p>"
+       for title in SECTION_TITLES[:2]]
+    + [f'<h2>{SECTION_TITLES[i + 2]}</h2><p>See '
+       f'<a href="{url}">the page</a>.</p>'
+       for i, url in enumerate(SECTION_URLS)])
+
+
+def test_every_section_in_the_brief_survives_as_its_own_heading():
+    import re
+
+    fields = content._parse_email_draft(MANY_SECTIONS)
+    clean = ed.sanitize_body_html(fields["body"])
+
+    headings = re.findall(r"<h2>(.*?)</h2>", clean)
+    assert len(headings) == len(SECTION_TITLES), \
+        f"{len(SECTION_TITLES)} sections in, {len(headings)} out"
+    assert headings == SECTION_TITLES, "sections were reordered or merged"
+
+    found = set(re.findall(r'href="([^"]+)"', clean))
+    assert set(SECTION_URLS) <= found, f"lost: {set(SECTION_URLS) - found}"
+
+
+def test_the_scope_rule_is_in_both_prompts():
+    import inspect
+    source = inspect.getsource(content)
+    for rule in ("Keep EVERY section",
+                 "applies ONLY to a brief with no sections"):
+        assert source.count(rule) == 2, f"{rule!r} is not in both prompts"
+
+
+# ---------------------------------------------------------------------------
+# The repetition guard is advisory
+# ---------------------------------------------------------------------------
+
+def test_the_repetition_guard_cannot_prevent_a_save():
+    """It informs; it does not gate.
+
+    The note is built when a draft is generated, not when one is saved,
+    and a topic covered four times in six weeks is a reason for a person
+    to think again — not a reason for Jidhr to refuse.
+    """
+    import inspect
+
+    source = inspect.getsource(content._save_email_draft)
+    assert "_repetition_note" not in source
+    assert "find_topic_matches" not in source
+
+    # And it holds in practice, with the guard loudly claiming a match.
+    client = RecordingHubSpot()
+    ctx = make_ctx(hubspot=client)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(content, "_repetition_note",
+                      lambda topic: "⚠️ covered 9× in the last six weeks")
+        reply = content._save_email_draft("save this", ctx, apply=True)
+
+    assert "Saved to HubSpot" in reply
+    assert ("POST", "marketing/v3/emails") in client.calls
+
+
+def test_a_broken_repetition_guard_cannot_break_a_draft():
+    """Its own docstring promises this; pin it."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(content, "find_topic_matches",
+                      lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db")))
+        assert content._repetition_note("anything") is None

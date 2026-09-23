@@ -510,6 +510,11 @@ BODY RULES — the AMCF template owns every pixel of styling:
 - Secondary calls to action are inline links in the body, written into the sentence.
 - Exactly ONE primary call to action, and it goes in BUTTON_LABEL/BUTTON_URL, never in the body. The template renders one button and shows it only when both fields are set.
 
+SCOPE — when the brief already has sections:
+- Keep EVERY section. One <h2> per section, in the brief's order, with its content intact. Tighten the sentences; never drop a section, never merge two, never summarise several into one.
+- A newsletter with eight items is an email with eight sections. Dropping one is not editing, it is losing the item — and the person who wrote it will not know until it has gone out.
+- The "2-3 paragraphs" guidance below applies ONLY to a brief with no sections of its own.
+
 Format your response as:
 SUBJECT: [subject line]
 PREVIEW: [preview line]
@@ -1273,6 +1278,11 @@ BODY RULES — the AMCF template owns every pixel of styling:
 - Paragraphs <p>, lists <ul>/<li>, emphasis <strong>/<em>, links <a href>. Nothing else. No tables.
 - Secondary calls to action are inline links in the body, written into the sentence.
 - Exactly ONE primary call to action, and it goes in BUTTON_LABEL/BUTTON_URL, never in the body. The template renders one button and shows it only when both fields are set.
+
+SCOPE — when the brief already has sections:
+- Keep EVERY section. One <h2> per section, in the brief's order, with its content intact. Tighten the sentences; never drop a section, never merge two, never summarise several into one.
+- A newsletter with eight items is an email with eight sections. Dropping one is not editing, it is losing the item — and the person who wrote it will not know until it has gone out.
+- The "2-3 paragraphs" guidance below applies ONLY to a brief with no sections of its own.
 
 Return the revised email in this format:
 SUBJECT: [revised subject line]
