@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 from dateutil import parser as dateutil_parser
 
-from config import ORG_FACTS_PROMPT
+from config import Config, ORG_FACTS_PROMPT
 from intents.context import new_draft_state
 from content.content_analysis import find_topic_matches
 from content.queue_check import CheckResult, check_schedule, get_queue, suggest_slot
@@ -546,55 +546,158 @@ BODY:
         return f"❌ Failed to generate email draft: {e}"
 
 
-def _save_email_draft(query: str, ctx) -> str:
-    """Save the email draft to HubSpot."""
-    template = "amcf"
-    if 'giving circle' in query.lower():
-        template = "giving circle"
+# Which coded template a request routes to. These are the only signals
+# that exist today: the words the user typed, and draft_state["template"],
+# a key that is in the draft shape and that nothing currently sets. There
+# is no structured tag or campaign field on a draft, and none is invented
+# here — if routing needs to be better than keyword matching, the draft
+# flow has to start carrying a tag.
+TEMPLATE_KEYWORDS = (
+    ("giving_circle", ("giving circle", "giving-circle", "givingcircle",
+                       "women's giving", "womens giving")),
+    ("socal", ("socal", "so cal", "southern california")),
+)
+
+DEFAULT_TEMPLATE = "standard"
+
+TEMPLATE_LABELS = {
+    "standard": "AMCF Standard Email",
+    "giving_circle": "Giving Circle",
+    "socal": "SoCal",
+}
+
+
+def _template_key(query: str, draft_state: dict = None) -> str:
+    """Which of the three coded templates this draft belongs on.
+
+    An explicit draft_state["template"] wins if it names a real template;
+    otherwise the query is matched on keywords; otherwise "standard". An
+    unrecognised explicit value is ignored rather than passed through,
+    because build_email_payload would raise on it and the user would lose
+    a finished draft over a routing typo.
+    """
+    from clients.email_draft import EMAIL_TEMPLATES
+
+    explicit = (draft_state or {}).get("template")
+    if explicit in EMAIL_TEMPLATES:
+        return explicit
+    if explicit:
+        logger.warning("draft template %r is not one of %s — using %s",
+                       explicit, sorted(EMAIL_TEMPLATES), DEFAULT_TEMPLATE)
+
+    lowered = (query or "").lower()
+    for key, words in TEMPLATE_KEYWORDS:
+        if any(word in lowered for word in words):
+            return key
+    return DEFAULT_TEMPLATE
+
+
+def _date_bar(draft_state: dict = None, today=None) -> str:
+    """The text for the template's green date bar.
+
+    The event's date when the draft carries one, otherwise today. Nothing
+    in the draft flow sets an event date today, so in practice this is
+    today's date; the lookup is here so a flow that gains one does not
+    need this function changed.
+
+    Format matches how every AMCF newsletter in the portal names its
+    send — "September 18, 2026". No email has used the `date_bar` slot
+    yet, so there is no stored precedent to copy; the naming convention
+    is the closest evidence there is.
+    """
+    value = (draft_state or {}).get("event_date")
+    when = None
+    if value:
+        try:
+            when = (value if isinstance(value, datetime)
+                    else dateutil_parser.parse(str(value)))
+        except (ValueError, TypeError, OverflowError):
+            logger.warning("draft event_date %r is not a date — using today",
+                           value)
+    if when is None:
+        when = today or datetime.now()
+    return f"{when:%B} {when.day}, {when.year}"
+
+
+def _body_as_html(body: str) -> str:
+    """A drafted body as HTML, before the allowlist sees it."""
+    if body and body.strip().startswith("<"):
+        return body
+    paragraphs = (body or "").replace(chr(13), "")
+    paragraphs = paragraphs.replace(chr(10) + chr(10), "</p><p>")
+    return "<p>" + paragraphs.replace(chr(10), "<br>") + "</p>"
+
+
+def _save_email_draft(query: str, ctx, apply: bool = False) -> str:
+    """Save the email draft to HubSpot.
+
+    Dry run unless the caller passes apply=True. The payload is built and
+    the body is put through the allowlist either way, so a body that
+    cannot be rendered fails here rather than in the portal.
+    """
+    from clients.email_draft import (EmptyBody, TemplateDidNotAttach,
+                                     UnknownTemplate, build_email_payload,
+                                     create_draft_email)
 
     subject = ctx.draft_state["subject"]
     body = ctx.draft_state["body"]
-
-    # Convert plain text body to HTML if needed
-    if not body.startswith("<"):
-        body = f"<p>{body.replace(chr(10)+chr(10), '</p><p>').replace(chr(10), '<br>')}</p>"
-
+    template = _template_key(query, ctx.draft_state)
     name = f"{subject[:50]} - {datetime.now().strftime('%Y-%m-%d')}"
 
     try:
-        result = ctx.services.hubspot.create_marketing_email_draft(
+        payload = build_email_payload(
+            template,
+            body_html=_body_as_html(body),
+            date_bar=_date_bar(ctx.draft_state),
+            preview_text=subject,
             name=name,
             subject=subject,
-            body_html=body,
-            template=template,
         )
+    except EmptyBody as e:
+        return f"❌ The draft body is empty once formatting is stripped: {e}"
+    except (UnknownTemplate, ValueError) as e:
+        return f"❌ Could not build the email: {e}"
 
-        if "error" in result:
-            return f"❌ Failed to save email: {result['error']}"
+    try:
+        created = create_draft_email(payload, apply=apply,
+                                     client=ctx.services.hubspot)
+    except TemplateDidNotAttach as e:
+        # The draft was archived before this was raised, so there is
+        # nothing half-made sitting in the portal.
+        logger.error("email draft rejected: %s", e)
+        return ("❌ HubSpot did not attach the AMCF template, so the draft "
+                "was discarded rather than left for someone to send. "
+                f"{e}")
+    except Exception as e:
+        logger.error(f"Email save error: {e}")
+        return f"❌ Failed to save email: {e}"
 
-        email_id = result.get("id", "Unknown")
-        edit_url = result.get(
-            "edit_url",
-            f"https://app-na2.hubspot.com/email/243832852/edit/{email_id}/content",
-        )
+    label = TEMPLATE_LABELS.get(template, template)
 
-        _clear_draft_state(ctx)
-
-        template_display = "AMCF Emails" if template == "amcf" else "Giving Circle Email"
-
-        return f"""✅ **Email Draft Saved to HubSpot!**
+    if not apply:
+        return f"""📝 **Email draft prepared — not saved**
 
 📧 **{subject}**
-• Template: {template_display}
+• Template: {label}
+• Body: {len(payload['content']['widgets']['email_template_main_email_body']['body']['html']):,} characters after formatting was stripped
+
+*Dry run: nothing was written to HubSpot.*"""
+
+    email_id = (created or {}).get("id", "Unknown")
+    edit_url = (f"https://app-na2.hubspot.com/email/"
+                f"{Config.HUBSPOT_PORTAL_ID}/edit/{email_id}/content")
+
+    _clear_draft_state(ctx)
+
+    return f"""✅ **Email Draft Saved to HubSpot!**
+
+📧 **{subject}**
+• Template: {label}
 • Status: Draft (not sent)
 
 ✏️ **Edit in HubSpot:** {edit_url}
 
 *You can now add images, adjust formatting, select recipients, and schedule/send from HubSpot.*"""
-
-    except Exception as e:
-        logger.error(f"Email save error: {e}")
-        return f"❌ Failed to save email: {e}"
 
 
 # ---------------------------------------------------------------------------
