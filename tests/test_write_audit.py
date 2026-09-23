@@ -31,7 +31,17 @@ class Recorder:
     def __call__(self, sql, params=None, fetch=True):
         if self.fail:
             raise RuntimeError("audit database unreachable")
+        text = " ".join(str(sql).split())
+        if text.startswith("UPDATE write_audit"):
+            # complete_write stamping the outcome on a reserved row.
+            status, http_status, error, duration_ms, row_id = params
+            self.rows[int(row_id) - 1].update(
+                status=status, http_status=http_status, error=error,
+                duration_ms=duration_ms)
+            return 1
         self.rows.append(dict(zip(COLUMNS, params)))
+        if "RETURNING id" in text:
+            return [{"id": len(self.rows)}]
         return 1
 
     @property
@@ -439,54 +449,144 @@ class TestActor:
 # Auditing never changes the caller's result
 # ===========================================================================
 
-class TestAuditFailureIsHarmless:
+class TestAuditFailureRefusesTheWrite:
+    """The 2026-09-23 reversal.
+
+    Auditing used to run after the fact and swallow its own failures, so
+    when the store was unreachable every write still went out unrecorded
+    and nothing upstream could tell. That is not hypothetical: the email
+    probe of 2026-09-23 wrote to HubSpot twice with no row between them.
+    Now reserve_write claims the row first and the write is refused if it
+    cannot.
+    """
+
     def _failing(self, monkeypatch):
         rec = Recorder(fail=True)
         monkeypatch.setattr("clients.database.execute_query", rec)
         monkeypatch.setattr("clients.database.is_configured", lambda: True)
-        monkeypatch.setattr(audit, "_warned_no_database", False)
         return rec
 
-    def test_hubspot_write_is_unaffected(self, monkeypatch, caplog):
+    def test_a_hubspot_write_is_refused_and_never_sent(self, monkeypatch):
         self._failing(monkeypatch)
-        client, _ = hubspot_client(
+        client, calls = hubspot_client(
             monkeypatch, response=Response(200, {"id": "701"}))
 
-        assert client._post("crm/v3/objects/contacts", {}) == {"id": "701"}
+        result = client._post("crm/v3/objects/contacts", {})
 
-    def test_csuite_write_is_unaffected(self, monkeypatch):
+        assert "not audited" in result["error"]
+        assert calls == [], "the request went out despite having no audit row"
+
+    def test_a_csuite_write_is_refused_and_never_sent(self, monkeypatch):
         self._failing(monkeypatch)
-        client, _ = csuite_client(monkeypatch)
+        client, calls = csuite_client(monkeypatch)
 
-        result = client._request("profile/create/individual", {"first_name": "A"})
+        result = client._request("profile/create/individual",
+                                 {"first_name": "A"})
 
-        assert result["success"] is True
-        assert result["data"] == {"profile_id": 19879}
+        assert "not audited" in result["error"]
+        assert calls == [], "the request went out despite having no audit row"
 
-    def test_record_write_reports_failure_without_raising(self, monkeypatch):
+    def test_a_read_is_not_refused(self, monkeypatch):
+        """Only writes need a row. A refused read would break every report."""
         self._failing(monkeypatch)
+        client, calls = hubspot_client(
+            monkeypatch, response=Response(200, {"results": []}))
 
-        assert audit.record_write("hubspot", "POST", "x", payload={}) is False
+        assert client._post("crm/v3/objects/contacts/search", {}) == \
+            {"results": []}
+        assert len(calls) == 1
 
-    def test_a_missing_database_url_skips_quietly(self, monkeypatch, caplog):
-        import logging
+    def test_reserve_write_raises_rather_than_returning_false(self,
+                                                              monkeypatch):
+        self._failing(monkeypatch)
+        with pytest.raises(audit.AuditUnavailable):
+            audit.reserve_write("hubspot", "POST", "x", payload={})
 
+    def test_record_write_raises_too(self, monkeypatch):
+        self._failing(monkeypatch)
+        with pytest.raises(audit.AuditUnavailable):
+            audit.record_write("hubspot", "POST", "x", payload={})
+
+    def test_a_missing_database_url_refuses_with_a_clear_message(self,
+                                                                 monkeypatch):
         rec = Recorder()
         monkeypatch.setattr("clients.database.execute_query", rec)
         monkeypatch.setattr("clients.database.is_configured", lambda: False)
-        monkeypatch.setattr(audit, "_warned_no_database", False)
 
-        with caplog.at_level(logging.WARNING, logger="clients.audit"):
-            assert audit.record_write("hubspot", "POST", "x", payload={}) is False
-            audit.record_write("hubspot", "POST", "x", payload={})
+        with pytest.raises(audit.AuditUnavailable) as caught:
+            audit.reserve_write("hubspot", "POST", "x", payload={})
 
+        assert "DATABASE_URL" in str(caught.value)
         assert rec.rows == []
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert len(warnings) == 1, "warned once, not once per write"
 
-    def test_an_unserialisable_payload_does_not_break_the_write(self,
-                                                               monkeypatch,
-                                                               recorder):
+    def test_a_store_that_returns_no_id_refuses(self, monkeypatch):
+        """A reserve that stores nothing must not read as success."""
+        monkeypatch.setattr("clients.database.execute_query",
+                            lambda *a, **k: [])
+        monkeypatch.setattr("clients.database.is_configured", lambda: True)
+
+        with pytest.raises(audit.AuditUnavailable):
+            audit.reserve_write("hubspot", "POST", "x", payload={})
+
+
+class TestReserveThenComplete:
+    def test_the_row_exists_before_the_request_goes_out(self, monkeypatch,
+                                                        recorder):
+        """The ordering that makes a killed process visible."""
+        seen = {}
+
+        def sender(url, **kwargs):
+            # At this moment the audit row must already be there.
+            # Copied, not referenced: complete_write mutates these dicts
+            # in place afterwards.
+            seen["rows"] = [dict(row) for row in recorder.rows]
+            return Response(200, {"id": "701"})
+
+        monkeypatch.setattr("clients.hubspot.requests.post", sender)
+        client = HubSpotClient()
+        client.access_token = "test-token"
+        client._post("crm/v3/objects/contacts", {})
+
+        assert len(seen["rows"]) == 1
+        assert seen["rows"][0]["status"] == audit.ATTEMPTED
+
+    def test_the_outcome_is_stamped_on_the_same_row(self, monkeypatch,
+                                                    recorder):
+        client, _ = hubspot_client(
+            monkeypatch, response=Response(201, {"id": "701"}))
+        client._post("crm/v3/objects/contacts", {})
+
+        assert recorder.one["status"] == "success"
+        assert recorder.one["http_status"] == 201
+
+    def test_a_lost_completion_leaves_the_row_attempted(self, monkeypatch,
+                                                        recorder, caplog):
+        """The write happened, so complete_write must not raise.
+
+        The 'attempted' row is the visible residue — which is the point.
+        """
+        import logging
+        real = recorder.__call__
+
+        def flaky(sql, params=None, fetch=True):
+            if " ".join(str(sql).split()).startswith("UPDATE write_audit"):
+                raise RuntimeError("gone")
+            return real(sql, params, fetch)
+
+        monkeypatch.setattr("clients.database.execute_query", flaky)
+        client, calls = hubspot_client(
+            monkeypatch, response=Response(201, {"id": "701"}))
+
+        with caplog.at_level(logging.ERROR, logger="clients.audit"):
+            result = client._post("crm/v3/objects/contacts", {})
+
+        assert result == {"id": "701"}, "a bookkeeping failure hid a real result"
+        assert len(calls) == 1
+        assert recorder.one["status"] == audit.ATTEMPTED
+        assert "attempted" in caplog.text
+
+    def test_an_unserialisable_payload_does_not_break_the_write(
+            self, monkeypatch, recorder):
         class Odd:
             pass
 

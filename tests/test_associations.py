@@ -14,6 +14,17 @@ import pytest
 from clients.hubspot import HubSpotClient, flatten_error_body
 from intents.context import Actor, RequestContext, Services, new_draft_state
 
+
+@pytest.fixture(autouse=True)
+def _audited(audit_store):
+    """Every write in this file needs an audit store to be allowed through.
+
+    Auditing is pre-flight since 2026-09-23 (clients/audit.reserve_write):
+    no row, no request. See tests/conftest.AuditStore.
+    """
+    return audit_store
+
+
 ACTOR = Actor(user_id=1, email="staff@amuslimcf.org", role="staff")
 
 
@@ -59,8 +70,10 @@ def make_client(monkeypatch, responder):
         monkeypatch.setattr(f"clients.hubspot.requests.{verb}",
                             make_sender(verb.upper()))
 
-    # Auditing is exercised elsewhere; keep it out of the way here.
-    monkeypatch.setattr("clients.database.is_configured", lambda: False)
+    # Auditing is exercised elsewhere, but it can no longer be switched
+    # OFF here: since 2026-09-23 it is pre-flight, and a client with no
+    # audit store refuses every write before the request goes out. The
+    # module's autouse _audited fixture supplies a working one.
 
     client = HubSpotClient()
     client.access_token = "test-token"

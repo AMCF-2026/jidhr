@@ -26,7 +26,8 @@ import requests
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from config import Config
-from clients.audit import record_write
+from clients.audit import (AuditUnavailable, complete_write,
+                           record_write, reserve_write)
 
 logger = logging.getLogger(__name__)
 
@@ -183,16 +184,33 @@ class HubSpotClient:
             logger.error("HubSpot access token not configured")
             result = {"error": "HubSpot access token not configured"}
             if is_hubspot_write(method, endpoint):
-                # 'skipped', not 'failed': nothing was attempted.
-                record_write(
-                    "hubspot", method, endpoint, payload=data,
-                    status="skipped", error=result["error"], duration_ms=0)
+                # 'skipped', not 'failed': nothing was attempted. Nothing
+                # left the process, so a missing audit row here costs
+                # nothing and must not become a second error.
+                try:
+                    record_write(
+                        "hubspot", method, endpoint, payload=data,
+                        status="skipped", error=result["error"],
+                        duration_ms=0)
+                except AuditUnavailable as e:
+                    logger.warning("skipped write not audited: %s", e)
             return result, None
 
         url = f"{self.base_url}/{endpoint}"
-        logger.info(f"HubSpot {method}: {endpoint}")
 
         audited = is_hubspot_write(method, endpoint)
+        reservation = None
+        if audited:
+            # Pre-flight. If the audit store will not take a row, the
+            # request does not go out — see clients/audit.reserve_write.
+            try:
+                reservation = reserve_write(
+                    "hubspot", method, endpoint, payload=data)
+            except AuditUnavailable as e:
+                logger.error("HubSpot %s %s REFUSED: %s", method, endpoint, e)
+                return {"error": f"write refused, not audited: {e}"}, None
+
+        logger.info(f"HubSpot {method}: {endpoint}")
         started = time.perf_counter()
 
         try:
@@ -205,11 +223,9 @@ class HubSpotClient:
             response = sender(url, **kwargs)
         except requests.exceptions.RequestException as e:
             logger.error(f"HubSpot {method} {endpoint} error: {e}")
-            if audited:
-                record_write(
-                    "hubspot", method, endpoint, payload=data,
-                    status="failed", error=str(e),
-                    duration_ms=(time.perf_counter() - started) * 1000)
+            complete_write(
+                reservation, status="failed", error=str(e),
+                duration_ms=(time.perf_counter() - started) * 1000)
             return {"error": str(e)}, None
 
         elapsed_ms = (time.perf_counter() - started) * 1000
@@ -218,8 +234,8 @@ class HubSpotClient:
 
         if audited:
             ok = status_code is not None and 200 <= status_code < 300
-            record_write(
-                "hubspot", method, endpoint, payload=data,
+            complete_write(
+                reservation,
                 status="success" if ok else "failed",
                 http_status=status_code,
                 error=None if ok else (

@@ -23,7 +23,8 @@ import time
 import logging
 import requests
 from config import Config
-from clients.audit import record_write
+from clients.audit import (AuditUnavailable, complete_write,
+                           record_write, reserve_write)
 
 logger = logging.getLogger(__name__)
 
@@ -88,11 +89,16 @@ class CSuiteClient:
         if not self.api_key or not self.api_secret:
             logger.error("CSuite API credentials not configured")
             if is_csuite_write(endpoint):
-                # 'skipped', not 'failed': nothing was attempted.
-                record_write(
-                    "csuite", "POST", endpoint, payload=data, status="skipped",
-                    error="CSuite API credentials not configured",
-                    duration_ms=0)
+                # 'skipped', not 'failed': nothing was attempted, so a
+                # missing audit row here costs nothing.
+                try:
+                    record_write(
+                        "csuite", "POST", endpoint, payload=data,
+                        status="skipped",
+                        error="CSuite API credentials not configured",
+                        duration_ms=0)
+                except AuditUnavailable as e:
+                    logger.warning("skipped write not audited: %s", e)
             return {"error": "CSuite API credentials not configured"}
         
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
@@ -105,16 +111,28 @@ class CSuiteClient:
             "SIGNATURE": self._generate_signature(body)
         }
         
+        audited = is_csuite_write(endpoint)
+        reservation = None
+        if audited:
+            # Pre-flight: no audit row, no request. Every CSuite call is a
+            # POST, so `audited` is decided by endpoint name, not verb —
+            # see is_csuite_write.
+            try:
+                reservation = reserve_write(
+                    "csuite", "POST", endpoint, payload=data)
+            except AuditUnavailable as e:
+                logger.error("CSuite POST %s REFUSED: %s", endpoint, e)
+                return {"error": f"write refused, not audited: {e}"}
+
         logger.info(f"CSuite POST: {endpoint} | data keys: {list((data or {}).keys())}")
 
-        audited = is_csuite_write(endpoint)
         started = time.perf_counter()
 
         def audit(status, http_status=None, error=None):
             if audited:
-                record_write(
-                    "csuite", "POST", endpoint, payload=data, status=status,
-                    http_status=http_status, error=error,
+                complete_write(
+                    reservation, status=status, http_status=http_status,
+                    error=error,
                     duration_ms=(time.perf_counter() - started) * 1000)
 
         try:
