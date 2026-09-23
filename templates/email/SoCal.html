@@ -1,0 +1,184 @@
+<!--
+    templateType: email
+    isAvailableForNewContent: true
+    label: AMCF SoCal Connections Email
+-->
+<!doctype html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="x-apple-disable-message-reformatting">
+    <title>{% if content.html_title and content.html_title != '' %}{{ content.html_title }}{% else %}{{ content.body.subject }}{% endif %}</title>
+    {% if content.meta_description %}<meta name="description" content="{{ content.meta_description }}"/>{% endif %}
+    <!--[if mso]>
+    <xml>
+      <o:OfficeDocumentSettings>
+        <o:AllowPNG/>
+        <o:PixelsPerInch>96</o:PixelsPerInch>
+      </o:OfficeDocumentSettings>
+    </xml>
+    <style type="text/css">
+      body, td, p, a, h1, h2, h3, h4, li { font-family: Arial, Helvetica, sans-serif !important; }
+    </style>
+    <![endif]-->
+    <style type="text/css" id="hs-inline-css">
+      /*<![CDATA[*/
+      /* everything in this style tag will be inlined onto matching elements */
+      body { margin: 0; padding: 0; background-color: #EAF0F6; }
+      table { border-collapse: collapse; mso-table-lspace: 0pt; mso-table-rspace: 0pt; }
+      img { border: 0; outline: none; text-decoration: none; -ms-interpolation-mode: bicubic; }
+
+      /* Main body (rich text area) */
+      .amcf-body p { margin: 0 0 14px 0; font-family: Arial, Helvetica, sans-serif; font-size: 14px; line-height: 175%; color: #1A1A1A; }
+      .amcf-body li { font-family: Arial, Helvetica, sans-serif; font-size: 14px; line-height: 175%; color: #1A1A1A; }
+      .amcf-body ul, .amcf-body ol { margin: 0 0 14px 0; padding-left: 24px; }
+      .amcf-body h1, .amcf-body h2, .amcf-body h3, .amcf-body h4 { margin: 0 0 8px 0; font-family: Arial, Helvetica, sans-serif; font-size: 18px; font-weight: bold; line-height: 150%; color: #5A9366; }
+      .amcf-body a { color: #0600FF; text-decoration: underline; }
+      .amcf-body hr { border: 0; border-top: 1.25px solid #285786; width: 50%; height: 0; margin: 16px auto; }
+
+      /* Footer */
+      .amcf-footer a { color: #0600FF; text-decoration: underline; }
+      /*]]>*/
+    </style>
+    <style type="text/css">
+      @media only screen and (max-width: 620px) {
+        .amcf-container { width: 100% !important; }
+        .amcf-pad { padding-left: 20px !important; padding-right: 20px !important; }
+        .amcf-logo { width: 100% !important; height: auto !important; }
+      }
+    </style>
+  </head>
+  <body style="margin:0; padding:0; background-color:#EAF0F6;">
+    <!-- Preview text (set it explicitly in each email's settings) -->
+    <div id="preview_text" style="display:none; font-size:1px; line-height:1px; max-height:0; max-width:0; opacity:0; overflow:hidden; mso-hide:all;">{% text "preview_text" label="Preview Text <span class=help-text>This will be used as the preview text that displays in some email clients</span>", value="", no_wrapper=True %}</div>
+
+    <!-- Editable fields that feed the optional separator and button below -->
+    {% boolean "show_separator" label="Show separator bar above the button", value=True, export_to_template_context=True %}
+    {% text "button_label" label="Button text (leave blank to hide the button)", value="", export_to_template_context=True %}
+    {% text "button_url" label="Button URL", value="", export_to_template_context=True %}
+
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#EAF0F6" style="width:100%; background-color:#EAF0F6;">
+      <tr>
+        <td align="center" valign="top" style="padding:20px 10px;">
+          <!--[if mso]><table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" align="center"><tr><td><![endif]-->
+          <table role="presentation" class="amcf-container" width="600" cellpadding="0" cellspacing="0" border="0" align="center" style="width:100%; max-width:600px;">
+
+            <!-- 1. Tagline (locked) -->
+            <tr>
+              <td class="amcf-pad" align="center" bgcolor="#285786" style="background-color:#285786; padding:10px 20px; font-family:Arial, Helvetica, sans-serif; font-size:15px; line-height:175%; color:#FFFFFF; font-style:italic;">
+                Building community by mobilizing resources, strengthening nonprofits, and growing leaders for collective impact.
+              </td>
+            </tr>
+
+            <!-- 2. Logo (locked, links to homepage) -->
+            <tr>
+              <td class="amcf-pad" align="center" bgcolor="#EFEFEF" style="background-color:#EFEFEF; padding:10px 20px;">
+                <a href="https://amuslimcf.org" target="_blank" style="text-decoration:none;">
+                  <img class="amcf-logo" src="https://hs-243832852.f.hubspotemail-na2.net/hub/243832852/hubfs/AMCF_Full-Dark.png?width=1120&upscale=true&name=AMCF_Full-Dark.png" width="560" alt="American Muslim Community Foundation" style="display:block; width:560px; max-width:100%; height:auto; border:0; outline:none; text-decoration:none;">
+                </a>
+              </td>
+            </tr>
+
+            <!-- 3. Date bar (editable each send) -->
+            <tr>
+              <td class="amcf-pad" align="center" bgcolor="#5A9366" style="background-color:#5A9366; padding:10px 20px; font-family:Arial, Helvetica, sans-serif; font-size:18px; font-weight:bold; line-height:175%; color:#FFFFFF;">
+                {% text "date_bar" label="Date bar", value="DATE" %}
+              </td>
+            </tr>
+
+            <!-- 3b. SoCal Connections header (locked) -->
+            <tr>
+              <td class="amcf-pad" align="center" bgcolor="#FFFFFF" style="background-color:#FFFFFF; padding:20px 20px 0 20px;">
+                <img src="https://hs-243832852.f.hubspotemail-na2.net/hub/243832852/hubfs/SoCalHeader.jpg?width=500&upscale=true&name=SoCalHeader.jpg" width="250" alt="SoCal Connections" style="display:block; width:250px; max-width:100%; height:auto; border:0; outline:none; text-decoration:none;">
+              </td>
+            </tr>
+
+            <!-- 4. Main body (rich text, edited each send) -->
+            <tr>
+              <td class="amcf-body amcf-pad" align="left" bgcolor="#FFFFFF" style="background-color:#FFFFFF; padding:20px 20px 10px 20px; font-family:Arial, Helvetica, sans-serif; font-size:14px; line-height:175%; color:#1A1A1A;">
+                {% module "email_template_main_email_body" path="@hubspot/email_body" label="Main Email Body" %}
+              </td>
+            </tr>
+
+            <!-- 5. Separator bar (toggle on/off) -->
+            {% if widget_data.show_separator.value %}
+            <tr>
+              <td align="center" bgcolor="#FFFFFF" style="background-color:#FFFFFF; padding:10px 20px;">
+                <table role="presentation" width="50%" cellpadding="0" cellspacing="0" border="0" align="center" style="width:50%;">
+                  <tr>
+                    <td height="1" style="border-top:1.25px solid #285786; font-size:0; line-height:0; height:1px;">&nbsp;</td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            {% endif %}
+
+            <!-- 6. Button (only shows when both text and URL are filled in) -->
+            {% if widget_data.button_label.value and widget_data.button_url.value %}
+            <tr>
+              <td align="center" bgcolor="#FFFFFF" style="background-color:#FFFFFF; padding:10px 20px 20px 20px;">
+                <table role="presentation" align="center" cellpadding="0" cellspacing="0" border="0" style="border-collapse:separate;">
+                  <tr>
+                    <td align="center" valign="middle" bgcolor="#285786" style="background-color:#285786; border-radius:8px; mso-padding-alt:12px 18px;">
+                      <a href="{{ widget_data.button_url.value }}" target="_blank" style="display:inline-block; padding:12px 18px; font-family:Arial, Helvetica, sans-serif; font-size:16px; font-weight:bold; line-height:120%; color:#FFFFFF; text-decoration:none; border-radius:8px;">{{ widget_data.button_label.value }}</a>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            {% else %}
+            <tr>
+              <td bgcolor="#FFFFFF" style="background-color:#FFFFFF; font-size:0; line-height:0; height:10px;" height="10">&nbsp;</td>
+            </tr>
+            {% endif %}
+
+            <!-- 7. Social bar (locked) -->
+            <tr>
+              <td align="center" bgcolor="#285786" style="background-color:#285786; padding:10px 20px;">
+                <table role="presentation" align="center" cellpadding="0" cellspacing="0" border="0">
+                  <tr>
+                    <td style="padding:8px 5px;"><a href="https://www.facebook.com/amuslimcf" target="_blank"><img src="https://hs-243832852.f.hubspotemail-na2.net/hs/hsstatic/TemplateAssets/static-1.262/img/hs_default_template_images/modules/Follow+Me+-+Email/facebook_square_color.png" width="25" height="25" alt="Facebook" style="display:block; width:25px; height:25px; border:0;"></a></td>
+                    <td style="padding:8px 5px;"><a href="https://www.linkedin.com/company/16214040/" target="_blank"><img src="https://hs-243832852.f.hubspotemail-na2.net/hs/hsstatic/TemplateAssets/static-1.262/img/hs_default_template_images/modules/Follow+Me+-+Email/linkedin_square_color.png" width="25" height="25" alt="LinkedIn" style="display:block; width:25px; height:25px; border:0;"></a></td>
+                    <td style="padding:8px 5px;"><a href="https://www.instagram.com/amuslimcf" target="_blank"><img src="https://hs-243832852.f.hubspotemail-na2.net/hs/hsstatic/TemplateAssets/static-1.262/img/hs_default_template_images/modules/Follow+Me+-+Email/instagram_square_color.png" width="25" height="25" alt="Instagram" style="display:block; width:25px; height:25px; border:0;"></a></td>
+                    <td style="padding:8px 5px;"><a href="https://bsky.app/profile/amuslimcf.bsky.social" target="_blank"><img src="https://243832852.fs1.hubspotusercontent-na2.net/hubfs/243832852/BlurSkyicon.png" width="25" height="25" alt="Bluesky" style="display:block; width:25px; height:25px; border:0;"></a></td>
+                    <td style="padding:8px 5px;"><a href="https://www.threads.com/@amuslimcf" target="_blank"><img src="https://hs-243832852.f.hubspotemail-na2.net/hub/243832852/hubfs/Threads.jpg?height=50&upscale=true&name=Threads.jpg" width="25" height="25" alt="Threads" style="display:block; width:25px; height:25px; border:0;"></a></td>
+                    <td style="padding:8px 5px;"><a href="https://www.youtube.com/channel/UC0cIlmVGysAcKEuMdWLiIVg" target="_blank"><img src="https://hs-243832852.f.hubspotemail-na2.net/hs/hsstatic/TemplateAssets/static-1.262/img/hs_default_template_images/modules/Follow+Me+-+Email/youtube_square_color.png" width="25" height="25" alt="YouTube" style="display:block; width:25px; height:25px; border:0;"></a></td>
+                    <td style="padding:8px 5px;"><a href="https://x.com/AMuslimCF" target="_blank"><img src="https://hs-243832852.f.hubspotemail-na2.net/hs/hsstatic/TemplateAssets/static-1.262/img/hs_default_template_images/modules/Follow+Me+-+Email/twitter_square_color.png" width="25" height="25" alt="X" style="display:block; width:25px; height:25px; border:0;"></a></td>
+                    <td style="padding:8px 5px;"><a href="https://wa.me/15557072435" target="_blank"><img src="https://hs-243832852.f.hubspotemail-na2.net/hs/hsstatic/TemplateAssets/static-1.262/img/hs_default_template_images/modules/Follow+Me+-+Email/whatsapp_square_color.png" width="25" height="25" alt="WhatsApp" style="display:block; width:25px; height:25px; border:0;"></a></td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+
+            <!-- 8. Footer (locked) -->
+            <tr>
+              <td class="amcf-footer amcf-pad" align="center" bgcolor="#EFEFEF" style="background-color:#EFEFEF; padding:30px 20px; text-align:center; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:175%; color:#23496D;">
+                <p style="margin:0; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:175%; font-weight:bold; color:#69A84F;">About Us</p>
+                <p style="margin:0; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:175%; color:#23496D;">American Muslim Community Foundation (AMCF) is a national community foundation that advances charitable giving through Donor-Advised Funds, Giving Circles, endowments, and fiscal sponsorships. Since 2017, AMCF has distributed over $28 million to 1000+ nonprofits, supporting basic social needs, racial justice, and health equity.</p>
+                <p style="margin:0; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:175%; color:#23496D;">Charitable giving (zakat/sadaqah) is central to Islam, embodying generosity, compassion, and social justice. AMCF strengthens this tradition by empowering donors, building collective giving platforms, and ensuring today&rsquo;s generosity benefits future generations. It remains the only U.S. organization dedicated to Donor Advised Funds, Giving Circles, and Endowments for the Muslim community.</p>
+                <p style="margin:0; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:175%; font-weight:bold; color:#69A84F;">Vision</p>
+                <p style="margin:0; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:175%; color:#23496D;">Leading sustainable &amp; strategic Muslim philanthropy for today and future generations.</p>
+                <p style="margin:0; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:175%; font-weight:bold; color:#69A84F;">Mission</p>
+                <p style="margin:0; font-family:Arial, Helvetica, sans-serif; font-size:13px; line-height:175%; color:#23496D;">Cultivating donor giving and diversifying funding to advance charitable causes.</p>
+
+                <!-- Required by HubSpot: company address + unsubscribe links -->
+                <p style="margin:20px 0 0 0; font-family:Arial, Helvetica, sans-serif; font-size:12px; line-height:135%; color:#23496D;">
+                  {{ site_settings.company_name }}, {{ site_settings.company_street_address_1 }}{% if site_settings.company_street_address_2 %}, {{ site_settings.company_street_address_2 }}{% endif %}, {{ site_settings.company_city }}, {{ site_settings.company_state }} {{ site_settings.company_zip }} {{ site_settings.company_country }}
+                </p>
+                <p style="margin:10px 0 0 0; font-family:Arial, Helvetica, sans-serif; font-size:12px; line-height:135%; color:#23496D;">
+                  <a class="hubspot-mergetag" data-unsubscribe="true" href="{{ unsubscribe_link_all }}" style="color:#0600FF; text-decoration:underline;">Unsubscribe</a>
+                  &nbsp;
+                  <a class="hubspot-mergetag" data-unsubscribe="true" href="{{ unsubscribe_link }}" style="color:#0600FF; text-decoration:underline;">Manage preferences</a>
+                </p>
+              </td>
+            </tr>
+
+          </table>
+          <!--[if mso]></td></tr></table><![endif]-->
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>
