@@ -23,8 +23,15 @@ if REPO_ROOT not in sys.path:
 
 @pytest.fixture(autouse=True)
 def _unset_database_url(monkeypatch):
-    """Remove DATABASE_URL from the environment for the duration of each test."""
-    monkeypatch.delenv("DATABASE_URL", raising=False)
+    """Remove every database URL for the duration of each test.
+
+    Both of them: since 2026-09-23 clients.database prefers
+    DATABASE_PUBLIC_URL when it is set and the process is not running
+    inside Railway, so leaving it behind would let a developer's .env
+    make "no database configured" tests pass for the wrong reason.
+    """
+    for name in ("DATABASE_URL", "DATABASE_PUBLIC_URL"):
+        monkeypatch.delenv(name, raising=False)
 
 
 class AuditStore:

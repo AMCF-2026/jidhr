@@ -35,9 +35,16 @@ def fresh_modules():
 
 
 def _import_app(monkeypatch, secret_key, database_url=""):
-    """Import app.py fresh under a given environment."""
+    """Import app.py fresh under a given environment.
+
+    Both database URLs are set, not just one: importing app imports
+    config, which calls load_dotenv(), and load_dotenv does not override
+    a variable that is already set. Leaving DATABASE_PUBLIC_URL unset
+    would let the developer's own .env supply one mid-test.
+    """
     monkeypatch.setenv("SECRET_KEY", secret_key)
     monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("DATABASE_PUBLIC_URL", database_url)
     for name in _RELOADED:
         sys.modules.pop(name, None)
     return importlib.import_module("app")

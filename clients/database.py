@@ -32,10 +32,40 @@ logger = logging.getLogger(__name__)
 
 
 _MISSING_DATABASE_URL_MESSAGE = (
-    "DATABASE_URL environment variable is not set. "
-    "Railway should inject this automatically when a Postgres "
+    "Neither DATABASE_URL nor DATABASE_PUBLIC_URL is set. "
+    "Railway injects DATABASE_URL automatically when a Postgres "
     "plugin is attached; check the service's Variables tab."
 )
+
+# Railway sets these inside its own runtime and nowhere else. Their
+# absence is how this process knows it is running on someone's laptop.
+_RAILWAY_MARKERS = ("RAILWAY_ENVIRONMENT", "RAILWAY_PROJECT_ID",
+                    "RAILWAY_SERVICE_ID", "RAILWAY_SERVICE_NAME")
+
+
+def inside_railway() -> bool:
+    return any(os.environ.get(marker) for marker in _RAILWAY_MARKERS)
+
+
+def database_url():
+    """The connection string to use, or None.
+
+    DATABASE_URL names `postgres.railway.internal`, which is Railway's
+    PRIVATE hostname and resolves only inside Railway. Off Railway it
+    does not resolve at all, which is why every write from a developer
+    machine went unaudited until 2026-09-23 — the audit insert failed
+    and the old post-flight recorder swallowed it.
+
+    So: inside Railway, always the private URL (faster, and the traffic
+    never leaves their network). Outside it, DATABASE_PUBLIC_URL when
+    one is set. The choice is logged once, because "which database am I
+    talking to" should never be a guess.
+    """
+    private = os.environ.get('DATABASE_URL')
+    public = os.environ.get('DATABASE_PUBLIC_URL')
+    if inside_railway() or not public:
+        return private or public
+    return public
 
 
 # ---------------------------------------------------------------------------
@@ -47,12 +77,12 @@ _pool_lock = threading.Lock()
 
 
 def is_configured() -> bool:
-    """Return True if DATABASE_URL is set.
+    """Return True if a connection string is available.
 
     Cheap and side-effect free: reads the environment only. Does not
     build the pool and does not open a connection.
     """
-    return bool(os.environ.get('DATABASE_URL'))
+    return bool(database_url())
 
 
 def get_pool():
@@ -76,15 +106,16 @@ def get_pool():
         if _pool is not None:
             return _pool
 
-        database_url = os.environ.get('DATABASE_URL')
-        if not database_url:
+        dsn = database_url()
+        if not dsn:
             raise RuntimeError(_MISSING_DATABASE_URL_MESSAGE)
 
         try:
-            _pool = ThreadedConnectionPool(
-                minconn=1, maxconn=2, dsn=database_url
-            )
-            logger.info("Database pool initialized (minconn=1, maxconn=2)")
+            _pool = ThreadedConnectionPool(minconn=1, maxconn=2, dsn=dsn)
+            logger.info(
+                "Database pool initialized (minconn=1, maxconn=2) via the %s "
+                "URL", "private" if dsn == os.environ.get('DATABASE_URL')
+                else "public proxy")
         except psycopg2.Error as e:
             logger.error(f"Failed to initialize database pool: {e}")
             raise
