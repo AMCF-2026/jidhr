@@ -330,3 +330,85 @@ def test_the_step_6_constraint_failure_names_its_own_cause():
     assert "Failed to save email" not in reply, "the generic branch fired"
     assert sent == [], "the request went out despite having no audit row"
     assert ctx.draft_state["active"] is True
+
+
+# ---------------------------------------------------------------------------
+# What the prompts ask for, and what survives the allowlist
+# ---------------------------------------------------------------------------
+
+# A reply in the shape the prompts now demand: real headings, no span,
+# no style, secondary CTAs inline, one primary CTA in the fields.
+MULTI_SECTION = """SUBJECT: Round One Voting Begins This Weekend
+PREVIEW: Voting opens Saturday. Here is who is on the ballot.
+BUTTON_LABEL: Cast your vote
+BUTTON_URL: https://www.grapevine.org/giving-circle/zjrhaGG
+
+BODY:
+<h2>Round one opens Saturday</h2>
+<p>Members choose three of the eight nominees. The
+<a href="https://amuslimcf.org/donors/giving-circles/nominees/">full nominee
+list</a> has each organisation's summary.</p>
+<h3>How the ballot works</h3>
+<ul><li>Three votes each</li><li>Closes Tuesday</li></ul>
+<h2>Also this month</h2>
+<p>The <a href="https://amuslimcf.org/events/">events page</a> has the
+Directory webinar, and <a href="https://ispu.org/islamophobia/introduction/">
+ISPU's report</a> is out.</p>"""
+
+FIXTURE_URLS = {
+    "https://www.grapevine.org/giving-circle/zjrhaGG",
+    "https://amuslimcf.org/donors/giving-circles/nominees/",
+    "https://amuslimcf.org/events/",
+    "https://ispu.org/islamophobia/introduction/",
+}
+
+
+def test_a_multi_section_reply_survives_parse_and_sanitise():
+    """The shape the prompts ask for is the shape that survives.
+
+    Before the body rules, AMCF newsletters carried their headings as
+    <span style="font-size:18px">, which the allowlist strips — so every
+    section heading arrived as ordinary body text.
+    """
+    import re
+
+    fields = content._parse_email_draft(MULTI_SECTION)
+    clean = ed.sanitize_body_html(fields["body"])
+
+    assert len(re.findall(r"<h2[ >]", clean)) >= 2
+    assert "<h3" in clean
+    assert "<span" not in clean
+    assert "style=" not in clean
+
+    # Every URL in the fixture reaches the output, in the body or the button.
+    found = set(re.findall(r'href="([^"]+)"', clean))
+    found.add(fields["button_url"])
+    assert FIXTURE_URLS <= found, f"lost: {FIXTURE_URLS - found}"
+
+    # Exactly one primary CTA, and it is in the fields, not the body.
+    assert fields["button_label"] == "Cast your vote"
+    assert fields["button_url"] == "https://www.grapevine.org/giving-circle/zjrhaGG"
+    assert fields["button_url"] not in clean, "the primary CTA leaked into the body"
+
+
+def test_the_body_rules_are_in_both_prompts():
+    """The initial draft and the refinement must agree.
+
+    A refinement that forgets the rules rewrites a compliant body into a
+    non-compliant one, and the loss only shows up after sending.
+    """
+    import inspect
+    source = inspect.getsource(content)
+    for rule in ("Section headings are real <h2>",
+                 "No <span>, no style attributes",
+                 "Exactly ONE primary call to action"):
+        assert source.count(rule) == 2, f"{rule!r} is not in both prompts"
+
+
+def test_a_styled_heading_still_arrives_as_body_text():
+    """Why the rule exists, pinned as a test."""
+    clean = ed.sanitize_body_html(
+        '<p><span style="font-size:18px; color:#5a9366">'
+        '<strong>Round one opens</strong></span></p>')
+    assert "<h2" not in clean
+    assert clean == "<p><strong>Round one opens</strong></p>"

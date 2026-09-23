@@ -501,7 +501,14 @@ Write:
 3. A call-to-action button, ONLY if the email genuinely needs one. Leave both button fields blank otherwise; a button with no destination is worse than no button.
 4. The email body (2-3 paragraphs, warm but professional tone)
 
-Do not put the call to action inside the body as a link — it is rendered as a button from the fields below.
+The PRIMARY call to action is not written into the body — it is rendered as a button from the fields below. Secondary links belong in the sentences, as the rules below say.
+
+BODY RULES — the AMCF template owns every pixel of styling:
+- Section headings are real <h2> tags. Subsections are <h3>. Never a styled <p> or <span>.
+- No <span>, no style attributes, no font, size or colour anywhere. They are stripped before sending, and a heading built from a styled span arrives as plain body text.
+- Paragraphs <p>, lists <ul>/<li>, emphasis <strong>/<em>, links <a href>. Nothing else. No tables.
+- Secondary calls to action are inline links in the body, written into the sentence.
+- Exactly ONE primary call to action, and it goes in BUTTON_LABEL/BUTTON_URL, never in the body. The template renders one button and shows it only when both fields are set.
 
 Format your response as:
 SUBJECT: [subject line]
@@ -510,7 +517,7 @@ BUTTON_LABEL: [button text, or leave blank]
 BUTTON_URL: [https://... , or leave blank]
 
 BODY:
-[email body - paragraphs, lists, <strong> and <em>. No tables, no inline styles, no colours: the AMCF template owns all of that.]"""
+[email body, following the rules above]"""
 
     try:
         draft = ctx.services.claude.chat(
@@ -1260,6 +1267,13 @@ Current Body:
 
 Feedback: {feedback}
 
+BODY RULES — the AMCF template owns every pixel of styling:
+- Section headings are real <h2> tags. Subsections are <h3>. Never a styled <p> or <span>.
+- No <span>, no style attributes, no font, size or colour anywhere. They are stripped before sending, and a heading built from a styled span arrives as plain body text.
+- Paragraphs <p>, lists <ul>/<li>, emphasis <strong>/<em>, links <a href>. Nothing else. No tables.
+- Secondary calls to action are inline links in the body, written into the sentence.
+- Exactly ONE primary call to action, and it goes in BUTTON_LABEL/BUTTON_URL, never in the body. The template renders one button and shows it only when both fields are set.
+
 Return the revised email in this format:
 SUBJECT: [revised subject line]
 PREVIEW: [preview line, under 100 characters]
@@ -1267,7 +1281,7 @@ BUTTON_LABEL: [button text, or leave blank]
 BUTTON_URL: [https://... , or leave blank]
 
 BODY:
-[revised body — paragraphs, lists, <strong> and <em>; no tables, no inline styles]"""
+[revised body, following the rules above]"""
     else:
         platform = ctx.draft_state.get("platform", "social media")
         refine_prompt = f"""Revise this {platform} post based on the feedback.
