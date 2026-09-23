@@ -846,6 +846,17 @@ class HubSpotClient:
     ) -> dict:
         """Create a marketing email draft in HubSpot.
 
+        DEPRECATED 2026-09-23 — use clients.email_draft.create_draft_email.
+
+        This is the clone-and-patch workaround, and it was built on a
+        wrong diagnosis. The API does apply a coded template; it just
+        needs templatePath inside `content` rather than at the top level
+        (probes 399921857254 and 399908795086, see clients/email_draft).
+        Cloning a 36-module drag-and-drop email and patching one widget
+        was never necessary, and it is why the body sometimes landed in
+        the wrong module. Kept only until intents/content.py is moved
+        over; do not call it from anything new.
+
         Uses clone-and-patch approach because HubSpot v3 API does not apply
         user-created templates via templateId.
 
@@ -956,6 +967,10 @@ class HubSpotClient:
             logger.error(f"EMAIL {email_id} — ALL body injection approaches failed")
 
         # --- Step 4: Verify the template is correct (not plain_text.html) ---
+        # DEPRECATED 2026-09-23. This check was right about the symptom and
+        # could do nothing about it: it warns AFTER the draft exists and
+        # leaves it in the portal. clients.email_draft.create_draft_email
+        # makes the same check and archives the draft before raising.
         final_check = self._get(patch_endpoint)
         final_template = (final_check.get("content") or {}).get("templatePath", "unknown")
         logger.info(f"EMAIL {email_id} — final templatePath: {final_template}")
