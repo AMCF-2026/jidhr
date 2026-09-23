@@ -66,6 +66,14 @@ DEFAULT_DRAFT_STATE = {
     "template": None,
     "link_url": None,
     "photo_url": None,
+    # Email only. The coded templates carry a preview line and an optional
+    # button, and neither can be expressed in the body: the button is its
+    # own module and the template hides it unless BOTH label and url are
+    # set. They are fields on the draft so a person can set them in chat
+    # and see them before anything is saved.
+    "preview_text": None,
+    "button_label": None,
+    "button_url": None,
 }
 
 

@@ -232,3 +232,24 @@ builder serve all three. `site_settings.company_country` is present in all
 three as published. Because a `201` is not evidence — probe 1 returned one
 — `create_draft_email` reads the email back and archives it before raising
 if the stored path or mode is not what was asked for.
+
+## 2026-09-23 — The chat flow saves for real, and HubL tokens pass the sanitizer
+
+`_save_email_draft` is called with `apply=True`, so asking Jidhr to save an
+email creates the HubSpot draft rather than preparing one. It never
+downgrades to a dry run without saying so: if the audit store is
+unreachable the reply is "Draft not saved: audit store unreachable" with
+the full payload summary and the draft left open, because a person who
+asked for a save and got silence will assume it worked. Every save reply
+— succeeded, refused or dry — lists the template key, the date bar, the
+preview text and the button as label plus URL or the words **NO BUTTON**,
+since an email that quietly went out without its call to action is the
+failure that list exists to prevent. Separately: HubL personalization
+tokens such as `{{ personalization_token('contact.firstname', 'Friend') }}`
+pass `sanitize_body_html` untouched, because the allowlist works on tags
+and a token is text. That is acceptable while every body is
+Jidhr-generated and every template is staff-owned. It stops being
+acceptable the moment staff can paste HTML into a draft: a pasted token
+is then an expression someone else wrote, rendering inside AMCF's
+templates against AMCF's contact data. Revisit before any paste path
+ships.

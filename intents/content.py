@@ -497,13 +497,20 @@ AMCF is a national community foundation that advances charitable giving through 
 
 Write:
 1. A compelling subject line
-2. The email body (2-3 paragraphs, warm but professional tone)
+2. A preview line (under 100 characters) — the text an inbox shows next to the subject
+3. A call-to-action button, ONLY if the email genuinely needs one. Leave both button fields blank otherwise; a button with no destination is worse than no button.
+4. The email body (2-3 paragraphs, warm but professional tone)
+
+Do not put the call to action inside the body as a link — it is rendered as a button from the fields below.
 
 Format your response as:
 SUBJECT: [subject line]
+PREVIEW: [preview line]
+BUTTON_LABEL: [button text, or leave blank]
+BUTTON_URL: [https://... , or leave blank]
 
 BODY:
-[email body - can include basic HTML like <p>, <strong>, <a>]"""
+[email body - paragraphs, lists, <strong> and <em>. No tables, no inline styles, no colours: the AMCF template owns all of that.]"""
 
     try:
         draft = ctx.services.claude.chat(
@@ -511,12 +518,16 @@ BODY:
             system_prompt="You are a nonprofit marketing copywriter. Write warm, engaging emails." + ORG_FACTS_PROMPT,
         )
 
-        subject, body = _parse_email_draft(draft)
+        fields = _parse_email_draft(draft)
+        subject, body = fields["subject"], fields["body"]
 
         # Seeded from the shared shape, so a key added to
         # DEFAULT_DRAFT_STATE appears on new drafts without a second edit here.
         _start_draft(ctx, type="email", subject=subject, body=body,
-                     template="amcf")
+                     template=None,
+                     preview_text=fields["preview_text"] or subject,
+                     button_label=fields["button_label"],
+                     button_url=fields["button_url"])
 
         response = f"""📧 **Email Draft**
 
@@ -628,6 +639,76 @@ def _body_as_html(body: str) -> str:
     return "<p>" + paragraphs.replace(chr(10), "<br>") + "</p>"
 
 
+# "button: Register now -> https://amuslimcf.org/x"
+_BUTTON_RE = re.compile(
+    r"^\s*button\s*:\s*(?P<label>.+?)\s*(?:->|=>|→)\s*(?P<url>\S+)\s*$",
+    re.IGNORECASE)
+_NO_BUTTON_RE = re.compile(r"^\s*(no|remove|drop|clear)\s+button\s*$",
+                           re.IGNORECASE)
+_PREVIEW_RE = re.compile(r"^\s*preview\s*:\s*(?P<text>.+?)\s*$",
+                         re.IGNORECASE)
+
+
+def _apply_email_field_command(query: str, ctx) -> str | None:
+    """Handle "button:", "no button" and "preview:". None if not one.
+
+    These are commands, not refinements: they must not reach Claude, and
+    they must not be mistaken for a save.
+    """
+    from clients.email_draft import safe_href
+
+    match = _NO_BUTTON_RE.match(query or "")
+    if match:
+        ctx.draft_state["button_label"] = ""
+        ctx.draft_state["button_url"] = ""
+        return "🔘 Button removed. The email will send without one."
+
+    match = _PREVIEW_RE.match(query or "")
+    if match:
+        text = match.group("text").strip()
+        ctx.draft_state["preview_text"] = text
+        return f"👁 Preview text set to: *{text}*"
+
+    match = _BUTTON_RE.match(query or "")
+    if match:
+        label = match.group("label").strip()
+        url = match.group("url").strip()
+        if not safe_href(url):
+            # The label is kept: the person said what they wanted the
+            # button to say, and only the address is unusable.
+            ctx.draft_state["button_label"] = label
+            return (f"⚠️ *{url}* is not a usable button link — it must start "
+                    "with https://, http:// or mailto:. I kept the label "
+                    f"*{label}*; send the link again with "
+                    f"*\"button: {label} -> https://...\"*.")
+        ctx.draft_state["button_label"] = label
+        ctx.draft_state["button_url"] = url
+        return f"🔘 Button set: **{label}** → {url}"
+
+    return None
+
+
+def _draft_summary(template, date_bar, preview_text, button_label,
+                   button_url, payload) -> str:
+    """Every field that is about to be sent, in one block.
+
+    Shown on the save reply whether the save succeeded, was refused or
+    was a dry run, so what would have gone out is never left implicit.
+    """
+    body_html = (payload["content"]["widgets"]
+                 ["email_template_main_email_body"]["body"]["html"])
+    button = (f"**{button_label}** → {button_url}"
+              if button_label and button_url else "**NO BUTTON**")
+    return "\n".join([
+        f"📧 **{payload['subject']}**",
+        f"• Template: `{template}` ({TEMPLATE_LABELS.get(template, template)})",
+        f"• Date bar: {date_bar}",
+        f"• Preview text: {preview_text}",
+        f"• Button: {button}",
+        f"• Body: {len(body_html):,} characters after formatting was stripped",
+    ])
+
+
 def _save_email_draft(query: str, ctx, apply: bool = False) -> str:
     """Save the email draft to HubSpot.
 
@@ -635,21 +716,29 @@ def _save_email_draft(query: str, ctx, apply: bool = False) -> str:
     the body is put through the allowlist either way, so a body that
     cannot be rendered fails here rather than in the portal.
     """
+    from clients.audit import AuditUnavailable
     from clients.email_draft import (EmptyBody, TemplateDidNotAttach,
                                      UnknownTemplate, build_email_payload,
                                      create_draft_email)
 
-    subject = ctx.draft_state["subject"]
-    body = ctx.draft_state["body"]
-    template = _template_key(query, ctx.draft_state)
+    draft = ctx.draft_state
+    subject = draft["subject"]
+    body = draft["body"]
+    template = _template_key(query, draft)
+    date_bar = _date_bar(draft)
+    preview_text = draft.get("preview_text") or subject
+    button_label = draft.get("button_label") or ""
+    button_url = draft.get("button_url") or ""
     name = f"{subject[:50]} - {datetime.now().strftime('%Y-%m-%d')}"
 
     try:
         payload = build_email_payload(
             template,
             body_html=_body_as_html(body),
-            date_bar=_date_bar(ctx.draft_state),
-            preview_text=subject,
+            date_bar=date_bar,
+            preview_text=preview_text,
+            button_label=button_label,
+            button_url=button_url,
             name=name,
             subject=subject,
         )
@@ -658,30 +747,36 @@ def _save_email_draft(query: str, ctx, apply: bool = False) -> str:
     except (UnknownTemplate, ValueError) as e:
         return f"❌ Could not build the email: {e}"
 
+    # Everything that is about to be sent, shown before it is sent. The
+    # button line especially: an email that quietly went out without its
+    # call to action is the failure this list exists to prevent.
+    summary = _draft_summary(template, date_bar, preview_text,
+                             button_label, button_url, payload)
+
     try:
         created = create_draft_email(payload, apply=apply,
                                      client=ctx.services.hubspot)
+    except AuditUnavailable as e:
+        # Never quietly downgrade to a dry run: the person asked for a
+        # save, and "nothing happened" has to say so.
+        logger.error("email draft not saved, audit store unreachable: %s", e)
+        return (f"❌ **Draft not saved: audit store unreachable**\n\n{summary}"
+                f"\n\nNothing was written to HubSpot. Jidhr refuses a write "
+                f"it cannot record.\n\n> {e}")
     except TemplateDidNotAttach as e:
         # The draft was archived before this was raised, so there is
         # nothing half-made sitting in the portal.
         logger.error("email draft rejected: %s", e)
-        return ("❌ HubSpot did not attach the AMCF template, so the draft "
-                "was discarded rather than left for someone to send. "
-                f"{e}")
+        return (f"❌ **HubSpot did not attach the AMCF template**\n\n{summary}"
+                f"\n\nThe draft was archived rather than left for someone "
+                f"to send.\n\n> {e}")
     except Exception as e:
         logger.error(f"Email save error: {e}")
-        return f"❌ Failed to save email: {e}"
-
-    label = TEMPLATE_LABELS.get(template, template)
+        return f"❌ Failed to save email: {e}\n\n{summary}"
 
     if not apply:
-        return f"""📝 **Email draft prepared — not saved**
-
-📧 **{subject}**
-• Template: {label}
-• Body: {len(payload['content']['widgets']['email_template_main_email_body']['body']['html']):,} characters after formatting was stripped
-
-*Dry run: nothing was written to HubSpot.*"""
+        return (f"📝 **Email draft prepared — not saved**\n\n{summary}\n\n"
+                "*Dry run: nothing was written to HubSpot.*")
 
     email_id = (created or {}).get("id", "Unknown")
     edit_url = (f"https://app-na2.hubspot.com/email/"
@@ -691,9 +786,7 @@ def _save_email_draft(query: str, ctx, apply: bool = False) -> str:
 
     return f"""✅ **Email Draft Saved to HubSpot!**
 
-📧 **{subject}**
-• Template: {label}
-• Status: Draft (not sent)
+{summary}
 
 ✏️ **Edit in HubSpot:** {edit_url}
 
@@ -1051,11 +1144,18 @@ def _handle_draft_conversation(query: str, ctx) -> str:
         _clear_draft_state(ctx)
         return "👍 Draft cancelled. Let me know if you'd like to start something new!"
 
+    # Email field commands, before the save matcher: "no button" must not
+    # be read as "done" and silently save.
+    if ctx.draft_state["type"] == "email":
+        field_reply = _apply_email_field_command(query, ctx)
+        if field_reply is not None:
+            return field_reply
+
     # Save email to HubSpot
     if ctx.draft_state["type"] == "email" and any(
         w in query_lower for w in ['save', 'create', 'done', 'looks good', 'that works']
     ):
-        return _save_email_draft(query, ctx)
+        return _save_email_draft(query, ctx, apply=True)
 
     # Cadence override — must run BEFORE the generic "schedule" matcher
     # below, since "schedule anyway" contains "schedule".
@@ -1160,9 +1260,12 @@ Feedback: {feedback}
 
 Return the revised email in this format:
 SUBJECT: [revised subject line]
+PREVIEW: [preview line, under 100 characters]
+BUTTON_LABEL: [button text, or leave blank]
+BUTTON_URL: [https://... , or leave blank]
 
 BODY:
-[revised body]"""
+[revised body — paragraphs, lists, <strong> and <em>; no tables, no inline styles]"""
     else:
         platform = ctx.draft_state.get("platform", "social media")
         refine_prompt = f"""Revise this {platform} post based on the feedback.
@@ -1188,12 +1291,19 @@ Return only the revised post content, nothing else."""
             return _draft_unchanged_notice(revised)
 
         if draft_type == "email":
-            subject, body = _parse_email_draft(revised)
+            fields = _parse_email_draft(revised)
+            subject, body = fields["subject"], fields["body"]
             if not body or not body.strip():
                 logger.warning("Refinement produced no email body; draft kept")
                 return _draft_unchanged_notice(revised)
             ctx.draft_state["subject"] = subject
             ctx.draft_state["body"] = body
+            if fields["preview_text"]:
+                ctx.draft_state["preview_text"] = fields["preview_text"]
+            # A refinement that returns no button CLEARS one that was set:
+            # "take the button off" has to be expressible.
+            ctx.draft_state["button_label"] = fields["button_label"]
+            ctx.draft_state["button_url"] = fields["button_url"]
 
             return f"""📧 **Revised Email Draft**
 
@@ -1340,29 +1450,76 @@ def _detect_platform(query: str) -> str:
     return 'facebook'
 
 
-def _parse_email_draft(draft: str) -> tuple:
-    """Parse subject and body from Claude's email draft response."""
-    lines = draft.strip().split('\n')
-    subject = ""
+# The header fields the model is asked for, and the draft key each one
+# fills. Anything the model leaves out arrives as an empty string rather
+# than None, so a missing CTA and a cleared CTA look the same downstream.
+_EMAIL_HEADERS = {
+    "SUBJECT:": "subject",
+    "PREVIEW:": "preview_text",
+    "BUTTON_LABEL:": "button_label",
+    "BUTTON_URL:": "button_url",
+}
+
+# Placeholder text a model returns when it has nothing to say for a
+# field. Treated as blank, because "[leave blank]" in a button label is
+# how a template ends up with a button reading "[leave blank]".
+_BLANK_MARKERS = ("[leave blank]", "[blank]", "none", "n/a", "(none)", "-",
+                  "[button text, or leave blank]", "[preview line]")
+
+
+def _blank(value: str) -> bool:
+    text = (value or "").strip().lower()
+    return not text or text in _BLANK_MARKERS or (
+        text.startswith("[") and text.endswith("]"))
+
+
+def _parse_email_draft(draft: str) -> dict:
+    """Claude's email draft as structured fields.
+
+    Returns subject, body, preview_text, button_label and button_url.
+    The four header fields are empty strings when the model omits them,
+    and a button is dropped unless BOTH halves survive — the template
+    renders the button only when both are set, so half of one is a
+    silent omission.
+    """
+    fields = {key: "" for key in _EMAIL_HEADERS.values()}
     body_lines = []
     in_body = False
 
-    for line in lines:
-        if line.upper().startswith('SUBJECT:'):
-            subject = line.split(':', 1)[1].strip()
-        elif line.upper().startswith('BODY:'):
+    for line in (draft or "").strip().split('\n'):
+        upper = line.upper()
+        if upper.startswith('BODY:'):
             in_body = True
-        elif in_body:
+            continue
+        if in_body:
             body_lines.append(line)
+            continue
+        for header, key in _EMAIL_HEADERS.items():
+            if upper.startswith(header):
+                fields[key] = line.split(':', 1)[1].strip()
+                break
 
     body = '\n'.join(body_lines).strip()
 
-    if not subject:
-        subject = "AMCF Update"
-    if not body:
-        body = draft
+    for key in ("preview_text", "button_label", "button_url"):
+        if _blank(fields[key]):
+            fields[key] = ""
 
-    return subject, body
+    if not fields["subject"] or _blank(fields["subject"]):
+        fields["subject"] = "AMCF Update"
+    if not body:
+        body = draft or ""
+
+    # A label with no usable url, or a url with no label, is no button.
+    from clients.email_draft import safe_href
+    if not (fields["button_label"] and safe_href(fields["button_url"])):
+        if fields["button_label"] or fields["button_url"]:
+            logger.info("dropping an incomplete button: label=%r url=%r",
+                        fields["button_label"], fields["button_url"])
+        fields["button_label"] = fields["button_url"] = ""
+
+    fields["body"] = body
+    return fields
 
 
 def _html_to_display(html: str) -> str:
