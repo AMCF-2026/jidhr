@@ -147,7 +147,7 @@ def test_the_payload_is_json_serialisable():
 # The sanitiser
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("tag", sorted(ed.ALLOWED_TAGS - {"br", "a"}))
+@pytest.mark.parametrize("tag", sorted(ed.ALLOWED_TAGS - {"br", "a", "img"}))
 def test_allowed_tags_survive(tag):
     out = ed.sanitize_body_html(f"<{tag}>text</{tag}>")
     assert out == f"<{tag}>text</{tag}>"
@@ -177,6 +177,86 @@ def test_br_and_links_survive():
 ])
 def test_layout_and_styling_are_stripped_but_the_words_remain(raw, expected):
     assert ed.sanitize_body_html(raw) == expected
+
+
+# --- images, allowed 2026-09-23 --------------------------------------
+# The 9/22 Giving Circle newsletter lost all three of its images to the
+# allowlist. They are back, https-only.
+
+IMG = ('<img src="https://cdn.example.org/banner.png" alt="Round one" '
+       'width="560" height="180">')
+
+
+def test_an_https_image_survives_with_its_four_attributes():
+    out = ed.sanitize_body_html(f"<p>Before.</p>{IMG}")
+    assert 'src="https://cdn.example.org/banner.png"' in out
+    assert 'alt="Round one"' in out
+    assert 'width="560"' in out and 'height="180"' in out
+
+
+def test_an_image_is_void_and_never_leaves_an_open_tag():
+    out = ed.sanitize_body_html(f"<p>a</p>{IMG}<p>b</p>")
+    assert "</img>" not in out
+    assert out.count("<p>") == out.count("</p>")
+
+
+def test_a_self_closed_image_meets_the_same_check():
+    """<img /> must not be a way round the src gate."""
+    assert ed.sanitize_body_html(
+        '<p>x</p><img src="https://cdn.example.org/a.png" />').count("<img") == 1
+    assert "<img" not in ed.sanitize_body_html(
+        '<p>x</p><img src="javascript:alert(1)" />')
+
+
+@pytest.mark.parametrize("src", [
+    "javascript:alert(1)", "data:image/png;base64,AAAA", "vbscript:x",
+    "http://cdn.example.org/a.png",   # http breaks the padlock
+    "//cdn.example.org/a.png", "/local/a.png", "cdn.example.org/a.png",
+])
+def test_a_src_that_is_not_https_drops_the_whole_element(src):
+    """Not just the attribute.
+
+    An <img> with no src is a broken-image icon, and its alt would be
+    left reading as a sentence in the middle of the body. An image is
+    not a sentence.
+    """
+    out = ed.sanitize_body_html(f'<p>Before.</p><img src="{src}" alt="Banner">')
+    assert "<img" not in out
+    assert "Banner" not in out, "the alt text leaked into the body"
+    assert "Before." in out
+
+
+def test_an_image_with_no_src_at_all_drops():
+    out = ed.sanitize_body_html('<p>Before.</p><img alt="Banner" width="560">')
+    assert "<img" not in out
+    assert "Banner" not in out
+    assert "Before." in out
+
+
+def test_an_image_inside_a_stripped_table_survives_the_table():
+    out = ed.sanitize_body_html(f"<table><tr><td>{IMG}</td></tr></table>")
+    assert "<table" not in out
+    assert 'src="https://cdn.example.org/banner.png"' in out
+
+
+def test_a_style_attribute_on_an_image_still_goes():
+    out = ed.sanitize_body_html(
+        '<img src="https://cdn.example.org/a.png" style="border:4px solid red">')
+    assert "<img" in out and "style" not in out
+
+
+def test_an_email_that_is_only_an_image_is_not_empty():
+    """One banner is still an email; it just has no sentences."""
+    assert ed.sanitize_body_html(IMG).startswith("<img")
+    with pytest.raises(ed.EmptyBody):
+        ed.sanitize_body_html('<img src="javascript:alert(1)">')
+
+
+def test_what_was_stripped_names_the_image_reason(caplog):
+    with caplog.at_level("INFO"):
+        ed.sanitize_body_html('<p>x</p><img src="http://a.org/b.png">')
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "img[src:not-https]" in logged
 
 
 def test_script_loses_its_contents_too():

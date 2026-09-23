@@ -74,18 +74,35 @@ DESIGN_MANAGER = "DESIGN_MANAGER"
 # Tags a generated body may use. Everything else is layout or styling,
 # and layout and styling belong to the template.
 ALLOWED_TAGS = frozenset(
-    ("p", "br", "ul", "ol", "li", "a", "strong", "em", "b", "i", "h2", "h3"))
+    ("p", "br", "ul", "ol", "li", "a", "strong", "em", "b", "i", "h2", "h3",
+     "img"))
 
 # Per-tag attribute allowlist. Empty means "no attributes at all", which
-# is the case for every tag but one.
-ALLOWED_ATTRS = {"a": frozenset(("href",))}
+# is the case for every tag but two.
+ALLOWED_ATTRS = {
+    "a": frozenset(("href",)),
+    # Dimensions are kept because an image without them reflows the
+    # whole email while it loads in Outlook.
+    "img": frozenset(("src", "alt", "width", "height")),
+}
+
+# Attributes that decide where a tag points, rather than how it looks.
+# If one of these fails its scheme check the ELEMENT goes, not just the
+# attribute: an <a> with no href is still its own text, but an <img>
+# with no src is a broken image icon, and its alt would be left reading
+# as a sentence in the middle of the body. An image is not a sentence.
+REQUIRED_URL_ATTRS = {"img": "src"}
 
 # Tags whose CONTENT is dropped along with the tag. Everything else that
 # is not allowed has its tag removed and its text kept, because silently
 # losing a sentence is harder to notice than losing a <div>.
 DROP_CONTENT_TAGS = frozenset(("script", "style", "head", "title"))
 
-VOID_TAGS = frozenset(("br",))
+VOID_TAGS = frozenset(("br", "img"))
+
+# An image may only be loaded over https. http would break the padlock
+# in every modern client, and any other scheme is not an image at all.
+IMAGE_SCHEMES = ("https://",)
 
 # Schemes a link may use. A javascript: href in a marketing email is the
 # one injection this allowlist exists to stop.
@@ -113,11 +130,10 @@ class TemplateDidNotAttach(RuntimeError):
 # Sanitising
 # ---------------------------------------------------------------------------
 
-def safe_href(value) -> str | None:
-    """A link target, or None if the scheme is not one we allow."""
+def safe_href(value, schemes=SAFE_SCHEMES) -> str | None:
+    """A URL, or None if its scheme is not one of `schemes`."""
     text = (value or "").strip()
-    lowered = text.lower()
-    if lowered.startswith(SAFE_SCHEMES):
+    if text.lower().startswith(tuple(schemes)):
         return text
     return None
 
@@ -148,6 +164,9 @@ class _Sanitiser(HTMLParser):
 
         kept = []
         allowed = ALLOWED_ATTRS.get(tag, frozenset())
+        required = REQUIRED_URL_ATTRS.get(tag)
+        have_required = False
+
         for name, value in attrs:
             name = (name or "").lower()
             if name.startswith("on") or name == "style" or name not in allowed:
@@ -159,17 +178,30 @@ class _Sanitiser(HTMLParser):
                 if value is None:
                     self.stripped.add("a[href:unsafe-scheme]")
                     continue
+            if name == required:
+                value = safe_href(value, IMAGE_SCHEMES)
+                if value is None:
+                    # The whole element goes — see REQUIRED_URL_ATTRS.
+                    self.stripped.add(f"{tag}[{required}:not-https]")
+                    return
+                have_required = True
             kept.append(f' {name}="{html.escape(value or "", quote=True)}"')
 
+        if required and not have_required:
+            self.stripped.add(f"{tag}[no-{required}]")
+            return
+
         if tag in VOID_TAGS:
-            self.out.append(f"<{tag}>")
+            self.out.append(f"<{tag}{''.join(kept)}>")
             return
         self.out.append(f"<{tag}{''.join(kept)}>")
         self._open.append(tag)
 
     def handle_startendtag(self, tag, attrs):
-        if tag in VOID_TAGS and not self._suppress:
-            self.out.append(f"<{tag}>")
+        # Routed through handle_starttag so a self-closed <img /> meets
+        # the same src check as an open one.
+        if tag in VOID_TAGS:
+            self.handle_starttag(tag, attrs)
         elif tag not in ALLOWED_TAGS:
             self.stripped.add(tag)
 
@@ -194,6 +226,10 @@ class _Sanitiser(HTMLParser):
         self.out.append(html.escape(data, quote=False))
         if data.strip():
             self.text_seen = True
+
+    def has_content(self) -> bool:
+        """Text, or an image. An email that is one banner is still an email."""
+        return self.text_seen or "<img" in "".join(self.out)
 
     def result(self) -> str:
         while self._open:
@@ -224,7 +260,7 @@ def sanitize_body_html(body_html) -> str:
         logger.info("body_html: stripped %s",
                     ", ".join(sorted(parser.stripped)))
 
-    if not parser.text_seen:
+    if not parser.has_content():
         raise EmptyBody(
             "body_html has no text once tags are stripped — refusing to "
             f"build an email with an empty body (input was {len(str(body_html))} "
