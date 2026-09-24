@@ -187,7 +187,9 @@ def clear():
     try:
         log_user_action("Cleared conversation")
         assistant = get_assistant(current_user.id)
-        assistant.clear_history(flask_session=session)
+        # actor so the pending draft is deleted from Postgres too, not
+        # just from this worker's copy of the state.
+        assistant.clear_history(flask_session=session, actor=current_user)
         return jsonify({"status": "cleared"})
     except Exception as e:
         logger.exception(f"Clear error: {e}")

@@ -13,6 +13,7 @@ import logging
 from datetime import datetime
 from config import SYSTEM_PROMPT
 from clients import OpenRouterClient, HubSpotClient, CSuiteClient
+from clients import drafts
 from clients.openrouter import OpenRouterError
 from intents import route_intent
 from intents.context import (
@@ -96,8 +97,14 @@ class JidhrAssistant:
         )
 
     def _load_state_from_session(self, flask_session):
-        """Load draft and workflow state from Flask session cookie."""
-        saved_draft = flask_session.get("draft_state")
+        """Load workflow state from the Flask session cookie.
+
+        The DRAFT no longer travels in the cookie — see clients/drafts.py.
+        A newsletter draft measured 3,851 signed bytes against a browser's
+        4,096-byte cap, so the largest and most valuable drafts were
+        exactly the ones the browser silently dropped.
+        """
+        saved_draft = None
         if saved_draft and isinstance(saved_draft, dict):
             self.draft_state.update(saved_draft)
             logger.debug(f"Loaded draft_state from session: active={saved_draft.get('active')}")
@@ -108,10 +115,42 @@ class JidhrAssistant:
             logger.debug(f"Loaded workflow_state from session: active={saved_workflow.get('active')}")
 
     def _save_state_to_session(self, flask_session):
-        """Persist draft and workflow state back to the Flask session cookie."""
-        flask_session["draft_state"] = dict(self.draft_state)
+        """Persist workflow state back to the Flask session cookie.
+
+        The draft goes to Postgres instead, in _persist_draft.
+        """
+        flask_session.pop("draft_state", None)
         flask_session["workflow_state"] = dict(self.workflow_state)
         flask_session.modified = True
+
+    # -- the pending draft, in Postgres --------------------------------
+
+    def _load_draft(self, actor):
+        """Restore the pending draft for this requester, if there is one."""
+        user_id = getattr(actor, "user_id", None) or (
+            actor.get("id") if isinstance(actor, dict) else None)
+        stored = drafts.load(user_id) if user_id else None
+        self.draft_state = new_draft_state()
+        if stored:
+            self.draft_state.update(stored)
+            logger.debug("loaded pending draft: active=%s",
+                         stored.get("active"))
+
+    def _persist_draft(self, actor):
+        """Write the draft back, or delete it if it is no longer live.
+
+        Deleting on inactive is what makes save and cancel stick: both
+        clear the state in place, and a row left behind would be offered
+        back on the next message.
+        """
+        user_id = getattr(actor, "user_id", None) or (
+            actor.get("id") if isinstance(actor, dict) else None)
+        if not user_id:
+            return
+        if self.draft_state.get("active"):
+            drafts.save(user_id, dict(self.draft_state))
+        else:
+            drafts.clear(user_id)
 
     def get_system_prompt(self) -> str:
         """Get system prompt with current date."""
@@ -141,6 +180,7 @@ class JidhrAssistant:
         # the empty defaults.
         if flask_session is not None:
             self._load_state_from_session(flask_session)
+        self._load_draft(actor)
 
         ctx = self.build_context(actor)
 
@@ -221,16 +261,22 @@ class JidhrAssistant:
             return response
 
         finally:
-            # Always persist draft/workflow state back to the session cookie
+            # Always persist: the workflow to the cookie, the draft to
+            # Postgres. In `finally` because a handler that raised partway
+            # through may still have changed the draft, and losing that is
+            # how a draft "disappears" after an error.
             if flask_session is not None:
                 self._save_state_to_session(flask_session)
+            self._persist_draft(actor)
 
-    def clear_history(self, flask_session=None):
+    def clear_history(self, flask_session=None, actor=None):
         """Clear conversation history and all active states."""
         logger.info("Clearing conversation history and states")
         self.conversation_history = []
         self.draft_state.update(new_draft_state())
         self.workflow_state.update(default_workflow_state())
+        if actor is not None:
+            self._persist_draft(actor)
 
         # Clear session cookie state too
         if flask_session is not None:

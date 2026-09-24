@@ -386,3 +386,47 @@ guard. The `jidhr-jobs` Railway service, which `railway.toml` documents as
 created by hand in the dashboard, has therefore never claimed it. A
 manual refresh on 2026-09-23 completed all ten record types in 28m32s
 across 979 CSuite calls with no 429s.
+
+## 2026-09-24 — A pending draft lives in Postgres, not in the session cookie
+
+A brief was drafted successfully and the next message — "Save this to the
+AMCF template" — answered "I don't have a recent draft to act on". The
+draft was stored in Flask's signed session cookie, which is client-side
+and capped near 4 KB by every browser. The 2026-09-22 Giving Circle draft
+measures **3,851 signed bytes against a 4,096-byte cap**: 242 bytes of
+headroom. A slightly longer newsletter, or one with more URLs and names
+(which compress poorly), goes over, the browser silently declines the
+cookie, and the next message finds nothing. The failure is therefore
+worst on exactly the longest and most valuable drafts, and it is silent —
+the response still carries a Set-Cookie header.
+
+Note what was *not* the cause. Production runs eight gunicorn workers,
+but the cookie already crossed workers by design, so the worker count
+explains nothing here. The draft's own four-hour staleness rule never
+fired either. It was size, and only size.
+
+Drafts now live in `pending_drafts`, one row per (user, channel), with a
+two-hour TTL enforced in the SELECT so an aged-out draft cannot reappear
+merely because no sweeper has run. A new generation replaces the row; a
+save or a cancel deletes it. There is deliberately **no in-memory
+fallback**: a fallback that works on one worker of eight is a bug that
+reproduces once a day and never in testing. The workflow state, which is
+small and bounded, stays in the cookie.
+
+## 2026-09-24 — Follow-ups for the draft reply (design record, no code)
+
+**A subject supplied in the brief is the subject.** When a brief carries
+its own subject or title line, the generated draft keeps it verbatim
+unless the requester asks for something else. Today the model writes a
+fresh subject every time, so a subject someone chose deliberately —
+already agreed, already used in a calendar invite — is quietly replaced,
+and the only way to notice is to read the draft reply closely.
+
+**The draft reply shows every field, not just subject and body.** It
+currently prints the subject and the body, while preview text, date bar
+and button state are invisible until the save reply lists them — which is
+after the write. Those three are the fields most likely to be wrong and
+cheapest to correct, and a person cannot correct what they have not been
+shown. The save reply keeps its summary; the draft reply gains the same
+one, so the button in particular can be set or cleared before anything
+reaches HubSpot rather than after.

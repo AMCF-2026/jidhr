@@ -142,3 +142,28 @@ CREATE INDEX IF NOT EXISTS idx_jobs_claimable
 -- CREATE INDEX idx_csuite_donations_date    ON csuite_donations (donation_date);
 -- CREATE INDEX idx_csuite_donations_profile ON csuite_donations (profile_id);
 -- CREATE INDEX idx_csuite_donations_fund    ON csuite_donations (funit_id, donation_date);
+
+
+-- ---------------------------------------------------------------------------
+-- pending_drafts — a half-finished email or social draft between messages
+-- ---------------------------------------------------------------------------
+-- Applied to Railway on 2026-09-24. It replaces the Flask session cookie,
+-- which is client-side and capped near 4 KB: the 2026-09-22 Giving Circle
+-- draft measured 3,851 signed bytes against that cap, so a slightly longer
+-- newsletter was silently dropped by the browser and the next message found
+-- no draft. One row per (user, channel); replaced on a new generation,
+-- deleted on save or cancel. See clients/drafts.py.
+
+CREATE TABLE IF NOT EXISTS pending_drafts (
+    id           BIGSERIAL PRIMARY KEY,
+    user_id      BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    channel      TEXT   NOT NULL DEFAULT 'web',
+    draft        JSONB  NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at   TIMESTAMPTZ NOT NULL,
+    UNIQUE (user_id, channel)
+);
+
+CREATE INDEX IF NOT EXISTS pending_drafts_expires_idx
+    ON pending_drafts (expires_at);
