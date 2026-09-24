@@ -41,6 +41,18 @@ EMAIL_PATTERNS = [
     'draft the newsletter', 'create a newsletter', 'write newsletter',
     'draft newsletter', 'newsletter draft', 'newsletter blurb',
     'weekly newsletter', 'monthly newsletter', 'amcf newsletter',
+    # "Here is the copy, make an email out of it." Carl's production
+    # phrasing on 2026-09-23 matched none of the above, so a newsletter
+    # brief fell through to keyword intakes that scraped a name, an email
+    # and a phone number out of its prose.
+    'hubspot email', 'format it for a hubspot email',
+    'format this for a hubspot email', 'format for a hubspot email',
+    'format it as an email', 'format this as an email',
+    'format it for email', 'format this for email', 'format for email',
+    'format it into an email', 'format this into an email',
+    'turn this into an email', 'turn it into an email',
+    'make this an email', 'make this into an email',
+    'format as a newsletter', 'format this as a newsletter',
 ]
 
 SOCIAL_PATTERNS = [

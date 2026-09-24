@@ -46,6 +46,81 @@ _EXCLUDE_PHRASES = [
     'this month', 'last month', 'inquiries this', 'inquiry summary',
 ]
 
+# An intake request is a COMMAND, not a document. "process the latest
+# endowment inquiry" is six words; a newsletter brief pasted into chat is
+# hundreds. On 2026-09-23 a brief containing "new endowment" in its prose
+# opened this workflow twice, and the intake then scraped a name, an email
+# and a phone number out of the newsletter and offered to create a CSuite
+# profile and fund from them.
+#
+# A length ceiling is a blunt rule and it is the right one here: the cost
+# of refusing a very long intake command is that someone retypes it
+# shortly; the cost of accepting a very long anything-else is a workflow
+# that proposes writing to CSuite on the strength of a word it read in a
+# paragraph.
+MAX_COMMAND_WORDS = 25
+
+# Answers that mean "no". Matched as whole words, not substrings: "no"
+# sits inside "nominate" and "know", and the previous affirmative list
+# matched the bare letter "y" as a substring, so "not yet", "definitely
+# not" and "absolutely not" all read as confirmation to create a profile
+# and a fund.
+#
+# "not" is here as a bare token, which means "create it, why not" also
+# cancels. That is the right direction to be wrong in: this step writes a
+# profile and a fund to CSuite, so an unnecessary cancel costs one
+# retyped word and an unnecessary create costs a record someone has to
+# find and unpick.
+NEGATIVES = frozenset({
+    "no", "n", "not", "nope", "nah", "negative", "dont", "don't",
+    "cancel", "abort", "stop", "nevermind", "never", "quit", "exit",
+})
+
+AFFIRMATIVES = frozenset({
+    "yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "create",
+    "confirm", "proceed", "go", "do", "it",
+})
+
+# Multi-word confirmations, matched as phrases.
+AFFIRMATIVE_PHRASES = ("do it", "go ahead", "create it", "sounds good",
+                       "looks good", "yes please")
+
+
+def _words(text: str) -> list:
+    """Lowercase word tokens, punctuation stripped."""
+    import re
+    return re.findall(r"[a-z']+", (text or "").lower())
+
+
+def says_no(query: str) -> bool:
+    """True if this message is a refusal.
+
+    Checked BEFORE the affirmative, so "no, don't create it" cancels
+    rather than confirming on the word "create".
+    """
+    tokens = _words(query)
+    if not tokens:
+        return False
+    return bool(NEGATIVES.intersection(tokens))
+
+
+def says_yes(query: str) -> bool:
+    """True if this message is a clear confirmation, and not a refusal."""
+    if says_no(query):
+        return False
+    lowered = (query or "").lower()
+    if any(phrase in lowered for phrase in AFFIRMATIVE_PHRASES):
+        return True
+    tokens = set(_words(query))
+    # "do" and "it" alone mean nothing; they only count as "do it",
+    # which the phrase list above already catches.
+    return bool(tokens.intersection(AFFIRMATIVES - {"do", "it"}))
+
+
+def _is_prose(query: str) -> bool:
+    """True if this is a document someone pasted, not a command."""
+    return len(_words(query)) > MAX_COMMAND_WORDS
+
 
 # ---------------------------------------------------------------------------
 # Default workflow state (assistant.py holds this dict)
@@ -75,13 +150,31 @@ def _reset_state(state: dict):
 # ---------------------------------------------------------------------------
 
 def can_handle(query: str, workflow_state: dict = None, **kwargs) -> bool:
-    """Match if trigger phrase detected OR DAF workflow is already active."""
+    """Match on an explicit trigger phrase, or an already-active workflow.
+
+    Never on a keyword buried in prose. This workflow proposes writing to
+    CSuite — a profile and a fund — so it has to be asked for, not
+    inferred from a word inside a paragraph someone pasted.
+    """
     if workflow_state and workflow_state.get("active"):
         return workflow_state.get("workflow_type") == "daf"
+
     q = query.lower().strip()
+
+    # An explicit content request always wins over a keyword intake. The
+    # handler chain already puts content first, but stating it here means
+    # the precedence survives someone reordering the chain.
+    from intents import content
+    if content.can_handle(query) and not content.claims_by_draft_only(query):
+        return False
+
     # Don't match summary/report queries that happen to contain "daf inquiry"
     if any(ex in q for ex in _EXCLUDE_PHRASES):
         return False
+
+    if _is_prose(q):
+        return False
+
     return any(p in q for p in TRIGGER_PHRASES)
 
 
@@ -187,8 +280,10 @@ def _handle_active_workflow(query: str, state: dict, hubspot, csuite) -> str:
     q = query.lower().strip()
     step = state.get("step")
 
-    # Cancel at any point
-    if any(w in q for w in ['cancel', 'abort', 'stop', 'nevermind', 'forget it']):
+    # Cancel at any point. "No" means no: before this, it matched neither
+    # the cancel list nor the affirmative list, so it fell through to
+    # "I need a clear confirmation" and left the workflow open.
+    if says_no(q) or "forget it" in q:
         _reset_state(state)
         return "👍 Workflow cancelled."
 
@@ -221,9 +316,8 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
       3. Update HubSpot contact with CSuite IDs
       4. Close associated ticket (if found)
     """
-    # Only proceed on affirmative
-    affirmatives = ['yes', 'y', 'create', 'do it', 'go ahead', 'proceed', 'confirm', 'create it']
-    if not any(w in query for w in affirmatives):
+    # Only proceed on a clear affirmative, matched as whole words.
+    if not says_yes(query):
         return (
             "❓ I need a clear confirmation. Say *\"Yes\"* to create the profile and fund, "
             "or *\"Cancel\"* to abort."
