@@ -38,6 +38,8 @@ from config import Config
 
 logger = logging.getLogger(__name__)
 
+from intents import anchors
+
 
 # ---------------------------------------------------------------------------
 # Triggers
@@ -83,8 +85,12 @@ def is_personal(query: str) -> bool:
 
 
 def can_handle(query: str, **kwargs) -> bool:
+    # Anchored, not scanned: the trigger must LEAD the message.
+    # See intents/anchors.py for the two production failures.
     q = query.lower().strip()
-    return is_personal(q) or any(phrase in q for phrase in TRIGGER_PHRASES)
+    if anchors.yields_to_content(query) or anchors.is_document(q):
+        return False
+    return is_personal(q) or anchors.anchored(q, TRIGGER_PHRASES)
 
 
 def handle(query: str, ctx) -> str:

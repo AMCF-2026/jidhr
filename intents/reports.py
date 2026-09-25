@@ -53,6 +53,8 @@ from intents.queries import (
 
 logger = logging.getLogger(__name__)
 
+from intents import anchors
+
 # ---------------------------------------------------------------------------
 # Trigger keywords (grouped by sub-handler)
 # ---------------------------------------------------------------------------
@@ -143,7 +145,12 @@ def can_handle(query: str, **kwargs) -> bool:
         _QUARTERLY_TRIGGERS + _DAF_INQUIRY_TRIGGERS + _TASK_TRIGGERS +
         _INVESTMENT_TRIGGERS + _ENDOWMENT_DIST_TRIGGERS
     )
-    return any(t in q for t in all_triggers)
+    # Anchored, not scanned. On 2026-09-25 a newsletter brief containing
+    # "investment requests" in its prose returned a report of 34
+    # investment requests instead of the email that was asked for.
+    if anchors.yields_to_content(query):
+        return False
+    return anchors.anchored(q, all_triggers)
 
 
 def handle(query: str, ctx) -> str:

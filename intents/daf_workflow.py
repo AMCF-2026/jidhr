@@ -19,6 +19,8 @@ from config import Config
 
 logger = logging.getLogger(__name__)
 
+from intents import anchors
+
 
 # ---------------------------------------------------------------------------
 # Access control
@@ -164,8 +166,7 @@ def can_handle(query: str, workflow_state: dict = None, **kwargs) -> bool:
     # An explicit content request always wins over a keyword intake. The
     # handler chain already puts content first, but stating it here means
     # the precedence survives someone reordering the chain.
-    from intents import content
-    if content.can_handle(query) and not content.claims_by_draft_only(query):
+    if anchors.yields_to_content(query):
         return False
 
     # Don't match summary/report queries that happen to contain "daf inquiry"
@@ -175,7 +176,10 @@ def can_handle(query: str, workflow_state: dict = None, **kwargs) -> bool:
     if _is_prose(q):
         return False
 
-    return any(p in q for p in TRIGGER_PHRASES)
+    # Anchored as well as length-capped: the Step 11 ceiling stopped a
+    # 5,000-character brief, and a 300-character one would still have
+    # slipped through on a word in its last sentence.
+    return anchors.anchored(q, TRIGGER_PHRASES)
 
 
 def handle(query: str, ctx) -> str:

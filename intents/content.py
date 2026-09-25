@@ -89,6 +89,11 @@ DRAFT_CANCEL_PATTERNS = [
     'cancel', 'discard', 'nevermind', 'never mind', 'forget it',
 ]
 
+# Bare answers that mean "drop it". Matched as whole words, because "no"
+# sits inside "nominate" and "another". Same rule as daf_workflow's
+# NEGATIVES, and for the same reason: "no" has to mean no.
+DRAFT_CANCEL_WORDS = frozenset({'no', 'nope', 'nah', 'stop', 'abort'})
+
 # A draft this old is assumed abandoned. It lives in a session cookie, so
 # without an expiry a draft from this morning silently swallows tonight's
 # messages.
@@ -157,8 +162,23 @@ def draft_is_stale(draft_state: dict | None) -> bool:
     return age > DRAFT_MAX_AGE
 
 
+# Words that may sit alongside a bare "no" without changing what it
+# means. Anything else makes the message about something.
+_CANCEL_FILLER = frozenset({'thanks', 'thank', 'you', 'please', 'dont',
+                            "don't", 'do', 'not', 'it', 'that', 'this'})
+
+
 def _is_draft_cancel(query: str) -> bool:
-    return any(p in query for p in DRAFT_CANCEL_PATTERNS)
+    if any(p in query for p in DRAFT_CANCEL_PATTERNS):
+        return True
+
+    # A bare "no". It has to BE the message: "no" and "no thanks" cancel,
+    # while "no button" clears the button and "no, make it shorter" is a
+    # refinement. Whole words, so "nominate the fund" is neither.
+    tokens = set(re.findall(r"[a-z']+", query))
+    if not tokens or not DRAFT_CANCEL_WORDS.intersection(tokens):
+        return False
+    return not (tokens - DRAFT_CANCEL_WORDS - _CANCEL_FILLER)
 
 
 def _looks_like_topic_change(query: str) -> bool:
@@ -308,8 +328,44 @@ def _is_task_creation(query: str) -> bool:
     return any(p in query for p in TASK_PATTERNS)
 
 
+# Read the FIRST LINE, not the whole message. Twice in production a
+# newsletter brief was routed by a word in its third paragraph while its
+# first line said plainly what was wanted (2026-09-23, 2026-09-25). A
+# phrase list will always be one phrasing behind the person typing; the
+# shape of the ask is stable.
+_EMAIL_NOUNS = ("email", "e-mail", "newsletter", "hubspot")
+_FORMAT_VERBS = ("format", "draft", "write", "turn", "make", "compose",
+                 "prepare", "build", "create")
+
+# A message this long carrying "email" or "newsletter" in its first line
+# is a brief with an instruction on top of it. Nothing else looks like
+# that.
+BRIEF_MIN_CHARS = 1500
+
+
+def _asks_for_an_email(query: str) -> bool:
+    """True if the first line asks for an email, however it is phrased."""
+    from intents import anchors
+
+    line = anchors.first_line(query)
+    if not line:
+        return False
+
+    noun = any(word in line for word in _EMAIL_NOUNS)
+    if noun and any(verb in line for verb in _FORMAT_VERBS):
+        return True
+
+    # "Newsletter copy:" followed by five thousand characters. No verb,
+    # but nothing else it could be.
+    if len(query or "") >= BRIEF_MIN_CHARS and any(
+            word in line for word in ("email", "e-mail", "newsletter")):
+        return True
+
+    return False
+
+
 def _is_email_draft_request(query: str) -> bool:
-    return any(p in query for p in EMAIL_PATTERNS)
+    return _asks_for_an_email(query) or any(p in query for p in EMAIL_PATTERNS)
 
 
 def _is_social_post_request(query: str) -> bool:
@@ -545,6 +601,15 @@ BODY:
         fields = _parse_email_draft(draft)
         subject, body = fields["subject"], fields["body"]
 
+        # A subject the brief supplied wins. Someone who wrote "Subject:
+        # Round One Voting Begins This Weekend" has already chosen it —
+        # it may be in a calendar invite or agreed with a colleague — and
+        # a freshly invented one replaces it where the only way to notice
+        # is to read the draft reply closely.
+        supplied = _subject_from_brief(query)
+        if supplied:
+            subject = supplied
+
         # Seeded from the shared shape, so a key added to
         # DEFAULT_DRAFT_STATE appears on new drafts without a second edit here.
         _start_draft(ctx, type="email", subject=subject, body=body,
@@ -555,14 +620,15 @@ BODY:
 
         response = f"""📧 **Email Draft**
 
-**Subject:** {subject}
+{_field_lines(ctx.draft_state)}
 
 **Body:**
 {_html_to_display(body)}
 
 ---
 💬 **What would you like to do?**
-• Request changes: *"Make it shorter"*, *"Add more urgency"*, *"Include a call to action"*
+• Change a field: *"preview: …"*, *"date: October 3, 2026"*, *"button: Register -> https://…"*, *"no button"*
+• Request changes: *"Make it shorter"*, *"Add more urgency"*
 • Save to HubSpot: *"Save this to the AMCF template"* or *"Save to Giving Circle template"*
 • Start over: *"Start over"* or *"Cancel"*"""
 
@@ -640,6 +706,10 @@ def _date_bar(draft_state: dict = None, today=None) -> str:
     yet, so there is no stored precedent to copy; the naming convention
     is the closest evidence there is.
     """
+    explicit = (draft_state or {}).get("date_bar")
+    if explicit:
+        return str(explicit)
+
     value = (draft_state or {}).get("event_date")
     when = None
     if value:
@@ -663,14 +733,24 @@ def _body_as_html(body: str) -> str:
     return "<p>" + paragraphs.replace(chr(10), "<br>") + "</p>"
 
 
-# "button: Register now -> https://amuslimcf.org/x"
+# "button: Register now -> https://amuslimcf.org/x". Any case, any of
+# three arrows, whitespace anywhere, and a trailing full stop forgiven.
 _BUTTON_RE = re.compile(
-    r"^\s*button\s*:\s*(?P<label>.+?)\s*(?:->|=>|→)\s*(?P<url>\S+)\s*$",
+    r"^\s*button\s*[:\-]\s*(?P<label>.+?)\s*(?:->|-->|=>|→|\|)\s*"
+    r"(?P<url>\S+?)[.\s]*$",
     re.IGNORECASE)
-_NO_BUTTON_RE = re.compile(r"^\s*(no|remove|drop|clear)\s+button\s*$",
-                           re.IGNORECASE)
-_PREVIEW_RE = re.compile(r"^\s*preview\s*:\s*(?P<text>.+?)\s*$",
+# Anything starting "button:" that the pattern above could not read. With
+# a draft open this must answer, not fall through to the model as a
+# refinement request.
+_BUTTON_ANY_RE = re.compile(r"^\s*button\s*[:\-]\s*(?P<rest>.*)$",
+                            re.IGNORECASE)
+_NO_BUTTON_RE = re.compile(
+    r"^\s*(no|remove|drop|clear|delete|without)\s+button\s*[.!]*$",
+    re.IGNORECASE)
+_PREVIEW_RE = re.compile(r"^\s*preview\s*[:\-]\s*(?P<text>.+?)\s*$",
                          re.IGNORECASE)
+_DATE_RE = re.compile(r"^\s*date\s*[:\-]\s*(?P<text>.+?)\s*$",
+                      re.IGNORECASE)
 
 
 def _apply_email_field_command(query: str, ctx) -> str | None:
@@ -693,6 +773,12 @@ def _apply_email_field_command(query: str, ctx) -> str | None:
         ctx.draft_state["preview_text"] = text
         return f"👁 Preview text set to: *{text}*"
 
+    match = _DATE_RE.match(query or "")
+    if match:
+        text = match.group("text").strip()
+        ctx.draft_state["date_bar"] = text
+        return f"📅 Date bar set to: *{text}*"
+
     match = _BUTTON_RE.match(query or "")
     if match:
         label = match.group("label").strip()
@@ -709,7 +795,44 @@ def _apply_email_field_command(query: str, ctx) -> str | None:
         ctx.draft_state["button_url"] = url
         return f"🔘 Button set: **{label}** → {url}"
 
+    # Starts "button:" but could not be read. Answer it; never hand it to
+    # the model as a refinement, which is how "button: Register" became a
+    # rewritten draft body.
+    match = _BUTTON_ANY_RE.match(query or "")
+    if match and draft_is_active(ctx.draft_state):
+        rest = match.group("rest").strip()
+        if not rest:
+            missing = "a label and a link"
+        elif not any(a in rest for a in ("->", "-->", "=>", "→", "|")):
+            missing = "the arrow between the label and the link"
+        else:
+            missing = "a usable link after the arrow"
+        return (f"⚠️ I could not read that button — it is missing "
+                f"{missing}.\n\nUse: *button: Register now -> "
+                f"https://amuslimcf.org/…*\n\nOr say *no button*.")
+
     return None
+
+
+def _field_lines(draft: dict) -> str:
+    """Every field that will be sent, shown while it can still be changed.
+
+    The draft reply used to show the subject and the body only. Preview
+    text, date bar and button state were invisible until the SAVE reply
+    listed them — which is after the write. Those three are the fields
+    most likely to be wrong and the cheapest to correct, and nobody can
+    correct what they have not been seen.
+    """
+    draft = draft or {}
+    label = (draft.get("button_label") or "").strip()
+    url = (draft.get("button_url") or "").strip()
+    button = f"**{label}** → {url}" if label and url else "**NO BUTTON**"
+    return "\n".join([
+        f"**Subject:** {draft.get('subject') or '(none)'}",
+        f"**Preview:** {draft.get('preview_text') or '(none)'}",
+        f"**Date bar:** {draft.get('date_bar') or _date_bar(draft)}",
+        f"**Button:** {button}",
+    ])
 
 
 def _draft_summary(template, date_bar, preview_text, button_label,
@@ -1345,7 +1468,7 @@ Return only the revised post content, nothing else."""
 
             return f"""📧 **Revised Email Draft**
 
-**Subject:** {subject}
+{_field_lines(ctx.draft_state)}
 
 **Body:**
 {_html_to_display(body)}
@@ -1454,6 +1577,28 @@ def _format_et_schedule(dt) -> str:
     hour_12 = (dt.hour % 12) or 12
     period = "AM" if dt.hour < 12 else "PM"
     return f"{weekday}, {month} {dt.day} at {hour_12}:{dt.minute:02d} {period} ET"
+
+
+# "Subject: ..." / "Subject line: ..." / "Title: ..." in the brief.
+_BRIEF_SUBJECT_RE = re.compile(
+    r"^\s*(?:subject(?:\s*line)?|title|headline)\s*[:\-]\s*(?P<text>.+?)\s*$",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def _subject_from_brief(query: str):
+    """A subject the brief states outright, or None.
+
+    Only the first one, and only if it has content after the colon: a
+    brief that says "Subject:" and nothing else has not chosen anything.
+    """
+    match = _BRIEF_SUBJECT_RE.search(query or "")
+    if not match:
+        return None
+    text = match.group("text").strip()
+    # Guard against matching the format instructions Jidhr itself sends.
+    if not text or text.startswith("[") or len(text) > 200:
+        return None
+    return text
 
 
 def _extract_topic(query: str, context: str) -> str:

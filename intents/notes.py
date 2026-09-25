@@ -18,6 +18,8 @@ import re
 
 logger = logging.getLogger(__name__)
 
+from intents import anchors
+
 # ---------------------------------------------------------------------------
 # Trigger keywords
 # ---------------------------------------------------------------------------
@@ -225,10 +227,14 @@ def can_handle(query: str, workflow_state: dict = None, **kwargs) -> bool:
         if _CONTACT_PICK_RE.match(query or ""):
             return True
 
-    if is_gc_status_command(q):
+    if anchors.yields_to_content(query):
+        return False
+
+    if is_gc_status_command(q) and not anchors.is_document(q):
         return True
 
-    return any(p in q for p in TRIGGER_PHRASES)
+    # Anchored, not scanned — see intents/anchors.py.
+    return anchors.anchored(q, TRIGGER_PHRASES)
 
 
 def handle(query: str, ctx) -> str:

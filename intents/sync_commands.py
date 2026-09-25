@@ -12,6 +12,8 @@ from sync import run_donation_sync, run_event_sync, run_newsletter_sync
 
 logger = logging.getLogger(__name__)
 
+from intents import anchors
+
 
 # ---------------------------------------------------------------------------
 # Access control
@@ -36,11 +38,15 @@ ALL_SYNC_PHRASES = ['sync all', 'sync everything', 'run all syncs']
 
 def can_handle(query: str, **kwargs) -> bool:
     """Check if query is a sync command."""
+    # Anchored, not scanned: the trigger must LEAD the message.
+    # See intents/anchors.py for the two production failures.
     q = query.lower().strip()
+    if anchors.yields_to_content(query):
+        return False
     return (
-        any(p in q for p in DONATION_SYNC_PHRASES) or
-        any(p in q for p in EVENT_SYNC_PHRASES) or
-        any(p in q for p in NEWSLETTER_SYNC_PHRASES) or
+        anchors.anchored(q, DONATION_SYNC_PHRASES) or
+        anchors.anchored(q, EVENT_SYNC_PHRASES) or
+        anchors.anchored(q, NEWSLETTER_SYNC_PHRASES) or
         q in ALL_SYNC_PHRASES
     )
 

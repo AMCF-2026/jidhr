@@ -322,3 +322,43 @@ def test_the_draft_no_longer_travels_in_the_session_cookie(store):
     a._save_state_to_session(session)
     assert "draft_state" not in session, \
         "the draft was written back into the cookie"
+
+
+# ---------------------------------------------------------------------------
+# General chat never looks like it produced a draft (2026-09-25)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("reply", [
+    "📧 Email Formatted for HubSpot\n\nSubject: Voting begins\n\n…",
+    "Email Formatted for HubSpot — here you go",
+    "Here is your email, formatted and ready:",
+    "**Subject:** Voting Begins This Weekend",
+    "Draft email below:",
+])
+def test_a_chat_echo_dressed_as_a_draft_carries_the_warning(reply):
+    """2026-09-25: general chat echoed a pasted brief back under
+    "📧 Email Formatted for HubSpot". Nothing was generated and nothing
+    was stored, so the save that followed found no draft — and the
+    obvious next move is to paste the brief again."""
+    from assistant import NOT_A_DRAFT_NOTICE, _mark_if_not_a_draft
+
+    marked = _mark_if_not_a_draft(reply, draft_active=False)
+    assert marked.startswith(NOT_A_DRAFT_NOTICE)
+    assert "Format it for a HubSpot email" in marked
+    assert reply in marked
+
+
+def test_a_real_pending_draft_is_not_warned_about():
+    from assistant import _mark_if_not_a_draft
+    reply = "📧 Email Draft\n\n**Subject:** Voting begins"
+    assert _mark_if_not_a_draft(reply, draft_active=True) == reply
+
+
+@pytest.mark.parametrize("reply", [
+    "The fund balance for END0026 is $52,400.",
+    "I found 34 investment requests this month.",
+    "",
+])
+def test_an_ordinary_answer_is_left_alone(reply):
+    from assistant import _mark_if_not_a_draft
+    assert _mark_if_not_a_draft(reply, draft_active=False) == reply

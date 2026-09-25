@@ -30,6 +30,39 @@ from intents.daf_workflow import default_workflow_state
 logger = logging.getLogger(__name__)
 
 
+# Openings a model uses when it thinks it has produced an email. On
+# 2026-09-25 general chat echoed a pasted brief back under
+# "📧 Email Formatted for HubSpot" — nothing was generated and nothing
+# was stored, so the save command that followed found no draft. The reply
+# looked exactly like success.
+_DRAFT_HEADERS = (
+    "📧", "email formatted", "email draft", "formatted for hubspot",
+    "here is your email", "here's your email", "subject:",
+    "**subject:**", "draft email", "newsletter draft",
+)
+
+NOT_A_DRAFT_NOTICE = (
+    "⚠️ This is not a saved draft. To generate one, start with "
+    "\"Format it for a HubSpot email:\"\n\n"
+)
+
+
+def _mark_if_not_a_draft(response: str, draft_active: bool) -> str:
+    """Prepend a warning when a chat reply is dressed up as a draft.
+
+    Only when no draft is actually pending. The cost of the missing line
+    is someone typing "save this" at a reply that was never stored and
+    being told there is nothing to save — twice over, because the obvious
+    next move is to paste the brief again.
+    """
+    if draft_active or not response:
+        return response
+    head = " ".join(response.strip().split())[:120].lower()
+    if any(marker in head for marker in _DRAFT_HEADERS):
+        return NOT_A_DRAFT_NOTICE + response
+    return response
+
+
 class JidhrAssistant:
     """Main assistant that orchestrates queries across systems.
 
@@ -246,6 +279,10 @@ class JidhrAssistant:
                     f"⚠️ The AI service didn't respond (HTTP {e.status}). "
                     "Your message wasn't lost — try again in a moment."
                 )
+
+            # General chat must never look like it produced a draft.
+            response = _mark_if_not_a_draft(response,
+                                            self.draft_state.get("active"))
 
             self.conversation_history.append(user_turn)
             self.conversation_history.append({

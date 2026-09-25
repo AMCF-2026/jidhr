@@ -511,3 +511,140 @@ def test_a_broken_repetition_guard_cannot_break_a_draft():
         patch.setattr(content, "find_topic_matches",
                       lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db")))
         assert content._repetition_note("anything") is None
+
+
+# ---------------------------------------------------------------------------
+# Draft commands, lenient (2026-09-25)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("command", [
+    "button: Register now -> https://amuslimcf.org/x",
+    "BUTTON: Register now -> https://amuslimcf.org/x",
+    "Button : Register now  →  https://amuslimcf.org/x",
+    "  button:Register now=>https://amuslimcf.org/x  ",
+    "button - Register now --> https://amuslimcf.org/x",
+    "button: Register now | https://amuslimcf.org/x",
+    "button: Register now -> https://amuslimcf.org/x.",
+])
+def test_the_button_command_is_lenient(command):
+    ctx = make_ctx()
+    reply = content._apply_email_field_command(command, ctx)
+    assert reply is not None, f"not recognised: {command!r}"
+    assert ctx.draft_state["button_label"] == "Register now"
+    assert ctx.draft_state["button_url"] == "https://amuslimcf.org/x"
+
+
+@pytest.mark.parametrize("command, missing", [
+    ("button:", "a label and a link"),
+    ("button: Register now", "the arrow"),
+    ("button: Register now ->", "a usable link"),
+])
+def test_a_malformed_button_answers_instead_of_falling_through(command,
+                                                               missing):
+    """It must never reach the model as a refinement.
+
+    "button: Register" handed to Claude comes back as a rewritten draft
+    body, and the button is still not set.
+    """
+    ctx = make_ctx(button_label="", button_url="")
+    reply = content._apply_email_field_command(command, ctx)
+    assert reply is not None, "fell through to the model"
+    assert missing in reply
+    assert "button: Register now -> https://" in reply
+
+
+def test_a_malformed_button_with_no_draft_open_is_left_alone():
+    """Without a draft there is nothing to correct, so it is not ours."""
+    ctx = make_ctx()
+    ctx.draft_state["active"] = False
+    assert content._apply_email_field_command("button: Register", ctx) is None
+
+
+@pytest.mark.parametrize("command, expected", [
+    ("date: October 3, 2026", "October 3, 2026"),
+    ("DATE: October 3, 2026", "October 3, 2026"),
+    ("date - October 3, 2026", "October 3, 2026"),
+    ("  date:   October 3, 2026  ", "October 3, 2026"),
+])
+def test_the_date_command_sets_the_date_bar(command, expected):
+    ctx = make_ctx()
+    reply = content._apply_email_field_command(command, ctx)
+    assert ctx.draft_state["date_bar"] == expected
+    assert expected in reply
+
+
+def test_the_date_bar_defaults_to_today_when_unset():
+    from datetime import datetime
+    today = datetime.now()
+    assert content._date_bar({}) == f"{today:%B} {today.day}, {today.year}"
+
+
+def test_an_explicit_date_bar_beats_the_default():
+    assert content._date_bar({"date_bar": "October 3, 2026"}) == \
+        "October 3, 2026"
+
+
+@pytest.mark.parametrize("answer", ["no", "No", "NO", "no thanks", "nope",
+                                    "nah", "No thank you"])
+def test_a_bare_no_cancels_a_draft(answer):
+    assert content._is_draft_cancel(answer.lower())
+
+
+@pytest.mark.parametrize("answer", ["no button", "no, make it shorter",
+                                    "nominate the fund", "another one",
+                                    "preview: no rain expected"])
+def test_no_inside_something_else_does_not_cancel(answer):
+    assert not content._is_draft_cancel(answer.lower())
+
+
+# ---------------------------------------------------------------------------
+# The draft reply shows every field
+# ---------------------------------------------------------------------------
+
+def test_the_draft_reply_lists_subject_preview_date_and_button():
+    lines = content._field_lines({
+        "subject": "Round One Voting Begins",
+        "preview_text": "Voting opens Saturday",
+        "date_bar": "October 3, 2026",
+        "button_label": "Cast your vote",
+        "button_url": "https://example.org/vote",
+    })
+    assert "Round One Voting Begins" in lines
+    assert "Voting opens Saturday" in lines
+    assert "October 3, 2026" in lines
+    assert "**Cast your vote** → https://example.org/vote" in lines
+
+
+def test_the_draft_reply_says_no_button_when_there_is_none():
+    assert "**NO BUTTON**" in content._field_lines({"subject": "S"})
+
+
+def test_the_draft_reply_falls_back_to_todays_date():
+    from datetime import datetime
+    today = datetime.now()
+    assert f"{today:%B} {today.day}" in content._field_lines({"subject": "S"})
+
+
+# ---------------------------------------------------------------------------
+# A subject the brief supplied is kept
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("brief, expected", [
+    ("Format email for HubSpot:\nSubject: Round One Voting Begins\n\nbody",
+     "Round One Voting Begins"),
+    ("Subject line: Fall Update\n\nbody", "Fall Update"),
+    ("Title: Fall Update\n\nbody", "Fall Update"),
+    ("Headline: Fall Update\n\nbody", "Fall Update"),
+])
+def test_a_subject_in_the_brief_is_found(brief, expected):
+    assert content._subject_from_brief(brief) == expected
+
+
+@pytest.mark.parametrize("brief", [
+    "no subject anywhere in this brief",
+    "Subject:",
+    "Subject: [subject line]",
+    "Subject: " + "x" * 250,
+])
+def test_nothing_is_taken_as_a_subject_when_none_was_chosen(brief):
+    assert content._subject_from_brief(brief) is None

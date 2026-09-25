@@ -430,3 +430,51 @@ cheapest to correct, and a person cannot correct what they have not been
 shown. The save reply keeps its summary; the draft reply gains the same
 one, so the button in particular can be set or cleared before anything
 reaches HubSpot rather than after.
+
+## 2026-09-25 — Keyword intakes are anchored, not scanned
+
+Every handler matched its triggers with a substring scan over the whole
+message — `any(p in q for p in TRIGGER_PHRASES)`. That is right for "show
+me open tickets" and wrong for a five-thousand-character newsletter
+someone pasted into chat. It failed twice in production within three
+days: a brief containing "new endowment" in its prose opened the CSuite
+intake, which scraped a name, an email and a phone number out of the
+newsletter and offered to create a profile and a fund from them; and a
+brief containing "investment requests" returned a report of 34
+investment requests instead of the email that was asked for.
+
+A trigger now counts only when it LEADS the message — within the first 80
+characters, in a message no longer than 400 (`intents/anchors.py`). The
+numbers come from the cost of being wrong in each direction: refusing a
+long-winded command costs one retyped sentence, while accepting a keyword
+found in prose costs a report nobody asked for, or a write to CSuite
+nobody asked for. Nine handlers were scanning; all nine are anchored, and
+a test asserts every one of them also defers to an explicit content
+request.
+
+## 2026-09-25 — Routing is intent-first: the ask is on the first line
+
+Both failures were the same mistake. The message said plainly on its
+first line what it wanted — "Format it for a HubSpot email:", "Format
+email for HubSpot:" — and nothing read it; routing was decided by
+whichever phrase list happened to contain a word from paragraph three.
+`content.can_handle` now reads the first line for an email noun beside a
+formatting verb, and claims any message over 1,500 characters whose first
+line mentions an email or a newsletter at all. A phrase list will always
+be one phrasing behind the person typing; the shape of the ask is stable.
+
+General chat is the backstop. When a reply opens like an email draft and
+no draft is pending, it is prefixed with "This is not a saved draft" and
+the phrasing that does work — because a chat echo that looks like success
+is why the same brief was pasted twice.
+
+## 2026-09-25 — Additive schema ships with the change; alterations ask first
+
+`pending_drafts` was created on the production database on 2026-09-24 as
+part of the fix that needed it, and recorded in `schema.sql`. That is the
+rule: a new table or a new column touches nothing that exists, is
+reversible with a DROP, and ships with the code that requires it.
+Altering or dropping anything — the `write_audit` status constraint on
+2026-09-23 is the example — is asked for first and applied in a single
+transaction with the before and after reported, because the failure mode
+is someone else's data rather than an unused table.

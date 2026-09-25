@@ -23,6 +23,8 @@ from content.content_analysis import (
 
 logger = logging.getLogger(__name__)
 
+from intents import anchors
+
 
 # ---------------------------------------------------------------------------
 # Access control
@@ -74,8 +76,12 @@ _TOP_N = 10
 
 def can_handle(query: str, **kwargs) -> bool:
     """Check if query is a content-report command."""
+    # Anchored, not scanned: the trigger must LEAD the message.
+    # See intents/anchors.py for the two production failures.
     q = query.lower().strip()
-    return any(p in q for p in CONTENT_REPORT_PHRASES)
+    if anchors.yields_to_content(query):
+        return False
+    return anchors.anchored(q, CONTENT_REPORT_PHRASES)
 
 
 def handle(query: str, ctx) -> str:

@@ -17,6 +17,8 @@ from content.social_capture import backfill_social_content
 
 logger = logging.getLogger(__name__)
 
+from intents import anchors
+
 
 # ---------------------------------------------------------------------------
 # Access control
@@ -43,8 +45,12 @@ SOCIAL_SYNC_PHRASES = [
 
 def can_handle(query: str, **kwargs) -> bool:
     """Check if query is a social sync command."""
+    # Anchored, not scanned: the trigger must LEAD the message.
+    # See intents/anchors.py for the two production failures.
     q = query.lower().strip()
-    return any(p in q for p in SOCIAL_SYNC_PHRASES)
+    if anchors.yields_to_content(query):
+        return False
+    return anchors.anchored(q, SOCIAL_SYNC_PHRASES)
 
 
 def handle(query: str, ctx) -> str:
