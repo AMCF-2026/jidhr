@@ -34,10 +34,14 @@ class Recorder:
         text = " ".join(str(sql).split())
         if text.startswith("UPDATE write_audit"):
             # complete_write stamping the outcome on a reserved row.
-            status, http_status, error, duration_ms, row_id = params
-            self.rows[int(row_id) - 1].update(
-                status=status, http_status=http_status, error=error,
-                duration_ms=duration_ms)
+            (status, http_status, error, duration_ms, target_id,
+             row_id) = params
+            row = self.rows[int(row_id) - 1]
+            row.update(status=status, http_status=http_status, error=error,
+                       duration_ms=duration_ms)
+            # COALESCE(target_id, %s): the reserved value wins if set.
+            if row.get("target_id") is None and target_id is not None:
+                row["target_id"] = target_id
             return 1
         self.rows.append(dict(zip(COLUMNS, params)))
         if "RETURNING id" in text:
@@ -601,3 +605,90 @@ class TestReserveThenComplete:
 
         assert result == {"id": "1"}
         assert recorder.one["payload_hash"] is not None
+
+
+# ===========================================================================
+# Provenance: the deployed build, and the id of what a create created
+# ===========================================================================
+
+class TestDeployedVersion:
+    """/health names the build it is running.
+
+    Without it, "which build is live?" can only be inferred — and on
+    2026-09-25 a post-deploy check was carried out against a build that
+    turned out to predate the change it was verifying.
+    """
+
+    def test_the_short_sha_is_served(self, monkeypatch):
+        import app
+        monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA",
+                           "a964994c0ffee1234567890abcdef1234567890")
+        assert app.deployed_version() == "a964994"
+
+    def test_an_unset_sha_reads_unknown(self, monkeypatch):
+        import app
+        monkeypatch.delenv("RAILWAY_GIT_COMMIT_SHA", raising=False)
+        assert app.deployed_version() == "unknown"
+
+    def test_a_blank_sha_reads_unknown(self, monkeypatch):
+        import app
+        monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "   ")
+        assert app.deployed_version() == "unknown"
+
+    def test_health_carries_it(self, monkeypatch):
+        import app
+        monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "abcdef1234567")
+        with app.app.test_client() as client:
+            body = client.get("/health").get_json()
+        assert body["version"] == "abcdef1"
+
+
+class TestCreatedIdIsRecorded:
+    """reserve_write runs BEFORE the request, so a create has no id yet.
+
+    Every marketing email Jidhr made was audited with target_id NULL, and
+    working out which row made which email meant matching timestamps by
+    hand (2026-09-25).
+    """
+
+    def test_a_create_records_the_id_from_the_response(self, monkeypatch,
+                                                       recorder):
+        client, _ = hubspot_client(
+            monkeypatch, response=Response(201, {"id": "400628858587"}))
+        client._post("marketing/v3/emails", {"name": "x"})
+
+        assert recorder.one["target_id"] == "400628858587"
+        assert recorder.one["status"] == "success"
+        assert recorder.one["http_status"] == 201
+
+    def test_an_id_already_known_at_reserve_time_is_not_overwritten(
+            self, monkeypatch, recorder):
+        """A PATCH has its id in the URL; the response must not replace it."""
+        client, _ = hubspot_client(
+            monkeypatch, response=Response(200, {"id": "999999"}))
+        client._patch("crm/v3/objects/contacts/42", {"properties": {}})
+
+        assert recorder.one["target_id"] == "42"
+
+    def test_a_failed_create_records_no_id(self, monkeypatch, recorder):
+        client, _ = hubspot_client(
+            monkeypatch, response=Response(400, {"message": "Bad Request"}))
+        client._post("marketing/v3/emails", {"name": "x"})
+
+        assert recorder.one["status"] == "failed"
+        assert recorder.one["target_id"] is None
+
+    @pytest.mark.parametrize("body, expected", [
+        ({"id": "123"}, "123"),
+        ({"id": 123}, "123"),
+        ({"objectId": "456"}, "456"),
+        ({"emailId": "789"}, "789"),
+        ({"results": []}, None),
+        ({"id": ""}, None),
+        ({}, None),
+        (None, None),
+        ("not a dict", None),
+    ])
+    def test_the_id_is_read_from_the_shapes_hubspot_returns(self, body,
+                                                            expected):
+        assert audit.target_id_from_response(body) == expected

@@ -76,9 +76,13 @@ _INSERT_SQL = """
 # deploying this.
 _RESERVE_SQL = _INSERT_SQL + " RETURNING id"
 
+# COALESCE, not assignment: a reserve that already knew the id (a PATCH
+# or DELETE, where it is in the URL) keeps it. Only a create arrives here
+# with something new to say.
 _COMPLETE_SQL = """
     UPDATE write_audit
-       SET status = %s, http_status = %s, error = %s, duration_ms = %s
+       SET status = %s, http_status = %s, error = %s, duration_ms = %s,
+           target_id = COALESCE(target_id, %s)
      WHERE id = %s
 """
 
@@ -310,8 +314,27 @@ def reserve_write(target_system: str, http_method: str, endpoint: str,
     return row.get("id") if isinstance(row, dict) else row[0]
 
 
+def target_id_from_response(response) -> str | None:
+    """The id of the thing a create just created, from its response body.
+
+    reserve_write runs BEFORE the request, so on a create there is no id
+    to record yet — the server has not minted one. Every marketing email
+    Jidhr made was therefore audited with target_id NULL, and recovering
+    which row made which email meant matching timestamps by hand
+    (2026-09-25). The id exists by the time complete_write runs; this is
+    where it is read.
+    """
+    if not isinstance(response, dict):
+        return None
+    for key in ("id", "objectId", "emailId"):
+        value = response.get(key)
+        if value not in (None, "", [], {}):
+            return str(value)
+    return None
+
+
 def complete_write(reservation, status: str = "success", http_status=None,
-                   error=None, duration_ms=None) -> bool:
+                   error=None, duration_ms=None, target_id=None) -> bool:
     """Stamp the outcome on a reserved row. Returns True if it landed.
 
     Never raises, and deliberately does NOT refuse anything: by the time
@@ -329,6 +352,7 @@ def complete_write(reservation, status: str = "success", http_status=None,
             (status, http_status,
              str(error)[:MAX_ERROR_CHARS] if error else None,
              int(duration_ms) if duration_ms is not None else None,
+             str(target_id) if target_id is not None else None,
              reservation),
             fetch=False,
         )

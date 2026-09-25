@@ -196,6 +196,24 @@ def clear():
         return jsonify({"error": "Failed to clear history"}), 500
 
 
+# Railway injects the deployed commit. Without it, "which build is
+# live?" can only be inferred — and on 2026-09-25 a post-deploy check
+# was carried out against a build that turned out to predate the change
+# it was verifying, because nothing the app serves could say otherwise.
+SHORT_SHA_CHARS = 7
+
+
+def deployed_version() -> str:
+    """The short SHA of the running build, or "unknown".
+
+    "unknown" rather than an empty string or a guess: a verification
+    that cannot name the build it tested should say so in the place
+    someone is already looking.
+    """
+    sha = (os.environ.get("RAILWAY_GIT_COMMIT_SHA") or "").strip()
+    return sha[:SHORT_SHA_CHARS] if sha else "unknown"
+
+
 @app.route('/health')
 def health():
     """Health check endpoint for Railway (no auth required).
@@ -226,6 +244,7 @@ def health():
 
     return jsonify({
         "status": overall,
+        "version": deployed_version(),
         "env_vars": env_status,
         "database": db_status,
         "database_config": db_config_status,

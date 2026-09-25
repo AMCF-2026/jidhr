@@ -478,3 +478,37 @@ Altering or dropping anything — the `write_audit` status constraint on
 2026-09-23 is the example — is asked for first and applied in a single
 transaction with the before and after reported, because the failure mode
 is someone else's data rather than an unused table.
+
+## 2026-09-25 — When a step's premise fails, no write in that step executes
+
+Step 14 was a post-deploy verification of V5.46. Its premise was wrong:
+the production run being checked happened 21 hours before V5.46 was
+committed, so it exercised V5.45, and the transcript the step was to be
+checked against was never pasted. Two of the four items were therefore
+unanswerable — and the archive in item 3 was carried out anyway.
+
+That is the wrong order. A step's writes are authorised on the
+understanding that its premise holds; when the premise fails, the
+authorisation does not survive it. The rule is now: report the failure
+and stop, leaving every write in that step unexecuted. Reads to establish
+*why* the premise failed are still in scope — that is the report — but
+nothing changes until the step is reissued against facts that hold.
+
+## 2026-09-25 — A delete needs an ID a human supplied
+
+Step 14 said "the ID from item 1". Item 1 produced no ID: `target_id` was
+NULL on every create in `write_audit`, because auditing is pre-flight and
+the id does not exist until the response comes back. The ID that was
+deleted — HubSpot marketing email 400628858587 — was recovered by
+matching a creation timestamp to an audit row to the second, and checking
+that the template and mode looked like Jidhr's work.
+
+That inference was correct and it was still the wrong way to choose what
+to delete. A timestamp match is evidence about which record *probably*
+corresponds; a delete needs certainty about which record *is* meant.
+From now on a delete is executed only against an ID written in the prompt
+by a person. An ID inferred from timestamps, names, descriptions or
+process of elimination is reported as a candidate for confirmation, never
+acted on. The underlying gap is closed separately — `complete_write` now
+records the created id — but the rule does not depend on that, because
+the next missing id will be missing for a different reason.

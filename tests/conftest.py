@@ -53,10 +53,12 @@ class AuditStore:
     def __call__(self, sql, params=None, fetch=True):
         text = " ".join(str(sql).split())
         if text.startswith("UPDATE write_audit"):
-            status, http_status, error, duration_ms, row_id = params
+            status, http_status, error, duration_ms, target_id, row_id = params
             row = self.rows[int(row_id) - 1]
             row.update(status=status, http_status=http_status, error=error,
                        duration_ms=duration_ms)
+            if target_id is not None:
+                row["target_id"] = target_id
             return 1
         self.rows.append({"params": params})
         if "RETURNING id" in text:

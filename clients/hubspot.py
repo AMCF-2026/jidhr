@@ -27,7 +27,8 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from config import Config
 from clients.audit import (AuditUnavailable, complete_write,
-                           record_write, reserve_write)
+                           record_write, reserve_write,
+                           target_id_from_response)
 
 logger = logging.getLogger(__name__)
 
@@ -245,7 +246,10 @@ class HubSpotClient:
                 http_status=status_code,
                 error=None if ok else (
                     (result or {}).get("error") or f"HTTP {status_code}"),
-                duration_ms=elapsed_ms)
+                duration_ms=elapsed_ms,
+                # A create has no id until now: the reserve ran before
+                # the request and the server had not minted one yet.
+                target_id=target_id_from_response(result) if ok else None)
 
         return result, status_code
 
