@@ -312,6 +312,50 @@ def _handle_active_workflow(query: str, state: dict, hubspot, csuite) -> str:
 # Step: Create profile + fund + link + close ticket
 # ---------------------------------------------------------------------------
 
+def _hubspot_contact_id(email: str, hubspot) -> str:
+    """The contact's HubSpot id, or None. READ-ONLY, and never logs the email.
+
+    crm/v3/objects/contacts/search is a POST that carries a query, which
+    is_hubspot_write() classifies as a read — so this changes nothing.
+    """
+    if not email or hubspot is None:
+        return None
+    try:
+        found = hubspot.search_contact_by_email(email)
+    except Exception as e:
+        logger.warning("could not resolve a HubSpot contact id: %s", e)
+        return None
+    if not isinstance(found, dict) or "error" in found:
+        return None
+    rows = found.get("results")
+    if isinstance(rows, list) and rows:
+        return rows[0].get("id")
+    return None
+
+
+def _log_skipped_create(data: dict, hubspot) -> str:
+    """Record the skip against a HubSpot id. Returns the id, or None.
+
+    The id, not the name or the email: this line goes to a log that is not
+    the place for a donor's contact details. When the contact cannot be
+    resolved the log says so, rather than going quiet — a skip nobody can
+    trace back to a person is a skip nobody will action.
+    """
+    contact_id = _hubspot_contact_id(data.get("email"), hubspot)
+    if contact_id:
+        logger.warning(
+            "CSuite profile create SKIPPED for HubSpot contact %s: "
+            "CSUITE_DAF_CREATE_ENABLED is off. create_individual_profile "
+            "sends input names CSuite does not recognise and drops the "
+            "values without erroring. No profile was created.", contact_id)
+    else:
+        logger.warning(
+            "CSuite profile create SKIPPED: CSUITE_DAF_CREATE_ENABLED is "
+            "off, and no HubSpot contact id could be resolved for this "
+            "submission. No profile was created.")
+    return contact_id
+
+
 def _step_create(query: str, state: dict, hubspot, csuite) -> str:
     """
     After user confirms, execute the full creation pipeline:
@@ -342,30 +386,52 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         # succeed. Distinct from ticket_closed being False because no ticket
         # matched — that is not a failure, and says nothing to the user.
         "ticket_close_failed": None,
+        # Distinct from profile_created being False after a failed attempt:
+        # nothing was sent. Reported to the user as skipped, not as failed,
+        # because "Failed to create" would be a false statement.
+        "profile_skipped": False,
         "errors": [],
     }
 
     # --- 1. Create CSuite profile ---
-    logger.info(f"Creating CSuite profile for {data.get('first_name')} {data.get('last_name')}...")
-    try:
-        profile_result = csuite.create_individual_profile(
-            first_name=data.get("first_name", ""),
-            last_name=data.get("last_name", ""),
-            email=data.get("email", ""),
-            phone=data.get("phone"),
-        )
-        if profile_result.get('success') and profile_result.get('data'):
-            profile_id = profile_result['data'].get('profile_id')
-            state["profile_id"] = profile_id
-            results["profile_created"] = True
-            logger.info(f"Profile created: {profile_id}")
-        else:
-            error = profile_result.get('error', 'Unknown error')
-            results["errors"].append(f"Profile creation: {error}")
-            logger.error(f"Profile creation failed: {error}")
-    except Exception as e:
-        results["errors"].append(f"Profile creation: {e}")
-        logger.error(f"Profile creation error: {e}")
+    if not Config.CSUITE_DAF_CREATE_ENABLED:
+        # Off by default. create_individual_profile has sent primary_email
+        # since 2026-03-17 and CSuite does not recognise that input name —
+        # it returns 200 with a profile_id and drops the value. A profile
+        # created here would be missing its email, and probably its phone
+        # and address, with nothing in the response to say so.
+        _log_skipped_create(data, hubspot)
+        results["profile_skipped"] = True
+    else:
+        logger.info(f"Creating CSuite profile for {data.get('first_name')} {data.get('last_name')}...")
+        try:
+            profile_result = csuite.create_individual_profile(
+                first_name=data.get("first_name", ""),
+                last_name=data.get("last_name", ""),
+                email=data.get("email", ""),
+                phone=data.get("phone"),
+            )
+            if profile_result.get('success') and profile_result.get('data'):
+                profile_id = profile_result['data'].get('profile_id')
+                state["profile_id"] = profile_id
+                results["profile_created"] = True
+                logger.info(f"Profile created: {profile_id}")
+                # verify_writes is on, so a dropped field is reported rather
+                # than assumed stored. Surfaced to the user, not only logged.
+                if profile_result.get("fields_dropped"):
+                    dropped = sorted(profile_result["fields_dropped"])
+                    results["errors"].append(
+                        f"Profile created as {profile_id} but CSuite did not "
+                        f"store: {', '.join(dropped)}")
+                    logger.error("CSuite kept %s but dropped %s", profile_id,
+                                 dropped)
+            else:
+                error = profile_result.get('error', 'Unknown error')
+                results["errors"].append(f"Profile creation: {error}")
+                logger.error(f"Profile creation failed: {error}")
+        except Exception as e:
+            results["errors"].append(f"Profile creation: {e}")
+            logger.error(f"Profile creation error: {e}")
 
     # --- 2. Create CSuite fund ---
     if results["profile_created"]:
@@ -536,7 +602,12 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
     name = f"{data.get('first_name', '')} {data.get('last_name', '')}".strip()
     lines = []
 
-    if results["errors"] or results.get("ticket_close_failed"):
+    # A skip is not a creation and not a failure. Saying "Created" over a
+    # run that created nothing is the same class of false success as the
+    # 200 CSuite returns for a field it discarded.
+    if results.get("profile_skipped"):
+        lines.append(f"⏸️ **{type_label} Not Created**")
+    elif results["errors"] or results.get("ticket_close_failed"):
         lines.append(f"⚠️ **{type_label} Created (with warnings)**")
     else:
         lines.append(f"✅ **{type_label} Created!**")
@@ -547,6 +618,13 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
     if results["profile_created"]:
         profile_link = Config.CSUITE_PROFILE_URL.format(profile_id=state['profile_id'])
         lines.append(f"👤 Profile: {name} — [CSuite]({profile_link})")
+    elif results.get("profile_skipped"):
+        lines.append(
+            "⏸️ Profile: **not created — CSuite profile creation is "
+            "turned off.** CSuite silently discards the email, phone and "
+            "address this path sends, so a profile made now would be "
+            "missing them. Create it in CSuite by hand, or set "
+            "CSUITE_DAF_CREATE_ENABLED once the field names are fixed.")
     else:
         lines.append(f"❌ Profile: Failed to create")
 

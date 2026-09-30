@@ -94,6 +94,25 @@ class Config:
     CSUITE_SANDBOX_BASE_URL = os.environ.get(
         'CSUITE_SANDBOX_BASE_URL',
         'https://amuslimcf-sandbox.fcsuite.com/api/v2')
+
+    # Kill switch on the one live caller of profile/create/individual
+    # (intents/daf_workflow.py). OFF unless the variable says otherwise.
+    #
+    # The method has sent `primary_email`, `primary_phone_number` and
+    # `primary_address_string` since 2026-03-17. CSuite does not recognise
+    # `primary_email` as an input: it returns 200 with a profile_id and
+    # discards the value (measured 2026-09-30). The other two are the same
+    # shape of guess and `phone_number` is now known to be the real name
+    # for one of them. So every profile this path creates is missing the
+    # email, and probably the phone and address too, and nothing in the
+    # response says so.
+    #
+    # Default OFF rather than a warning, because the failure is silent by
+    # construction and a warning would be the thing that gets missed. The
+    # rest of the workflow still runs — see _step_create.
+    CSUITE_DAF_CREATE_ENABLED = (
+        os.environ.get('CSUITE_DAF_CREATE_ENABLED', 'False')
+        .strip().lower() == 'true')
     
     # CSuite UI base URL (for deep-linking to profiles, funds, etc.)
     CSUITE_UI_BASE_URL = "https://amuslimcf.fcsuite.com/erp"
