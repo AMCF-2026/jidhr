@@ -32,6 +32,7 @@ from sync import event_hubspot as eh  # noqa: E402
 EXIT_OK = 0
 EXIT_READ_FAILED = 1
 EXIT_NO_MIGRATION = 2
+EXIT_STOPPED = 3        # --apply halted on the first bad create
 
 DEFAULT_ORGANIZER = "American Muslim Community Foundation"
 
@@ -199,6 +200,15 @@ def render(result, fetched, hs_calls, applied, organizer) -> str:
         lines += ["## Not syncable", ""]
         for reason, count in Counter(reason for _m, reason in s).most_common():
             lines.append(f"- {count} × {reason}")
+        lines += ["", "Every one of them, by CSuite id and name — so the "
+                  "list can be worked through rather than described:", "",
+                  "| csuite_eventdate_id | name | reason |", "|---|---|---|"]
+        for mapped, reason in sorted(
+                s, key=lambda pair: (len(pair[0].csuite_eventdate_id),
+                                     pair[0].csuite_eventdate_id)):
+            name = (mapped.source_name or "(no name)").replace("|", "/")
+            lines.append(f"| `{mapped.csuite_eventdate_id}` | {name[:70]} "
+                         f"| {reason} |")
         lines.append("")
 
     lines += ["## Per-record outcome counts", "",
@@ -233,11 +243,44 @@ def _save_map(mapped, hubspot_event_id, status, error=None):
     ), fetch=False)
 
 
-def apply_plan(hubspot, result) -> list:
-    """Create and update in HubSpot. Never deletes. Returns outcomes."""
+class FirstFailureStop(Exception):
+    """A create failed or came back ambiguous, so the run stops here.
+
+    Carries the outcomes recorded up to that point, because a partial run
+    that reports nothing is worse than one that reports where it got to.
+    """
+
+    def __init__(self, outcomes, reason):
+        super().__init__(reason)
+        self.outcomes = outcomes
+        self.reason = reason
+
+
+def apply_plan(hubspot, result, limit=None) -> list:
+    """Create and update in HubSpot. Never deletes. Returns outcomes.
+
+    Stops on the FIRST create that fails or comes back ambiguous, and
+    makes no further creates. With no idempotency key, an error is not
+    evidence about what the next call will do — it may be a bad payload,
+    a revoked scope, or a rate limit, and running eighty more creates to
+    find out produces eighty more things to clean up by hand.
+
+    `limit` caps how many records this run writes. Updates count toward
+    it as well as creates: the point of a limit is to bound the blast
+    radius of a run, and an update to the wrong event is not free.
+    """
     outcomes = []
+    written = 0
+
+    def budget_left():
+        return limit is None or written < limit
 
     for mapped, why in result["creates"]:
+        if not budget_left():
+            outcomes.append({"id": mapped.csuite_eventdate_id,
+                             "outcome": "deferred",
+                             "why": f"--limit {limit} reached"})
+            continue
         created = hubspot._post(CREATE_ENDPOINT, mapped.payload)
         event_id = (created or {}).get("objectId") or (created or {}).get("id")
         error = (created or {}).get("error")
@@ -248,19 +291,30 @@ def apply_plan(hubspot, result) -> list:
             outcomes.append({"id": mapped.csuite_eventdate_id,
                              "outcome": "created", "hubspot_id": str(event_id),
                              "why": why})
+            written += 1
             continue
 
         # Ambiguous: no id came back. It may or may not have landed, and
         # there is no idempotency key to make a retry safe. Record
-        # 'unknown' and stop touching it — the next run looks it up.
+        # 'unknown', and STOP the run — see apply_plan's docstring.
         _save_map(mapped, None, "unknown", error or "no objectId in response")
         outcomes.append({"id": mapped.csuite_eventdate_id,
                          "outcome": "unknown",
                          "why": "create returned no id — NOT retried; the "
                                 "next run resolves it by lookup",
                          "error": str(error)[:200] if error else None})
+        raise FirstFailureStop(
+            outcomes,
+            f"create for {mapped.external_event_id} returned no id "
+            f"({error or 'no objectId in response'}). Stopped before any "
+            "further create.")
 
     for mapped, existing, why in result["updates"]:
+        if not budget_left():
+            outcomes.append({"id": mapped.csuite_eventdate_id,
+                             "outcome": "deferred",
+                             "why": f"--limit {limit} reached"})
+            continue
         hubspot_id = str(existing.get("objectId") or "")
         # PATCH by externalEventId is the documented update path for
         # marketing events; the objectId is stored for people, not used
@@ -279,6 +333,7 @@ def apply_plan(hubspot, result) -> list:
             outcomes.append({"id": mapped.csuite_eventdate_id,
                              "outcome": "updated", "hubspot_id": hubspot_id,
                              "why": why})
+            written += 1
 
     # Unchanged rows still get their timestamp refreshed, so "last seen"
     # and "last changed" are different questions with different answers.
@@ -345,6 +400,11 @@ def main(argv=None) -> int:
                              "written anywhere.")
     parser.add_argument("--out", default=None, help="Write the report here.")
     parser.add_argument("--organizer", default=DEFAULT_ORGANIZER)
+    parser.add_argument("--limit", type=int, default=None, metavar="N",
+                        help="With --apply, write at most N records this "
+                             "run. Updates count toward N as well as "
+                             "creates: the point is to bound how much one "
+                             "run can change.")
     parser.add_argument("--pace-ms", type=int, default=None)
     args = parser.parse_args(argv)
 
@@ -403,10 +463,21 @@ def main(argv=None) -> int:
         print("\nDRY RUN — nothing was written to HubSpot or to hubsync.")
         return EXIT_OK
 
-    outcomes = apply_plan(hubspot, result)
+    try:
+        outcomes = apply_plan(hubspot, result, limit=args.limit)
+        stopped = None
+    except FirstFailureStop as stop:
+        outcomes, stopped = stop.outcomes, stop.reason
+
     record_run(result, fetched, hs_calls, applied=True, outcomes=outcomes)
     for line in summarise_outcomes(outcomes):
         print(line)
+    if stopped:
+        print(f"\nSTOPPED: {stopped}\nNothing further was created. Re-run "
+              "after checking HubSpot — the next run resolves the "
+              "ambiguous record by lookup rather than retrying it.",
+              file=sys.stderr)
+        return EXIT_STOPPED
     return EXIT_OK
 
 
