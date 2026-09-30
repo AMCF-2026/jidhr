@@ -80,6 +80,20 @@ class Config:
     CSUITE_API_KEY = os.environ.get('CSUITE_API_KEY', '')
     CSUITE_API_SECRET = os.environ.get('CSUITE_API_SECRET', '')
     CSUITE_BASE_URL = os.environ.get('CSUITE_BASE_URL', 'https://amuslimcf.fcsuite.com/api/v2')
+
+    # Sandbox credentials. Separate variables, never a switched value of
+    # the production ones: a single pair that sometimes means sandbox is
+    # one typo away from writing to the live fund ledger.
+    CSUITE_SANDBOX_KEY = os.environ.get('CSUITE_SANDBOX_KEY', '')
+    CSUITE_SANDBOX_SECRET = os.environ.get('CSUITE_SANDBOX_SECRET', '')
+
+    # "sandbox" | "live". Unset means live, so production behaviour is
+    # unchanged by this setting existing.
+    CSUITE_ENV = (os.environ.get('CSUITE_ENV') or 'live').strip().lower()
+
+    CSUITE_SANDBOX_BASE_URL = os.environ.get(
+        'CSUITE_SANDBOX_BASE_URL',
+        'https://amuslimcf-sandbox.fcsuite.com/api/v2')
     
     # CSuite UI base URL (for deep-linking to profiles, funds, etc.)
     CSUITE_UI_BASE_URL = "https://amuslimcf.fcsuite.com/erp"

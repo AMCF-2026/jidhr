@@ -33,26 +33,178 @@ logger = logging.getLogger(__name__)
 # endpoint name is the only signal, so the rule lives here where it can be
 # read, rather than being inferred at each call site.
 #
-# Verified against every endpoint string in this file (40 of them): these
-# five substrings catch 11 writes and match none of the 29 reads.
+# Verified against every endpoint string in this file: these five words
+# catch every write and match none of the reads.
 CSUITE_WRITE_PATTERNS = ("create", "edit", "delete", "complete", "update")
+
+# Version prefixes that carry no meaning for classification. Stripped so
+# `/api/v1/note/create` is judged as `note/create`, and so a future
+# `/api/v3/` cannot smuggle a write past a rule that only knew about v2.
+_API_PREFIX_SEGMENTS = ("api", "v1", "v2", "v3")
+
+
+def _path_segments(endpoint: str) -> list:
+    """The meaningful, lowercased segments of an endpoint path."""
+    text = str(endpoint or "").lower().split("?")[0].split("#")[0]
+    return [seg for seg in text.replace("\\", "/").split("/")
+            if seg and seg not in _API_PREFIX_SEGMENTS]
 
 
 def is_csuite_write(endpoint: str) -> bool:
-    """True if this CSuite endpoint changes something."""
-    name = str(endpoint or "").lower()
-    return any(pattern in name for pattern in CSUITE_WRITE_PATTERNS)
+    """True if this CSuite endpoint changes something.
+
+    CSuite signs the request body, so every call is an HTTP POST and the
+    verb says nothing about what a call does. The endpoint name is the
+    only signal, which is why the rule lives here where it can be read
+    rather than being re-derived at each call site.
+
+    Matched on path SEGMENTS, not on the whole string, so every sub-path
+    is caught: `profile/create/individual`, `task/edit/complete`,
+    `custom_field/delete`, and `/api/v1/note/create` after its version
+    prefix is stripped.
+
+    The whole-string check is kept alongside the segment check, as a
+    union. It is redundant for every endpoint known today, and it means
+    this function can never become LESS strict than the substring rule it
+    replaced — an endpoint like `profile/createhousehold`, where the word
+    is inside a segment rather than equal to it, still reads as a write.
+    """
+    whole = str(endpoint or "").lower()
+    if any(pattern in whole for pattern in CSUITE_WRITE_PATTERNS):
+        return True
+    return any(pattern in segment
+               for segment in _path_segments(endpoint)
+               for pattern in CSUITE_WRITE_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
+# Which CSuite are we talking to
+# ---------------------------------------------------------------------------
+# Three things have to agree: the host, the `env` value inside the signed
+# body, and which key/secret pair signs it. They are derived HERE, once,
+# and nothing else is allowed to pick any of them independently — a host
+# chosen in one place and an `env` chosen in another is how a sandbox run
+# writes to the live fund ledger.
+
+ENV_LIVE = "live"
+ENV_SANDBOX = "sandbox"
+VALID_ENVS = (ENV_LIVE, ENV_SANDBOX)
+
+# A host is sandbox if its hostname says so. Matched on the hostname, not
+# the whole URL, so a query string or a path cannot spoof it.
+_SANDBOX_HOST_MARKER = "sandbox"
+
+
+class CSuiteEnvMismatch(RuntimeError):
+    """The host, the body `env`, and the credentials do not agree.
+
+    Raised at client construction, before anything can be sent. A
+    mismatch is not a thing to detect in a log afterwards.
+    """
+
+
+def host_of(url: str) -> str:
+    """The hostname of a base URL, lowercased. No scheme, no path."""
+    from urllib.parse import urlparse
+
+    text = str(url or "").strip()
+    parsed = urlparse(text if "//" in text else f"//{text}")
+    return (parsed.hostname or "").lower()
+
+
+def host_looks_like_sandbox(url: str) -> bool:
+    return _SANDBOX_HOST_MARKER in host_of(url)
+
+
+def resolve_csuite_env(env=None, base_url=None, key=None, secret=None,
+                       sandbox_key=None, sandbox_secret=None,
+                       sandbox_base_url=None) -> dict:
+    """The single place that decides host, body `env`, and credentials.
+
+    Returns {"env", "base_url", "key_var", "secret_var", "api_key",
+    "api_secret"}. The *_var entries name the environment variable each
+    credential came from, so a report can say where a key came from
+    without printing it.
+
+    Raises CSuiteEnvMismatch when the host and the env disagree, or when
+    the selected credential pair is missing. Both are refusals rather
+    than warnings: the failure they prevent is a write to the wrong
+    database, and there is no safe way to continue past either.
+    """
+    from config import Config
+
+    env = (env if env is not None else Config.CSUITE_ENV)
+    env = str(env or ENV_LIVE).strip().lower()
+    if env not in VALID_ENVS:
+        raise CSuiteEnvMismatch(
+            f"CSUITE_ENV is {env!r}; allowed values are "
+            f"{' | '.join(VALID_ENVS)}")
+
+    if env == ENV_SANDBOX:
+        base_url = base_url if base_url is not None else (
+            sandbox_base_url if sandbox_base_url is not None
+            else Config.CSUITE_SANDBOX_BASE_URL)
+        api_key = sandbox_key if sandbox_key is not None \
+            else Config.CSUITE_SANDBOX_KEY
+        api_secret = sandbox_secret if sandbox_secret is not None \
+            else Config.CSUITE_SANDBOX_SECRET
+        key_var, secret_var = "CSUITE_SANDBOX_KEY", "CSUITE_SANDBOX_SECRET"
+    else:
+        base_url = base_url if base_url is not None else Config.CSUITE_BASE_URL
+        api_key = key if key is not None else Config.CSUITE_API_KEY
+        api_secret = secret if secret is not None else Config.CSUITE_API_SECRET
+        key_var, secret_var = "CSUITE_API_KEY", "CSUITE_API_SECRET"
+
+    sandbox_host = host_looks_like_sandbox(base_url)
+    if env == ENV_SANDBOX and not sandbox_host:
+        raise CSuiteEnvMismatch(
+            f"CSUITE_ENV=sandbox but the host is {host_of(base_url)!r}, "
+            "which is not a sandbox host. Refusing to start: a sandbox "
+            "`env` against a production host is a request the live "
+            "system may well accept.")
+    if env == ENV_LIVE and sandbox_host:
+        raise CSuiteEnvMismatch(
+            f"CSUITE_ENV=live but the host is {host_of(base_url)!r}, "
+            "which is a sandbox host. Refusing to start rather than "
+            "guessing which one was meant.")
+
+    missing = [name for name, value in ((key_var, api_key),
+                                       (secret_var, api_secret)) if not value]
+    if missing:
+        raise CSuiteEnvMismatch(
+            f"CSUITE_ENV={env} needs {' and '.join(missing)}, which "
+            f"{'is' if len(missing) == 1 else 'are'} not set. Names only — "
+            "no value is read or logged here.")
+
+    return {"env": env, "base_url": base_url, "key_var": key_var,
+            "secret_var": secret_var, "api_key": api_key,
+            "api_secret": api_secret}
 
 
 class CSuiteClient:
     """Client for CSuite API with proper HMAC authentication"""
     
-    def __init__(self):
-        self.api_key = Config.CSUITE_API_KEY
-        self.api_secret = Config.CSUITE_API_SECRET
-        self.base_url = Config.CSUITE_BASE_URL
-        self.env = "live"
+    def __init__(self, env=None, base_url=None, api_key=None,
+                 api_secret=None):
+        # One resolver decides host, body `env` and credentials together,
+        # and refuses to start if they disagree. The arguments exist for
+        # tests and for the deliberate cross-checks in
+        # reports/csuite_sandbox_reads.md; nothing in the app passes them.
+        resolved = resolve_csuite_env(
+            env=env, base_url=base_url, key=api_key, secret=api_secret,
+            sandbox_key=api_key if env == ENV_SANDBOX else None,
+            sandbox_secret=api_secret if env == ENV_SANDBOX else None)
+        self.env = resolved["env"]
+        self.base_url = resolved["base_url"]
+        self.api_key = resolved["api_key"]
+        self.api_secret = resolved["api_secret"]
+        # Variable NAMES, kept so a diagnostic can say where a credential
+        # came from without reading its value.
+        self.key_var = resolved["key_var"]
+        self.secret_var = resolved["secret_var"]
         self.session = requests.Session()
+        logger.info("CSuite client: env=%s host=%s key from $%s",
+                    self.env, host_of(self.base_url), self.key_var)
     
     # =========================================================================
     # AUTHENTICATION & HTTP
