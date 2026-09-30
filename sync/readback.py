@@ -48,6 +48,9 @@ DERIVED_FIELDS = frozenset({
 # a pair has actually been observed.
 SENT_TO_STORED = {
     "email": "primary_email",
+    # 2026-09-30, profile/edit on 21626: sent "7035550100", stored
+    # "703-555-0100". CSuite punctuates it.
+    "phone_number": "primary_phone_number",
 }
 
 
@@ -103,7 +106,7 @@ def stored_name(sent_field: str) -> str:
 
 
 def _same(sent, stored) -> bool:
-    """Is `stored` what `sent` asked for?
+    """Is `stored` exactly what `sent` asked for?
 
     Compared as text, because CSuite returns 1 for a boolean and "1005"
     for an integer id often enough that strict equality would report
@@ -119,6 +122,38 @@ def _same(sent, stored) -> bool:
     return _as_text(sent) == _as_text(stored)
 
 
+def _digits(value) -> str:
+    return "".join(c for c in str(value) if c.isdigit())
+
+
+def _alnum(value) -> str:
+    return "".join(c for c in str(value).lower() if c.isalnum())
+
+
+def _reformatted(sent, stored) -> bool:
+    """Did CSuite store this value in a shape of its own?
+
+    Measured 2026-09-30: `profile/edit` was sent
+    phone_number="7035550100" and stored primary_phone_number
+    "703-555-0100". The value was kept in full and punctuated by the
+    server.
+
+    Without this, every phone write would be reported as dropped — a
+    false alarm on a field that was stored correctly, which is exactly as
+    damaging to trust in the check as a missed drop. So the test is
+    deliberately narrow: the two must carry the **same digits** or the
+    same letters-and-digits, and the sent value must not be empty of both.
+    A different number, a truncated number, or a blank still fails.
+    """
+    if sent is None or stored is None:
+        return False
+    sent_digits, stored_digits = _digits(sent), _digits(stored)
+    if sent_digits and sent_digits == stored_digits:
+        return True
+    sent_alnum, stored_alnum = _alnum(sent), _alnum(stored)
+    return bool(sent_alnum) and sent_alnum == stored_alnum
+
+
 def _as_text(value) -> str:
     """One text form for comparison.
 
@@ -131,18 +166,33 @@ def _as_text(value) -> str:
     return str(value).strip()
 
 
-def compare(sent: dict, stored: dict, ignore=DERIVED_FIELDS) -> dict:
-    """{sent field: (sent value, stored value)} for everything not kept."""
-    dropped = {}
+def compare_detail(sent: dict, stored: dict, ignore=DERIVED_FIELDS):
+    """(dropped, reformatted), each {sent field: (sent value, stored value)}.
+
+    `dropped` is what CSuite did not keep. `reformatted` is what it kept in
+    a shape of its own — the same value, punctuated differently. The two
+    are separated because only one of them is a fault.
+    """
+    dropped, reformatted = {}, {}
     for field, value in (sent or {}).items():
         if field in ignore or field in ("env", "epoch"):
             continue
         key = stored_name(field)
         if key in ignore:
             continue
-        if not _same(value, (stored or {}).get(key)):
-            dropped[field] = (value, (stored or {}).get(key))
-    return dropped
+        held = (stored or {}).get(key)
+        if _same(value, held):
+            continue
+        if _reformatted(value, held):
+            reformatted[field] = (value, held)
+            continue
+        dropped[field] = (value, held)
+    return dropped, reformatted
+
+
+def compare(sent: dict, stored: dict, ignore=DERIVED_FIELDS) -> dict:
+    """{sent field: (sent value, stored value)} for everything not kept."""
+    return compare_detail(sent, stored, ignore)[0]
 
 
 def verify(read, endpoint: str, sent: dict, record_id, id_field="profile_id",
@@ -162,7 +212,12 @@ def verify(read, endpoint: str, sent: dict, record_id, id_field="profile_id",
         raise ReadBackUnavailable(
             {"<read-back failed>": (None, None)}, endpoint, record_id)
 
-    dropped = compare(sent, data)
+    dropped, reformatted = compare_detail(sent, data)
+    if reformatted:
+        # Stored, not lost. Logged so a value the server rewrote is on the
+        # record somewhere, and not raised, because nothing went wrong.
+        logger.info("CSuite %s on %s stored %s in its own format",
+                    endpoint, record_id, sorted(reformatted))
     if dropped:
         logger.error("CSuite %s on %s dropped: %s", endpoint, record_id,
                      sorted(dropped))

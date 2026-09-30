@@ -235,3 +235,59 @@ def test_the_production_flag_is_on_by_default():
     """Flipped 2026-09-30. A dropped field is invisible without it."""
     from clients.csuite import CSuiteClient
     assert CSuiteClient.verify_writes is True
+
+
+# ---------------------------------------------------------------------------
+# Reformatted is not dropped
+# ---------------------------------------------------------------------------
+
+def test_a_value_csuite_punctuates_is_stored_not_dropped():
+    """2026-09-30: profile/edit on 21626 was sent phone_number
+    "7035550100" and profile/display returned primary_phone_number
+    "703-555-0100". Text comparison called that a drop, which would have
+    put a false error in front of a user on every phone write."""
+    from sync.readback import compare_detail
+
+    stored = display(primary_phone_number="703-555-0100")
+    dropped, reformatted = compare_detail({"phone_number": "7035550100"},
+                                          stored)
+    assert dropped == {}
+    assert "phone_number" in reformatted
+
+
+def test_a_reformatted_value_does_not_raise():
+    read = reader(display(primary_phone_number="703-555-0100"))
+    assert verify(read, "profile/edit", {"phone_number": "7035550100"}, 21626)
+
+
+@pytest.mark.parametrize("sent,stored", [
+    ("7035550100", "703-555-0101"),   # a different number
+    ("7035550100", "703-555-010"),    # truncated
+    ("7035550100", ""),               # blank
+    ("7035550100", "n/a"),            # no digits at all
+])
+def test_a_value_that_is_not_the_same_value_is_still_dropped(sent, stored):
+    """The allowance is for punctuation, not for a different answer."""
+    from sync.readback import compare_detail
+
+    dropped, reformatted = compare_detail(
+        {"phone_number": sent}, display(primary_phone_number=stored))
+    assert "phone_number" in dropped
+    assert reformatted == {}
+
+
+def test_punctuation_alone_is_not_enough_to_match():
+    """Two values of pure punctuation share an empty digit string. Matching
+    on that would make any two unrecognised values look equal."""
+    from sync.readback import compare_detail
+
+    dropped, _ = compare_detail({"website": "---"},
+                                display(website="..."))
+    assert "website" in dropped
+
+
+def test_compare_still_returns_only_real_drops():
+    """compare() is the older name and several callers use it."""
+    stored = display(primary_phone_number="703-555-0100", primary_email=None)
+    assert compare({"phone_number": "7035550100"}, stored) == {}
+    assert "email" in compare({"email": "a@b.invalid"}, stored)

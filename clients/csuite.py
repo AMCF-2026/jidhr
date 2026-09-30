@@ -172,6 +172,7 @@ CONFIRMED_INPUT_FIELDS = frozenset({
     "last_name",    # profile/create/individual -> last_name
     "email",        # profile/create/individual, profile/edit -> primary_email
     "website",      # profile/edit -> website
+    "phone_number", # profile/edit -> primary_phone_number (CSuite punctuates)
     "env",          # every endpoint; supplied by _build_payload
     "profile_id",   # profile/edit, profile/display
 })
@@ -188,11 +189,33 @@ CONFIRMED_INPUT_FIELDS = frozenset({
 # invalid value the cheapest way to test a candidate name: a 400 naming
 # the field proves the name is recognised, and no record is created.
 #
-# phone_number stays out of CONFIRMED_INPUT_FIELDS because "recognised" is
-# not "stored" — the create was rejected, so nothing was ever read back.
-RECOGNISED_UNCONFIRMED_FIELDS = frozenset({
-    "phone_number",  # profile/create/individual, validated -> 400
-})
+# phone_number graduated on 2026-09-30: profile/edit on sentinel 21626 was
+# sent phone_number="7035550100" and profile/display returned
+# primary_phone_number "703-555-0100". Stored, and punctuated by CSuite —
+# which is why sync/readback.py now tells a reformatted value apart from a
+# dropped one. Nothing is left in this set.
+RECOGNISED_UNCONFIRMED_FIELDS = frozenset()
+
+# Names PROVEN not to work as inputs, each by a sandbox write and a
+# read-back. They are all valid `profile/display` output names, which is the
+# trap: the display list reads like a field list and is not one.
+#
+# 2026-09-30, profile/create/individual on 21626: `primary_email` -> 200,
+# value gone. 2026-09-30, profile/edit on 21626: the four address names
+# below -> 200, `success: true`, and **0 of 81 fields changed, modified_ts
+# included**. CSuite did not touch the record and said nothing.
+#
+# Kept so the refusal can cite the evidence instead of only saying "not
+# confirmed", and so nobody spends another sandbox write proving it twice.
+KNOWN_INVALID_INPUT_FIELDS = {
+    "primary_email": "use `email` (confirmed 2026-09-30)",
+    "primary_phone_number": "use `phone_number` (confirmed 2026-09-30)",
+    "primary_address": "dropped by profile/edit, 2026-09-30",
+    "primary_city": "dropped by profile/edit, 2026-09-30",
+    "primary_state": "dropped by profile/edit, 2026-09-30",
+    "primary_zipcode": "dropped by profile/edit, 2026-09-30",
+    "primary_address_string": "a display name; no input name confirmed yet",
+}
 
 
 class UnconfirmedField(ValueError):
@@ -207,12 +230,19 @@ class UnconfirmedField(ValueError):
         self.unknown = sorted(unknown)
         self.endpoint = endpoint
         names = ", ".join(repr(n) for n in self.unknown)
+        # A name already proven wrong gets the evidence and the replacement,
+        # rather than the generic "not confirmed yet" — they are different
+        # situations and only one of them needs a sandbox write to resolve.
+        proven = [f"{n!r}: {KNOWN_INVALID_INPUT_FIELDS[n]}"
+                  for n in self.unknown if n in KNOWN_INVALID_INPUT_FIELDS]
+        detail = ("  Proven not to work: " + "; ".join(proven) + "."
+                  if proven else "")
         super().__init__(
             f"refusing {endpoint or 'this CSuite write'}: {names} "
             f"{'is' if len(self.unknown) == 1 else 'are'} not a confirmed "
             "CSuite input name. CSuite would accept the call, silently drop "
             "the field and return 200. Confirm the name with a sandbox write "
-            "and a read-back, then add it to CONFIRMED_INPUT_FIELDS. "
+            f"and a read-back, then add it to CONFIRMED_INPUT_FIELDS.{detail} "
             "Nothing was sent.")
 
 

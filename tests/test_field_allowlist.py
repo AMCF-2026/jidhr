@@ -61,7 +61,8 @@ def test_the_allowlist_holds_only_read_back_confirmed_names():
     plausibility.
     """
     assert set(CONFIRMED_INPUT_FIELDS) == {
-        "first_name", "last_name", "email", "website", "env", "profile_id"}
+        "first_name", "last_name", "email", "website", "phone_number",
+        "env", "profile_id"}
 
 
 @pytest.mark.parametrize("field", sorted(CONFIRMED_INPUT_FIELDS))
@@ -80,6 +81,7 @@ def test_nothing_to_check_is_not_an_error():
     "primary_address_string",
     "phone",
     "address",
+    "primary_city",
     "notes",
     "",
 ])
@@ -243,17 +245,58 @@ def test_the_read_back_never_repeats_the_write():
     assert "profile/create/individual" not in client.endpoints
 
 
-def test_a_recognised_name_is_not_a_confirmed_one():
-    """phone_number was validated by CSuite and still may not be sent.
+def test_recognised_and_confirmed_never_overlap():
+    """The holding pen is for names CSuite parses but has not yet stored.
 
-    2026-09-30: profile/create/individual answered HTTP 400,
-    `phone_number: phone [5550100] is not valid`. CSuite parsed the field,
-    so the name is real — but the create was rejected, so no value was ever
-    read back off a record. "Recognised" is not "stored".
+    phone_number spent a task in it — validated by a 400 on create, with no
+    value ever read back — and left it on 2026-09-30 when profile/edit
+    stored one. Empty now, and it must never share a name with the
+    allowlist, or a field would be both sendable and unconfirmed.
     """
     from clients.csuite import RECOGNISED_UNCONFIRMED_FIELDS
 
-    assert "phone_number" in RECOGNISED_UNCONFIRMED_FIELDS
     assert not (RECOGNISED_UNCONFIRMED_FIELDS & CONFIRMED_INPUT_FIELDS)
-    with pytest.raises(UnconfirmedField):
-        check_input_fields(["phone_number"], "profile/create/individual")
+
+
+def test_phone_number_may_now_be_sent():
+    """Confirmed by read-back: sent 7035550100, stored 703-555-0100."""
+    from sync.readback import SENT_TO_STORED
+
+    check_input_fields(["phone_number"], "profile/edit")
+    assert SENT_TO_STORED["phone_number"] == "primary_phone_number"
+
+
+# ---------------------------------------------------------------------------
+# Names proven wrong
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("field", [
+    "primary_email", "primary_phone_number", "primary_address",
+    "primary_city", "primary_state", "primary_zipcode",
+    "primary_address_string",
+])
+def test_a_proven_wrong_name_is_refused_with_its_evidence(field):
+    """Every one is a valid profile/display name and an invalid input.
+
+    profile/edit on 21626 was sent the four address names on 2026-09-30 and
+    answered 200, success: true, with 0 of 81 fields changed — modified_ts
+    included. It did not touch the record and it did not say so.
+    """
+    from clients.csuite import KNOWN_INVALID_INPUT_FIELDS
+
+    assert field in KNOWN_INVALID_INPUT_FIELDS
+    with pytest.raises(UnconfirmedField) as caught:
+        check_input_fields([field], "profile/edit")
+    assert "Proven not to work" in str(caught.value)
+
+
+def test_a_merely_unconfirmed_name_gets_no_false_evidence():
+    with pytest.raises(UnconfirmedField) as caught:
+        check_input_fields(["some_new_idea"], "profile/edit")
+    assert "Proven not to work" not in str(caught.value)
+
+
+def test_nothing_is_both_proven_wrong_and_allowed():
+    from clients.csuite import KNOWN_INVALID_INPUT_FIELDS
+
+    assert not (set(KNOWN_INVALID_INPUT_FIELDS) & CONFIRMED_INPUT_FIELDS)
