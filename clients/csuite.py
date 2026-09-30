@@ -95,6 +95,58 @@ VALID_ENVS = (ENV_LIVE, ENV_SANDBOX)
 _SANDBOX_HOST_MARKER = "sandbox"
 
 
+# What happened to a call, beyond "it didn't work".
+#
+# On 2026-09-30 a deliberate auth failure came back as
+# {"success": false, "error": "Unknown error"} — the 401 had been
+# swallowed, and telling an expired key from a malformed body meant
+# capturing the raw response by hand. An error that does not name its own
+# cause sends someone looking in the wrong place.
+OUTCOME_OK = "ok"
+OUTCOME_AUTH_REJECTED = "auth_rejected"      # 401 (and 403)
+OUTCOME_INVALID_REQUEST = "invalid_request"  # 400, 422
+OUTCOME_RATE_LIMITED = "rate_limited"        # 429
+OUTCOME_SERVER_ERROR = "server_error"        # 5xx
+OUTCOME_NETWORK = "network_error"            # timeout, connection refused
+OUTCOME_BAD_RESPONSE = "bad_response"        # 2xx that is not JSON
+OUTCOME_REJECTED = "rejected"                # HTTP 2xx, success != 1
+
+
+# Response bodies are echoed back to the caller so a failure can be read
+# without re-running it. CSuite never puts a credential in a response —
+# the signature travels in a request header — but the cap is here anyway,
+# because a body is the one place an unexpected value could appear.
+MAX_BODY_CHARS = 600
+
+
+def _safe_body(response) -> str:
+    """The response body, length-capped, for a diagnosable error."""
+    try:
+        text = getattr(response, "text", "") or ""
+    except Exception:  # pragma: no cover
+        return ""
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= MAX_BODY_CHARS else flat[:MAX_BODY_CHARS] + "…"
+
+
+def classify_status(status_code, exception=None) -> str:
+    """The outcome name for an HTTP status, or for a transport failure."""
+    if exception is not None:
+        return OUTCOME_NETWORK
+    if status_code is None:
+        return OUTCOME_NETWORK
+    code = int(status_code)
+    if code in (401, 403):
+        return OUTCOME_AUTH_REJECTED
+    if code == 429:
+        return OUTCOME_RATE_LIMITED
+    if 400 <= code < 500:
+        return OUTCOME_INVALID_REQUEST
+    if code >= 500:
+        return OUTCOME_SERVER_ERROR
+    return OUTCOME_OK
+
+
 class CSuiteEnvMismatch(RuntimeError):
     """The host, the body `env`, and the credentials do not agree.
 
@@ -251,7 +303,9 @@ class CSuiteClient:
                         duration_ms=0)
                 except AuditUnavailable as e:
                     logger.warning("skipped write not audited: %s", e)
-            return {"error": "CSuite API credentials not configured"}
+            return {"error": "CSuite API credentials not configured",
+                    "success": False, "http_status": None,
+                    "outcome": OUTCOME_AUTH_REJECTED}
         
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
         payload = self._build_payload(data)
@@ -307,7 +361,9 @@ class CSuiteClient:
                     return {
                         "success": True,
                         "data": json_response.get("data"),
-                        "messages": json_response.get("messages", [])
+                        "messages": json_response.get("messages", []),
+                        "http_status": status_code,
+                        "outcome": OUTCOME_OK,
                     }
                 else:
                     errors = json_response.get("errors", [])
@@ -315,21 +371,36 @@ class CSuiteClient:
                     error_text = errors[0] if errors else "Unknown error"
                     # HTTP 200 with success != 1 is still a failed write.
                     audit("failed", status_code, error_text)
+                    # A 2xx whose body says success != 1 is a
+                    # rejection by the application, not by HTTP. Named
+                    # separately so it is not read as a transport fault.
+                    outcome = classify_status(status_code)
+                    if outcome == OUTCOME_OK:
+                        outcome = OUTCOME_REJECTED
                     return {
                         "success": False,
                         "error": error_text,
-                        "errors": errors
+                        "errors": errors,
+                        "http_status": status_code,
+                        "outcome": outcome,
+                        "body": _safe_body(response),
                     }
 
             except json.JSONDecodeError as e:
                 logger.error(f"CSuite JSON decode error: {str(e)}")
                 audit("failed", status_code, f"Invalid JSON response: {e}")
-                return {"error": f"Invalid JSON response: {str(e)}"}
+                return {"error": f"Invalid JSON response: {str(e)}",
+                        "success": False, "http_status": status_code,
+                        "outcome": (classify_status(status_code)
+                                    if classify_status(status_code)
+                                    != OUTCOME_OK else OUTCOME_BAD_RESPONSE),
+                        "body": _safe_body(response)}
 
         except requests.exceptions.RequestException as e:
             logger.error(f"CSuite Request error: {str(e)}")
             audit("failed", None, str(e))
-            return {"error": str(e)}
+            return {"error": str(e), "success": False, "http_status": None,
+                    "outcome": OUTCOME_NETWORK}
     
     # =========================================================================
     # PAGINATION HELPER
