@@ -281,6 +281,12 @@ class CSuiteClient:
             payload.update(data)
         return payload
     
+    # Read-back verification on the PRODUCTION path, off by default.
+    # On rather than off is the right default and not this task's change
+    # to make: turning it on adds a profile/display to every write, which
+    # is a rate-limit question as well as a correctness one.
+    verify_writes = False
+
     def _request(self, endpoint: str, data: dict = None) -> dict:
         """Make authenticated POST request to CSuite API
         

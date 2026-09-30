@@ -29,6 +29,7 @@ import logging
 
 from clients.csuite import (host_of, is_csuite_write, resolve_csuite_env,
                             ENV_SANDBOX)
+from sync.readback import normalise_payload, verify
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +112,8 @@ def assert_sandbox(client) -> str:
     return host
 
 
-def sandbox_write(client, endpoint: str, data: dict, budget: WriteBudget):
+def sandbox_write(client, endpoint: str, data: dict, budget: WriteBudget,
+                  verify_with=None, record_id=None):
     """The single door every CSuite write goes through.
 
     Order matters: sandbox first, then the budget, then the endpoint must
@@ -133,4 +135,31 @@ def sandbox_write(client, endpoint: str, data: dict, budget: WriteBudget):
     # No retry, no wrapper, no fallback. One call, one result, whatever
     # it is. CSuite has no idempotency key, so a second attempt is not a
     # recovery — it is a second record.
-    return client._request(endpoint, data)
+    #
+    # Emails are normalised on the way out, because matching is exact and
+    # case-sensitive: what is stored has to be what a later search will
+    # look for.
+    sent = normalise_payload(data)
+    response = client._request(endpoint, sent)
+
+    if verify_with is None:
+        return response
+
+    # Read the record back. A 200 from CSuite means the request was
+    # accepted, not that the data was stored — see sync/readback.py.
+    if not (isinstance(response, dict) and response.get("success")):
+        return response
+    target = record_id
+    if target is None:
+        payload = response.get("data")
+        if isinstance(payload, dict):
+            target = payload.get("profile_id")
+    if target is None:
+        target = sent.get("profile_id")
+    if target is None:
+        logger.warning("no record id to read back after %s; verification "
+                       "skipped", endpoint)
+        return response
+
+    verify(verify_with, endpoint, sent, target)
+    return response
