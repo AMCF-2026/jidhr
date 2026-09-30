@@ -113,7 +113,7 @@ def assert_sandbox(client) -> str:
 
 
 def sandbox_write(client, endpoint: str, data: dict, budget: WriteBudget,
-                  verify_with=None, record_id=None):
+                  verify_with=None, record_id=None, modified_before=None):
     """The single door every CSuite write goes through.
 
     Order matters: sandbox first, then the budget, then the endpoint must
@@ -161,5 +161,6 @@ def sandbox_write(client, endpoint: str, data: dict, budget: WriteBudget,
                        "skipped", endpoint)
         return response
 
-    verify(verify_with, endpoint, sent, target)
+    verify(verify_with, endpoint, sent, target,
+           modified_before=modified_before)
     return response

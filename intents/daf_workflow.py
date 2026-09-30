@@ -418,7 +418,15 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
                 logger.info(f"Profile created: {profile_id}")
                 # verify_writes is on, so a dropped field is reported rather
                 # than assumed stored. Surfaced to the user, not only logged.
-                if profile_result.get("fields_dropped"):
+                if profile_result.get("nothing_stored"):
+                    # Stronger than a per-field drop: CSuite did not write to
+                    # the record at all, and still answered success.
+                    results["errors"].append(
+                        f"CSuite reported success on {profile_id} but stored "
+                        "NOTHING — the record was not modified. Treat this "
+                        "profile as empty.")
+                    logger.error("CSuite stored nothing on %s", profile_id)
+                elif profile_result.get("fields_dropped"):
                     dropped = sorted(profile_result["fields_dropped"])
                     results["errors"].append(
                         f"Profile created as {profile_id} but CSuite did not "

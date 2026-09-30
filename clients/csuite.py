@@ -416,11 +416,44 @@ class CSuiteClient:
         "profile/edit": ("profile/display", "profile_id"),
     }
 
-    def _verify_write(self, endpoint: str, sent: dict, response: dict) -> dict:
+    # Endpoints where a before-state is worth reading. An edit that stores
+    # nothing leaves modified_ts alone, and that is the only part of the
+    # result that says so — CSuite answers success either way. A create has
+    # no before-state, so it is not listed.
+    SNAPSHOT_BEFORE = ("profile/edit",)
+
+    def _modified_before(self, endpoint: str, data: dict):
+        """The record's `modified_ts` before this write, or None.
+
+        None means "not compared", never "unchanged" — the two would lead to
+        opposite conclusions and only one of them is knowable from a failed
+        read.
+        """
+        clean = str(endpoint or "").strip("/")
+        if clean not in self.SNAPSHOT_BEFORE:
+            return None
+        target = self.READBACK_TARGETS.get(clean)
+        if not target:
+            return None
+        display_endpoint, id_field = target
+        record_id = (data or {}).get(id_field)
+        if record_id is None:
+            return None
+        response = self._request(display_endpoint, {id_field: record_id})
+        record = response.get("data") if isinstance(response, dict) else None
+        if isinstance(record, list) and record:
+            record = record[0]
+        if not isinstance(record, dict):
+            return None
+        return record.get("modified_ts")
+
+    def _verify_write(self, endpoint: str, sent: dict, response: dict,
+                      modified_before=None) -> dict:
         """Read the record back; annotate `response` if anything was lost.
 
         Returns `response`, with `verified` set, and `fields_dropped` added
-        when CSuite kept less than it was sent.
+        when CSuite kept less than it was sent, or `nothing_stored` when it
+        did not touch the record at all.
         """
         target = self.READBACK_TARGETS.get(str(endpoint or "").strip("/"))
         if not target:
@@ -442,11 +475,25 @@ class CSuiteClient:
         # Imported here, not at module scope: sync.readback is a pure
         # module today and this keeps clients.csuite importable on its own
         # if that ever stops being true.
-        from sync.readback import FieldDropped, ReadBackUnavailable, verify
+        from sync.readback import (FieldDropped, NothingStored,
+                                    ReadBackUnavailable, verify)
 
         try:
             verify(self._request, endpoint, sent or {}, record_id,
-                   id_field=id_field, display_endpoint=display_endpoint)
+                   id_field=id_field, display_endpoint=display_endpoint,
+                   modified_before=modified_before)
+        except NothingStored as e:
+            # The strongest of the three: CSuite did not write to the record.
+            # Caught first because it is also a FieldDropped.
+            logger.warning("CSuite %s on %s %s STORED NOTHING: %s", endpoint,
+                           id_field, record_id, e)
+            response["verified"] = False
+            response["nothing_stored"] = True
+            response["fields_dropped"] = {
+                field: (value, None)
+                for field, value in (sent or {}).items()
+                if field not in ("profile_id", "env", "epoch")}
+            return response
         except ReadBackUnavailable as e:
             # "Not checked" is not "field lost". Caught before FieldDropped
             # because it is a subclass of it.
@@ -522,6 +569,17 @@ class CSuiteClient:
 
         logger.info(f"CSuite POST: {endpoint} | data keys: {list((data or {}).keys())}")
 
+        # Read before writing, so an edit that changes nothing can be told
+        # from an edit that changed something. Only for the endpoints in
+        # SNAPSHOT_BEFORE, and only when verification is on.
+        modified_before = None
+        if audited and self.verify_writes:
+            try:
+                modified_before = self._modified_before(endpoint, data)
+            except Exception as e:  # pragma: no cover - never block the write
+                logger.warning("could not snapshot %s before the write: %s",
+                               endpoint, e)
+
         started = time.perf_counter()
 
         def audit(status, http_status=None, error=None):
@@ -556,7 +614,8 @@ class CSuiteClient:
                     # A 200 means the request was accepted, not that the
                     # data was stored. Read it back before calling it done.
                     if audited and self.verify_writes:
-                        result = self._verify_write(endpoint, data, result)
+                        result = self._verify_write(endpoint, data, result,
+                                                    modified_before)
                     return result
                 else:
                     errors = json_response.get("errors", [])

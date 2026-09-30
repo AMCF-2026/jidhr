@@ -291,3 +291,66 @@ def test_compare_still_returns_only_real_drops():
     stored = display(primary_phone_number="703-555-0100", primary_email=None)
     assert compare({"phone_number": "7035550100"}, stored) == {}
     assert "email" in compare({"email": "a@b.invalid"}, stored)
+
+
+# ---------------------------------------------------------------------------
+# An untouched record stored nothing, whatever the fields say
+# ---------------------------------------------------------------------------
+
+def test_an_unchanged_modified_ts_means_nothing_was_stored():
+    """2026-09-30: profile/edit on 21626 was sent four unrecognised address
+    fields. 200, success: true, 0 of 81 fields changed, modified_ts
+    byte-identical. The success flag said nothing; modified_ts said it all."""
+    from sync.readback import NothingStored
+
+    stamp = "2026-09-30 16:13:49.24411"
+    read = reader(display(modified_ts=stamp))
+    with pytest.raises(NothingStored) as caught:
+        verify(read, "profile/edit", {"primary_city": "Fairfax"}, 21626,
+               modified_before=stamp)
+    assert "did NOT touch the record" in str(caught.value)
+    assert "modified_ts is unchanged" in str(caught.value)
+
+
+def test_nothing_stored_beats_a_field_comparison_that_looks_fine():
+    """The stronger statement wins.
+
+    A record CSuite did not write to cannot have stored anything, however
+    the per-field guess comes out — and the comparison can come out clean,
+    because a field already holding the sent value looks stored.
+    """
+    from sync.readback import NothingStored
+
+    stamp = "2026-09-30 16:13:49.24411"
+    read = reader(display(modified_ts=stamp, website="https://kept.invalid"))
+    with pytest.raises(NothingStored):
+        verify(read, "profile/edit", {"website": "https://kept.invalid"},
+               21626, modified_before=stamp)
+
+
+def test_a_moved_modified_ts_lets_the_field_check_decide():
+    read = reader(display(modified_ts="2026-09-30 17:00:00",
+                          website="https://example.invalid"))
+    assert verify(read, "profile/edit", {"website": "https://example.invalid"},
+                  21626, modified_before="2026-09-30 16:13:49.24411")
+
+
+def test_a_moved_modified_ts_still_catches_a_real_drop():
+    read = reader(display(modified_ts="2026-09-30 17:00:00"))
+    with pytest.raises(FieldDropped):
+        verify(read, "profile/edit", {"website": "https://example.invalid"},
+               21626, modified_before="2026-09-30 16:13:49.24411")
+
+
+def test_no_before_state_means_the_check_is_skipped_not_passed():
+    """A create has no before-state. None must not read as "unchanged"."""
+    read = reader(display(modified_ts="2026-09-30 17:00:00",
+                          primary_email="a@b.invalid"))
+    assert verify(read, "profile/create/individual",
+                  {"email": "a@b.invalid"}, 21626)
+
+
+def test_nothing_stored_is_a_field_dropped_so_callers_still_stop():
+    from sync.readback import NothingStored
+
+    assert issubclass(NothingStored, FieldDropped)

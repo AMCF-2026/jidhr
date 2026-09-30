@@ -68,6 +68,36 @@ class FieldDropped(RuntimeError):
             "request was accepted, not that the data was kept.")
 
 
+class NothingStored(FieldDropped):
+    """CSuite answered success and did not touch the record at all.
+
+    Measured 2026-09-30: `profile/edit` on 21626 was sent four address
+    fields it does not recognise. It answered HTTP 200 with
+    `success: true`, changed **0 of 81 fields**, and left `modified_ts`
+    byte-identical.
+
+    So `modified_ts` is the one part of an edit's result that carries
+    information the success flag does not. It is checked on its own, ahead
+    of the per-field comparison, because it is the stronger statement: a
+    record CSuite did not write to cannot have stored anything, whatever a
+    field-by-field guess concludes.
+
+    A subclass of FieldDropped so callers that stop on a failed check keep
+    stopping.
+    """
+
+    def __init__(self, endpoint: str = "", record_id=None,
+                 modified_ts=None):
+        self.modified_ts = modified_ts
+        super().__init__({"<nothing stored>": (None, modified_ts)},
+                         endpoint, record_id)
+        self.args = (
+            f"CSuite accepted {endpoint or 'the edit'} for record "
+            f"{record_id} with success=true and did NOT touch the record: "
+            f"modified_ts is unchanged at {modified_ts!r}. Nothing was "
+            "stored, whichever fields were sent.",)
+
+
 class ReadBackUnavailable(FieldDropped):
     """The record could not be read, so nothing is known either way.
 
@@ -196,11 +226,17 @@ def compare(sent: dict, stored: dict, ignore=DERIVED_FIELDS) -> dict:
 
 
 def verify(read, endpoint: str, sent: dict, record_id, id_field="profile_id",
-           display_endpoint="profile/display"):
+           display_endpoint="profile/display", modified_before=None):
     """Read the record back and raise FieldDropped if anything was lost.
 
     `read(endpoint, body) -> response` is injected so this stays testable
     without a network, and so the caller keeps control of pacing.
+
+    `modified_before` is the record's `modified_ts` as it stood before the
+    write. When it is given and has not moved, the write stored nothing and
+    `NothingStored` is raised — ahead of the field comparison, because it
+    is the stronger evidence. It is optional because a create has no
+    before-state to compare against.
 
     Returns the stored record on success.
     """
@@ -211,6 +247,13 @@ def verify(read, endpoint: str, sent: dict, record_id, id_field="profile_id",
     if not isinstance(data, dict):
         raise ReadBackUnavailable(
             {"<read-back failed>": (None, None)}, endpoint, record_id)
+
+    if modified_before is not None and \
+            _as_text(data.get("modified_ts")) == _as_text(modified_before):
+        logger.warning("CSuite %s on %s returned success and did not touch "
+                       "the record: modified_ts unchanged at %s",
+                       endpoint, record_id, modified_before)
+        raise NothingStored(endpoint, record_id, data.get("modified_ts"))
 
     dropped, reformatted = compare_detail(sent, data)
     if reformatted:

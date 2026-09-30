@@ -300,3 +300,43 @@ def test_nothing_is_both_proven_wrong_and_allowed():
     from clients.csuite import KNOWN_INVALID_INPUT_FIELDS
 
     assert not (set(KNOWN_INVALID_INPUT_FIELDS) & CONFIRMED_INPUT_FIELDS)
+
+
+# ---------------------------------------------------------------------------
+# The client's before-snapshot
+# ---------------------------------------------------------------------------
+
+def test_an_edit_that_touches_nothing_is_reported_as_nothing_stored():
+    stamp = "2026-09-30 16:13:49.24411"
+    client = Client({"profile/display": {
+        "success": True, "data": display(modified_ts=stamp)}})
+    result = client._verify_write(
+        "profile/edit", {"profile_id": 21626, "primary_city": "Fairfax"},
+        {"success": True, "data": None}, modified_before=stamp)
+
+    assert result["nothing_stored"] is True
+    assert result["verified"] is False
+    assert "primary_city" in result["fields_dropped"]
+    assert "profile_id" not in result["fields_dropped"], "not a sent field"
+
+
+def test_only_edits_are_snapshotted_before_the_write():
+    """A create has no before-state, so reading one would buy nothing."""
+    assert "profile/edit" in Client.SNAPSHOT_BEFORE
+    assert "profile/create/individual" not in Client.SNAPSHOT_BEFORE
+
+
+def test_the_snapshot_reads_the_record_by_its_id():
+    stamp = "2026-09-30 16:13:49.24411"
+    client = Client({"profile/display": {
+        "success": True, "data": display(modified_ts=stamp)}})
+    assert client._modified_before("profile/edit", {"profile_id": 21626}) == stamp
+    assert client.sent == [("profile/display", {"profile_id": 21626})]
+
+
+def test_no_snapshot_without_an_id_and_none_for_a_create():
+    client = Client()
+    assert client._modified_before("profile/edit", {}) is None
+    assert client._modified_before("profile/create/individual",
+                                   {"profile_id": 1}) is None
+    assert client.sent == []
