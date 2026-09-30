@@ -65,6 +65,16 @@ class FieldDropped(RuntimeError):
             "request was accepted, not that the data was kept.")
 
 
+class ReadBackUnavailable(FieldDropped):
+    """The record could not be read, so nothing is known either way.
+
+    A subclass of FieldDropped so a caller that stops on a failed check
+    keeps stopping — the sandbox path does, and should. It is separate so a
+    caller that reports the result can say "not checked" instead of "field
+    lost", which are different claims and only one of them is true.
+    """
+
+
 def normalise_email(value):
     """Trimmed and lowercased, or None.
 
@@ -149,7 +159,7 @@ def verify(read, endpoint: str, sent: dict, record_id, id_field="profile_id",
     if isinstance(data, list) and data:
         data = data[0]
     if not isinstance(data, dict):
-        raise FieldDropped(
+        raise ReadBackUnavailable(
             {"<read-back failed>": (None, None)}, endpoint, record_id)
 
     dropped = compare(sent, data)

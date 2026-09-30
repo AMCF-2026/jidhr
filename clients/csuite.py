@@ -147,6 +147,84 @@ def classify_status(status_code, exception=None) -> str:
     return OUTCOME_OK
 
 
+# =============================================================================
+# CONFIRMED INPUT FIELD NAMES
+# =============================================================================
+# CSuite validates the fields it recognises and discards the rest without
+# comment. A create with an unrecognised field returns HTTP 200 and a
+# profile_id, and the value is simply gone — measured 2026-09-30, when
+# `primary_email` was sent to profile/create/individual and read back as
+# None. The same happens on reads, where an unrecognised profile/list
+# filter returned all 18,797 rows.
+#
+# So an input name is not confirmed because it appears in profile/display,
+# and not because it reads like the field it sets. `primary_email` is a
+# valid DISPLAY name and an invalid INPUT name: CSuite's input and output
+# vocabularies are two different lists. A name goes below only after a
+# value sent under it has been read back off the record.
+#
+# Everything reaching a write method through **kwargs is checked against
+# this set BEFORE the request is built, because after the request there is
+# nothing left to check: the response to a dropped field is identical to
+# the response to a stored one.
+CONFIRMED_INPUT_FIELDS = frozenset({
+    "first_name",   # profile/create/individual -> first_name
+    "last_name",    # profile/create/individual -> last_name
+    "email",        # profile/create/individual, profile/edit -> primary_email
+    "website",      # profile/edit -> website
+    "env",          # every endpoint; supplied by _build_payload
+    "profile_id",   # profile/edit, profile/display
+})
+
+# Recognised by CSuite but NOT yet confirmed to store a value, so
+# deliberately absent from the set above.
+#
+# 2026-09-30: profile/create/individual was sent phone_number="555-0100"
+# and CSuite answered HTTP 400, `phone_number: phone [5550100] is not
+# valid` — it parsed the field, validated it, and rejected the whole
+# create. That is the opposite of the `primary_email` case, which returned
+# 200 and dropped the value. So CSuite VALIDATES the names it recognises
+# and SILENTLY DROPS the ones it does not, which makes a deliberately
+# invalid value the cheapest way to test a candidate name: a 400 naming
+# the field proves the name is recognised, and no record is created.
+#
+# phone_number stays out of CONFIRMED_INPUT_FIELDS because "recognised" is
+# not "stored" — the create was rejected, so nothing was ever read back.
+RECOGNISED_UNCONFIRMED_FIELDS = frozenset({
+    "phone_number",  # profile/create/individual, validated -> 400
+})
+
+
+class UnconfirmedField(ValueError):
+    """A write was asked to send a field name no read-back has confirmed.
+
+    Raised before the request is built. Sending it instead would be the
+    worse outcome: CSuite would accept the call, drop the field, and
+    return the same 200 it returns for a field that was stored.
+    """
+
+    def __init__(self, unknown, endpoint: str = ""):
+        self.unknown = sorted(unknown)
+        self.endpoint = endpoint
+        names = ", ".join(repr(n) for n in self.unknown)
+        super().__init__(
+            f"refusing {endpoint or 'this CSuite write'}: {names} "
+            f"{'is' if len(self.unknown) == 1 else 'are'} not a confirmed "
+            "CSuite input name. CSuite would accept the call, silently drop "
+            "the field and return 200. Confirm the name with a sandbox write "
+            "and a read-back, then add it to CONFIRMED_INPUT_FIELDS. "
+            "Nothing was sent.")
+
+
+def check_input_fields(names, endpoint: str = "") -> None:
+    """Raise UnconfirmedField unless every name has been confirmed."""
+    unknown = [n for n in (names or ()) if n not in CONFIRMED_INPUT_FIELDS]
+    if unknown:
+        logger.error("CSuite %s: unconfirmed field name(s) %s — nothing sent",
+                     endpoint or "(write)", sorted(unknown))
+        raise UnconfirmedField(unknown, endpoint)
+
+
 class CSuiteEnvMismatch(RuntimeError):
     """The host, the body `env`, and the credentials do not agree.
 
@@ -281,11 +359,85 @@ class CSuiteClient:
             payload.update(data)
         return payload
     
-    # Read-back verification on the PRODUCTION path, off by default.
-    # On rather than off is the right default and not this task's change
-    # to make: turning it on adds a profile/display to every write, which
-    # is a rate-limit question as well as a correctness one.
-    verify_writes = False
+    # Read-back verification on the PRODUCTION path, ON by default.
+    #
+    # It costs one extra profile/display per profile write. That is the
+    # price of knowing whether the write did anything: CSuite returns the
+    # same 200 and the same profile_id whether it stored a field or
+    # discarded it, so without the read-back a lost field is invisible
+    # forever. Only profile writes are covered — see READBACK_TARGETS.
+    #
+    # A drop does NOT raise here. It annotates the response and logs at
+    # ERROR. Raising after a create that succeeded would tell the caller
+    # the write failed when a record now exists, and CSuite has no
+    # idempotency key, so the natural response to that — try again — makes
+    # a second profile. A wrong record is recoverable; a duplicate pair is
+    # worse. The sandbox path (sync/sandbox_writes.py) still raises,
+    # because there the whole point is to stop.
+    verify_writes = True
+
+    # Which write endpoints can be read back, and how. An endpoint absent
+    # from this map is not verified — not because it is safe, but because
+    # nothing here knows how to look it up.
+    READBACK_TARGETS = {
+        "profile/create/individual": ("profile/display", "profile_id"),
+        "profile/create/org": ("profile/display", "profile_id"),
+        "profile/create/household": ("profile/display", "profile_id"),
+        "profile/edit": ("profile/display", "profile_id"),
+    }
+
+    def _verify_write(self, endpoint: str, sent: dict, response: dict) -> dict:
+        """Read the record back; annotate `response` if anything was lost.
+
+        Returns `response`, with `verified` set, and `fields_dropped` added
+        when CSuite kept less than it was sent.
+        """
+        target = self.READBACK_TARGETS.get(str(endpoint or "").strip("/"))
+        if not target:
+            return response
+        display_endpoint, id_field = target
+
+        record_id = None
+        payload = response.get("data")
+        if isinstance(payload, dict):
+            record_id = payload.get(id_field)
+        if record_id is None:
+            record_id = (sent or {}).get(id_field)
+        if record_id is None:
+            logger.warning("no %s to read back after %s; write not verified",
+                           id_field, endpoint)
+            response["verified"] = None
+            return response
+
+        # Imported here, not at module scope: sync.readback is a pure
+        # module today and this keeps clients.csuite importable on its own
+        # if that ever stops being true.
+        from sync.readback import FieldDropped, ReadBackUnavailable, verify
+
+        try:
+            verify(self._request, endpoint, sent or {}, record_id,
+                   id_field=id_field, display_endpoint=display_endpoint)
+        except ReadBackUnavailable as e:
+            # "Not checked" is not "field lost". Caught before FieldDropped
+            # because it is a subclass of it.
+            logger.error("could not read %s %s back after CSuite %s: %s",
+                         id_field, record_id, endpoint, e)
+            response["verified"] = None
+            return response
+        except FieldDropped as dropped:
+            logger.error("CSuite %s on %s %s DID NOT STORE: %s", endpoint,
+                         id_field, record_id, sorted(dropped.dropped))
+            response["verified"] = False
+            response["fields_dropped"] = dropped.dropped
+            return response
+        except Exception as e:  # the read-back itself failed
+            logger.error("read-back after CSuite %s on %s failed: %s",
+                         endpoint, record_id, e)
+            response["verified"] = None
+            return response
+
+        response["verified"] = True
+        return response
 
     def _request(self, endpoint: str, data: dict = None) -> dict:
         """Make authenticated POST request to CSuite API
@@ -364,13 +516,18 @@ class CSuiteClient:
 
                 if json_response.get("success") == 1:
                     audit("success", status_code)
-                    return {
+                    result = {
                         "success": True,
                         "data": json_response.get("data"),
                         "messages": json_response.get("messages", []),
                         "http_status": status_code,
                         "outcome": OUTCOME_OK,
                     }
+                    # A 200 means the request was accepted, not that the
+                    # data was stored. Read it back before calling it done.
+                    if audited and self.verify_writes:
+                        result = self._verify_write(endpoint, data, result)
+                    return result
                 else:
                     errors = json_response.get("errors", [])
                     logger.warning(f"CSuite API error: {errors}")
@@ -517,6 +674,12 @@ class CSuiteClient:
             data["primary_phone_number"] = phone
         if address:
             data["primary_address_string"] = address
+        # Checked before the payload is built, so an unconfirmed name is a
+        # refusal rather than a silent drop. The three named fields above
+        # are the method's own contract and are NOT gated here: two of them
+        # are known-wrong and fixing them is a separate change. With
+        # verify_writes on, a drop is now reported after the fact.
+        check_input_fields(kwargs, "profile/create/individual")
         data.update(kwargs)
         
         logger.info(f"Creating individual profile: {first_name} {last_name}")
@@ -542,6 +705,7 @@ class CSuiteClient:
             data["primary_email"] = email
         if phone:
             data["primary_phone_number"] = phone
+        check_input_fields(kwargs, "profile/create/org")
         data.update(kwargs)
         
         logger.info(f"Creating org profile: {organization}")
@@ -558,6 +722,7 @@ class CSuiteClient:
             dict with 'data': {'profile_id': int} on success
         """
         data = {"household": household}
+        check_input_fields(kwargs, "profile/create/household")
         data.update(kwargs)
         
         logger.info(f"Creating household profile: {household}")
@@ -573,6 +738,7 @@ class CSuiteClient:
         Returns:
             dict with success status
         """
+        check_input_fields(kwargs, "profile/edit")
         data = {"profile_id": profile_id, **kwargs}
         logger.info(f"Editing profile {profile_id}: {list(kwargs.keys())}")
         return self._request("profile/edit", data)
@@ -620,6 +786,7 @@ class CSuiteClient:
             "fgroup_id": fgroup_id,
             "cash_account_id": cash_account_id or Config.DEFAULT_CASH_ACCOUNT_ID,
         }
+        check_input_fields(kwargs, "funit/create")
         data.update(kwargs)
         
         logger.info(f"Creating fund: {name} (group: {fgroup_id})")
@@ -888,6 +1055,7 @@ class CSuiteClient:
             event_id: Parent event ID (required)
             **kwargs: event_date, start_time, location, event_description, etc.
         """
+        check_input_fields(kwargs, "event/create/eventdate")
         data = {"event_id": event_id, **kwargs}
         logger.info(f"Creating event date for event {event_id}")
         return self._request("event/create/eventdate", data)
@@ -899,6 +1067,7 @@ class CSuiteClient:
             event_date_id: Event date ID (required)
             **kwargs: Fields to update
         """
+        check_input_fields(kwargs, "event/edit/eventdate")
         data = {"event_date_id": event_date_id, **kwargs}
         return self._request("event/edit/eventdate", data)
     
@@ -930,6 +1099,12 @@ class CSuiteClient:
             data["due_date"] = due_date
         if description:
             data["task_description"] = description
+        # NOT gated by check_input_fields. This is task/create, outside the
+        # profile/fund/event surface, and no task input name has been
+        # confirmed by a read-back yet — gating it against
+        # CONFIRMED_INPUT_FIELDS would refuse `name` and `employee_id` and
+        # break the method. It carries the same silent-drop risk; confirming
+        # task field names is its own sandbox task.
         data.update(kwargs)
         
         logger.info(f"Creating CSuite task: {name}")

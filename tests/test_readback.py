@@ -158,6 +158,19 @@ def test_a_failed_read_back_is_a_failure_not_a_pass():
         verify(broken, "profile/edit", {"website": "x"}, 21625)
 
 
+def test_an_unreadable_record_is_its_own_kind_of_failure():
+    """Still a FieldDropped, so anything that stops keeps stopping — but
+    nameable, so a report can say "not checked" rather than "lost"."""
+    from sync.readback import ReadBackUnavailable
+
+    def broken(endpoint, body):
+        return {"success": False, "error": "boom"}
+
+    with pytest.raises(ReadBackUnavailable):
+        verify(broken, "profile/edit", {"website": "x"}, 21625)
+    assert issubclass(ReadBackUnavailable, FieldDropped)
+
+
 def test_a_list_shaped_display_is_unwrapped():
     def read(endpoint, body):
         return {"success": True, "data": [display(first_name="HUBSYNC")]}
@@ -218,6 +231,7 @@ def test_verification_is_off_unless_a_reader_is_given():
     assert result["success"] is True
 
 
-def test_the_production_flag_is_off_by_default():
+def test_the_production_flag_is_on_by_default():
+    """Flipped 2026-09-30. A dropped field is invisible without it."""
     from clients.csuite import CSuiteClient
-    assert CSuiteClient.verify_writes is False
+    assert CSuiteClient.verify_writes is True
