@@ -552,3 +552,49 @@ Three corollaries, each paid for:
   request failed as a whole and no key was shown to be wrong.
   `KNOWN_INVALID_INPUT_FIELDS` holds measurements, and an unproven entry
   in it would cost more than the empty space does.
+
+## 2026-10-01 — An inquiry creates a profile. A fund waits for the commitment.
+
+An inquiry form submission creates a CSuite **profile only**. A fund is
+opened when the donor commits, not when they enquire.
+
+An enquiry is a conversation. A fund in the ledger for a conversation that
+went nowhere is a finance record somebody has to explain, reconcile and
+eventually close, and the DAF and Endowment inquiry forms are the top of a
+funnel rather than the bottom. The profile is different: a person who
+enquired is a person worth having on file either way, and a duplicate
+profile is a nuisance where a stray fund is an accounting entry.
+
+`CSUITE_DAF_FUND_CREATE_ENABLED` carries this, default off, parsed the same
+fail-closed way as `CSUITE_WRITE_BUDGET` — only the exact string `"true"`
+turns it on. With it off the workflow builds **no fund payload at all**, so
+there is no call to fail and nothing to report as failed; the reply says the
+fund is not opened yet and why. `funit/create` and its read-back are kept
+intact behind the flag, because the commitment stage will need both.
+
+Three consequences worth writing down:
+
+- **An inquiry costs exactly one CSuite write.** `CSUITE_WRITE_BUDGET=1` is
+  now the right size for one run, where it used to be 2.
+- **`csuite_fund_id` is omitted from the HubSpot PATCH, never sent as null.**
+  HubSpot reads an explicit empty value as "clear this property", so a null
+  would wipe a fund id the commitment stage had set.
+- **The confirmation no longer says "DAF Created"** over a run that opened no
+  fund. A profile is not a DAF.
+
+### The same day, a second rule: a run that creates nothing says so
+
+A write refused by the budget raises inside `_request` **before**
+`reserve_write`, which is correct — nothing was sent, so nothing should be
+audited as sent. But it meant nothing recorded that the submission had been
+seen at all, and `_initiate_workflow` only ever reads `submissions[0]`. One
+newer submission and the refused one was out of reach of the workflow, with
+no trace anywhere. The reply, meanwhile, read **"⚠️ DAF Created (with
+warnings)"** over a run that had created nothing.
+
+So: a run that creates nothing reports **NOT Created**, and a submission it
+could not process is recorded by **HubSpot form id and submission id** — in
+`write_audit`, with status `skipped`, carrying no donor data, since HubSpot
+already holds the details. If even that cannot be stored the reply says so in
+as many words and tells the reader to find it by hand. A failure that is
+silent about what happens next is the failure that gets assumed handled.

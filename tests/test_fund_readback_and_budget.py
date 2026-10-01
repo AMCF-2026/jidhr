@@ -181,6 +181,9 @@ def test_the_fund_warning_reaches_the_confirmation_text(monkeypatch):
             return {"results": []}
 
     monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
+    # The fund path is off by default from 2026-10-01; this test is about the
+    # fund read-back, so it arms the commitment-stage flag explicitly.
+    monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", True)
     state = {"active": True, "workflow_type": "daf", "type": "daf",
              "step": "confirm",
              "submission_data": {"first_name": "A", "last_name": "B",

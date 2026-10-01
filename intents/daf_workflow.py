@@ -15,6 +15,7 @@ Workflow steps:
 """
 
 import logging
+from clients.audit import AuditUnavailable, record_write
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -245,11 +246,14 @@ def _initiate_workflow(query: str, state: dict, hubspot) -> str:
         )
 
     # Store in workflow state
+    form_id = (Config.DAF_INQUIRY_FORM_ID if wf_type == "daf"
+               else Config.ENDOWMENT_INQUIRY_FORM_ID)
     state.update({
         "active": True,
         "workflow_type": "daf",
         "type": wf_type,
         "step": "confirm",
+        "form_id": form_id,
         "submission_data": parsed,
         "profile_id": None,
         "funit_id": None,
@@ -356,6 +360,61 @@ def _log_skipped_create(data: dict, hubspot) -> str:
     return contact_id
 
 
+def record_unprocessed_submission(state: dict, reason: str) -> bool:
+    """Record WHICH submission could not be processed, so it can be replayed.
+
+    Why this exists
+    ---------------
+    2026-10-01: with the write budget spent, a second inquiry's
+    `profile/create/individual` was refused inside `_request` — before
+    `reserve_write`, so correctly leaving **no audit row**, since nothing was
+    sent. But nothing else recorded it either. The submission existed only in
+    the chat session's workflow state, and `_initiate_workflow` always reads
+    `submissions[0]`, the most recent. One newer submission and the refused
+    one is unreachable: not lost from HubSpot, but no longer findable by this
+    workflow, with nothing anywhere saying it had been seen.
+
+    What is stored, and what is NOT
+    ------------------------------
+    The HubSpot **form id** and the **submission id** (its `conversionId`, or
+    its `submittedAt` when HubSpot sends no conversionId). Those two locate
+    the submission in HubSpot, which already holds the donor's details.
+
+    **No name, email, phone or address is stored.** The row goes in
+    `write_audit`, an existing table — no new store, no migration — and
+    `payload_meta` keeps key names and id values only.
+
+    Returns True when the row landed. Never raises: this runs on a path that
+    has already failed, and a bookkeeping failure must not replace the real
+    error. It returns False instead, and the caller says so out loud.
+    """
+    submission_id = (state.get("submission_data") or {}).get("submission_id")
+    form_id = state.get("form_id")
+    if not (submission_id or form_id):
+        logger.error("a submission could not be processed (%s) and carries no "
+                     "identifier, so it cannot be replayed", reason)
+        return False
+
+    try:
+        record_write(
+            "csuite", "POST", "profile/create/individual",
+            target_id=submission_id or None,
+            payload={"hubspot_form_id": form_id,
+                     "hubspot_submission_id": submission_id},
+            status="skipped",
+            error=f"inquiry not processed, replayable from HubSpot: {reason}",
+            duration_ms=0)
+    except AuditUnavailable as e:
+        logger.error("could not record unprocessed submission %s on form %s: "
+                     "%s", submission_id, form_id, e)
+        return False
+
+    logger.warning("inquiry NOT processed and recorded for replay: "
+                   "form=%s submission=%s reason=%s",
+                   form_id, submission_id, reason)
+    return True
+
+
 def _step_create(query: str, state: dict, hubspot, csuite) -> str:
     """
     After user confirms, execute the full creation pipeline:
@@ -398,6 +457,12 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         # Set when funit/create succeeded but the fund did not read back
         # holding what was sent.
         "fund_warning": None,
+        # Set when no fund was attempted because an inquiry creates a profile
+        # only. Distinct from fund_created being False after a real failure.
+        "fund_deferred": False,
+        # True when a failed run was recorded for replay, False when even that
+        # could not be stored. None when the run succeeded.
+        "replay_recorded": None,
         # Set when the submission carried an address. CSuite's address input
         # name is unknown — nine candidates eliminated by sandbox write and
         # read-back — so it is not sent, and it is named to a human instead
@@ -473,8 +538,20 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
             results["errors"].append(f"Profile creation: {e}")
             logger.error(f"Profile creation error: {e}")
 
-    # --- 2. Create CSuite fund ---
-    if results["profile_created"]:
+        if not results["profile_created"]:
+            # Nothing was created, so the submission still needs processing.
+            # Record which one, so it is replayable after a newer submission
+            # has pushed it out of reach of submissions[0].
+            results["replay_recorded"] = record_unprocessed_submission(
+                state, "; ".join(results["errors"]) or "profile create failed")
+
+    # --- 2. Create CSuite fund — OFF by default ---
+    #
+    # Decision 2026-10-01: an inquiry creates a profile only. A fund is opened
+    # when the donor commits. With the flag off nothing is built and nothing is
+    # sent — not even a payload — so there is no fund call to fail and nothing
+    # to report as failed.
+    if results["profile_created"] and Config.CSUITE_DAF_FUND_CREATE_ENABLED:
         fund_name = data.get("fund_name") or f"{data.get('last_name', 'New')} Family Fund"
         fgroup_id = Config.FUND_GROUP_DAF if wf_type == "daf" else Config.FUND_GROUP_ENDOWMENT
 
@@ -501,6 +578,11 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         except Exception as e:
             results["errors"].append(f"Fund creation: {e}")
             logger.error(f"Fund creation error: {e}")
+    elif results["profile_created"]:
+        # Deliberate, not a failure. Recorded so the reply can say so.
+        results["fund_deferred"] = True
+        logger.info("fund creation deferred: an inquiry creates a profile "
+                    "only (CSUITE_DAF_FUND_CREATE_ENABLED is off)")
 
     # --- 3. Update (or create) HubSpot contact with CSuite IDs ---
     if results["profile_created"] and data.get("email"):
@@ -509,6 +591,10 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
             update_props = {
                 "csuite_profile_id": str(state["profile_id"]),
             }
+            # csuite_fund_id is OMITTED when no fund was created, never sent
+            # as null or "". HubSpot treats an explicit empty value as an
+            # instruction to clear the property, so a null here would wipe a
+            # fund id a later commitment-stage run had set.
             if state.get("funit_id"):
                 update_props["csuite_fund_id"] = str(state["funit_id"])
 
@@ -657,6 +743,11 @@ def submitted_address(data: dict) -> str:
 def _parse_submission(submission: dict) -> dict:
     """Parse a HubSpot form submission into a normalised dict."""
     parsed = {
+        # Identifiers, not donor data. They are what makes a submission
+        # replayable from HubSpot after a run that could not complete —
+        # see record_unprocessed_submission.
+        "submission_id": str(submission.get("conversionId")
+                             or submission.get("submittedAt") or ""),
         "first_name": "",
         "last_name": "",
         "email": "",
@@ -696,6 +787,19 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
     # 200 CSuite returns for a field it discarded.
     if results.get("profile_skipped"):
         lines.append(f"⏸️ **{type_label} Not Created**")
+    elif not results["profile_created"]:
+        # Nothing was created. "Created (with warnings)" over a run that made
+        # no record is the same overstatement as "Failed to create" over a run
+        # that sent nothing — measured 2026-10-01, when a budget-refused
+        # inquiry reported "⚠️ DAF Created (with warnings)".
+        lines.append(f"❌ **{type_label} NOT Created**")
+    elif results.get("fund_deferred"):
+        # "DAF Created" over a run that opened no fund is the same overstatement
+        # as "Failed to create" over a run that sent nothing. The profile was
+        # created; the DAF was not.
+        suffix = (" (with warnings)" if results["errors"]
+                  or results.get("ticket_close_failed") else "")
+        lines.append(f"✅ **{type_label} Inquiry — Profile Created**{suffix}")
     elif results["errors"] or results.get("ticket_close_failed"):
         lines.append(f"⚠️ **{type_label} Created (with warnings)**")
     else:
@@ -725,9 +829,25 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
             "CSUITE_DAF_CREATE_ENABLED once the field names are fixed.")
     else:
         lines.append(f"❌ Profile: Failed to create")
+        # Say whether the submission can still be picked up. A reply that
+        # reports a failure without saying what happens to the donor's form is
+        # a reply that invites someone to assume it was handled.
+        if results.get("replay_recorded"):
+            lines.append(
+                "📥 The submission is recorded and can be re-processed from "
+                "HubSpot — nothing was lost. Say *\"process DAF inquiry\"* "
+                "again once the cause is cleared.")
+        elif results.get("replay_recorded") is False:
+            lines.append(
+                "🚨 The submission could NOT be recorded for replay. Find it "
+                "in HubSpot by hand before another submission arrives on the "
+                "same form.")
 
     # Fund
-    if results["fund_created"]:
+    if results.get("fund_deferred"):
+        lines.append("💰 Fund: not opened yet — a fund is created when the "
+                     "donor commits, not at inquiry.")
+    elif results["fund_created"]:
         fund_name = data.get("fund_name") or f"{data.get('last_name', 'New')} Family Fund"
         fund_link = Config.CSUITE_FUND_URL.format(funit_id=state['funit_id'])
         lines.append(f"💰 Fund: {fund_name} — [CSuite]({fund_link})")
@@ -735,6 +855,7 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
             lines.append(results["fund_warning"])
     elif results["profile_created"]:
         lines.append("❌ Fund: Failed to create")
+    # No profile means no fund was ever in question, so no fund line at all.
 
     # HubSpot
     hs_contact_id = state.get("hubspot_contact_id")

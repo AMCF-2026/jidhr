@@ -138,6 +138,22 @@ class Config:
     CSUITE_WRITE_BUDGET = _int_or_zero(
         os.environ.get('CSUITE_WRITE_BUDGET', '0'))
 
+    # Whether an inquiry also OPENS A FUND. Off, and separate from
+    # CSUITE_DAF_CREATE_ENABLED on purpose.
+    #
+    # Decision 2026-10-01: an inquiry form submission creates a CSuite profile
+    # only. A fund is opened when the donor commits, not when they enquire —
+    # an enquiry is a conversation, and a fund in the ledger for a
+    # conversation that goes nowhere is a finance record somebody has to
+    # explain. The funit/create path and its read-back are kept intact behind
+    # this flag for the commitment stage.
+    #
+    # Same fail-closed parsing as CSUITE_WRITE_BUDGET: only the exact string
+    # "true" enables it.
+    CSUITE_DAF_FUND_CREATE_ENABLED = (
+        os.environ.get('CSUITE_DAF_FUND_CREATE_ENABLED', 'False')
+        .strip().lower() == 'true')
+
     CSUITE_DAF_CREATE_ENABLED = (
         os.environ.get('CSUITE_DAF_CREATE_ENABLED', 'False')
         .strip().lower() == 'true')
