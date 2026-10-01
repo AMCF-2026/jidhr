@@ -154,17 +154,26 @@ def test_the_org_create_is_marked_unverified():
     assert "never been called" in doc
 
 
-def test_the_single_dotted_key_is_recorded_as_dropped():
-    """2026-10-01, profile/edit on 21626, `address.city` ALONE: HTTP 200,
-    success: true, 0 of 81 fields changed, modified_ts unchanged.
+def test_the_dotted_address_keys_are_confirmed_together():
+    """2026-10-01, profile/edit on 21626: all four sent together, all four
+    stored, and CSuite derived primary_citystatezip, primary_address_string
+    and primary_country by itself.
 
-    Which also settles the 500 of 2026-09-30: one dotted key does not fault,
-    so the fault came from nine conflicting keys, not from the dot.
+    Sandbox-9 sent address.city ALONE against a profile with no address and
+    got nothing stored. That looked like a refutation and was a dependency:
+    one key cannot create an address row that does not exist yet.
     """
-    assert KNOWN_INVALID_INPUT_FIELDS["address.city"].startswith("dropped")
-    with pytest.raises(UnconfirmedField) as caught:
-        Client().edit_profile(21626, **{"address.city": "Fairfax"})
-    assert "Proven not to work" in str(caught.value)
+    from clients.csuite import INCONCLUSIVE_PROBES
+
+    for key in ("address.address", "address.city", "address.state",
+                "address.zipcode"):
+        assert key in CONFIRMED_INPUT_FIELDS
+        assert key not in KNOWN_INVALID_INPUT_FIELDS
+    assert "RESOLVED" in INCONCLUSIVE_PROBES["address.city"]
+
+    client = Client()
+    client.edit_profile(21626, **{"address.city": "Fairfax"})
+    assert client.payload["address.city"] == "Fairfax"
 
 
 @pytest.mark.parametrize("shape", ["41 Test Way, Fairfax, VA 22031",
@@ -178,11 +187,13 @@ def test_the_address_key_is_wrong_whatever_shape_it_takes(shape):
         Client().edit_profile(21626, address=shape)
 
 
-def test_the_address_refusal_names_what_has_been_eliminated():
-    """So the next person does not re-spend a capped write on a dead name."""
+def test_the_address_refusal_separates_eliminated_from_pending():
+    """So the next person re-spends a capped write on neither."""
     with pytest.raises(ValueError) as caught:
         Client().create_individual_profile("A", "B", address="1 Test Way")
     message = str(caught.value)
-    for spent in ("primary_address_string", "primary_city", "address.city",
-                  "nested"):
-        assert spent in message
+
+    assert "primary_*" in message                 # eliminated
+    assert "plain string" in message              # eliminated
+    assert "PENDING, not dead" in message         # documented, untested
+    assert "sandbox-12" in message

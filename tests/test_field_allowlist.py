@@ -62,7 +62,9 @@ def test_the_allowlist_holds_only_read_back_confirmed_names():
     """
     assert set(CONFIRMED_INPUT_FIELDS) == {
         "first_name", "last_name", "email", "website", "phone_number",
-        "env", "profile_id"}
+        "env", "profile_id",
+        # 2026-10-01, profile/edit on 21626, all four together
+        "address.address", "address.city", "address.state", "address.zipcode"}
 
 
 @pytest.mark.parametrize("field", sorted(CONFIRMED_INPUT_FIELDS))

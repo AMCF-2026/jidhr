@@ -77,6 +77,96 @@ class WriteBudget:
         return self.used
 
 
+class BudgetAuditMismatch(RuntimeError):
+    """The writes counted and the writes recorded do not agree."""
+
+
+def audit_now(query=None):
+    """`now()` as the AUDIT DATABASE sees it. Use this to open a window.
+
+    `write_audit.created_at` is UTC; a developer machine is not. Opening the
+    window with a local `datetime.now()` on 2026-10-01 set it four hours in
+    the past and swept in eight rows from three earlier tasks, so a run that
+    had reconciled perfectly reported a breached cap.
+
+    A false alarm on a cap is not harmless: the next person to see one has
+    every reason to assume this one was false too. So the clock comes from
+    the same place the rows do.
+    """
+    if query is None:
+        from clients.database import execute_query as query
+    rows = query("SELECT now() AS db_now") or []
+    if not rows:
+        raise BudgetAuditMismatch(
+            "could not read the audit database clock, so no write window can "
+            "be opened and no reconciliation can be trusted")
+    return rows[0]["db_now"]
+
+
+def assert_budget_matches_audit(budget, since, target_system="csuite",
+                                query=None, expected=None) -> int:
+    """Raise unless `write_audit` holds exactly `budget.used` rows since `since`.
+
+    Run at the END of a write run. A budget is a count kept in this process;
+    `write_audit` is a count kept in Postgres by the code that actually sends
+    the requests. They are independent, and the only reason to keep both is
+    to notice when they disagree.
+
+    2026-10-01 is why this exists. A run wrapped the client in a proxy whose
+    _request was never reached, so the budget counted 0 and two records
+    were created; the run printed "budget 0 of 1" and looked clean. The
+    budget cannot detect its own bypass; the audit table can.
+
+    Raises in BOTH directions:
+
+    * audit > budget — writes went out that nothing counted. The cap did not
+      hold.
+    * audit < budget — writes were counted that left no audit row. Either the
+      audit is failing silently, or the count is wrong. Both matter: a
+      pre-flight ledger that misses writes is the one thing this repository
+      relies on to know what it did.
+
+    `since` must come from the audit database's own clock — use
+    `audit_now()`. A local timestamp is four hours wrong against a UTC
+    `created_at` and turns a clean run into a false breach.
+
+    Returns the number of audited rows when they agree.
+    """
+    if since is None:
+        raise BudgetAuditMismatch(
+            "no window start was given, so the reconciliation would count "
+            "every write ever audited. Pass audit_now() from before the run.")
+    if query is None:
+        from clients.database import execute_query as query
+
+    rows = query(
+        """
+        SELECT endpoint, status FROM write_audit
+        WHERE target_system = %s AND created_at >= %s
+        ORDER BY created_at
+        """,
+        (target_system, since)) or []
+    audited = len(rows)
+    # `expected` is for a run split across processes, where budget.used is
+    # carried in from an earlier one and the window covers only this one.
+    # Reconciling the whole count against a partial window reports a missing
+    # ledger that is not missing — which happened on 2026-10-01 and is as
+    # misleading as the false breach the UTC window produced.
+    counted = (expected if expected is not None
+               else getattr(budget, "used", None))
+
+    if audited != counted:
+        direction = ("MORE writes were audited than counted — the cap did "
+                     "not hold" if audited > counted else
+                     "FEWER writes were audited than counted — the audit "
+                     "ledger is missing rows")
+        raise BudgetAuditMismatch(
+            f"{direction}. budget.used={counted}, write_audit rows since "
+            f"{since}={audited}: "
+            f"{[(r['endpoint'], r['status']) for r in rows]}")
+    return audited
+
+
 def assert_sandbox(client) -> str:
     """Raise unless this client writes to the sandbox. Returns the host.
 

@@ -51,7 +51,42 @@ SENT_TO_STORED = {
     # 2026-09-30, profile/edit on 21626: sent "7035550100", stored
     # "703-555-0100". CSuite punctuates it.
     "phone_number": "primary_phone_number",
+    # 2026-10-01, profile/edit on 21626: four dotted keys together, all four
+    # stored. CSuite then derived primary_citystatezip,
+    # primary_address_string and primary_country ("US") on its own.
+    "address.address": "primary_address",
+    "address.city": "primary_city",
+    "address.state": "primary_state",
+    "address.zipcode": "primary_zipcode",
 }
+
+# A sent field whose value is an OBJECT, and the display field each of its
+# subkeys lands in.
+#
+# 2026-10-01, profile/create/individual: `address` was sent as
+# {"address", "city", "state", "zipcode"} and every part was stored. The
+# read-back still reported `fields_dropped: {address: ...}` and
+# `verified: false`, because it looked for a display field called `address`
+# and there is none — the value fanned out across four of them.
+#
+# That is a false alarm of the same family as the boolean one and the
+# reformatting one, and the most expensive yet: with verify_writes on, every
+# create carrying an address would have told a user the address was
+# discarded, at the exact moment addresses finally started working.
+NESTED_TO_STORED = {
+    "address": {
+        "address": "primary_address",
+        "city": "primary_city",
+        "state": "primary_state",
+        "zipcode": "primary_zipcode",
+    },
+}
+
+# Fields CSuite assembles from an address it was given. Never sent, so never
+# compared — they would otherwise look like unexplained changes.
+DERIVED_FROM_ADDRESS = frozenset({
+    "primary_citystatezip", "primary_address_string", "primary_country",
+})
 
 
 class FieldDropped(RuntimeError):
@@ -207,6 +242,25 @@ def compare_detail(sent: dict, stored: dict, ignore=DERIVED_FIELDS):
     for field, value in (sent or {}).items():
         if field in ignore or field in ("env", "epoch"):
             continue
+
+        # An object-valued field lands in several display fields at once.
+        # Compared subkey by subkey, and reported as "address.city" so the
+        # message names the part that was lost rather than the whole object.
+        subkeys = NESTED_TO_STORED.get(field)
+        if subkeys and isinstance(value, dict):
+            for subkey, subvalue in value.items():
+                target = subkeys.get(subkey)
+                if target is None:
+                    dropped[f"{field}.{subkey}"] = (subvalue, None)
+                    continue
+                held = (stored or {}).get(target)
+                if _same(subvalue, held):
+                    continue
+                bucket = (reformatted if _reformatted(subvalue, held)
+                          else dropped)
+                bucket[f"{field}.{subkey}"] = (subvalue, held)
+            continue
+
         key = stored_name(field)
         if key in ignore:
             continue

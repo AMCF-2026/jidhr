@@ -175,7 +175,30 @@ CONFIRMED_INPUT_FIELDS = frozenset({
     "phone_number", # profile/edit -> primary_phone_number (CSuite punctuates)
     "env",          # every endpoint; supplied by _build_payload
     "profile_id",   # profile/edit, profile/display
+    # 2026-10-01, profile/edit on 21626: all four sent together, all four
+    # stored. CSuite then derived primary_citystatezip,
+    # primary_address_string and primary_country ("US") by itself.
+    "address.address",   # -> primary_address
+    "address.city",      # -> primary_city
+    "address.state",     # -> primary_state
+    "address.zipcode",   # -> primary_zipcode
 })
+
+# Names confirmed on SOME endpoints and disproved on others.
+#
+# `address` as a nested object is a confirmed input to
+# profile/create/individual (2026-10-01, sentinel 21660: every part stored)
+# and was silently discarded by profile/edit (2026-10-01, sentinel 21626:
+# 200, nothing stored, modified_ts unchanged). One name, two answers — so a
+# single flat allowlist cannot express what is now known, and a flat
+# KNOWN_INVALID entry would refuse a confirmed create input.
+#
+# Checked against the endpoint the caller names. Anything not listed here is
+# decided by CONFIRMED_INPUT_FIELDS as before.
+ENDPOINT_CONFIRMED_FIELDS = {
+    "address": ("profile/create/individual", "profile/create/org",
+                "profile/create/household"),
+}
 
 # Recognised by CSuite but NOT yet confirmed to store a value, so
 # deliberately absent from the set above.
@@ -220,13 +243,45 @@ KNOWN_INVALID_INPUT_FIELDS = {
     # primary_city still null. Dropped exactly like an unrecognised flat
     # name — so the HTTP 500 of 2026-09-30 came from sending nine
     # conflicting dotted keys at once, not from the dot itself.
-    "address.city": "dropped by profile/edit alone, 2026-10-01",
     # 2026-10-01, profile/edit on 21626, two isolated single-key edits:
     # "address" as a plain string ("41 Test Way, Fairfax, VA 22031") and
     # "address" as a nested object ({"city": "Vienna"}). Both returned
     # HTTP 200, success: true, 0 of 81 fields changed, modified_ts
-    # unchanged. The key is wrong whatever shape its value takes.
-    "address": "dropped by profile/edit as a string AND nested, 2026-10-01",
+    # unchanged. Neither is the documented EDIT shape.
+    # Endpoint-specific: see ENDPOINT_CONFIRMED_FIELDS. Nested `address` IS
+    # a confirmed input to profile/create/individual as of 2026-10-01.
+    "address": "dropped by profile/EDIT as a plain string AND as a nested "
+               "object, 2026-10-01. On profile/CREATE the nested object is "
+               "CONFIRMED — use the dotted address.* keys to edit",
+}
+
+# Probes whose result proved nothing, kept so the measurement is not lost and
+# not mistaken for a verdict.
+#
+# This list is a record, NOT a gate. check_input_fields never consults it: a
+# name in here may be sent freely, because "we learned nothing" is not
+# "this is wrong". Confusing the two is how `address.city` ended up in
+# KNOWN_INVALID_INPUT_FIELDS on 2026-10-01 — it is a DOCUMENTED edit key, and
+# the probe that looked like a refutation had a confound nobody had ruled
+# out.
+INCONCLUSIVE_PROBES = {
+    # RESOLVED 2026-10-01 — kept because the measurement explains a real
+    # dependency, and deleting it would invite someone to re-run the probe.
+    # The key is now in CONFIRMED_INPUT_FIELDS.
+    "address.city": "sandbox-9, 2026-10-01: sent ALONE, on a profile with no "
+                    "address at all — 200, nothing stored, modified_ts "
+                    "unchanged. RESOLVED later the same day: sent together "
+                    "with address.address, address.state and address.zipcode "
+                    "it stored fine, so one key alone cannot create an "
+                    "address that does not exist yet. A confound, as "
+                    "suspected, not a refutation.",
+    "address.street / address.address1 / address.line1 / address.zip / "
+    "address.zipcode / address.postal_code (and address.address, "
+    "address.city, address.state)": (
+        "sandbox-8, 2026-09-30: nine candidate keys in ONE payload, four "
+        "street names and three postcode names contradicting each other — "
+        "HTTP 500 with an empty errors array. The request failed as a whole, "
+        "so no individual key was tested."),
 }
 
 
@@ -302,8 +357,18 @@ def normalize_phone(raw):
 
 
 def check_input_fields(names, endpoint: str = "") -> None:
-    """Raise UnconfirmedField unless every name has been confirmed."""
-    unknown = [n for n in (names or ()) if n not in CONFIRMED_INPUT_FIELDS]
+    """Raise UnconfirmedField unless every name is confirmed for `endpoint`.
+
+    A name confirmed on one endpoint is not confirmed on all of them —
+    `address` is a valid nested input to profile/create/individual and is
+    silently discarded by profile/edit, both measured 2026-10-01.
+    """
+    clean = str(endpoint or "").strip("/")
+    unknown = [
+        n for n in (names or ())
+        if n not in CONFIRMED_INPUT_FIELDS
+        and clean not in ENDPOINT_CONFIRMED_FIELDS.get(n, ())
+    ]
     if unknown:
         logger.error("CSuite %s: unconfirmed field name(s) %s — nothing sent",
                      endpoint or "(write)", sorted(unknown))
@@ -854,20 +919,20 @@ class CSuiteClient:
         Returns:
             dict with 'data': {'profile_id': int} on success
         """
-        # TODO(hubsync-csuite-sandbox-10): the address is deliberately not
-        # sent, because CSuite's address INPUT name is still unknown.
-        # Eliminated so far, each by a sandbox write and a read-back:
-        #   primary_address_string, primary_address, primary_city,
-        #   primary_state, primary_zipcode  — dropped, profile/edit 2026-09-30
-        #   address.city, alone              — dropped, profile/edit 2026-10-01
-        #   address, as a plain string       — dropped, profile/edit 2026-10-01
-        #   address, as a nested object      — dropped, profile/edit 2026-10-01
-        # and nine dotted `address.*` keys in one payload, which returned
-        # HTTP 500 with an empty errors array — a fault on conflicting keys,
-        # not evidence about any one of them.
+        # TODO(hubsync-csuite-sandbox-12): the address is not sent yet. The
+        # DOCUMENTED shapes are under test; this method changes once the
+        # result is in.
         #
-        # Every obvious candidate is now spent. The next move is the vendor
-        # doc or CSuite support, not another guess.
+        # ELIMINATED, each by a sandbox write and a read-back:
+        #   primary_address_string, primary_address, primary_city,
+        #   primary_state, primary_zipcode   — dropped, profile/edit 2026-09-30
+        #   address, plain string            — dropped, profile/edit 2026-10-01
+        #   address, nested, on EDIT         — dropped, profile/edit 2026-10-01
+        #
+        # PENDING, documented, and NOT eliminated — see INCONCLUSIVE_PROBES:
+        #   address.address / .city / .state / .zipcode, four keys together
+        #     on profile/edit
+        #   address, nested, on profile/CREATE
         #
         # The plan, which sandbox-7 proved works: create the profile
         # without the address, then write the address with a follow-up
@@ -879,14 +944,16 @@ class CSuiteClient:
             # the exact bug this method is being fixed for, and doing it
             # ourselves would be worse than CSuite doing it.
             raise ValueError(
-                "create_individual_profile cannot send an address: CSuite's "
-                "address input name is unknown. Eliminated by sandbox write "
-                "and read-back: primary_address_string, primary_address, "
-                "primary_city, primary_state, primary_zipcode, address.city, "
-                "and `address` both as a plain string and as a nested "
-                "object. Create the profile without it, then set the address "
-                "with profile/edit once the name is confirmed. Nothing was "
-                "sent.")
+                "create_individual_profile does not send an address yet: the "
+                "documented shapes are under test on "
+                "hubsync-csuite-sandbox-12 and this method will be changed "
+                "once that result is in. Eliminated by sandbox write and "
+                "read-back so far: the flat primary_* names, and `address` "
+                "on profile/EDIT as a plain string and as a nested object. "
+                "The dotted `address.*` keys and the nested CREATE shape are "
+                "documented and PENDING, not dead. Create the profile "
+                "without an address for now, then set it with profile/edit. "
+                "Nothing was sent.")
 
         data = {
             "first_name": first_name,

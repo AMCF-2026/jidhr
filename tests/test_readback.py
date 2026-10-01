@@ -447,3 +447,72 @@ def test_delegating_through_a_proxy_still_hits_the_budget(monkeypatch):
     with pytest.raises(WriteBudgetExceeded):
         proxy.edit_profile(21626, website="https://example.invalid")
     assert harness.posted == []
+
+
+# ---------------------------------------------------------------------------
+# One sent field can fan out across several display fields
+# ---------------------------------------------------------------------------
+
+ADDRESS_SENT = {"address": "71 Test Way", "city": "Falls Church",
+                "state": "VA", "zipcode": "22042"}
+
+
+def stored_address(**overrides):
+    base = {"primary_address": "71 Test Way", "primary_city": "Falls Church",
+            "primary_state": "VA", "primary_zipcode": "22042",
+            "primary_citystatezip": "Falls Church, VA 22042",
+            "primary_address_string": "71 Test Way, Falls Church, VA 22042",
+            "primary_country": "US"}
+    base.update(overrides)
+    return display(**base)
+
+
+def test_a_nested_address_that_was_stored_is_not_reported_as_dropped():
+    """2026-10-01, profile/create/individual on 21660: every part of the
+    nested address was stored, and the read-back still said
+    `fields_dropped: {address: ...}` because there is no display field called
+    `address` — the value fanned out across four of them.
+
+    With verify_writes on, that would have told a user their address was
+    discarded at the moment addresses finally started working.
+    """
+    from sync.readback import compare_detail
+
+    dropped, _ = compare_detail({"address": ADDRESS_SENT}, stored_address())
+    assert dropped == {}
+
+
+def test_a_nested_address_does_not_raise():
+    assert verify(reader(stored_address()), "profile/create/individual",
+                  {"address": ADDRESS_SENT}, 21660)
+
+
+def test_one_lost_part_of_an_address_is_named_by_its_subkey():
+    """"address" would not tell anyone which part to re-enter."""
+    from sync.readback import compare_detail
+
+    dropped, _ = compare_detail({"address": ADDRESS_SENT},
+                                stored_address(primary_city=None))
+    assert "address.city" in dropped
+    assert "address.state" not in dropped
+
+
+def test_an_unknown_subkey_is_a_drop_not_a_silent_pass():
+    from sync.readback import compare_detail
+
+    dropped, _ = compare_detail({"address": {"county": "Fairfax"}},
+                                stored_address())
+    assert "address.county" in dropped
+
+
+def test_the_dotted_edit_keys_map_to_their_display_fields():
+    """2026-10-01, profile/edit on 21626: all four sent together, all stored."""
+    from sync.readback import SENT_TO_STORED, compare_detail
+
+    assert SENT_TO_STORED["address.city"] == "primary_city"
+    assert SENT_TO_STORED["address.zipcode"] == "primary_zipcode"
+
+    dropped, _ = compare_detail(
+        {"address.address": "71 Test Way", "address.city": "Falls Church",
+         "address.state": "VA", "address.zipcode": "22042"}, stored_address())
+    assert dropped == {}
