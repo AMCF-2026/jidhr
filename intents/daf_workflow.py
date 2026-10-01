@@ -360,6 +360,34 @@ def _log_skipped_create(data: dict, hubspot) -> str:
     return contact_id
 
 
+def matching_tickets(tickets, email) -> list:
+    """Open tickets whose subject or content carries `email`, in full.
+
+    [{"id", "subject"}], newest-first order preserved from HubSpot.
+
+    **The email and nothing else.** Matching on a first or last name closed
+    tickets belonging to other people: "sarah" appears in a different donor's
+    thread, in a vendor's name, in "Sarah to follow up". An address is an
+    identifier; a given name is not.
+
+    No email on the submission returns [] — nothing to match on means nothing
+    to close, not "close the first open ticket".
+    """
+    address = (email or "").strip().lower()
+    if not address:
+        return []
+
+    rows = tickets.get("results") if isinstance(tickets, dict) else None
+    found = []
+    for ticket in rows or []:
+        props = ticket.get("properties") or {}
+        haystack = f"{props.get('subject') or ''} {props.get('content') or ''}"
+        if address in haystack.lower():
+            found.append({"id": ticket.get("id"),
+                          "subject": props.get("subject") or "(no subject)"})
+    return found
+
+
 def record_unprocessed_submission(state: dict, reason: str) -> bool:
     """Record WHICH submission could not be processed, so it can be replayed.
 
@@ -445,6 +473,9 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         # succeed. Distinct from ticket_closed being False because no ticket
         # matched — that is not a failure, and says nothing to the user.
         "ticket_close_failed": None,
+        # Every open ticket carrying the donor's email. One is closed; more
+        # than one is listed for a human to pick; none is reported as none.
+        "ticket_matches": [],
         # Distinct from profile_created being False after a failed attempt:
         # nothing was sent. Reported to the user as skipped, not as failed,
         # because "Failed to create" would be a false statement.
@@ -630,40 +661,51 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
             results["errors"].append(f"HubSpot update: {e}")
             logger.error(f"HubSpot update error: {e}")
 
-    # --- 4. Close associated ticket (best effort) ---
+    # --- 4. Close the associated ticket, on the email and nothing else ---
+    #
+    # This used to match the donor's FIRST NAME or LAST NAME as a substring of
+    # a ticket's subject or content, and close the first hit. So an inquiry
+    # from any Sarah closed the oldest open ticket with "sarah" anywhere in
+    # it — a different donor's ticket, a vendor thread, "Sarah to follow up".
+    # A first name is not an identifier.
+    #
+    # An email address is. It is matched case-insensitively and in full, and
+    # if more than one open ticket carries it the workflow closes NOTHING and
+    # lists them, because "which of these two" is a judgement and closing the
+    # wrong one is not reversible by this workflow.
     try:
-        tickets = hubspot.get_open_tickets()
-        if 'results' in tickets:
-            # Try to find a ticket mentioning this person's name or email
-            search_terms = [
-                data.get("email", "").lower(),
-                data.get("last_name", "").lower(),
-                data.get("first_name", "").lower(),
-            ]
-            for t in tickets['results']:
-                subj = t.get('properties', {}).get('subject', '').lower()
-                content = t.get('properties', {}).get('content', '').lower()
-                combined = f"{subj} {content}"
-                if any(term and term in combined for term in search_terms):
-                    ticket_id = t.get('id')
-                    state["ticket_id"] = ticket_id
+        matches = matching_tickets(hubspot.get_open_tickets(),
+                                   data.get("email"))
+        results["ticket_matches"] = matches
 
-                    # The return value used to be discarded and ticket_closed
-                    # set to True regardless, so a failed close still printed
-                    # "📋 Ticket closed".
-                    close_result = hubspot.close_ticket(ticket_id)
-                    if close_result and not close_result.get("error"):
-                        results["ticket_closed"] = True
-                        logger.info(f"Closed ticket {ticket_id}")
-                    else:
-                        reason = (
-                            (close_result or {}).get("error")
-                            or "HubSpot returned no confirmation"
-                        )
-                        results["ticket_close_failed"] = reason
-                        logger.warning(
-                            f"Ticket {ticket_id} was NOT closed: {reason}")
-                    break
+        if not matches:
+            logger.info("no open ticket carries the submitted email; closing "
+                        "nothing")
+        elif len(matches) > 1:
+            # Ambiguous on purpose. A human picks.
+            logger.warning("%d open tickets carry the submitted email (%s); "
+                           "closing none", len(matches),
+                           ", ".join(str(m["id"]) for m in matches))
+        else:
+            ticket_id = matches[0]["id"]
+            state["ticket_id"] = ticket_id
+            state["ticket_subject"] = matches[0]["subject"]
+
+            # The return value used to be discarded and ticket_closed
+            # set to True regardless, so a failed close still printed
+            # "📋 Ticket closed".
+            close_result = hubspot.close_ticket(ticket_id)
+            if close_result and not close_result.get("error"):
+                results["ticket_closed"] = True
+                logger.info(f"Closed ticket {ticket_id}")
+            else:
+                reason = (
+                    (close_result or {}).get("error")
+                    or "HubSpot returned no confirmation"
+                )
+                results["ticket_close_failed"] = reason
+                logger.warning(
+                    f"Ticket {ticket_id} was NOT closed: {reason}")
     except Exception as e:
         logger.error(f"Ticket lookup/close error: {e}", exc_info=True)
         if state.get("ticket_id") and not results["ticket_closed"]:
@@ -870,10 +912,15 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
     elif results["profile_created"]:
         lines.append("⚠️ HubSpot contact: Could not update or create")
 
-    # Ticket
+    # Ticket. Always says which one, or that there was none — a bare
+    # "Ticket closed" does not let anyone check it closed the right thing.
+    matches = results.get("ticket_matches") or []
     if results["ticket_closed"]:
-        ticket_link = Config.HUBSPOT_TICKET_URL.format(ticket_id=state['ticket_id'])
-        lines.append(f"📋 Ticket closed — [View]({ticket_link})")
+        ticket_id = state["ticket_id"]
+        ticket_link = Config.HUBSPOT_TICKET_URL.format(ticket_id=ticket_id)
+        subject = state.get("ticket_subject") or "(no subject)"
+        lines.append(f"📋 Ticket {ticket_id} closed — *{subject}* "
+                     f"— [View]({ticket_link})")
     elif results.get("ticket_close_failed"):
         ticket_id = state.get("ticket_id", "unknown")
         ticket_link = Config.HUBSPOT_TICKET_URL.format(ticket_id=ticket_id)
@@ -882,6 +929,18 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
             f"({results['ticket_close_failed']}) — close it by hand: "
             f"[View]({ticket_link})"
         )
+    elif len(matches) > 1:
+        # Closing the wrong one is not reversible by this workflow, so it
+        # closes neither and hands the choice over with enough to decide on.
+        lines.append(
+            f"📋 **{len(matches)} open tickets** carry this email, so none was "
+            "closed — pick one and close it by hand:")
+        for match in matches:
+            link = Config.HUBSPOT_TICKET_URL.format(ticket_id=match["id"])
+            lines.append(f"   • Ticket {match['id']} — *{match['subject']}* "
+                         f"— [View]({link})")
+    else:
+        lines.append("📋 No matching ticket — nothing was closed.")
 
     # Errors
     if results["errors"]:
