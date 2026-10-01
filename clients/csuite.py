@@ -1711,8 +1711,9 @@ class CSuiteClient:
 
         from sync.readback import (FieldDropped, ReadBackUnavailable,
                                    verify_task)
+        record = None
         try:
-            verify_task(self._request, data, task_id)
+            record = verify_task(self._request, data, task_id)
         except ReadBackUnavailable as e:
             logger.error("could not read task %s back: %s", task_id, e)
             response["verified"] = None
@@ -1728,6 +1729,13 @@ class CSuiteClient:
                 f"{', '.join(sorted(dropped.dropped))}. Check it in CSuite.")
         else:
             response["verified"] = True
+            # The assignee's NAME, so a confirmation can say "Zouita, Kods"
+            # rather than "1007". It is only known after the read-back:
+            # task/create returns task_id and task_guid and nothing else.
+            stored = record if isinstance(record, dict) else {}
+            assigned = stored.get("assigned_employee") or {}
+            if assigned.get("employee_name"):
+                response["assignee_name"] = assigned["employee_name"]
         return response
 
     def complete_task(self, task_id: int = None, task_guid: str = None) -> dict:

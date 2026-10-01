@@ -240,7 +240,8 @@ def test_a_returning_donor_gets_a_task_on_the_EXISTING_profile(monkeypatch):
     assert "profile" not in csuite.kinds, "no profile may be created"
     assert csuite.task_kwargs["linked_profile_id"] == 19999
     assert "Already in CSuite" in reply
-    assert "📝 Follow-up task for Sarah Ahmed" in reply
+    assert "re: Sarah Ahmed" in reply
+    assert "📝 Follow-up task 1040 for" in reply
 
 
 def test_two_matches_mean_no_task_and_the_reason_is_the_ambiguity(monkeypatch):
@@ -260,12 +261,27 @@ def test_two_matches_mean_no_task_and_the_reason_is_the_ambiguity(monkeypatch):
 # STEP 4 — the three lines
 # ---------------------------------------------------------------------------
 
-def test_the_success_line(monkeypatch):
+def test_the_success_line_names_the_task_the_assignee_and_the_donor(monkeypatch):
+    """A line that says only "Follow-up task created" does not let anyone check
+    it went to the right person about the right donor."""
     reply, _ = run(monkeypatch)
 
-    assert "📝 Follow-up task for Sarah Ahmed — due 2026-10-05 — [View](" \
-        in reply
+    assert "📝 Follow-up task 1040 for 1007 — re: Sarah Ahmed — due " \
+        "2026-10-05 — [View](" in reply
     assert "task_id=1040" in reply
+
+
+def test_the_line_prefers_the_assignee_NAME_when_the_read_back_gave_one(
+        monkeypatch):
+    """"1007" makes the reader look it up. The name is only known after the
+    read-back — task/create returns task_id and task_guid and nothing else."""
+    csuite = CSuite(task_response={
+        "success": True, "data": {"task_id": 1040}, "verified": True,
+        "assignee_name": "Zouita, Kods"})
+    reply, _ = run(monkeypatch, csuite=csuite)
+
+    assert "📝 Follow-up task 1040 for Zouita, Kods — re: Sarah Ahmed" in reply
+    assert " for 1007 " not in reply
 
 
 def test_the_failure_line_never_blames_the_profile(monkeypatch):
@@ -307,7 +323,7 @@ def test_a_read_back_warning_is_surfaced_under_the_task_line(monkeypatch):
         "task_warning": "⚠️ Task 1040 was created but CSuite did not store: o."})
     reply, _ = run(monkeypatch, csuite=csuite)
 
-    assert "📝 Follow-up task for" in reply
+    assert "📝 Follow-up task 1040 for" in reply
     assert "did not store: o" in reply
 
 
@@ -418,3 +434,20 @@ def test_an_omitted_optional_field_cannot_be_reported_as_dropped():
     sent = {"task_description": "S", "employee_id": 1007}
     stored = {"task_id": 1040, "task_description": "S", "employee_id": 1007}
     assert compare_task(sent, stored) == {}
+
+
+def test_the_duplicate_path_shows_the_read_back_warning_too(monkeypatch):
+    """The two paths render the same line through one function, because they
+    had already drifted once — the duplicate path was missing this warning."""
+    class Dup(DuplicateCSuite):
+        def create_task(self, **kwargs):
+            self.calls.append(("task", kwargs))
+            return {"success": True, "data": {"task_id": 1041},
+                    "verified": False,
+                    "task_warning": "⚠️ Task 1041 … did not store: id."}
+
+    reply, _ = run(monkeypatch, csuite=Dup())
+
+    assert "Already in CSuite" in reply
+    assert "📝 Follow-up task 1041 for" in reply
+    assert "did not store: id" in reply

@@ -595,6 +595,11 @@ def _create_followup_task(data, state, results, csuite, wf_type, type_label):
         results["task_due"] = due
         results["task_subject"] = subject
         results["task_warning"] = task_result.get("task_warning")
+        # The name when the read-back supplied one, the id otherwise. A
+        # confirmation that says "1007" makes the reader look it up.
+        results["task_assignee"] = (task_result.get("assignee_name")
+                                    or str(assignee))
+        results["task_donor"] = name or email or "this donor"
         logger.info("CSuite follow-up task %s created on profile %s, due %s",
                     results["task_id"], profile_id, due)
     else:
@@ -724,6 +729,8 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         "task_failed": None,
         "task_skipped": None,
         "task_warning": None,
+        "task_assignee": None,
+        "task_donor": None,
         # Set when the submission carried an address. CSuite's address input
         # name is unknown — nine candidates eliminated by sandbox write and
         # read-back — so it is not sent, and it is named to a human instead
@@ -1090,6 +1097,34 @@ def _parse_submission(submission: dict) -> dict:
 # Confirmation formatter
 # ---------------------------------------------------------------------------
 
+def _task_lines(data: dict, results: dict) -> list:
+    """The one follow-up-task line, whichever it is.
+
+    Shared by the normal path and the duplicate-donor path so the two cannot
+    drift — they had already drifted once, with the duplicate path missing the
+    read-back warning.
+    """
+    if results.get("task_id"):
+        task_id = results["task_id"]
+        link = Config.CSUITE_TASK_URL.format(task_id=task_id)
+        donor = results.get("task_donor") or (
+            (data.get("first_name", "") + " "
+             + data.get("last_name", "")).strip() or "this donor")
+        assignee = results.get("task_assignee") or "unassigned"
+        out = [f"📝 Follow-up task {task_id} for {assignee} — re: {donor} — "
+               f"due {results['task_due']} — [View]({link})"]
+        if results.get("task_warning"):
+            out.append(f"   {results['task_warning']}")
+        return out
+    if results.get("task_failed"):
+        # Never presented as a failure of the profile, which succeeded.
+        return [f"⚠️ Follow-up task NOT created ({results['task_failed']}) — "
+                "add it by hand in CSuite."]
+    if results.get("task_skipped"):
+        return [f"📝 No task: {results['task_skipped']}"]
+    return []
+
+
 def _format_confirmation(data: dict, state: dict, results: dict, type_label: str) -> str:
     """Format the workflow completion confirmation."""
     name = f"{data.get('first_name', '')} {data.get('last_name', '')}".strip()
@@ -1107,19 +1142,7 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
             lines.append("")
             lines.append(f"👤 Profile {profile_id} — [CSuite]({link})")
             lines.append(f"   Found via: {results['duplicate_reason']}")
-            if results.get("task_id"):
-                task_link = Config.CSUITE_TASK_URL.format(
-                    task_id=results["task_id"])
-                who = (data.get("first_name", "") + " "
-                       + data.get("last_name", "")).strip() or "this donor"
-                lines.append(f"📝 Follow-up task for {who} — due "
-                             f"{results['task_due']} — [View]({task_link})")
-            elif results.get("task_failed"):
-                lines.append(f"⚠️ Follow-up task NOT created "
-                             f"({results['task_failed']}) — add it by hand in "
-                             "CSuite.")
-            elif results.get("task_skipped"):
-                lines.append(f"📝 No task: {results['task_skipped']}")
+            lines.extend(_task_lines(data, results))
         else:
             lines.append("🛑 **No profile created — a duplicate could not be "
                          "ruled out**")
@@ -1128,8 +1151,7 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
             lines.append("   Nothing was created and nothing was changed. "
                          "CSuite has no way to merge two donor profiles from "
                          "here, so this stops rather than guesses.")
-            if results.get("task_skipped"):
-                lines.append(f"📝 No task: {results['task_skipped']}")
+            lines.extend(_task_lines(data, results))
         lines.append("")
         lines.append("Say anything to continue, or start a new workflow.")
         return "\n".join(lines)
@@ -1221,20 +1243,7 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
 
     # Follow-up task. Exactly one line, and never silent: a reminder nobody
     # was told about is a reminder that does not exist.
-    if results.get("task_id"):
-        link = Config.CSUITE_TASK_URL.format(task_id=results["task_id"])
-        who = (data.get("first_name", "") + " "
-               + data.get("last_name", "")).strip() or "this donor"
-        lines.append(f"📝 Follow-up task for {who} — due "
-                     f"{results['task_due']} — [View]({link})")
-        if results.get("task_warning"):
-            lines.append(f"   {results['task_warning']}")
-    elif results.get("task_failed"):
-        # Never presented as a failure of the profile, which succeeded.
-        lines.append(f"⚠️ Follow-up task NOT created "
-                     f"({results['task_failed']}) — add it by hand in CSuite.")
-    elif results.get("task_skipped"):
-        lines.append(f"📝 No task: {results['task_skipped']}")
+    lines.extend(_task_lines(data, results))
 
     # Ticket. Always says which one, or that there was none — a bare
     # "Ticket closed" does not let anyone check it closed the right thing.
