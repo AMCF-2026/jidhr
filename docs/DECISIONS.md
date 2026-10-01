@@ -512,3 +512,43 @@ process of elimination is reported as a candidate for confirmation, never
 acted on. The underlying gap is closed separately — `complete_write` now
 records the created id — but the rule does not depend on that, because
 the next missing id will be missing for a different reason.
+
+## 2026-10-01 — A field name in a brief is used verbatim; disagreement is a STOP
+
+On 2026-09-30 a brief said to send `email` to
+`profile/create/individual`. I sent **`primary_email`** instead, and left a
+comment justifying it: `primary_email` is what `profile/list` filters on,
+what the mirror stores, and what this repo's `create_individual_profile`
+had always sent. The reasoning was coherent and it was wrong. CSuite
+returned HTTP 200 with a `profile_id` and discarded the field. It cost a
+sandbox profile, a write from a capped budget, and a wrong paragraph in a
+report that had to be corrected the next day.
+
+The brief was right because a brief is a statement about the far system,
+not a suggestion about ours. Code conventions, mirror column names and
+what the repo has always done are evidence about this repository; none of
+them is evidence about what CSuite accepts. The only things that are:
+a write, and a read-back.
+
+**The rule: a field name written in a brief is sent exactly as written.**
+If I believe one is wrong, I stop, report why, and ask — before any call.
+I do not substitute a different name, and I do not substitute one and
+explain it in a comment, which is worse: it reads as agreement and buries
+the disagreement where nobody is looking for it.
+
+Three corollaries, each paid for:
+
+- **A 200 is not confirmation.** CSuite validates the names it recognises
+  and silently drops the rest. Every name in
+  `CONFIRMED_INPUT_FIELDS` is there because a value sent under it was
+  read back off a record, and nothing else qualifies a name.
+- **An output name is not an input name.** `primary_email`,
+  `primary_phone_number` and four flat `primary_*` address names are all
+  valid `profile/display` fields and all invalid inputs. The display list
+  reads like a field list and is not one.
+- **A failed request proves nothing about its individual fields.** Nine
+  dotted `address.*` keys drew one HTTP 500 with an empty errors array on
+  2026-09-30. None of the nine was recorded as invalid, because the
+  request failed as a whole and no key was shown to be wrong.
+  `KNOWN_INVALID_INPUT_FIELDS` holds measurements, and an unproven entry
+  in it would cost more than the empty space does.

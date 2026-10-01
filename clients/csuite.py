@@ -215,6 +215,12 @@ KNOWN_INVALID_INPUT_FIELDS = {
     "primary_state": "dropped by profile/edit, 2026-09-30",
     "primary_zipcode": "dropped by profile/edit, 2026-09-30",
     "primary_address_string": "a display name; no input name confirmed yet",
+    # 2026-10-01, profile/edit on 21626, this key ALONE: HTTP 200,
+    # success: true, 0 of 81 fields changed, modified_ts unchanged,
+    # primary_city still null. Dropped exactly like an unrecognised flat
+    # name — so the HTTP 500 of 2026-09-30 came from sending nine
+    # conflicting dotted keys at once, not from the dot itself.
+    "address.city": "dropped by profile/edit alone, 2026-10-01",
 }
 
 
@@ -739,64 +745,120 @@ class CSuiteClient:
                                    email: str = None, phone: str = None,
                                    address: str = None, **kwargs) -> dict:
         """Create an individual profile in CSuite.
-        
+
         Used by: DAF/Endowment inquiry workflow (Kods)
-        
+
+        Field names, and how each one was established
+        ---------------------------------------------
+        From 2026-03-17 to 2026-10-01 this method sent `primary_email`,
+        `primary_phone_number` and `primary_address_string`. All three are
+        valid `profile/display` OUTPUT names and none of them is an input
+        name: CSuite accepted the create, returned HTTP 200 and a
+        profile_id, and discarded every one of them. Nothing in the
+        response said so.
+
+        What it sends now, and why each is trusted:
+
+        - `email` — VERIFIED 2026-09-30. Sent to
+          profile/create/individual and to profile/edit; read back as
+          `primary_email` both times.
+        - `phone_number` — VERIFIED 2026-09-30 on profile/edit. Sent
+          "7035550100", read back as `primary_phone_number`
+          "703-555-0100": CSuite punctuates the value it stores.
+
         Args:
             first_name: First name (required)
             last_name: Last name (required)
-            email: Primary email
-            phone: Primary phone number
-            address: Primary address
-            **kwargs: Additional profile fields
-            
+            email: email address -> primary_email
+            phone: phone number -> phone_number -> primary_phone_number.
+                CSuite VALIDATES this field and rejects the whole create
+                with HTTP 400 if it is not a full number — measured
+                2026-09-30: "phone_number: phone [5550100] is not valid".
+                A seven-digit or malformed number now fails the create
+                instead of being quietly dropped.
+            address: NOT SENT. See below; passing one raises.
+            **kwargs: checked against CONFIRMED_INPUT_FIELDS first
+
         Returns:
             dict with 'data': {'profile_id': int} on success
         """
+        # TODO(hubsync-csuite-sandbox-9): the address is deliberately not
+        # sent, because CSuite's address INPUT name is still unknown.
+        # Eliminated so far, each by a sandbox write and a read-back:
+        # primary_address_string, primary_address, primary_city,
+        # primary_state, primary_zipcode (all dropped, profile/edit,
+        # 2026-09-30), and nine dotted `address.*` keys which returned
+        # HTTP 500 with an empty errors array.
+        #
+        # The plan, which sandbox-7 proved works: create the profile
+        # without the address, then write the address with a follow-up
+        # profile/edit once its name is confirmed. profile/edit is a
+        # partial update (measured three times), so a second call costs
+        # nothing but a call.
+        if address:
+            # Not silently ignored. Accepting a value and dropping it is
+            # the exact bug this method is being fixed for, and doing it
+            # ourselves would be worse than CSuite doing it.
+            raise ValueError(
+                "create_individual_profile cannot send an address: CSuite's "
+                "address input name is unknown and every candidate tried so "
+                "far was dropped or faulted. Create the profile without it, "
+                "then set the address with profile/edit once the name is "
+                "confirmed. Nothing was sent.")
+
         data = {
             "first_name": first_name,
             "last_name": last_name,
         }
         if email:
-            data["primary_email"] = email
+            data["email"] = email
         if phone:
-            data["primary_phone_number"] = phone
-        if address:
-            data["primary_address_string"] = address
+            data["phone_number"] = phone
         # Checked before the payload is built, so an unconfirmed name is a
-        # refusal rather than a silent drop. The three named fields above
-        # are the method's own contract and are NOT gated here: two of them
-        # are known-wrong and fixing them is a separate change. With
-        # verify_writes on, a drop is now reported after the fact.
+        # refusal rather than a silent drop.
         check_input_fields(kwargs, "profile/create/individual")
         data.update(kwargs)
-        
+
         logger.info(f"Creating individual profile: {first_name} {last_name}")
         return self._request("profile/create/individual", data)
     
     def create_org_profile(self, organization: str, email: str = None,
                            phone: str = None, **kwargs) -> dict:
-        """Create an organization profile in CSuite.
-        
-        Used by: Nonprofit/org onboarding workflows (Ola)
-        
+        """Create an organization profile in CSuite. **UNVERIFIED.**
+
+        Used by: nothing. This method has no caller in any commit, and
+        `profile/create/org` has never been called from this repository —
+        not in production, not in the sandbox.
+
+        **UNVERIFIED:** `email` and `phone_number` are carried over from
+        `profile/create/individual`, where both were confirmed by a
+        read-back. Nothing has shown that the org endpoint takes the same
+        input names, and `organization` itself has never been confirmed
+        either. CSuite's input and output vocabularies differ per field, so
+        they may well differ per endpoint.
+
+        Before this is called for real: one sandbox create and one
+        `profile/display`, exactly as `profile/create/individual` was
+        confirmed. Until then treat a 200 from here as meaning nothing
+        about what was stored.
+
         Args:
-            organization: Organization name (required)
-            email: Primary email
-            phone: Primary phone number
-            **kwargs: Additional profile fields
-            
+            organization: Organization name (required) — UNVERIFIED name
+            email: email address -> primary_email (UNVERIFIED on this endpoint)
+            phone: phone number -> phone_number (UNVERIFIED on this endpoint)
+            **kwargs: checked against CONFIRMED_INPUT_FIELDS first
+
         Returns:
             dict with 'data': {'profile_id': int} on success
         """
         data = {"organization": organization}
         if email:
-            data["primary_email"] = email
+            data["email"] = email
         if phone:
-            data["primary_phone_number"] = phone
+            data["phone_number"] = phone
         check_input_fields(kwargs, "profile/create/org")
         data.update(kwargs)
-        
+
         logger.info(f"Creating org profile: {organization}")
         return self._request("profile/create/org", data)
     
