@@ -56,14 +56,74 @@ def _current_intent():
     except Exception:  # pragma: no cover - import failure is not fatal here
         return None
 
-_INSERT_SQL = """
-    INSERT INTO write_audit (
-        actor_user_id, actor_label, intent, target_system, http_method,
-        endpoint, target_id, payload_hash, payload_meta, status,
-        http_status, error, duration_ms, sync_run_id
-    )
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s)
+_BASE_COLUMNS = ("actor_user_id, actor_label, intent, target_system, "
+                 "http_method, endpoint, target_id, payload_hash, "
+                 "payload_meta, status, http_status, error, duration_ms, "
+                 "sync_run_id")
+_BASE_PLACEHOLDERS = "%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s"
+
+_INSERT_SQL = f"""
+    INSERT INTO write_audit ({_BASE_COLUMNS})
+    VALUES ({_BASE_PLACEHOLDERS})
 """
+
+# With csuite_env, once migrations/002 has been run.
+_INSERT_SQL_ENV = f"""
+    INSERT INTO write_audit ({_BASE_COLUMNS}, csuite_env)
+    VALUES ({_BASE_PLACEHOLDERS}, %s)
+"""
+
+# Resolved once per process, then cached. None means "not looked yet".
+#
+# Checked rather than assumed because reserve_write REFUSES the write when it
+# cannot record a row: if the code wrote a column the table did not have, every
+# CSuite and HubSpot write would stop until the migration ran. Fail-closed is
+# the right direction for a missing audit, and a wrong direction for a column
+# ordering mistake.
+_HAS_CSUITE_ENV = None
+
+
+def _csuite_env_column_exists(query=None) -> bool:
+    """Does write_audit have csuite_env? Asked once, then remembered."""
+    global _HAS_CSUITE_ENV
+    if _HAS_CSUITE_ENV is not None:
+        return _HAS_CSUITE_ENV
+    if query is None:
+        from clients.database import execute_query as query
+    try:
+        rows = query(
+            """
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'write_audit' AND column_name = 'csuite_env'
+            """) or []
+        _HAS_CSUITE_ENV = bool(rows)
+    except Exception as e:          # pragma: no cover - never block a write
+        logger.warning("could not check for write_audit.csuite_env, assuming "
+                       "it is absent: %s", e)
+        _HAS_CSUITE_ENV = False
+    if not _HAS_CSUITE_ENV:
+        logger.warning("write_audit has no csuite_env column; audit rows will "
+                       "not record the environment. Run "
+                       "migrations/002_write_audit_csuite_env.sql.")
+    return _HAS_CSUITE_ENV
+
+
+def current_csuite_env() -> str:
+    """CSUITE_ENV as this process sees it, for stamping on an audit row.
+
+    Resolved through the MODULE (`config.Config`) rather than a class imported
+    at module load. Several tests call `importlib.reload(config)` to check the
+    fail-closed parsing of the flags, and a reload rebinds `config.Config` to a
+    new class — leaving every `from config import Config` holding the old one.
+    Two callers can then disagree about the same setting. Reading it through the
+    module means there is one answer.
+    """
+    try:
+        import config
+        return str(getattr(config.Config, "CSUITE_ENV", "")
+                   or "").strip().lower() or None
+    except Exception:               # pragma: no cover
+        return None
 
 # The pre-flight pair. RESERVE goes in before the HTTP call and COMPLETE
 # stamps the outcome on the same row afterwards.
@@ -75,6 +135,14 @@ _INSERT_SQL = """
 # which is the correct direction to fail, but confirm the column before
 # deploying this.
 _RESERVE_SQL = _INSERT_SQL + " RETURNING id"
+_RESERVE_SQL_ENV = _INSERT_SQL_ENV + " RETURNING id"
+
+
+def _insert_sql(reserve: bool = False):
+    """(sql, append_env) for whichever shape the table currently has."""
+    if _csuite_env_column_exists():
+        return (_RESERVE_SQL_ENV if reserve else _INSERT_SQL_ENV), True
+    return (_RESERVE_SQL if reserve else _INSERT_SQL), False
 
 # COALESCE, not assignment: a reserve that already knew the id (a PATCH
 # or DELETE, where it is in the URL) keeps it. Only a create arrives here
@@ -340,13 +408,13 @@ def reserve_write(target_system: str, http_method: str, endpoint: str,
             "will not be attempted. Set DATABASE_URL (or DATABASE_PUBLIC_URL "
             "for a run outside Railway) and retry.")
 
+    sql, with_env = _insert_sql(reserve=True)
+    values = _row_values(target_system, http_method, endpoint, target_id,
+                         payload, ATTEMPTED, None, None, None, sync_run_id)
+    if with_env:
+        values = values + (current_csuite_env(),)
     try:
-        found = execute_query(
-            _RESERVE_SQL,
-            _row_values(target_system, http_method, endpoint, target_id,
-                        payload, ATTEMPTED, None, None, None, sync_run_id),
-            fetch=True,
-        )
+        found = execute_query(sql, values, fetch=True)
     except Exception as e:
         raise AuditUnavailable(
             f"could not reserve an audit row for {http_method} {endpoint}, "
@@ -438,14 +506,14 @@ def record_write(target_system: str, http_method: str, endpoint: str,
         raise AuditUnavailable(
             "DATABASE_URL is not set, so this write cannot be audited.")
 
+    sql, with_env = _insert_sql()
+    values = _row_values(target_system, http_method, endpoint, target_id,
+                         payload, status, http_status, error, duration_ms,
+                         sync_run_id)
+    if with_env:
+        values = values + (current_csuite_env(),)
     try:
-        execute_query(
-            _INSERT_SQL,
-            _row_values(target_system, http_method, endpoint, target_id,
-                        payload, status, http_status, error, duration_ms,
-                        sync_run_id),
-            fetch=False,
-        )
+        execute_query(sql, values, fetch=False)
         return True
     except Exception as e:
         raise AuditUnavailable(

@@ -41,15 +41,15 @@ def test_anything_but_live_is_marked(env):
 def test_passing_None_means_read_the_config_not_not_live(monkeypatch):
     """`None` is the "no opinion" value, so it defers. An explicit "" is a
     value, and an empty CSUITE_ENV is not live."""
-    monkeypatch.setattr(Config, "CSUITE_ENV", "live")
+    monkeypatch.setattr("config.Config.CSUITE_ENV", "live")
     assert mark_id(21663, None) == "21663"
     assert mark_id(21663, "") == "21663 (sandbox)"
 
 
 def test_it_reads_the_config_when_no_env_is_passed(monkeypatch):
-    monkeypatch.setattr(Config, "CSUITE_ENV", "sandbox")
+    monkeypatch.setattr("config.Config.CSUITE_ENV", "sandbox")
     assert mark_id(1035) == "1035 (sandbox)"
-    monkeypatch.setattr(Config, "CSUITE_ENV", "live")
+    monkeypatch.setattr("config.Config.CSUITE_ENV", "live")
     assert mark_id(1035) == "1035"
 
 
@@ -102,7 +102,7 @@ class HubSpot:
 
 
 def run(monkeypatch, env, csuite=None, hubspot=None, task=True):
-    monkeypatch.setattr(Config, "CSUITE_ENV", env)
+    monkeypatch.setattr("config.Config.CSUITE_ENV", env)
     monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
     monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
     monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", task)
@@ -187,7 +187,7 @@ def test_the_backfill_line_is_marked(monkeypatch):
 def test_a_fund_read_back_warning_is_marked(monkeypatch):
     from clients.csuite import CSuiteClient
 
-    monkeypatch.setattr(Config, "CSUITE_ENV", "sandbox")
+    monkeypatch.setattr("config.Config.CSUITE_ENV", "sandbox")
 
     class Client(CSuiteClient):
         verify_writes = True
@@ -209,7 +209,7 @@ def test_a_fund_read_back_warning_is_marked(monkeypatch):
 def test_a_task_read_back_warning_is_marked(monkeypatch):
     from clients.csuite import CSuiteClient
 
-    monkeypatch.setattr(Config, "CSUITE_ENV", "sandbox")
+    monkeypatch.setattr("config.Config.CSUITE_ENV", "sandbox")
 
     class Client(CSuiteClient):
         verify_writes = True
@@ -240,3 +240,98 @@ def test_a_full_sandbox_confirmation_marks_every_id_it_prints(monkeypatch):
     text = "\n".join(l for l in reply.splitlines() if "](" not in l)
     for number in re.findall(r"\b(1\d{4}|\d{4})\b", text):
         assert f"{number} (sandbox)" in reply, (number, text)
+
+
+# ---------------------------------------------------------------------------
+# The assignee is a NAME, through the real create_task + read-back
+# ---------------------------------------------------------------------------
+
+def test_the_live_line_names_the_assignee_not_a_bare_employee_id(monkeypatch):
+    """The sandbox-26 report printed "for 1006". That was a demo artifact — its
+    double returned `create_task` directly, so no read-back ran and no name was
+    available. Sandbox-21's real run printed "for Dodge, Carl".
+
+    This exercises the REAL create_task, faked only at _request, so the name
+    comes from the read-back the way it does in production.
+    """
+    from clients.csuite import CSuiteClient
+
+    monkeypatch.setattr("config.Config.CSUITE_ENV", "live")
+    monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
+    monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
+    monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", True)
+    monkeypatch.setattr(Config, "CSUITE_HUBSPOT_BACKFILL_ENABLED", False)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID", 1007)
+    monkeypatch.setattr(Config, "CSUITE_TASK_TYPE_ID", None)
+
+    class Real(CSuiteClient):
+        """The real create_individual_profile and create_task."""
+
+        base_url = "https://amuslimcf.fcsuite.com/api/v2"
+        verify_writes = True
+
+        def __init__(self):
+            self.endpoints = []
+
+        def _request(self, endpoint, data=None):
+            self.endpoints.append(endpoint)
+            if endpoint == "profile/list":
+                return NoDuplicates()._request(endpoint, data)
+            if endpoint == "profile/display":
+                return {"success": True, "data": {
+                    "profile_id": 21700, "first_name": "S", "last_name": "A",
+                    "primary_email": "s@example.invalid"}}
+            if endpoint == "task/display":
+                return {"success": True, "data": {
+                    "task_id": 1050, "task_description": "DAF inquiry "
+                    "follow-up: S A — s@example.invalid",
+                    "employee_id": 1007, "due_date": "2026-10-05",
+                    "o": "profile", "id": 21700,
+                    "assigned_employee": {"employee_id": 1007,
+                                          "employee_profile_id": 1039,
+                                          "employee_name": "Zouita, Kods"}}}
+            if endpoint == "profile/create/individual":
+                return {"success": True, "data": {"profile_id": 21700}}
+            if endpoint == "task/create":
+                return {"success": True, "data": {"task_id": 1050}}
+            raise AssertionError(endpoint)
+
+    csuite = Real()
+    state = {"active": True, "workflow_type": "daf", "type": "daf",
+             "step": "confirm", "form_id": Config.DAF_INQUIRY_FORM_ID,
+             "submission_data": {"first_name": "S", "last_name": "A",
+                                 "email": "s@example.invalid"},
+             "profile_id": None, "funit_id": None, "ticket_id": None}
+    reply = daf_workflow._step_create("yes", state, HubSpot(), csuite)
+
+    assert "📝 Follow-up task 1050 for Zouita, Kods — re: S A" in reply
+    assert " for 1007 " not in reply, "a bare employee id makes a reader look it up"
+    assert "(sandbox)" not in reply, "live output carries no marker"
+    assert "task/display" in csuite.endpoints, "the name comes from the read-back"
+
+
+def test_without_a_read_back_name_it_falls_back_to_the_id(monkeypatch):
+    """Honest degradation: an id is worse than a name and better than nothing."""
+    from clients.csuite import CSuiteClient
+
+    monkeypatch.setattr("config.Config.CSUITE_ENV", "live")
+    monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
+    monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
+    monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", True)
+    monkeypatch.setattr(Config, "CSUITE_HUBSPOT_BACKFILL_ENABLED", False)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID", 1007)
+    monkeypatch.setattr(Config, "CSUITE_TASK_TYPE_ID", None)
+
+    class NoName(CSuite):
+        def create_task(self, **kwargs):
+            return {"success": True, "data": {"task_id": 1050},
+                    "verified": True}          # no assignee_name
+
+    state = {"active": True, "workflow_type": "daf", "type": "daf",
+             "step": "confirm", "form_id": Config.DAF_INQUIRY_FORM_ID,
+             "submission_data": {"first_name": "S", "last_name": "A",
+                                 "email": "s@example.invalid"},
+             "profile_id": None, "funit_id": None, "ticket_id": None}
+    reply = daf_workflow._step_create("yes", state, HubSpot(), NoName())
+
+    assert "📝 Follow-up task 1050 for 1007 — re: S A" in reply

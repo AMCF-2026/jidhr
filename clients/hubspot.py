@@ -57,8 +57,14 @@ def flatten_error_body(text, limit: int = ERROR_BODY_MAX_CHARS) -> str:
 
 
 def csuite_env() -> str:
-    """The CSuite environment this process is configured for."""
-    return str(getattr(Config, "CSUITE_ENV", "") or "").strip().lower()
+    """The CSuite environment this process is configured for.
+
+    Through the module, not the class imported at load — see the note on
+    clients.audit.current_csuite_env. A reloaded config must not leave two
+    callers disagreeing about which environment this is.
+    """
+    import config
+    return str(getattr(config.Config, "CSUITE_ENV", "") or "").strip().lower()
 
 
 def hubspot_writes_allowed() -> bool:

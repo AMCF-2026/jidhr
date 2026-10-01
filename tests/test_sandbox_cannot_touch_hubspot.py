@@ -25,7 +25,7 @@ from tests.csuite_doubles import NoDuplicates, StaleLink, contact
 
 
 def client(monkeypatch, env):
-    monkeypatch.setattr(Config, "CSUITE_ENV", env)
+    monkeypatch.setattr("config.Config.CSUITE_ENV", env)
     monkeypatch.setattr("clients.hubspot.reserve_write",
                         lambda *a, **kw: {"id": 1})
     monkeypatch.setattr("clients.hubspot.complete_write", lambda *a, **kw: None)
@@ -61,12 +61,12 @@ def client(monkeypatch, env):
 @pytest.mark.parametrize("env", ["sandbox", "SANDBOX", " sandbox ", "", "staging",
                                  None])
 def test_anything_but_live_refuses_writes(monkeypatch, env):
-    monkeypatch.setattr(Config, "CSUITE_ENV", env)
+    monkeypatch.setattr("config.Config.CSUITE_ENV", env)
     assert hubspot_writes_allowed() is False
 
 
 def test_live_allows_writes(monkeypatch):
-    monkeypatch.setattr(Config, "CSUITE_ENV", "live")
+    monkeypatch.setattr("config.Config.CSUITE_ENV", "live")
     assert hubspot_writes_allowed() is True
     assert csuite_env() == "live"
 
@@ -105,7 +105,7 @@ def test_read_shaped_posts_are_NOT_refused(monkeypatch, endpoint):
 
 def test_the_refusal_is_recorded_as_skipped_not_failed(monkeypatch):
     rows = []
-    monkeypatch.setattr(Config, "CSUITE_ENV", "sandbox")
+    monkeypatch.setattr("config.Config.CSUITE_ENV", "sandbox")
     monkeypatch.setattr("clients.hubspot.record_write",
                         lambda *a, **kw: rows.append(kw) or True)
     hs = HubSpotClient()
@@ -177,7 +177,7 @@ class HubSpot:
 
 
 def run(monkeypatch, env, csuite=None, hubspot=None, backfill=True):
-    monkeypatch.setattr(Config, "CSUITE_ENV", env)
+    monkeypatch.setattr("config.Config.CSUITE_ENV", env)
     monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
     monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
     monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", False)

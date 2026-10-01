@@ -587,8 +587,15 @@ def mark_id(value, env=None) -> str:
     """
     if value in (None, ""):
         return str(value)
-    environment = str(env if env is not None
-                      else getattr(Config, "CSUITE_ENV", "") or "").strip().lower()
+    if env is not None:
+        environment = str(env).strip().lower()
+    else:
+        # Through the module, not the class imported at load — a reloaded
+        # config rebinds config.Config, and two callers reading different
+        # class objects would disagree about which environment this is.
+        import config
+        environment = str(getattr(config.Config, "CSUITE_ENV", "")
+                          or "").strip().lower()
     return f"{value}" if environment == ENV_LIVE else f"{value} (sandbox)"
 
 
