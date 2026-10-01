@@ -18,6 +18,8 @@ import logging
 
 import pytest
 
+from tests.csuite_doubles import NoDuplicates, contact
+
 from config import Config
 from intents import daf_workflow
 
@@ -34,7 +36,7 @@ class CSuiteNeverCalled:
             f"the create is disabled and CSuite.{name}() was still called")
 
 
-class CSuiteCreating:
+class CSuiteCreating(NoDuplicates):
     def __init__(self, response=None):
         self.calls = []
         self.response = response or {"success": True,

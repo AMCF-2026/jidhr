@@ -299,8 +299,22 @@ class HubSpotClient:
             "limit": limit
         })
     
-    def search_contact_by_email(self, email: str) -> dict:
-        """Search for a contact by exact email match"""
+    # Properties every caller of search_contact_by_email gets back.
+    #
+    # It used to request none, so a caller could not tell whether a contact
+    # already carried a CSuite id — and the DAF workflow then PATCHed a new one
+    # over the top without reading it (2026-10-01). Asking for them costs
+    # nothing: the search is already being made.
+    CONTACT_SEARCH_PROPERTIES = ("email", "firstname", "lastname",
+                                 "csuite_profile_id", "csuite_fund_id")
+
+    def search_contact_by_email(self, email: str, properties=None) -> dict:
+        """Search for a contact by exact email match.
+
+        Returns CONTACT_SEARCH_PROPERTIES unless `properties` says otherwise,
+        so a caller can see an existing csuite_profile_id before overwriting
+        it.
+        """
         return self._post("crm/v3/objects/contacts/search", {
             "filterGroups": [{
                 "filters": [{
@@ -309,6 +323,9 @@ class HubSpotClient:
                     "value": email
                 }]
             }],
+            "properties": list(properties
+                               if properties is not None
+                               else self.CONTACT_SEARCH_PROPERTIES),
             "limit": 1
         })
 

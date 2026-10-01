@@ -16,6 +16,8 @@ No network.
 
 import pytest
 
+from tests.csuite_doubles import NoDuplicates, contact
+
 from clients.csuite import CSuiteClient
 from config import Config
 from sync.readback import FieldDropped, ReadBackUnavailable, verify_fund
@@ -158,7 +160,7 @@ def test_a_failed_create_is_not_read_back():
 def test_the_fund_warning_reaches_the_confirmation_text(monkeypatch):
     from intents import daf_workflow
 
-    class CSuite:
+    class CSuite(NoDuplicates):
         def create_individual_profile(self, **kwargs):
             return {"success": True, "data": {"profile_id": 21662}}
 
@@ -172,7 +174,7 @@ def test_the_fund_warning_reaches_the_confirmation_text(monkeypatch):
 
     class HubSpot:
         def search_contact_by_email(self, email):
-            return {"results": [{"id": "70123"}]}
+            return contact(self.contact_id if hasattr(self, "contact_id") else "70123")
 
         def update_contact_by_email(self, email, properties):
             return {"id": "70123"}

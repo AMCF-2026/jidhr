@@ -258,7 +258,9 @@ OBSERVED_OUTPUT = {
 
 ENDPOINT_ALLOWED_UNVERIFIED = {
     "task_description": ("task/create",),
-    "due_date": ("task/create",),
+    # `due_ts`, not `due_date`: CSuite named due_ts as required while due_date
+    # was in the payload (2026-10-01).
+    "due_ts": ("task/create",),
     "employee_id": ("task/create",),
     "task_type_id": ("task/create",),
     "task_id": ("task/create", "task/edit/complete"),
@@ -282,7 +284,18 @@ ENDPOINT_ALLOWED_UNVERIFIED = {
 # primary_phone_number "703-555-0100". Stored, and punctuated by CSuite —
 # which is why sync/readback.py now tells a reformatted value apart from a
 # dropped one. Nothing is left in this set.
-RECOGNISED_UNCONFIRMED_FIELDS = frozenset()
+# 2026-10-01, task/create returned HTTP 400 naming two fields as REQUIRED:
+#     due_ts: due_ts is required
+#     name:   name is required
+# CSuite therefore parses and demands both, which makes them real input names.
+# Neither has been STORED — the create was rejected, so nothing was read back,
+# and `due_ts`'s accepted FORMAT is unknown (the output is a plain
+# "2026-10-05", but "ts" suggests a timestamp). Same holding pen `phone_number`
+# sat in before a read-back promoted it.
+RECOGNISED_UNCONFIRMED_FIELDS = frozenset({
+    "name",      # task/create, required
+    "due_ts",    # task/create, required; format unverified
+})
 
 # Names PROVEN not to work as inputs, each by a sandbox write and a
 # read-back. They are all valid `profile/display` output names, which is the
@@ -315,6 +328,12 @@ KNOWN_INVALID_INPUT_FIELDS = {
     # unchanged. Neither is the documented EDIT shape.
     # Endpoint-specific: see ENDPOINT_CONFIRMED_FIELDS. Nested `address` IS
     # a confirmed input to profile/create/individual as of 2026-10-01.
+    # 2026-10-01, task/create: `due_date` was SENT and CSuite still answered
+    # HTTP 400 `due_ts: due_ts is required`. So due_date did not satisfy the
+    # due-date requirement — it is the OUTPUT name (task/display returns
+    # due_date "2026-10-05") and not the input name.
+    "due_date": "sent to task/create and CSuite still required `due_ts`, "
+                "2026-10-01; it is the output name — use `due_ts`",
     "address": "dropped by profile/EDIT as a plain string AND as a nested "
                "object, 2026-10-01. On profile/CREATE the nested object is "
                "CONFIRMED — use the dotted address.* keys to edit",
@@ -1588,13 +1607,20 @@ class CSuiteClient:
         Args:
             name: Task name (required)
             employee_id: Assigned employee's name_link_id (required)
-            due_date: Due date in YYYY-MM-DD format
+            due_date: due date -> sent as `due_ts` (REQUIRED by CSuite).
+                Format unverified; task/display returns YYYY-MM-DD.
             description: Task description
             **kwargs: Additional task fields
         """
         data = {"name": name, "employee_id": employee_id}
         if due_date:
-            data["due_date"] = due_date
+            # `due_ts`, not `due_date`. 2026-10-01: a create carrying
+            # `due_date` was refused with `due_ts: due_ts is required`, so
+            # due_date is the output name only. The FORMAT due_ts accepts is
+            # unverified — task/display returns a plain "2026-10-05", but
+            # "ts" suggests a timestamp. A wrong format is a 400, which
+            # creates nothing, so this fails safely either way.
+            data["due_ts"] = due_date
         if description:
             data["task_description"] = description
         # Gated from 2026-10-01. Against ENDPOINT_ALLOWED_UNVERIFIED, not
@@ -1606,10 +1632,15 @@ class CSuiteClient:
         # The method's own `name` and `employee_id` are not gated, same as the
         # profile create — see the note above about `name`.
         #
-        # TODO(sandbox-17): this method cannot link a task to anything. A
+        # TODO(sandbox-18): this method cannot link a task to anything. A
         # UI-made task reads back o="profile" / id=21661, so CSuite supports
-        # it; the input names are unknown. Until they are confirmed, every
-        # task this method could create would be free-floating.
+        # it; the input names are unknown.
+        #
+        # 2026-10-01: `o` and `id` were sent to task/create alongside
+        # task_description, employee_id, due_date and task_type_id. The call
+        # was refused for MISSING `name` and `due_ts` and said nothing about
+        # the link keys — so whether `o`/`id` are accepted on the way in is
+        # still untested. Nothing was created.
         check_input_fields(kwargs, "task/create")
         data.update(kwargs)
         

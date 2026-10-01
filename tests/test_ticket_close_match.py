@@ -15,6 +15,8 @@ No network.
 
 import pytest
 
+from tests.csuite_doubles import NoDuplicates, contact
+
 from config import Config
 from intents import daf_workflow
 from intents.daf_workflow import matching_tickets
@@ -111,7 +113,7 @@ def test_a_ticket_with_no_subject_is_still_identifiable():
 # Through the workflow
 # ---------------------------------------------------------------------------
 
-class CSuite:
+class CSuite(NoDuplicates):
     def create_individual_profile(self, **kwargs):
         return {"success": True, "data": {"profile_id": 21680}}
 
@@ -122,7 +124,7 @@ class HubSpot:
         self.closed = []
 
     def search_contact_by_email(self, email):
-        return {"results": [{"id": "70123"}]}
+        return contact(self.contact_id if hasattr(self, "contact_id") else "70123")
 
     def update_contact_by_email(self, email, properties):
         return {"id": "70123"}

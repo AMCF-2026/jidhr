@@ -388,6 +388,105 @@ def matching_tickets(tickets, email) -> list:
     return found
 
 
+def existing_hubspot_link(email: str, hubspot):
+    """(contact_id, csuite_profile_id) for `email`. READ-ONLY.
+
+    One search, both answers. Until 2026-10-01 the workflow created a profile
+    and then PATCHed `csuite_profile_id` over whatever was there, having never
+    read it — so a second inquiry from the same donor made a second CSuite
+    profile and repointed HubSpot at it, with the old id gone and nothing
+    recording what it had been. CSuite has no idempotency key, so the first
+    profile stays.
+
+    Returns (None, None) when the contact cannot be read. "Unknown" is not
+    "absent": the caller treats a failed lookup as a reason to stop, not as
+    permission to create.
+    """
+    if not email or hubspot is None:
+        return None, None
+    try:
+        found = hubspot.search_contact_by_email(email)
+    except Exception as e:
+        logger.error("could not read the HubSpot contact for a duplicate "
+                     "check: %s", e)
+        return None, None
+    if not isinstance(found, dict) or "error" in found:
+        return None, None
+
+    rows = found.get("results")
+    if not (isinstance(rows, list) and rows):
+        return None, None          # no contact yet; nothing to duplicate
+    row = rows[0]
+    props = row.get("properties") or {}
+    existing = (props.get("csuite_profile_id") or "").strip() or None
+    return row.get("id"), existing
+
+
+class _SkipHubSpotUpdate(Exception):
+    """Internal: leave the HubSpot contact alone and keep going."""
+
+
+class DuplicateProfile(Exception):
+    """The donor already has a CSuite profile. Nothing should be created."""
+
+    def __init__(self, profile_id, source: str):
+        self.profile_id = profile_id
+        self.source = source
+        super().__init__(f"profile {profile_id} already exists ({source})")
+
+
+def already_in_csuite(data: dict, hubspot, csuite):
+    """The existing CSuite profile id for this donor, or None. READ-ONLY.
+
+    Two independent checks, because they fail differently:
+
+    1. **The HubSpot contact's `csuite_profile_id`.** Cheap, and definitive
+       when set — this workflow put it there.
+    2. **A trusted `primary_email` search of CSuite.** Catches a profile
+       created by hand, by an import, or by a run whose HubSpot PATCH failed.
+       It goes through `filter_trust`, so a filter CSuite has decided to
+       ignore raises instead of answering 0 — the 18,797-row lesson.
+
+    Raises DuplicateProfile on a match, and also when the CSuite side cannot
+    be trusted or is ambiguous. **Ambiguity stops the create.** The cost of
+    stopping is a message; the cost of continuing is a duplicate donor record
+    in a fund-accounting system, which nothing here can undo.
+    """
+    from sync.filter_trust import FilterNotTrusted, search_before_create
+
+    contact_id, existing = existing_hubspot_link(data.get("email"), hubspot)
+    if existing:
+        raise DuplicateProfile(existing, "HubSpot contact csuite_profile_id")
+
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        return contact_id          # nothing to search on; the create decides
+
+    try:
+        count, response = search_before_create(
+            lambda endpoint, body: csuite._request(endpoint, body),
+            "profile/list", "primary_email", email)
+    except FilterNotTrusted as e:
+        raise DuplicateProfile(
+            None, f"CSuite could not be searched, so a duplicate cannot be "
+                  f"ruled out: {e}")
+    except Exception as e:
+        raise DuplicateProfile(
+            None, f"the CSuite duplicate check failed, so a duplicate cannot "
+                  f"be ruled out: {e}")
+
+    if count == 0:
+        return contact_id
+
+    rows = (response.get("data") or {}).get("results") or []
+    ids = [r.get("profile_id") for r in rows if r.get("profile_id")]
+    if count == 1 and len(ids) == 1:
+        raise DuplicateProfile(ids[0], "CSuite primary_email search")
+    raise DuplicateProfile(
+        None, f"{count} CSuite profiles already carry this email "
+              f"({', '.join(str(i) for i in ids) or 'ids not returned'})")
+
+
 def record_unprocessed_submission(state: dict, reason: str) -> bool:
     """Record WHICH submission could not be processed, so it can be replayed.
 
@@ -480,6 +579,11 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         # nothing was sent. Reported to the user as skipped, not as failed,
         # because "Failed to create" would be a false statement.
         "profile_skipped": False,
+        # Set when a CSuite profile already exists for this donor, or when a
+        # duplicate could not be ruled out. Either way nothing is created and
+        # nothing is PATCHed.
+        "duplicate_of": None,
+        "duplicate_reason": None,
         # Set when CSuite would have refused the submitted phone number, so
         # it was left out and the profile made anyway. Shown to the user, not
         # only logged: a number dropped in silence is the failure this path
@@ -512,6 +616,21 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         _log_skipped_create(data, hubspot)
         results["profile_skipped"] = True
     else:
+        # Search before create. CSuite has no idempotency key, so a duplicate
+        # cannot be undone from here — and an ambiguous or unanswerable check
+        # stops the create just as a match does.
+        try:
+            existing_contact_id = already_in_csuite(data, hubspot, csuite)
+            state["hubspot_contact_id"] = existing_contact_id
+        except DuplicateProfile as duplicate:
+            results["duplicate_of"] = duplicate.profile_id
+            results["duplicate_reason"] = duplicate.source
+            logger.warning("CSuite profile create SKIPPED: %s", duplicate)
+            state["step"] = "done"
+            if duplicate.profile_id:
+                state["profile_id"] = duplicate.profile_id
+            return _format_confirmation(data, state, results, type_label)
+
         logger.info(f"Creating CSuite profile for {data.get('first_name')} {data.get('last_name')}...")
         try:
             profile_result = csuite.create_individual_profile(
@@ -629,6 +748,22 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
             if state.get("funit_id"):
                 update_props["csuite_fund_id"] = str(state["funit_id"])
 
+            # Never overwrite an id that is already there. The duplicate guard
+            # above should have stopped this run, so reaching here with a value
+            # set means the two disagree — and the stored id wins, because it
+            # is the one staff and the donation sync have been using.
+            _, already = existing_hubspot_link(data["email"], hubspot)
+            if already:
+                logger.error("HubSpot contact for this submission already has "
+                             "csuite_profile_id %s; refusing to overwrite it "
+                             "with %s", already, state["profile_id"])
+                results["errors"].append(
+                    f"HubSpot already links this contact to CSuite profile "
+                    f"{already}, so it was NOT repointed at the new profile "
+                    f"{state['profile_id']}. Two profiles now exist for this "
+                    "donor — merge them in CSuite.")
+                raise _SkipHubSpotUpdate
+
             hs_result = hubspot.update_contact_by_email(data["email"], update_props)
             if hs_result and "error" not in hs_result:
                 results["hubspot_updated"] = True
@@ -657,6 +792,8 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
             else:
                 error = hs_result.get('error', 'Unknown error') if hs_result else 'No response'
                 results["errors"].append(f"HubSpot update: {error}")
+        except _SkipHubSpotUpdate:
+            pass            # already explained in results["errors"]
         except Exception as e:
             results["errors"].append(f"HubSpot update: {e}")
             logger.error(f"HubSpot update error: {e}")
@@ -827,6 +964,27 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
     # A skip is not a creation and not a failure. Saying "Created" over a
     # run that created nothing is the same class of false success as the
     # 200 CSuite returns for a field it discarded.
+    if results.get("duplicate_reason"):
+        # Nothing was created and nothing was PATCHed.
+        profile_id = results.get("duplicate_of")
+        if profile_id:
+            link = Config.CSUITE_PROFILE_URL.format(profile_id=profile_id)
+            lines.append(f"♻️ **Already in CSuite — no new profile created**")
+            lines.append("")
+            lines.append(f"👤 Profile {profile_id} — [CSuite]({link})")
+            lines.append(f"   Found via: {results['duplicate_reason']}")
+        else:
+            lines.append("🛑 **No profile created — a duplicate could not be "
+                         "ruled out**")
+            lines.append("")
+            lines.append(f"   {results['duplicate_reason']}")
+            lines.append("   Nothing was created and nothing was changed. "
+                         "CSuite has no way to merge two donor profiles from "
+                         "here, so this stops rather than guesses.")
+        lines.append("")
+        lines.append("Say anything to continue, or start a new workflow.")
+        return "\n".join(lines)
+
     if results.get("profile_skipped"):
         lines.append(f"⏸️ **{type_label} Not Created**")
     elif not results["profile_created"]:

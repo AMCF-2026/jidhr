@@ -17,6 +17,8 @@ No network.
 
 import pytest
 
+from tests.csuite_doubles import NoDuplicates, contact
+
 from clients.csuite import CSuiteClient, normalize_phone
 from config import Config
 from intents import daf_workflow
@@ -129,7 +131,7 @@ def test_no_phone_at_all_warns_about_nothing():
 # It reaches the user
 # ---------------------------------------------------------------------------
 
-class CSuiteWithBadPhone:
+class CSuiteWithBadPhone(NoDuplicates):
     def create_individual_profile(self, **kwargs):
         number, warning = normalize_phone(kwargs.get("phone"))
         response = {"success": True, "data": {"profile_id": 21659}}
@@ -143,7 +145,7 @@ class CSuiteWithBadPhone:
 
 class HubSpot:
     def search_contact_by_email(self, email):
-        return {"results": [{"id": "70123"}]}
+        return contact(self.contact_id if hasattr(self, "contact_id") else "70123")
 
     def update_contact_by_email(self, email, properties):
         return {"id": "70123"}

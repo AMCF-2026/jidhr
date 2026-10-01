@@ -368,7 +368,7 @@ def test_unverified_names_are_never_mistaken_for_confirmed_ones():
                 & set(KNOWN_INVALID_INPUT_FIELDS))
 
 
-@pytest.mark.parametrize("field", ["task_description", "due_date",
+@pytest.mark.parametrize("field", ["task_description", "due_ts",
                                    "employee_id", "task_type_id"])
 def test_a_task_field_passes_on_task_create_only(field):
     check_input_fields([field], "task/create")
@@ -379,8 +379,8 @@ def test_a_task_field_passes_on_task_create_only(field):
 @pytest.mark.parametrize("field", [
     "primary_email",        # the proven-wrong typo shape
     "task_name",            # plausible and never seen
-    "name",                 # sent by the method, absent from every read
     "subject",
+    "due_date",             # the OUTPUT name; CSuite requires due_ts
 ])
 def test_an_unknown_or_proven_wrong_task_key_raises(field):
     with pytest.raises(UnconfirmedField):

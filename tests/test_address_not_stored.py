@@ -19,6 +19,8 @@ No network.
 
 import pytest
 
+from tests.csuite_doubles import NoDuplicates, contact
+
 from clients.csuite import (CSuiteClient, build_address,
                             normalize_phone)
 from config import Config
@@ -90,7 +92,7 @@ class Client(CSuiteClient):
                 "http_status": 200, "outcome": "ok"}
 
 
-class CSuiteSpy:
+class CSuiteSpy(NoDuplicates):
     """Stands in for the client; records the kwargs the workflow passes."""
 
     def __init__(self, phone_warning=None):
@@ -120,7 +122,7 @@ class HubSpot:
 
     def search_contact_by_email(self, email):
         self.calls.append("search_contact_by_email")
-        return {"results": [{"id": "70123"}]}
+        return contact(self.contact_id if hasattr(self, "contact_id") else "70123")
 
     def update_contact_by_email(self, email, properties):
         self.calls.append(f"update_contact_by_email {sorted(properties)}")

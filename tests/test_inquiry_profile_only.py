@@ -18,6 +18,8 @@ import logging
 
 import pytest
 
+from tests.csuite_doubles import NoDuplicates, contact
+
 from clients.audit import AuditUnavailable
 from clients.csuite import CSuiteClient
 from config import Config
@@ -36,7 +38,7 @@ def submission(**fields):
             "values": [{"name": k, "value": v} for k, v in base.items() if v]}
 
 
-class CSuiteSpy:
+class CSuiteSpy(NoDuplicates):
     def __init__(self, fail=None):
         self.calls = []
         self.fail = fail
@@ -62,7 +64,7 @@ class HubSpot:
         self.patched = []
 
     def search_contact_by_email(self, email):
-        return {"results": [{"id": "70123"}]} if self.found else {"results": []}
+        return contact(self.contact_id if hasattr(self, "contact_id") else "70123") if self.found else {"results": []}
 
     def update_contact_by_email(self, email, properties):
         self.patched.append(dict(properties))
