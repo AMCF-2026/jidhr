@@ -395,6 +395,9 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         # only logged: a number dropped in silence is the failure this path
         # has been carrying since 2026-03-17.
         "phone_warning": None,
+        # Set when funit/create succeeded but the fund did not read back
+        # holding what was sent.
+        "fund_warning": None,
         # Set when the submission carried an address. CSuite's address input
         # name is unknown — nine candidates eliminated by sandbox write and
         # read-back — so it is not sent, and it is named to a human instead
@@ -487,6 +490,10 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
                 state["funit_id"] = funit_id
                 results["fund_created"] = True
                 logger.info(f"Fund created: {funit_id}")
+                # funit/create is read back now. A fund whose group or cash
+                # account did not store is a finance problem, so it is named
+                # to the user rather than left in a log.
+                results["fund_warning"] = fund_result.get("fund_warning")
             else:
                 error = fund_result.get('error', 'Unknown error')
                 results["errors"].append(f"Fund creation: {error}")
@@ -724,6 +731,8 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
         fund_name = data.get("fund_name") or f"{data.get('last_name', 'New')} Family Fund"
         fund_link = Config.CSUITE_FUND_URL.format(funit_id=state['funit_id'])
         lines.append(f"💰 Fund: {fund_name} — [CSuite]({fund_link})")
+        if results.get("fund_warning"):
+            lines.append(results["fund_warning"])
     elif results["profile_created"]:
         lines.append("❌ Fund: Failed to create")
 

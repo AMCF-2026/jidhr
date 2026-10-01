@@ -537,7 +537,13 @@ class CSuiteClient:
         self.session = requests.Session()
         logger.info("CSuite client: env=%s host=%s key from $%s",
                     self.env, host_of(self.base_url), self.key_var)
-    
+
+        # A cap from config, so a client built anywhere starts with one.
+        # Default 0: nothing can be written unless someone raised it on
+        # purpose. Callers that manage their own cap (the sandbox scripts)
+        # reassign client.write_budget after construction.
+        self.write_budget = self._budget_from_config()
+
     # =========================================================================
     # AUTHENTICATION & HTTP
     # =========================================================================
@@ -601,6 +607,16 @@ class CSuiteClient:
     # printed "budget 0 of 1" — a guard that silently does not guard, which
     # is worse than no guard, because the output looked clean.
     write_budget = None
+
+    def _budget_from_config(self):
+        """The cap this client starts with, from Config.CSUITE_WRITE_BUDGET.
+
+        Default 0, so a client built with no deliberate budget cannot write.
+        See the note on CSUITE_WRITE_BUDGET in config.py for how to raise it
+        for a live run.
+        """
+        from sync.sandbox_writes import WriteBudget
+        return WriteBudget(int(getattr(Config, "CSUITE_WRITE_BUDGET", 0) or 0))
 
     # Endpoints where a before-state is worth reading. An edit that stores
     # nothing leaves modified_ts alone, and that is the only part of the
@@ -1147,9 +1163,48 @@ class CSuiteClient:
         }
         check_input_fields(kwargs, "funit/create")
         data.update(kwargs)
-        
+
         logger.info(f"Creating fund: {name} (group: {fgroup_id})")
-        return self._request("funit/create", data)
+        response = self._request("funit/create", data)
+
+        # funit/create had no read-back until 2026-10-01. Sandbox-11 created
+        # fund 1564 and nothing checked what was in it; its contents are known
+        # only because I chose to look afterwards. A fund pointed at the wrong
+        # cash account is a finance problem, not a data-entry one.
+        if not (self.verify_writes and isinstance(response, dict)
+                and response.get("success")):
+            return response
+        payload = response.get("data")
+        funit_id = payload.get("funit_id") if isinstance(payload, dict) else None
+        if funit_id is None:
+            logger.warning("no funit_id came back from funit/create; the fund "
+                           "was not verified")
+            response["verified"] = None
+            return response
+
+        from sync.readback import (FieldDropped, ReadBackUnavailable,
+                                   verify_fund)
+        try:
+            verify_fund(self._request, data, funit_id)
+        except ReadBackUnavailable as e:
+            logger.error("could not read fund %s back: %s", funit_id, e)
+            response["verified"] = None
+            response["fund_warning"] = (
+                f"⚠️ Fund {funit_id} was created but could not be read back, "
+                "so its group and cash account are unconfirmed. Check it in "
+                "CSuite.")
+        except FieldDropped as dropped:
+            logger.error("fund %s does not hold what was sent: %s", funit_id,
+                         sorted(dropped.dropped))
+            response["verified"] = False
+            response["fields_dropped"] = dropped.dropped
+            response["fund_warning"] = (
+                f"⚠️ Fund {funit_id} was created but CSuite did not store: "
+                f"{', '.join(sorted(dropped.dropped))}. Check its fund group "
+                "and cash account in CSuite before using it.")
+        else:
+            response["verified"] = True
+        return response
     
     def get_fund_groups(self) -> dict:
         """Get fund groups (DAF, Endowment, Fiscal Sponsorship, etc.)"""

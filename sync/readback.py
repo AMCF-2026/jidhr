@@ -279,6 +279,59 @@ def compare(sent: dict, stored: dict, ignore=DERIVED_FIELDS) -> dict:
     return compare_detail(sent, stored, ignore)[0]
 
 
+# funit/create input -> funit/display output. Measured 2026-10-01 against the
+# fund sandbox-11 created without authorisation (1564): `name` is read back as
+# `fund_name`, and fgroup_id / cash_account_id keep their names — except that
+# the cash account comes back as `account_id`.
+FUND_SENT_TO_STORED = {
+    "name": "fund_name",
+    "fgroup_id": "fgroup_id",
+    "cash_account_id": "account_id",
+}
+
+
+def compare_fund(sent: dict, stored: dict) -> dict:
+    """{sent field: (sent, stored)} for anything funit/create did not keep.
+
+    A separate mapping from SENT_TO_STORED because a fund is a different
+    object with its own vocabulary, and because getting this wrong on
+    2026-10-01 recorded a fund's cash account as the fund's own id.
+    """
+    dropped = {}
+    for field, target in FUND_SENT_TO_STORED.items():
+        if field not in (sent or {}):
+            continue
+        held = (stored or {}).get(target)
+        if not _same(sent[field], held) and not _reformatted(sent[field], held):
+            dropped[field] = (sent[field], held)
+    return dropped
+
+
+def verify_fund(read, sent: dict, funit_id, display_endpoint="funit/display"):
+    """Read a created fund back and raise FieldDropped if it is wrong.
+
+    `funit/create` has never had a read-back. Sandbox-11 created fund 1564
+    and nothing checked what was in it — the only reason its contents are
+    known is that I chose to look afterwards.
+    """
+    response = read(display_endpoint, {"funit_id": funit_id})
+    data = response.get("data") if isinstance(response, dict) else None
+    if isinstance(data, list) and data:
+        data = data[0]
+    if not isinstance(data, dict) or not data.get("funit_id"):
+        raise ReadBackUnavailable(
+            {"<fund not found>": (funit_id, None)}, "funit/create", funit_id)
+
+    dropped = compare_fund(sent, data)
+    if dropped:
+        logger.error("CSuite funit/create on %s did NOT store: %s",
+                     funit_id, sorted(dropped))
+        raise FieldDropped(dropped, "funit/create", funit_id)
+
+    logger.info("read-back OK: fund %s holds what was sent", funit_id)
+    return data
+
+
 def verify(read, endpoint: str, sent: dict, record_id, id_field="profile_id",
            display_endpoint="profile/display", modified_before=None):
     """Read the record back and raise FieldDropped if anything was lost.

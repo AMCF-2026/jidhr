@@ -20,6 +20,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _int_or_zero(raw):
+    """A non-negative int, or 0. A typo must fail closed, never open."""
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
 class Config:
     """Application configuration"""
     
@@ -110,6 +119,25 @@ class Config:
     # Default OFF rather than a warning, because the failure is silent by
     # construction and a warning would be the thing that gets missed. The
     # rest of the workflow still runs — see _step_create.
+    # A hard cap on CSuite writes per client, enforced inside
+    # CSuiteClient._request. **0 means no CSuite write can leave the process.**
+    #
+    # Default 0 rather than unlimited. CSUITE_DAF_CREATE_ENABLED decides
+    # whether the workflow TRIES to create; this decides whether anything can
+    # actually be sent, and two independent switches is the point — on
+    # 2026-10-01 a guard that looked like it was counting writes was not on
+    # the path the calls took, and two records were created under a cap of
+    # one.
+    #
+    # To enable the first live runs, set BOTH:
+    #     CSUITE_DAF_CREATE_ENABLED=true
+    #     CSUITE_WRITE_BUDGET=2        # one profile + one fund = one run
+    # Raise it deliberately, one run at a time, and read the first create
+    # back before allowing a second. An empty or unparseable value is 0, not
+    # unlimited: a typo must fail closed.
+    CSUITE_WRITE_BUDGET = _int_or_zero(
+        os.environ.get('CSUITE_WRITE_BUDGET', '0'))
+
     CSUITE_DAF_CREATE_ENABLED = (
         os.environ.get('CSUITE_DAF_CREATE_ENABLED', 'False')
         .strip().lower() == 'true')
