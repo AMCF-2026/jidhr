@@ -19,16 +19,29 @@ are about.
 
 
 class _ProfileListDouble:
-    """Answers profile/list the way filter_trust needs. Nothing else."""
+    """Answers profile/list and profile/display. Nothing else.
+
+    `profile/display` matters from 2026-10-01: the guard no longer trusts a
+    stored csuite_profile_id, it reads the profile back. `live_profile_ids`
+    says which ids exist; anything else answers a clean "Profile not found",
+    and `unreadable_profile_ids` answers a fault instead — which is NOT the
+    same thing and must not be treated as missing.
+    """
 
     unfiltered_total = 18797
     duplicate_ids = ()
+    # Everything is assumed to exist unless a subclass narrows it.
+    live_profile_ids = None          # None = "any id exists"
+    unreadable_profile_ids = ()
 
     def _request(self, endpoint, data=None):
         data = data or {}
+        if endpoint == "profile/display":
+            return self._display(data.get("profile_id"))
         if endpoint != "profile/list":
             raise AssertionError(
-                f"this double only answers profile/list, not {endpoint!r}")
+                f"this double only answers profile/list and profile/display, "
+                f"not {endpoint!r}")
 
         if "primary_email" not in data:
             return self._page(self.unfiltered_total, [])
@@ -39,6 +52,18 @@ class _ProfileListDouble:
 
         rows = [{"profile_id": pid} for pid in self.duplicate_ids]
         return self._page(len(rows), rows)
+
+    def _display(self, profile_id):
+        key = str(profile_id)
+        if key in {str(i) for i in self.unreadable_profile_ids}:
+            return {"success": False, "error": "Internal server error",
+                    "http_status": 500}
+        if self.live_profile_ids is not None and \
+                key not in {str(i) for i in self.live_profile_ids}:
+            return {"success": False, "error": "Profile not found",
+                    "errors": ["Profile not found"], "http_status": 200}
+        return {"success": True, "http_status": 200,
+                "data": {"profile_id": int(profile_id), "ptype": "indiv"}}
 
     @staticmethod
     def _page(count, rows):
@@ -69,3 +94,22 @@ def contact(contact_id="70123", csuite_profile_id=None, **props):
         properties["csuite_profile_id"] = csuite_profile_id
     properties.update(props)
     return {"results": [{"id": contact_id, "properties": properties}]}
+
+
+class StaleLink(_ProfileListDouble):
+    """HubSpot's stored id does not exist in CSuite, and no email match either."""
+
+    live_profile_ids = ()
+
+
+class StaleLinkWithMatch(_ProfileListDouble):
+    """The stored id is stale, and the email search finds the real profile."""
+
+    live_profile_ids = (21663,)
+    duplicate_ids = (21663,)
+
+
+class UnreadableProfile(_ProfileListDouble):
+    """CSuite will not say whether the stored id exists."""
+
+    unreadable_profile_ids = ("99999",)

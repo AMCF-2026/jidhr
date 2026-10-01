@@ -220,28 +220,19 @@ def test_a_DISAGREEING_value_is_never_overwritten_and_is_warned_about(
         "Merge them in CSuite.")
 
 
-def test_the_guard_short_circuits_so_a_disagreement_is_never_SEEN(monkeypatch):
-    """A finding, pinned.
-
-    `already_in_csuite` checks the HubSpot property FIRST and raises on it, so
-    when HubSpot holds an id the CSuite primary_email search is never run. The
-    workflow therefore stops on HubSpot's id and never learns that CSuite's
-    match is a different profile.
-
-    So the conflict branch above cannot fire from here, and more importantly
-    **the workflow does not detect that kind of disagreement at all.** Noticing
-    it would mean running both checks rather than returning on the first.
-    """
+def test_a_disagreement_between_hubspot_and_csuite_is_NOW_SEEN(monkeypatch):
+    """Fixed 2026-10-01. The guard used to return on the HubSpot property
+    without running the CSuite search, so it could not tell that CSuite's email
+    match was a different profile. It now runs both."""
     hubspot = HubSpot(contact("561059265217", csuite_profile_id="12345"))
     reply, state = run(monkeypatch, csuite=DuplicateCSuite(), hubspot=hubspot,
                        backfill=True)
 
-    # Stopped on HubSpot's 12345, not on CSuite's 19999.
-    assert state["profile_id"] == "12345"
-    assert "HubSpot contact csuite_profile_id" in reply
-    assert "19999" not in reply, "the CSuite search was never run"
-    assert hubspot.patched == []
-    assert "already linked to 12345" in reply
+    assert "⚠️ **Two CSuite profiles — no new profile created**" in reply
+    assert "HubSpot points at 12345, CSuite email match is 19999" in reply
+    assert "merge by hand" in reply
+    assert hubspot.patched == [], "neither id may be overwritten"
+    assert "no change to HubSpot — the stored id needs a human" in reply
 
 
 def test_no_contact_means_no_write_and_no_contact_is_created(monkeypatch):

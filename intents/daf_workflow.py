@@ -428,12 +428,59 @@ class _SkipHubSpotUpdate(Exception):
 
 
 class DuplicateProfile(Exception):
-    """The donor already has a CSuite profile. Nothing should be created."""
+    """Nothing should be created. `kind` says why, so the reply can differ.
 
-    def __init__(self, profile_id, source: str):
+    `profile_id` is the profile to treat as the donor's — the one a follow-up
+    task links to — or None when there isn't one to trust.
+    """
+
+    def __init__(self, profile_id, source: str, kind: str = "duplicate"):
         self.profile_id = profile_id
         self.source = source
+        self.kind = kind
         super().__init__(f"profile {profile_id} already exists ({source})")
+
+
+# A stored id is not evidence that a profile exists.
+PROFILE_EXISTS = "exists"
+PROFILE_MISSING = "missing"
+PROFILE_UNREADABLE = "unreadable"
+
+
+def csuite_profile_state(csuite, profile_id):
+    """(state, record) for a profile id. One READ; no write budget is touched.
+
+    Three outcomes, because two of them lead to opposite decisions:
+
+    * PROFILE_EXISTS — read back, with a profile_id in it.
+    * PROFILE_MISSING — a clean "not found". The id is stale.
+    * PROFILE_UNREADABLE — anything else. **Not** the same as missing: a
+      transport fault or a 500 says nothing about whether the profile is there,
+      and treating it as missing would invite creating a duplicate.
+    """
+    try:
+        response = csuite._request("profile/display", {"profile_id": profile_id})
+    except Exception as e:
+        logger.error("could not read CSuite profile %s: %s", profile_id, e)
+        return PROFILE_UNREADABLE, None
+
+    if not isinstance(response, dict):
+        return PROFILE_UNREADABLE, None
+
+    record = response.get("data")
+    if isinstance(record, list) and record:
+        record = record[0]
+    if isinstance(record, dict) and record.get("profile_id"):
+        return PROFILE_EXISTS, record
+
+    # CSuite answers a missing profile with success=0 and "Profile not found".
+    # Anything else — a 5xx, a network fault, an unparseable body — is not a
+    # statement that the profile is absent.
+    error = str(response.get("error") or "")
+    errors = " ".join(str(e) for e in (response.get("errors") or []))
+    if "not found" in (error + " " + errors).lower():
+        return PROFILE_MISSING, None
+    return PROFILE_UNREADABLE, None
 
 
 def already_in_csuite(data: dict, hubspot, csuite):
@@ -456,36 +503,78 @@ def already_in_csuite(data: dict, hubspot, csuite):
     from sync.filter_trust import FilterNotTrusted, search_before_create
 
     contact_id, existing = existing_hubspot_link(data.get("email"), hubspot)
-    if existing:
-        raise DuplicateProfile(existing, "HubSpot contact csuite_profile_id")
-
     email = (data.get("email") or "").strip().lower()
+
+    def email_search():
+        """(count, ids). Raises DuplicateProfile when it cannot be trusted."""
+        if not email:
+            return 0, []
+        try:
+            count, response = search_before_create(
+                lambda endpoint, body: csuite._request(endpoint, body),
+                "profile/list", "primary_email", email)
+        except FilterNotTrusted as e:
+            raise DuplicateProfile(
+                None, f"CSuite could not be searched, so a duplicate cannot be "
+                      f"ruled out: {e}", kind="unverifiable")
+        except Exception as e:
+            raise DuplicateProfile(
+                None, f"the CSuite duplicate check failed, so a duplicate "
+                      f"cannot be ruled out: {e}", kind="unverifiable")
+        rows = (response.get("data") or {}).get("results") or []
+        return count, [r.get("profile_id") for r in rows if r.get("profile_id")]
+
+    # A stored csuite_profile_id is a claim, not a fact. 68 production contacts
+    # carry ids that do not resolve in CSuite (measured 2026-09-30), and
+    # trusting one meant the donor silently never got a profile while staff were
+    # told they already had one — and a follow-up task was linked to nothing.
+    if existing:
+        state, _record = csuite_profile_state(csuite, existing)
+
+        if state == PROFILE_UNREADABLE:
+            raise DuplicateProfile(
+                None, f"CSuite would not say whether profile {existing} exists, "
+                      "so nothing was created or changed", kind="unverifiable")
+
+        if state == PROFILE_EXISTS:
+            count, ids = email_search()
+            if count == 1 and len(ids) == 1 and \
+                    str(ids[0]).strip() != str(existing).strip():
+                raise DuplicateProfile(
+                    existing,
+                    f"HubSpot points at {existing}, CSuite email match is "
+                    f"{ids[0]} — two profiles, merge by hand.",
+                    kind="conflict")
+            # Same id, or no single email match to disagree with: as before.
+            raise DuplicateProfile(
+                existing, "HubSpot contact csuite_profile_id", kind="duplicate")
+
+        # PROFILE_MISSING — the stored id is stale.
+        count, ids = email_search()
+        if count == 1 and len(ids) == 1:
+            raise DuplicateProfile(
+                ids[0],
+                f"HubSpot's csuite_profile_id is stale; CSuite match is "
+                f"{ids[0]} — fix HubSpot by hand.",
+                kind="stale_with_match")
+        raise DuplicateProfile(
+            None, f"HubSpot points at profile {existing}, which doesn't exist "
+                  "in CSuite. No profile created — needs a human.",
+            kind="stale_no_match")
+
     if not email:
         return contact_id          # nothing to search on; the create decides
 
-    try:
-        count, response = search_before_create(
-            lambda endpoint, body: csuite._request(endpoint, body),
-            "profile/list", "primary_email", email)
-    except FilterNotTrusted as e:
-        raise DuplicateProfile(
-            None, f"CSuite could not be searched, so a duplicate cannot be "
-                  f"ruled out: {e}")
-    except Exception as e:
-        raise DuplicateProfile(
-            None, f"the CSuite duplicate check failed, so a duplicate cannot "
-                  f"be ruled out: {e}")
-
+    count, ids = email_search()
     if count == 0:
         return contact_id
-
-    rows = (response.get("data") or {}).get("results") or []
-    ids = [r.get("profile_id") for r in rows if r.get("profile_id")]
     if count == 1 and len(ids) == 1:
-        raise DuplicateProfile(ids[0], "CSuite primary_email search")
+        raise DuplicateProfile(ids[0], "CSuite primary_email search",
+                               kind="duplicate")
     raise DuplicateProfile(
         None, f"{count} CSuite profiles already carry this email "
-              f"({', '.join(str(i) for i in ids) or 'ids not returned'})")
+              f"({', '.join(str(i) for i in ids) or 'ids not returned'})",
+        kind="ambiguous")
 
 
 def task_due_date(submitted_at=None, business_days: int = 2) -> str:
@@ -771,6 +860,7 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         # nothing is PATCHed.
         "duplicate_of": None,
         "duplicate_reason": None,
+        "duplicate_kind": None,
         # Set when CSuite would have refused the submitted phone number, so
         # it was left out and the profile made anyway. Shown to the user, not
         # only logged: a number dropped in silence is the failure this path
@@ -831,6 +921,7 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         except DuplicateProfile as duplicate:
             results["duplicate_of"] = duplicate.profile_id
             results["duplicate_reason"] = duplicate.source
+            results["duplicate_kind"] = duplicate.kind
             logger.warning("CSuite profile create SKIPPED: %s", duplicate)
             state["step"] = "done"
             if duplicate.profile_id:
@@ -843,8 +934,16 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
             # The link never heals on its own: a profile found by the CSuite
             # search means HubSpot has none, and this path returns before the
             # step-3 PATCH.
-            _backfill_hubspot_link(data, state, results, hubspot,
-                                   duplicate.profile_id)
+            # Not on a stale or conflicting link. The stored id is wrong and
+            # a human has to fix it; writing over it would destroy the only
+            # record of what it pointed at. The line already says so.
+            if duplicate.kind in ("stale_with_match", "stale_no_match",
+                                  "conflict"):
+                results["backfill"] = (
+                    "no change to HubSpot — the stored id needs a human")
+            else:
+                _backfill_hubspot_link(data, state, results, hubspot,
+                                       duplicate.profile_id)
             return _format_confirmation(data, state, results, type_label)
 
         logger.info(f"Creating CSuite profile for {data.get('first_name')} {data.get('last_name')}...")
@@ -1215,6 +1314,39 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
     if results.get("duplicate_reason"):
         # Nothing was created and nothing was PATCHed.
         profile_id = results.get("duplicate_of")
+        kind = results.get("duplicate_kind")
+
+        if kind == "stale_no_match":
+            # The donor has NO profile and nobody can safely make one here:
+            # HubSpot's link is wrong and only a person can say what it meant.
+            lines.append("🛑 **No profile created — HubSpot's CSuite link is "
+                         "broken**")
+            lines.append("")
+            lines.append(f"⚠️ {results['duplicate_reason']}")
+            lines.append("")
+            lines.extend(_task_lines(data, results))
+            lines.append("")
+            lines.append("Say anything to continue, or start a new workflow.")
+            return "\n".join(lines)
+
+        if kind in ("stale_with_match", "conflict") and profile_id:
+            heading = ("♻️ **Already in CSuite — no new profile created**"
+                       if kind == "stale_with_match"
+                       else "⚠️ **Two CSuite profiles — no new profile "
+                            "created**")
+            lines.append(heading)
+            lines.append("")
+            link = ui_url(Config.CSUITE_PROFILE_URL,
+                          state.get("csuite_api_base"), profile_id=profile_id)
+            lines.append(f"👤 Profile {profile_id} — [CSuite]({link})")
+            lines.append(f"⚠️ {results['duplicate_reason']}")
+            if results.get("backfill"):
+                lines.append(f"🔗 {results['backfill']}")
+            lines.extend(_task_lines(data, results))
+            lines.append("")
+            lines.append("Say anything to continue, or start a new workflow.")
+            return "\n".join(lines)
+
         if profile_id:
             link = ui_url(Config.CSUITE_PROFILE_URL,
                           state.get("csuite_api_base"), profile_id=profile_id)

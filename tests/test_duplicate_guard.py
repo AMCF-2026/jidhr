@@ -93,16 +93,29 @@ def test_a_failed_lookup_returns_unknown_not_absent():
 # already_in_csuite
 # ---------------------------------------------------------------------------
 
-def test_a_hubspot_link_stops_the_create_without_touching_csuite():
-    """The cheap check first, and it is definitive."""
-    class Exploding(NoDuplicates):
-        def _request(self, endpoint, data=None):
-            raise AssertionError("CSuite must not be searched; HubSpot knew")
+def test_a_hubspot_link_is_VERIFIED_against_csuite_before_it_is_trusted():
+    """Changed 2026-10-01. The stored id used to be taken on faith, so CSuite
+    was never read — and 68 production contacts carry ids that do not resolve.
 
+    It is now read back. A profile that exists still stops the create, as
+    before; what changed is that the claim is checked.
+    """
+    class Watching(NoDuplicates):
+        def __init__(self):
+            self.endpoints = []
+
+        def _request(self, endpoint, data=None):
+            self.endpoints.append(endpoint)
+            return super()._request(endpoint, data)
+
+    csuite = Watching()
     with pytest.raises(DuplicateProfile) as caught:
         already_in_csuite(DATA, HubSpot(contact(csuite_profile_id="19999")),
-                          Exploding())
+                          csuite)
+
+    assert "profile/display" in csuite.endpoints, "the id must be verified"
     assert caught.value.profile_id == "19999"
+    assert caught.value.kind == "duplicate"
     assert "HubSpot" in caught.value.source
 
 
