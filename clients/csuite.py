@@ -199,6 +199,28 @@ CONFIRMED_INPUT_FIELDS = frozenset({
 ENDPOINT_CONFIRMED_FIELDS = {
     "address": ("profile/create/individual", "profile/create/org",
                 "profile/create/household"),
+    # VERIFIED 2026-10-01 by task/create -> task/display on sandbox task 1034.
+    # Every one of these was sent and read back. They are endpoint-scoped
+    # because `id` in particular must never become a global input name: a task
+    # already has a `task_id`, and `id` here means the id of the LINKED
+    # object, not of the task.
+    "name": ("task/create",),            # required; text read back as task_description
+    "task_description": ("task/create",),
+    "employee_id": ("task/create",),
+    "due_ts": ("task/create",),          # "2026-10-05" -> due_date "2026-10-05"
+    "task_type_id": ("task/create",),    # 1065 -> task_type "DIY Form-Contact"
+    "o": ("task/create",),               # "profile" -> o "profile"
+    "id": ("task/create",),              # 21661 -> id 21661
+}
+
+# Names refused on specific endpoints EVEN THOUGH they are globally confirmed.
+#
+# CONFIRMED_INPUT_FIELDS is endpoint-agnostic, so `profile_id` — confirmed for
+# profile/edit — was accepted on task/create, where CSuite would silently
+# discard it. A task's link is `o` + `id`, not `profile_id`, VERIFIED on task
+# 1034. Checked before the allowlist, so a block wins.
+ENDPOINT_BLOCKED_FIELDS = {
+    "profile_id": ("task/create",),
 }
 
 # Names allowed on specific endpoints that are **NOT confirmed inputs**.
@@ -257,12 +279,9 @@ OBSERVED_OUTPUT = {
 
 
 ENDPOINT_ALLOWED_UNVERIFIED = {
-    "task_description": ("task/create",),
-    # `due_ts`, not `due_date`: CSuite named due_ts as required while due_date
-    # was in the payload (2026-10-01).
-    "due_ts": ("task/create",),
-    "employee_id": ("task/create",),
-    "task_type_id": ("task/create",),
+    # Everything else on task/create graduated to ENDPOINT_CONFIRMED_FIELDS on
+    # 2026-10-01, read back off task 1034. These two have not: neither was
+    # sent, and `task/edit/complete` has never been called at all.
     "task_id": ("task/create", "task/edit/complete"),
     "task_guid": ("task/create", "task/edit/complete"),
 }
@@ -292,10 +311,10 @@ ENDPOINT_ALLOWED_UNVERIFIED = {
 # and `due_ts`'s accepted FORMAT is unknown (the output is a plain
 # "2026-10-05", but "ts" suggests a timestamp). Same holding pen `phone_number`
 # sat in before a read-back promoted it.
-RECOGNISED_UNCONFIRMED_FIELDS = frozenset({
-    "name",      # task/create, required
-    "due_ts",    # task/create, required; format unverified
-})
+# Both entries graduated on 2026-10-01: task 1034 was created with `name` and
+# `due_ts="2026-10-05"`, and read back with due_date "2026-10-05". The format
+# is no longer a guess, and nothing is left in this set.
+RECOGNISED_UNCONFIRMED_FIELDS = frozenset()
 
 # Names PROVEN not to work as inputs, each by a sandbox write and a
 # read-back. They are all valid `profile/display` output names, which is the
@@ -520,9 +539,12 @@ def check_input_fields(names, endpoint: str = "") -> None:
     clean = str(endpoint or "").strip("/")
     unknown = [
         n for n in (names or ())
-        if n not in CONFIRMED_INPUT_FIELDS
-        and clean not in ENDPOINT_CONFIRMED_FIELDS.get(n, ())
-        and clean not in ENDPOINT_ALLOWED_UNVERIFIED.get(n, ())
+        # A block wins over the global allowlist: a name confirmed elsewhere
+        # can still be wrong here.
+        if clean in ENDPOINT_BLOCKED_FIELDS.get(n, ())
+        or (n not in CONFIRMED_INPUT_FIELDS
+            and clean not in ENDPOINT_CONFIRMED_FIELDS.get(n, ())
+            and clean not in ENDPOINT_ALLOWED_UNVERIFIED.get(n, ()))
     ]
     if unknown:
         logger.error("CSuite %s: unconfirmed field name(s) %s — nothing sent",
@@ -1601,52 +1623,78 @@ class CSuiteClient:
         return self._request("task/display", {"task_id": task_id})
     
     def create_task(self, name: str, employee_id: int, due_date: str = None,
-                    description: str = None, **kwargs) -> dict:
-        """Create a task in CSuite.
-        
+                    description: str = None, linked_profile_id: int = None,
+                    task_type_id: int = None, **kwargs) -> dict:
+        """Create a task in CSuite, optionally linked to a profile.
+
+        Every field name here was VERIFIED on 2026-10-01 by creating sandbox
+        task 1034 and reading it back with `task/display`:
+
+        | sent | read back as |
+        |---|---|
+        | `name` | the text appears in `task_description` |
+        | `task_description` | `task_description` |
+        | `employee_id` | `employee_id`, and `assigned_employee` |
+        | `due_ts` `"2026-10-05"` | `due_date` `"2026-10-05"` |
+        | `task_type_id` `1065` | `task_type_id`, and `task_type.task_type_name` |
+        | `o` `"profile"` | `o` `"profile"` |
+        | `id` `21661` | `id` `21661` |
+
+        CSuite then derives `task_object`, e.g.
+        `"Profile :: SENTINEL 6 - SANDBOX ONLY, HUBSYNC"`.
+
+        **`name` and `due_ts` are both REQUIRED** — measured 2026-10-01, when a
+        create without them was refused with
+        `["due_ts: due_ts is required", "name: name is required"]`.
+
+        **`due_date` is NOT the input name.** It was sent, and CSuite still
+        demanded `due_ts`. It is the output name only.
+
+        **The link is `o` + `id`, not `profile_id`.** `o` names the object type
+        and `id` its id, so this is polymorphic — a task could presumably hang
+        off a fund or a grant the same way, untested. `profile_id` is BLOCKED
+        on this endpoint: it is confirmed for `profile/edit` and would be
+        silently discarded here.
+
         Args:
-            name: Task name (required)
-            employee_id: Assigned employee's name_link_id (required)
-            due_date: due date -> sent as `due_ts` (REQUIRED by CSuite).
-                Format unverified; task/display returns YYYY-MM-DD.
-            description: Task description
-            **kwargs: Additional task fields
+            name: task title (required by CSuite)
+            employee_id: the assignee's employee_id — 1006 is Carl and 1007 is
+                Kods in the SANDBOX. 1007 is confirmed in production; 1006 is
+                NOT (no production task carries it). Do not assume.
+            due_date: YYYY-MM-DD, sent as `due_ts`. Required by CSuite, so a
+                task with no due date cannot be created through this method.
+            description: sent as `task_description`
+            linked_profile_id: the profile this task is about. Sent as
+                `o="profile"` + `id=<profile_id>`.
+            task_type_id: 1065 is "DIY Form-Contact" in the SANDBOX. **NOT
+                confirmed in production** — no production task carries any
+                type at all.
+            **kwargs: checked against the task/create allowlist first
         """
         data = {"name": name, "employee_id": employee_id}
         if due_date:
-            # `due_ts`, not `due_date`. 2026-10-01: a create carrying
-            # `due_date` was refused with `due_ts: due_ts is required`, so
-            # due_date is the output name only. The FORMAT due_ts accepts is
-            # unverified — task/display returns a plain "2026-10-05", but
-            # "ts" suggests a timestamp. A wrong format is a 400, which
-            # creates nothing, so this fails safely either way.
+            # `due_ts`, not `due_date`. VERIFIED 2026-10-01: due_ts accepts
+            # YYYY-MM-DD and reads back as due_date.
             data["due_ts"] = due_date
         if description:
             data["task_description"] = description
-        # Gated from 2026-10-01. Against ENDPOINT_ALLOWED_UNVERIFIED, not
-        # CONFIRMED_INPUT_FIELDS: no task input name has ever been confirmed
-        # by a read-back, so nothing here is measured. A gate against CSuite's
-        # own task field names still stops a caller inventing one and having
-        # it silently discarded, which is what this method allowed before.
-        #
-        # The method's own `name` and `employee_id` are not gated, same as the
-        # profile create — see the note above about `name`.
-        #
-        # TODO(sandbox-18): this method cannot link a task to anything. A
-        # UI-made task reads back o="profile" / id=21661, so CSuite supports
-        # it; the input names are unknown.
-        #
-        # 2026-10-01: `o` and `id` were sent to task/create alongside
-        # task_description, employee_id, due_date and task_type_id. The call
-        # was refused for MISSING `name` and `due_ts` and said nothing about
-        # the link keys — so whether `o`/`id` are accepted on the way in is
-        # still untested. Nothing was created.
+        if task_type_id is not None:
+            data["task_type_id"] = task_type_id
+        if linked_profile_id is not None:
+            # The polymorphic link, VERIFIED on task 1034. `id` is the LINKED
+            # object's id — the task's own id is `task_id`, which CSuite mints.
+            data["o"] = "profile"
+            data["id"] = linked_profile_id
+
         check_input_fields(kwargs, "task/create")
         data.update(kwargs)
-        
-        logger.info(f"Creating CSuite task: {name}")
+
+        logger.info("Creating CSuite task %r for employee %s%s", name,
+                    employee_id,
+                    f" on profile {linked_profile_id}" if linked_profile_id
+                    else " (unlinked)")
         return self._request("task/create", data)
-    
+
     def complete_task(self, task_id: int = None, task_guid: str = None) -> dict:
         """Mark a CSuite task as complete.
         

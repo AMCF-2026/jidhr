@@ -274,15 +274,17 @@ def test_due_date_is_recorded_as_the_wrong_input_name():
     assert "due_ts" in KNOWN_INVALID_INPUT_FIELDS["due_date"]
 
 
-def test_name_and_due_ts_are_recognised_but_not_stored():
-    """CSuite named both as REQUIRED, which makes them real input names. The
-    create was rejected, so neither has ever been read back — the holding pen
-    phone_number sat in before a read-back promoted it."""
-    from clients.csuite import (CONFIRMED_INPUT_FIELDS,
+def test_name_and_due_ts_graduated_once_a_task_was_created():
+    """They were in the holding pen on 2026-10-01 while CSuite had only
+    DEMANDED them. Task 1034 was then created with both and read back, so they
+    are confirmed — endpoint-scoped, because `name` means something else
+    everywhere else."""
+    from clients.csuite import (ENDPOINT_CONFIRMED_FIELDS,
                                 RECOGNISED_UNCONFIRMED_FIELDS)
 
-    assert RECOGNISED_UNCONFIRMED_FIELDS == {"name", "due_ts"}
-    assert not (RECOGNISED_UNCONFIRMED_FIELDS & CONFIRMED_INPUT_FIELDS)
+    assert RECOGNISED_UNCONFIRMED_FIELDS == frozenset()
+    for field in ("name", "due_ts"):
+        assert ENDPOINT_CONFIRMED_FIELDS[field] == ("task/create",)
 
 
 def test_create_task_now_sends_due_ts():
@@ -314,3 +316,83 @@ def test_name_is_required_by_csuite_so_it_stays_a_required_argument():
 
     params = inspect.signature(CSuiteClient.create_task).parameters
     assert params["name"].default is inspect.Parameter.empty
+
+
+# ---------------------------------------------------------------------------
+# create_task links a task to a profile
+# ---------------------------------------------------------------------------
+
+class TaskClient:
+    """Captures the task/create payload. No network."""
+
+    def __init__(self):
+        from clients.csuite import CSuiteClient
+        self.sent = []
+        self._create = CSuiteClient.create_task
+
+    def _request(self, endpoint, data=None):
+        self.sent.append((endpoint, dict(data or {})))
+        return {"success": True, "data": {"task_id": 1034,
+                                          "task_guid": "g"}}
+
+    def create_task(self, *a, **kw):
+        return self._create(self, *a, **kw)
+
+    @property
+    def payload(self):
+        return self.sent[0][1]
+
+
+def test_a_linked_task_sends_o_and_id():
+    """VERIFIED 2026-10-01 on sandbox task 1034."""
+    client = TaskClient()
+    client.create_task("SENTINEL", 1006, due_date="2026-10-05",
+                       description="SENTINEL", linked_profile_id=21661,
+                       task_type_id=1065)
+
+    assert client.payload == {
+        "name": "SENTINEL", "employee_id": 1006, "due_ts": "2026-10-05",
+        "task_description": "SENTINEL", "task_type_id": 1065,
+        "o": "profile", "id": 21661}
+    assert "due_date" not in client.payload
+    assert "profile_id" not in client.payload
+
+
+def test_an_unlinked_task_sends_neither_o_nor_id():
+    client = TaskClient()
+    client.create_task("SENTINEL", 1006, due_date="2026-10-05")
+
+    assert "o" not in client.payload
+    assert "id" not in client.payload
+
+
+def test_profile_zero_is_still_a_link():
+    """`if linked_profile_id is not None`, not a truthiness test."""
+    client = TaskClient()
+    client.create_task("SENTINEL", 1006, due_date="2026-10-05",
+                       linked_profile_id=0)
+    assert client.payload["id"] == 0
+
+
+def test_a_caller_cannot_pass_profile_id_through_kwargs():
+    from clients.csuite import UnconfirmedField
+
+    client = TaskClient()
+    with pytest.raises(UnconfirmedField):
+        client.create_task("SENTINEL", 1006, due_date="2026-10-05",
+                           profile_id=21661)
+    assert client.sent == []
+
+
+def test_the_docstring_warns_that_1006_and_1065_are_sandbox_only():
+    """Production has 7 tasks, none Carl's and none carrying a type. That is
+    unknown, not absent — the sandbox-17 mistake, written down."""
+    from clients.csuite import CSuiteClient
+
+    doc = CSuiteClient.create_task.__doc__
+    # Asserted on normalised whitespace: the warnings are wrapped across
+    # lines, and a test that breaks on re-wrapping tests the formatting.
+    flat = " ".join(doc.split())
+    assert "1007 is confirmed in production" in flat
+    assert "1006 is NOT" in flat
+    assert "no production task carries any type at all" in flat

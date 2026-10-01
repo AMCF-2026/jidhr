@@ -397,18 +397,22 @@ def test_name_is_deliberately_absent_from_the_task_allowlist():
     assert "UNTESTED" in INCONCLUSIVE_PROBES["name (task/create)"]
 
 
-def test_profile_id_slips_through_on_task_create_and_that_is_a_known_gap():
-    """CONFIRMED_INPUT_FIELDS is endpoint-agnostic, so a name confirmed for
-    profile/edit is accepted everywhere.
+def test_profile_id_is_blocked_on_task_create():
+    """The gap from 2026-10-01, closed. CONFIRMED_INPUT_FIELDS is
+    endpoint-agnostic, so `profile_id` — confirmed for profile/edit — used to be
+    accepted here and would have been silently discarded. A task's link is
+    `o` + `id`, VERIFIED on task 1034.
 
-    A CSuite task has no profile link — `task_object`, `o` and `id` are null on
-    all seven sandbox tasks, and the only profile ids on task/display belong to
-    the EMPLOYEE. So `profile_id` on task/create would be silently discarded,
-    and the gate does not stop it. Pinned here as the gap it is: scoping every
-    confirmed name to its endpoints is a larger change than the task gate was.
+    A block beats the global allowlist: a name confirmed elsewhere can still be
+    wrong here.
     """
-    check_input_fields(["profile_id"], "task/create")   # no raise: the gap
+    from clients.csuite import ENDPOINT_BLOCKED_FIELDS
+
     assert "profile_id" in CONFIRMED_INPUT_FIELDS
+    assert ENDPOINT_BLOCKED_FIELDS["profile_id"] == ("task/create",)
+    with pytest.raises(UnconfirmedField):
+        check_input_fields(["profile_id"], "task/create")
+    check_input_fields(["profile_id"], "profile/edit")   # still fine there
 
 
 # ---------------------------------------------------------------------------
@@ -446,9 +450,24 @@ def test_observed_output_never_leaks_into_an_allowlist():
                 f"{field} is an observed OUTPUT name on {endpoint}"
 
 
-@pytest.mark.parametrize("field", ["o", "id", "task_object", "object_id",
-                                   "object_type"])
-def test_a_link_field_is_still_refused_on_task_create(field):
-    """Until a sandbox write and a read-back confirm the input name."""
+@pytest.mark.parametrize("field", ["task_object", "object_id", "object_type"])
+def test_an_unproven_link_name_is_still_refused_on_task_create(field):
+    """`o` and `id` were proven on 2026-10-01. These were not: object_type and
+    object_id were never sent, and task_object is a DERIVED output."""
     with pytest.raises(UnconfirmedField):
         check_input_fields([field], "task/create")
+
+
+@pytest.mark.parametrize("field", ["o", "id"])
+def test_the_proven_link_names_pass_on_task_create_and_nowhere_else(field):
+    """VERIFIED 2026-10-01 on task 1034: o="profile", id=21661 both stored.
+
+    Scoped hard. `id` must never be a global input name — a task already has a
+    `task_id`, and `id` here is the LINKED object's id.
+    """
+    check_input_fields([field], "task/create")
+    assert field not in CONFIRMED_INPUT_FIELDS
+    for elsewhere in ("profile/edit", "profile/create/individual",
+                      "funit/create"):
+        with pytest.raises(UnconfirmedField):
+            check_input_fields([field], elsewhere)
