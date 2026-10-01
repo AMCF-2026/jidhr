@@ -154,6 +154,44 @@ class Config:
         os.environ.get('CSUITE_DAF_FUND_CREATE_ENABLED', 'False')
         .strip().lower() == 'true')
 
+    # Whether an inquiry also creates a CSuite FOLLOW-UP TASK. Off, and
+    # separate from the profile and fund switches, so each is a decision of its
+    # own.
+    CSUITE_DAF_TASK_CREATE_ENABLED = (
+        os.environ.get('CSUITE_DAF_TASK_CREATE_ENABLED', 'False')
+        .strip().lower() == 'true')
+
+    # Who the follow-up task is assigned to. **No default.**
+    #
+    # A constant here would be the DEFAULT_CASH_ACCOUNT_ID mistake again: 1069
+    # sat in this file for months before anyone checked it meant the same
+    # account in both environments. Employee ids are worse, because they differ
+    # per environment in a way that is invisible — 1006 is Carl in the SANDBOX
+    # and is not present in production at all, while 1007 is Kods in both
+    # (measured 2026-10-01).
+    #
+    # Unset means the task is SKIPPED with a stated reason, never assigned to a
+    # guess. The two may share a value.
+    CSUITE_TASK_EMPLOYEE_ID = _int_or_zero(
+        os.environ.get('CSUITE_TASK_EMPLOYEE_ID', '0')) or None
+    CSUITE_DAF_TASK_EMPLOYEE_ID = _int_or_zero(
+        os.environ.get('CSUITE_DAF_TASK_EMPLOYEE_ID', '0')) or None
+    CSUITE_ENDOWMENT_TASK_EMPLOYEE_ID = _int_or_zero(
+        os.environ.get('CSUITE_ENDOWMENT_TASK_EMPLOYEE_ID', '0')) or None
+
+    # The CSuite task type. **No default, and unset is fine.**
+    #
+    # INFERRED optional: five of the seven sandbox tasks carry no
+    # task_type_id at all, and in PRODUCTION not one of the seven tasks carries
+    # a type. So a task without one is normal, and `task_type_id` is omitted
+    # entirely when this is unset rather than guessed at.
+    #
+    # 1065 is "DIY Form-Contact" in the SANDBOX (VERIFIED 2026-10-01, task
+    # 1033). It is NOT confirmed in production — there is no task-type list
+    # endpoint this key may read, and no production task uses any type.
+    CSUITE_TASK_TYPE_ID = _int_or_zero(
+        os.environ.get('CSUITE_TASK_TYPE_ID', '0')) or None
+
     CSUITE_DAF_CREATE_ENABLED = (
         os.environ.get('CSUITE_DAF_CREATE_ENABLED', 'False')
         .strip().lower() == 'true')
@@ -165,6 +203,9 @@ class Config:
     CSUITE_GRANT_URL = f"{CSUITE_UI_BASE_URL}/grant/display?grant_id={{grant_id}}"
     CSUITE_DONATION_URL = f"{CSUITE_UI_BASE_URL}/donation/display?donation_id={{donation_id}}"
     CSUITE_CHECK_URL = f"{CSUITE_UI_BASE_URL}/check/display?check_id={{check_id}}"
+    # INFERRED from the pattern of the others; the task UI path has not been
+    # opened and confirmed.
+    CSUITE_TASK_URL = f"{CSUITE_UI_BASE_URL}/task/display?task_id={{task_id}}"
     
     # Fund Group IDs (from funit/list/fgroup endpoint)
     FUND_GROUP_SYSTEM = 1000

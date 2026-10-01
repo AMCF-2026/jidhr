@@ -1693,7 +1693,42 @@ class CSuiteClient:
                     employee_id,
                     f" on profile {linked_profile_id}" if linked_profile_id
                     else " (unlinked)")
-        return self._request("task/create", data)
+        response = self._request("task/create", data)
+
+        # Read back, like the profile and fund creates. A task whose link went
+        # missing looks exactly like a task that worked: `o` and `id` are two
+        # names CSuite would discard in silence.
+        if not (self.verify_writes and isinstance(response, dict)
+                and response.get("success")):
+            return response
+        payload = response.get("data")
+        task_id = payload.get("task_id") if isinstance(payload, dict) else None
+        if task_id is None:
+            logger.warning("no task_id came back from task/create; the task "
+                           "was not verified")
+            response["verified"] = None
+            return response
+
+        from sync.readback import (FieldDropped, ReadBackUnavailable,
+                                   verify_task)
+        try:
+            verify_task(self._request, data, task_id)
+        except ReadBackUnavailable as e:
+            logger.error("could not read task %s back: %s", task_id, e)
+            response["verified"] = None
+            response["task_warning"] = (
+                f"⚠️ Task {task_id} was created but could not be read back, "
+                "so its link and due date are unconfirmed. Check it in CSuite.")
+        except FieldDropped as dropped:
+            logger.error("task %s does not hold what was sent: %s", task_id,
+                         sorted(dropped.dropped))
+            response["verified"] = False
+            response["task_warning"] = (
+                f"⚠️ Task {task_id} was created but CSuite did not store: "
+                f"{', '.join(sorted(dropped.dropped))}. Check it in CSuite.")
+        else:
+            response["verified"] = True
+        return response
 
     def complete_task(self, task_id: int = None, task_guid: str = None) -> dict:
         """Mark a CSuite task as complete.

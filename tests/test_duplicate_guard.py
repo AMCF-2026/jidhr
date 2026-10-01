@@ -323,17 +323,34 @@ def test_name_is_required_by_csuite_so_it_stays_a_required_argument():
 # ---------------------------------------------------------------------------
 
 class TaskClient:
-    """Captures the task/create payload. No network."""
+    """Captures the task/create payload and answers its read-back. No network."""
 
-    def __init__(self):
+    verify_writes = True
+
+    def __init__(self, stored=None):
         from clients.csuite import CSuiteClient
         self.sent = []
+        self.stored = stored
         self._create = CSuiteClient.create_task
 
     def _request(self, endpoint, data=None):
         self.sent.append((endpoint, dict(data or {})))
-        return {"success": True, "data": {"task_id": 1034,
-                                          "task_guid": "g"}}
+        if endpoint == "task/display":
+            return {"success": True, "data": self._read_back()}
+        return {"success": True, "data": {"task_id": 1034, "task_guid": "g"}}
+
+    def _read_back(self):
+        if self.stored is not None:
+            return self.stored
+        # Echo the create payload back under its display names, so a clean
+        # create verifies.
+        from sync.readback import TASK_SENT_TO_STORED
+        sent = self.payload
+        record = {"task_id": 1034, "task_guid": "g"}
+        for field, target in TASK_SENT_TO_STORED.items():
+            if field in sent:
+                record[target] = sent[field]
+        return record
 
     def create_task(self, *a, **kw):
         return self._create(self, *a, **kw)

@@ -332,6 +332,66 @@ def verify_fund(read, sent: dict, funit_id, display_endpoint="funit/display"):
     return data
 
 
+# task/create input -> task/display output. Every pair VERIFIED 2026-10-01 on
+# sandbox task 1034.
+#
+# `name` is deliberately NOT here. It was sent with the SAME text as
+# `task_description` on 1034, and the text came back in `task_description` — so
+# which of the two populated it is unknown. Comparing `name` against
+# `task_description` would pass for the wrong reason, and comparing it against
+# a field that may not exist would fail for the wrong one.
+TASK_SENT_TO_STORED = {
+    "task_description": "task_description",
+    "employee_id": "employee_id",
+    "due_ts": "due_date",          # "2026-10-05" -> "2026-10-05"
+    "task_type_id": "task_type_id",
+    "o": "o",                      # the linked object's TYPE
+    "id": "id",                    # the linked object's id, not the task's
+}
+
+
+def compare_task(sent: dict, stored: dict) -> dict:
+    """{sent field: (sent, stored)} for anything task/create did not keep.
+
+    Only the fields in TASK_SENT_TO_STORED that were actually sent — an
+    optional field nobody sent cannot have been dropped.
+    """
+    dropped = {}
+    for field, target in TASK_SENT_TO_STORED.items():
+        if field not in (sent or {}):
+            continue
+        held = (stored or {}).get(target)
+        if not _same(sent[field], held) and not _reformatted(sent[field], held):
+            dropped[field] = (sent[field], held)
+    return dropped
+
+
+def verify_task(read, sent: dict, task_id, display_endpoint="task/display"):
+    """Read a created task back and raise FieldDropped if it is wrong.
+
+    `task/create` had no read-back until 2026-10-01, and it is the write most
+    likely to be quietly wrong: the link is `o` + `id`, two names CSuite would
+    discard in silence if they were ever changed, and a task whose link went
+    missing looks exactly like a task that worked.
+    """
+    response = read(display_endpoint, {"task_id": task_id})
+    data = response.get("data") if isinstance(response, dict) else None
+    if isinstance(data, list) and data:
+        data = data[0]
+    if not isinstance(data, dict) or not data.get("task_id"):
+        raise ReadBackUnavailable(
+            {"<task not found>": (task_id, None)}, "task/create", task_id)
+
+    dropped = compare_task(sent, data)
+    if dropped:
+        logger.error("CSuite task/create on %s did NOT store: %s",
+                     task_id, sorted(dropped))
+        raise FieldDropped(dropped, "task/create", task_id)
+
+    logger.info("read-back OK: task %s holds what was sent", task_id)
+    return data
+
+
 def verify(read, endpoint: str, sent: dict, record_id, id_field="profile_id",
            display_endpoint="profile/display", modified_before=None):
     """Read the record back and raise FieldDropped if anything was lost.

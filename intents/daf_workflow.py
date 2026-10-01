@@ -487,6 +487,123 @@ def already_in_csuite(data: dict, hubspot, csuite):
               f"({', '.join(str(i) for i in ids) or 'ids not returned'})")
 
 
+def task_due_date(submitted_at=None, business_days: int = 2) -> str:
+    """`business_days` working days from `submitted_at`, as YYYY-MM-DD.
+
+    Saturdays and Sundays are skipped. Public holidays are NOT — this repo has
+    no holiday calendar, and inventing one would be a guess that silently moves
+    due dates. A task due on a holiday is late by a day; a task due on a
+    Saturday is late by two and looks like a mistake.
+
+    `submitted_at` may be a HubSpot epoch-milliseconds value, an ISO string, a
+    date, or None for today.
+    """
+    from datetime import date, datetime, timedelta, timezone
+
+    start = None
+    if isinstance(submitted_at, datetime):
+        start = submitted_at.date()
+    elif isinstance(submitted_at, date):
+        start = submitted_at
+    elif isinstance(submitted_at, (int, float)):
+        # HubSpot sends submittedAt in milliseconds.
+        start = datetime.fromtimestamp(
+                float(submitted_at) / 1000, timezone.utc).date()
+    elif isinstance(submitted_at, str) and submitted_at.strip():
+        text = submitted_at.strip()
+        if text.isdigit():
+            start = datetime.fromtimestamp(
+                int(text) / 1000, timezone.utc).date()
+        else:
+            try:
+                start = datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+            except ValueError:
+                start = None
+    if start is None:
+        start = date.today()
+
+    due, added = start, 0
+    while added < business_days:
+        due += timedelta(days=1)
+        if due.weekday() < 5:          # Mon-Fri
+            added += 1
+    return due.isoformat()
+
+
+def task_assignee(wf_type: str):
+    """The employee the follow-up task goes to, or None.
+
+    A per-type variable wins over the shared one, so DAF and endowment can be
+    different people or the same. None means no task — never a guessed id.
+    """
+    specific = (Config.CSUITE_DAF_TASK_EMPLOYEE_ID if wf_type == "daf"
+                else Config.CSUITE_ENDOWMENT_TASK_EMPLOYEE_ID)
+    return specific or Config.CSUITE_TASK_EMPLOYEE_ID
+
+
+def _create_followup_task(data, state, results, csuite, wf_type, type_label):
+    """Create the CSuite follow-up task, or record why it was not created.
+
+    Runs AFTER the profile step and never changes its result. A task is a
+    reminder; a profile is a record. Nothing here may make a successful profile
+    look like a failure.
+    """
+    profile_id = state.get("profile_id")
+    label = "DAF" if wf_type == "daf" else "Endowment"
+
+    if not Config.CSUITE_DAF_TASK_CREATE_ENABLED:
+        results["task_skipped"] = "follow-up tasks are turned off"
+        return
+    if not profile_id:
+        results["task_skipped"] = (
+            "no CSuite profile to attach it to" if not results.get(
+                "duplicate_reason")
+            else f"the profile is ambiguous — {results['duplicate_reason']}")
+        return
+
+    assignee = task_assignee(wf_type)
+    if not assignee:
+        results["task_skipped"] = (
+            "no assignee configured (set CSUITE_TASK_EMPLOYEE_ID)")
+        return
+
+    name = (data.get("first_name", "") + " " + data.get("last_name", "")).strip()
+    email = (data.get("email") or "").strip()
+    subject = (f"{label} inquiry follow-up: {name or 'unnamed'}"
+               + (f" — {email}" if email else ""))
+    due = task_due_date(data.get("submitted_at"))
+
+    try:
+        task_result = csuite.create_task(
+            name=subject,
+            employee_id=assignee,
+            due_date=due,
+            description=subject,
+            linked_profile_id=profile_id,
+            task_type_id=Config.CSUITE_TASK_TYPE_ID,
+        )
+    except Exception as e:
+        # Never rolls back and never hides the profile. A reminder that was not
+        # made is a person to tell, not a record to undo.
+        results["task_failed"] = str(e)
+        logger.error("CSuite follow-up task NOT created for profile %s: %s",
+                     profile_id, e)
+        return
+
+    if task_result.get("success") and isinstance(task_result.get("data"), dict):
+        results["task_id"] = task_result["data"].get("task_id")
+        results["task_due"] = due
+        results["task_subject"] = subject
+        results["task_warning"] = task_result.get("task_warning")
+        logger.info("CSuite follow-up task %s created on profile %s, due %s",
+                    results["task_id"], profile_id, due)
+    else:
+        results["task_failed"] = (task_result.get("error")
+                                  or "CSuite returned no task id")
+        logger.error("CSuite follow-up task NOT created for profile %s: %s",
+                     profile_id, results["task_failed"])
+
+
 def record_unprocessed_submission(state: dict, reason: str) -> bool:
     """Record WHICH submission could not be processed, so it can be replayed.
 
@@ -598,6 +715,15 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         # True when a failed run was recorded for replay, False when even that
         # could not be stored. None when the run succeeded.
         "replay_recorded": None,
+        # The follow-up task. Exactly one of these is set: task_id on success,
+        # task_failed when a create was attempted and did not work,
+        # task_skipped when none was attempted and why.
+        "task_id": None,
+        "task_due": None,
+        "task_subject": None,
+        "task_failed": None,
+        "task_skipped": None,
+        "task_warning": None,
         # Set when the submission carried an address. CSuite's address input
         # name is unknown — nine candidates eliminated by sandbox write and
         # read-back — so it is not sent, and it is named to a human instead
@@ -629,6 +755,11 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
             state["step"] = "done"
             if duplicate.profile_id:
                 state["profile_id"] = duplicate.profile_id
+            # A returning donor still needs following up, and the existing
+            # profile is the right thing to link to. Two matches leave
+            # profile_id unset, so the task is skipped with that as the reason.
+            _create_followup_task(data, state, results, csuite, wf_type,
+                                  type_label)
             return _format_confirmation(data, state, results, type_label)
 
         logger.info(f"Creating CSuite profile for {data.get('first_name')} {data.get('last_name')}...")
@@ -733,6 +864,9 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         results["fund_deferred"] = True
         logger.info("fund creation deferred: an inquiry creates a profile "
                     "only (CSUITE_DAF_FUND_CREATE_ENABLED is off)")
+
+    # --- 2b. CSuite follow-up task ---
+    _create_followup_task(data, state, results, csuite, wf_type, type_label)
 
     # --- 3. Update (or create) HubSpot contact with CSuite IDs ---
     if results["profile_created"] and data.get("email"):
@@ -973,6 +1107,19 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
             lines.append("")
             lines.append(f"👤 Profile {profile_id} — [CSuite]({link})")
             lines.append(f"   Found via: {results['duplicate_reason']}")
+            if results.get("task_id"):
+                task_link = Config.CSUITE_TASK_URL.format(
+                    task_id=results["task_id"])
+                who = (data.get("first_name", "") + " "
+                       + data.get("last_name", "")).strip() or "this donor"
+                lines.append(f"📝 Follow-up task for {who} — due "
+                             f"{results['task_due']} — [View]({task_link})")
+            elif results.get("task_failed"):
+                lines.append(f"⚠️ Follow-up task NOT created "
+                             f"({results['task_failed']}) — add it by hand in "
+                             "CSuite.")
+            elif results.get("task_skipped"):
+                lines.append(f"📝 No task: {results['task_skipped']}")
         else:
             lines.append("🛑 **No profile created — a duplicate could not be "
                          "ruled out**")
@@ -981,6 +1128,8 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
             lines.append("   Nothing was created and nothing was changed. "
                          "CSuite has no way to merge two donor profiles from "
                          "here, so this stops rather than guesses.")
+            if results.get("task_skipped"):
+                lines.append(f"📝 No task: {results['task_skipped']}")
         lines.append("")
         lines.append("Say anything to continue, or start a new workflow.")
         return "\n".join(lines)
@@ -1069,6 +1218,23 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
         lines.append(f"🎯 HubSpot contact synced with CSuite IDs")
     elif results["profile_created"]:
         lines.append("⚠️ HubSpot contact: Could not update or create")
+
+    # Follow-up task. Exactly one line, and never silent: a reminder nobody
+    # was told about is a reminder that does not exist.
+    if results.get("task_id"):
+        link = Config.CSUITE_TASK_URL.format(task_id=results["task_id"])
+        who = (data.get("first_name", "") + " "
+               + data.get("last_name", "")).strip() or "this donor"
+        lines.append(f"📝 Follow-up task for {who} — due "
+                     f"{results['task_due']} — [View]({link})")
+        if results.get("task_warning"):
+            lines.append(f"   {results['task_warning']}")
+    elif results.get("task_failed"):
+        # Never presented as a failure of the profile, which succeeded.
+        lines.append(f"⚠️ Follow-up task NOT created "
+                     f"({results['task_failed']}) — add it by hand in CSuite.")
+    elif results.get("task_skipped"):
+        lines.append(f"📝 No task: {results['task_skipped']}")
 
     # Ticket. Always says which one, or that there was none — a bare
     # "Ticket closed" does not let anyone check it closed the right thing.
