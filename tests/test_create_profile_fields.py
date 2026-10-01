@@ -94,25 +94,25 @@ def test_an_empty_email_or_phone_is_simply_absent():
 # The address is refused, not dropped
 # ---------------------------------------------------------------------------
 
-def test_an_address_raises_rather_than_being_quietly_discarded():
-    """Accepting a value and dropping it is the bug being fixed here.
-
-    Doing it ourselves would be worse than CSuite doing it, because at
-    least CSuite does not claim to support the field.
-    """
+def test_a_complete_address_is_sent_as_the_confirmed_nested_object():
+    """VERIFIED 2026-10-01 on sentinel 21660: all four parts stored."""
     client = Client()
-    with pytest.raises(ValueError) as caught:
-        client.create_individual_profile("A", "B", address="1 Test Way")
+    client.create_individual_profile("A", "B", address_line="1 Test Way",
+                                     city="Fairfax", state="VA",
+                                     zipcode="22031")
 
-    assert "Nothing was sent" in str(caught.value)
-    assert client.sent == [], "the request must not leave the process"
+    assert client.payload["address"] == {
+        "address": "1 Test Way", "city": "Fairfax", "state": "VA",
+        "zipcode": "22031"}
 
 
-def test_no_address_is_not_an_address():
+def test_no_address_at_all_is_not_an_incomplete_address():
+    """A blank form is not a malformed one, and warns about nothing."""
     client = Client()
-    client.create_individual_profile("A", "B", address=None)
-    client.create_individual_profile("A", "B", address="")
-    assert len(client.sent) == 2
+    result = client.create_individual_profile("A", "B")
+
+    assert "address" not in client.payload
+    assert "address_warning" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -159,9 +159,11 @@ def test_the_dotted_address_keys_are_confirmed_together():
     stored, and CSuite derived primary_citystatezip, primary_address_string
     and primary_country by itself.
 
-    Sandbox-9 sent address.city ALONE against a profile with no address and
-    got nothing stored. That looked like a refutation and was a dependency:
-    one key cannot create an address row that does not exist yet.
+    One key ALONE stores nothing — measured twice, against a profile with no
+    address and against one with a full address, nothing blanked either time.
+    So profile/edit does not act on a single address key, and the earlier
+    guess that it was a missing-row precondition was wrong. The smallest
+    working set is still unknown.
     """
     from clients.csuite import INCONCLUSIVE_PROBES
 
@@ -169,7 +171,7 @@ def test_the_dotted_address_keys_are_confirmed_together():
                 "address.zipcode"):
         assert key in CONFIRMED_INPUT_FIELDS
         assert key not in KNOWN_INVALID_INPUT_FIELDS
-    assert "RESOLVED" in INCONCLUSIVE_PROBES["address.city"]
+    assert "ALONE" in INCONCLUSIVE_PROBES["address.city"]
 
     client = Client()
     client.edit_profile(21626, **{"address.city": "Fairfax"})
@@ -187,13 +189,58 @@ def test_the_address_key_is_wrong_whatever_shape_it_takes(shape):
         Client().edit_profile(21626, address=shape)
 
 
-def test_the_address_refusal_separates_eliminated_from_pending():
-    """So the next person re-spends a capped write on neither."""
-    with pytest.raises(ValueError) as caught:
-        Client().create_individual_profile("A", "B", address="1 Test Way")
-    message = str(caught.value)
+@pytest.mark.parametrize("missing", ["address_line", "city", "state",
+                                    "zipcode"])
+def test_any_missing_part_means_no_address_object_is_sent(missing):
+    """CSuite derives primary_address_string and primary_citystatezip from
+    the parts, so a partial object writes a malformed address."""
+    parts = {"address_line": "1 Test Way", "city": "Fairfax", "state": "VA",
+             "zipcode": "22031"}
+    parts[missing] = None
 
-    assert "primary_*" in message                 # eliminated
-    assert "plain string" in message              # eliminated
-    assert "PENDING, not dead" in message         # documented, untested
-    assert "sandbox-12" in message
+    client = Client()
+    result = client.create_individual_profile("A", "B", **parts)
+
+    assert "address" not in client.payload
+    assert "Address incomplete" in result["address_warning"]
+    assert client.sent, "the profile is still created"
+
+
+def test_the_payload_is_still_only_confirmed_names():
+    client = Client()
+    client.create_individual_profile("A", "B", email="a@b.invalid",
+                                     phone="7035550100",
+                                     address_line="1 Test Way", city="Fairfax",
+                                     state="VA", zipcode="22031")
+
+    assert set(client.payload) == {"first_name", "last_name", "email",
+                                  "phone_number", "address"}
+    assert set(client.payload["address"]) == {"address", "city", "state",
+                                              "zipcode"}
+    assert "address2" not in client.payload["address"]
+
+
+def test_a_single_address_key_is_recorded_as_storing_nothing():
+    """Measured twice, 2026-10-01: against a profile with NO address
+    (sandbox-9) and against 21626 holding a full one (sandbox-13). Both times
+    200, 0 of 81 fields changed, modified_ts unchanged, nothing blanked.
+
+    Which is why build_address sends all four or none — not only because a
+    partial object derives a malformed primary_address_string, but because a
+    partial set is not acted on at all.
+    """
+    from clients.csuite import INCONCLUSIVE_PROBES, build_address
+
+    evidence = INCONCLUSIVE_PROBES["address.city"]
+    assert "nothing blanked" in evidence
+    assert "smallest working set is untested" in evidence
+
+    for parts in ({"city": "Vienna"},
+                  {"address_line": "81 Test Way", "city": "Vienna"},
+                  {"address_line": "81 Test Way", "city": "Vienna",
+                   "state": "VA"}):
+        address, warning = build_address(parts.get("address_line"),
+                                        parts.get("city"), parts.get("state"),
+                                        parts.get("zipcode"))
+        assert address is None, "a partial set is never sent"
+        assert warning and "Address incomplete" in warning

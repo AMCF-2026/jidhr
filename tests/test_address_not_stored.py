@@ -1,24 +1,26 @@
-"""The submitted address is reported, never sent, and never silent.
+"""The submitted address is sent when it is complete, and named when it is not.
 
-CSuite's address INPUT name is unknown. Nine candidates have been
-eliminated, each by a sandbox write and a read-back:
-primary_address_string, primary_address, primary_city, primary_state,
-primary_zipcode, address.city, and `address` both as a plain string and as a
-nested object — every one accepted with HTTP 200 and stored nothing.
+A complete address now reaches CSuite as a nested `address` object of
+`address`, `city`, `state`, `zipcode` — the confirmed create shape, VERIFIED
+2026-10-01 on sentinel 21660, where all four stored and CSuite derived
+primary_citystatezip, primary_address_string and primary_country itself.
 
-Meanwhile the DAF Inquiry Form and the Endowment Inquiry Form both carry
-address, city, state and zip as REQUIRED fields, so every submission has a
-full address. It was not mapped in _FIELD_MAP, so it was discarded at the
-parse step and nobody downstream could tell it had been submitted at all.
+An INCOMPLETE address is not sent at all. CSuite derives those three fields
+from the parts it is given, so a half-filled object puts a malformed address
+on the record, and an address nobody can trust is worse than one a person is
+asked to enter.
 
-It is mapped now so it can be shown to a person. It is still not sent.
+The DAF Inquiry Form and the Endowment Inquiry Form both carry address, city,
+state and zip as REQUIRED fields, so a complete address is the normal case.
+Until 2026-10-01 none of it was even parsed.
 
 No network.
 """
 
 import pytest
 
-from clients.csuite import CSuiteClient, normalize_phone
+from clients.csuite import (CSuiteClient, build_address,
+                            normalize_phone)
 from config import Config
 from intents import daf_workflow
 from intents.daf_workflow import _parse_submission, submitted_address
@@ -97,10 +99,15 @@ class CSuiteSpy:
 
     def create_individual_profile(self, **kwargs):
         self.calls.append(kwargs)
-        number, warning = normalize_phone(kwargs.get("phone"))
         response = {"success": True, "data": {"profile_id": 21660}}
-        if warning:
-            response["phone_warning"] = warning
+        _, phone_warning = normalize_phone(kwargs.get("phone"))
+        if phone_warning:
+            response["phone_warning"] = phone_warning
+        _, address_warning = build_address(
+            kwargs.get("address_line"), kwargs.get("city"),
+            kwargs.get("state"), kwargs.get("zipcode"))
+        if address_warning:
+            response["address_warning"] = address_warning
         return response
 
     def create_fund(self, **kwargs):
@@ -135,32 +142,62 @@ def run(monkeypatch, sub=None, csuite=None, hubspot=None):
     return reply, state
 
 
-def test_the_workflow_does_not_pass_address_to_the_create(monkeypatch):
+def test_the_workflow_passes_the_four_parsed_address_parts(monkeypatch):
     csuite = CSuiteSpy()
     run(monkeypatch, csuite=csuite)
 
     assert len(csuite.calls) == 1
-    assert set(csuite.calls[0]) == {"first_name", "last_name", "email",
-                                    "phone"}
-    assert "address" not in csuite.calls[0]
+    call = csuite.calls[0]
+    assert set(call) == {"first_name", "last_name", "email", "phone",
+                         "address_line", "city", "state", "zipcode"}
+    assert call["address_line"] == "51 Test Way"
+    assert call["city"] == "Fairfax"
+    assert call["state"] == "VA"
+    assert call["zipcode"] == "22031"
+    assert "address2" not in call, "not in the confirmed set"
 
 
-def test_the_create_itself_refuses_an_address_if_anyone_adds_one_later():
-    """Belt and braces: the method raises rather than dropping it, so
-    re-adding the argument here cannot reintroduce a silent loss."""
-    with pytest.raises(ValueError):
-        Client().create_individual_profile("A", "B", address="51 Test Way")
+def test_the_create_sends_the_confirmed_nested_shape():
+    client = Client()
+    client.create_individual_profile("A", "B", address_line="51 Test Way",
+                                     city="Fairfax", state="VA",
+                                     zipcode="22031")
+    sent = client.sent[0][1]
+    assert sent["address"] == {"address": "51 Test Way", "city": "Fairfax",
+                               "state": "VA", "zipcode": "22031"}
+
+
+def test_a_partial_address_is_never_sent_as_a_partial_object():
+    """CSuite derives primary_address_string from the parts, so half an
+    address becomes a malformed one on the record."""
+    client = Client()
+    result = client.create_individual_profile(
+        "A", "B", address_line="51 Test Way", city="Fairfax", state="VA")
+
+    assert "address" not in client.sent[0][1]
+    assert "Address incomplete" in result["address_warning"]
+    assert "51 Test Way, Fairfax, VA" in result["address_warning"]
 
 
 # ---------------------------------------------------------------------------
 # It reaches the user
 # ---------------------------------------------------------------------------
 
-def test_the_address_warning_reaches_the_confirmation_text(monkeypatch):
+def test_a_complete_address_produces_no_warning_at_all(monkeypatch):
+    """It is stored now. There is nothing to tell anyone."""
     reply, _ = run(monkeypatch)
 
-    assert "🏠 Address not stored in CSuite yet: '51 Test Way, Fairfax, " \
-           "VA 22031'. Enter it manually." in reply
+    assert "Address not stored" not in reply
+    assert "Address incomplete" not in reply
+    assert "🏠" not in reply
+
+
+def test_an_incomplete_address_warning_reaches_the_confirmation_text(
+        monkeypatch):
+    reply, _ = run(monkeypatch, sub=submission(zip=None))
+
+    assert "🏠 Address incomplete, not stored: '51 Test Way, Fairfax, VA'. " \
+           "Enter it manually." in reply
 
 
 def test_no_address_submitted_means_no_address_line(monkeypatch):
@@ -173,31 +210,44 @@ def test_no_address_submitted_means_no_address_line(monkeypatch):
     assert "🏠" not in reply
 
 
-def test_a_good_phone_adds_no_phone_line_but_the_address_line_stays(monkeypatch):
+def test_a_complete_submission_adds_no_lines_at_all(monkeypatch):
     reply, _ = run(monkeypatch)
 
     assert "Phone not stored" not in reply
-    assert "Address not stored" in reply
+    assert "Address" not in reply
 
 
-def test_a_bad_phone_and_an_address_both_warn_and_the_profile_is_created(
+def test_a_bad_phone_with_a_COMPLETE_address_warns_about_the_phone_only(
         monkeypatch):
-    """The two warnings are independent, and neither blocks the create."""
+    """The address is stored, so only the phone has anything to report."""
     csuite = CSuiteSpy()
     reply, state = run(monkeypatch, sub=submission(phone="555-0122"),
                        csuite=csuite)
 
     assert state["profile_id"] == 21660, "the profile was still created"
-    assert len(csuite.calls) == 1
     assert "📱 Profile created. Phone not stored: '555-0122' isn't a " \
            "10-digit US number. Enter it manually." in reply
-    assert "🏠 Address not stored in CSuite yet: '51 Test Way, Fairfax, " \
-           "VA 22031'. Enter it manually." in reply
+    assert "Address" not in reply
+    assert "Failed to create" not in reply
+
+
+def test_a_bad_phone_and_an_incomplete_address_both_warn(monkeypatch):
+    """The two warnings are independent, and neither blocks the create."""
+    csuite = CSuiteSpy()
+    reply, state = run(monkeypatch,
+                       sub=submission(phone="555-0122", zip=None),
+                       csuite=csuite)
+
+    assert state["profile_id"] == 21660
+    assert len(csuite.calls) == 1
+    assert "Phone not stored: '555-0122'" in reply
+    assert "🏠 Address incomplete, not stored: '51 Test Way, Fairfax, VA'." \
+        in reply
     assert "Failed to create" not in reply
 
 
 def test_neither_warning_is_ever_only_in_a_log(monkeypatch, caplog):
-    reply, _ = run(monkeypatch, sub=submission(phone="n/a"))
+    reply, _ = run(monkeypatch, sub=submission(phone="n/a", state=None))
 
-    for fragment in ("Phone not stored", "Address not stored"):
+    for fragment in ("Phone not stored", "Address incomplete"):
         assert fragment in reply, f"{fragment} must be visible to the user"

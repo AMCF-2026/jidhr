@@ -86,17 +86,19 @@ def test_no_rows_at_all_is_handled_like_zero():
 # INCONCLUSIVE_PROBES is a record, not a gate
 # ---------------------------------------------------------------------------
 
-def test_address_city_is_confirmed_and_its_confound_is_on_record():
-    """It was never invalid. Sent alone against a profile with no address it
-    stored nothing; sent with the other three keys it stored fine.
+def test_address_city_is_confirmed_and_its_open_question_is_on_record():
+    """It was never invalid: sent with the other three keys it stores.
 
-    The entry stays in INCONCLUSIVE_PROBES, marked resolved, because the
-    measurement explains a real dependency — deleting it would invite
-    someone to re-run the probe and reach the same wrong conclusion.
+    Sent ALONE it stores nothing — twice, against a profile with no address
+    and against one with a full address. The entry stays in
+    INCONCLUSIVE_PROBES because what is still unknown is the smallest working
+    set, and deleting the measurement would invite someone to re-run the same
+    probe and draw the same wrong conclusion sandbox-12 drew.
     """
     assert "address.city" not in KNOWN_INVALID_INPUT_FIELDS
     assert "address.city" in CONFIRMED_INPUT_FIELDS
-    assert "RESOLVED" in INCONCLUSIVE_PROBES["address.city"]
+    assert "smallest working set is untested" in \
+        INCONCLUSIVE_PROBES["address.city"]
 
 
 def test_an_inconclusive_probe_never_blocks_a_request():
@@ -138,7 +140,9 @@ def test_the_nested_and_plain_string_address_stay_proven_wrong_on_edit():
     assert "profile/create/individual" in ENDPOINT_CONFIRMED_FIELDS["address"]
 
 
-def test_the_create_refusal_no_longer_calls_the_documented_shapes_dead():
+def test_the_create_no_longer_refuses_an_address_at_all():
+    """It sends one. The refusal message that called the documented shapes
+    dead is gone, because the shape was confirmed on 2026-10-01."""
     from clients.csuite import CSuiteClient
 
     class Client(CSuiteClient):
@@ -146,17 +150,14 @@ def test_the_create_refusal_no_longer_calls_the_documented_shapes_dead():
             self.sent = []
 
         def _request(self, endpoint, data=None):
-            self.sent.append(endpoint)
+            self.sent.append((endpoint, dict(data or {})))
             return {"success": True, "data": {"profile_id": 1}}
 
     client = Client()
-    with pytest.raises(ValueError) as caught:
-        client.create_individual_profile("A", "B", address="1 Test Way")
-
-    message = str(caught.value)
-    assert "PENDING, not dead" in message
-    assert "sandbox-12" in message
-    assert client.sent == []
+    client.create_individual_profile("A", "B", address_line="1 Test Way",
+                                     city="Fairfax", state="VA",
+                                     zipcode="22031")
+    assert client.sent[0][1]["address"]["city"] == "Fairfax"
 
 
 # ---------------------------------------------------------------------------

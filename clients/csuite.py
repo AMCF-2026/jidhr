@@ -24,7 +24,8 @@ import logging
 import requests
 from config import Config
 from clients.audit import (AuditUnavailable, complete_write,
-                           record_write, reserve_write)
+                           record_write, reserve_write,
+                           target_id_from_response)
 
 logger = logging.getLogger(__name__)
 
@@ -265,16 +266,25 @@ KNOWN_INVALID_INPUT_FIELDS = {
 # the probe that looked like a refutation had a confound nobody had ruled
 # out.
 INCONCLUSIVE_PROBES = {
-    # RESOLVED 2026-10-01 — kept because the measurement explains a real
-    # dependency, and deleting it would invite someone to re-run the probe.
-    # The key is now in CONFIRMED_INPUT_FIELDS.
-    "address.city": "sandbox-9, 2026-10-01: sent ALONE, on a profile with no "
-                    "address at all — 200, nothing stored, modified_ts "
-                    "unchanged. RESOLVED later the same day: sent together "
-                    "with address.address, address.state and address.zipcode "
-                    "it stored fine, so one key alone cannot create an "
-                    "address that does not exist yet. A confound, as "
-                    "suspected, not a refutation.",
+    # The key is CONFIRMED — it stores, with the other three. What is NOT
+    # known is the smallest set that works.
+    #
+    # Corrected 2026-10-01 (sandbox-13). Sandbox-12 inferred that one key
+    # alone failed because the address row did not exist yet. That was wrong:
+    # sent alone against 21626, which by then HELD a full address, it stored
+    # nothing again — 200, 0 of 81 fields changed, modified_ts unchanged. So
+    # the precondition is not a missing row.
+    #
+    # Nothing was blanked either time, so a partial address edit does not
+    # destroy an address that is already there.
+    "address.city": "sandbox-9 and sandbox-13, 2026-10-01: sent ALONE, both "
+                    "against a profile with NO address and against one with "
+                    "a full address — 200, nothing stored, modified_ts "
+                    "unchanged, nothing blanked, both times. So "
+                    "profile/edit does not act on a single address key. All "
+                    "four together DO store (sandbox-12). The smallest "
+                    "working set is untested: two and three keys have never "
+                    "been tried.",
     "address.street / address.address1 / address.line1 / address.zip / "
     "address.zipcode / address.postal_code (and address.address, "
     "address.city, address.state)": (
@@ -353,6 +363,48 @@ def normalize_phone(raw):
         return digits, None
 
     return None, (f"Phone not stored: {text!r} isn't a 10-digit US number. "
+                  "Enter it manually.")
+
+
+# The four parts of the nested address CSuite accepts on a create, and the
+# display field each one fills. VERIFIED 2026-10-01, sentinel 21660.
+ADDRESS_PARTS = ("address", "city", "state", "zipcode")
+
+
+def build_address(address_line, city, state, zipcode):
+    """(nested address | None, warning | None) for profile/create/individual.
+
+    All four parts or none. Two reasons, both measured:
+
+    * CSuite derives `primary_address_string`, `primary_citystatezip` and
+      `primary_country` from the parts it is given, so a partial object puts
+      a malformed address on the record — and an address nobody can trust is
+      worse than one a person is asked to enter.
+    * On `profile/edit`, a single address key stores **nothing at all**
+      (2026-10-01, sentinel 21626, tried both against an empty address and
+      against a full one). All four together store. The smallest working set
+      has never been established, so "all four" is the only size known to
+      work.
+
+    `address2` is deliberately absent: it is not in the confirmed set.
+    """
+    parts = {
+        "address": (address_line or "").strip(),
+        "city": (city or "").strip(),
+        "state": (state or "").strip(),
+        "zipcode": (zipcode or "").strip(),
+    }
+    missing = [name for name in ADDRESS_PARTS if not parts[name]]
+
+    if not missing:
+        return parts, None
+
+    if len(missing) == len(ADDRESS_PARTS):
+        # Nothing was submitted. Not an incomplete address — no address.
+        return None, None
+
+    given = ", ".join(parts[name] for name in ADDRESS_PARTS if parts[name])
+    return None, (f"🏠 Address incomplete, not stored: {given!r}. "
                   "Enter it manually.")
 
 
@@ -725,12 +777,17 @@ class CSuiteClient:
 
         started = time.perf_counter()
 
-        def audit(status, http_status=None, error=None):
+        def audit(status, http_status=None, error=None, body=None):
             if audited:
+                # The created id exists only in the response. reserve_write
+                # runs before the request and deliberately records NULL for a
+                # create rather than guessing from the payload — see
+                # clients/audit.target_id_from_payload.
                 complete_write(
                     reservation, status=status, http_status=http_status,
                     error=error,
-                    duration_ms=(time.perf_counter() - started) * 1000)
+                    duration_ms=(time.perf_counter() - started) * 1000,
+                    target_id=target_id_from_response(body))
 
         try:
             response = self.session.post(
@@ -746,7 +803,7 @@ class CSuiteClient:
                 json_response = response.json()
 
                 if json_response.get("success") == 1:
-                    audit("success", status_code)
+                    audit("success", status_code, body=json_response)
                     result = {
                         "success": True,
                         "data": json_response.get("data"),
@@ -880,7 +937,9 @@ class CSuiteClient:
     
     def create_individual_profile(self, first_name: str, last_name: str,
                                    email: str = None, phone: str = None,
-                                   address: str = None, **kwargs) -> dict:
+                                   address_line: str = None, city: str = None,
+                                   state: str = None, zipcode: str = None,
+                                   **kwargs) -> dict:
         """Create an individual profile in CSuite.
 
         Used by: DAF/Endowment inquiry workflow (Kods)
@@ -891,70 +950,47 @@ class CSuiteClient:
         `primary_phone_number` and `primary_address_string`. All three are
         valid `profile/display` OUTPUT names and none of them is an input
         name: CSuite accepted the create, returned HTTP 200 and a
-        profile_id, and discarded every one of them. Nothing in the
-        response said so.
+        profile_id, and discarded every one of them.
 
-        What it sends now, and why each is trusted:
+        What it sends now, every name confirmed by a sandbox write and a
+        read-back:
 
-        - `email` — VERIFIED 2026-09-30. Sent to
-          profile/create/individual and to profile/edit; read back as
-          `primary_email` both times.
-        - `phone_number` — VERIFIED 2026-09-30 on profile/edit. Sent
-          "7035550100", read back as `primary_phone_number`
-          "703-555-0100": CSuite punctuates the value it stores.
+        - `email` -> `primary_email`. VERIFIED 2026-09-30, create and edit.
+        - `phone_number` -> `primary_phone_number`. VERIFIED 2026-09-30.
+          CSuite punctuates a ten-digit value ("7035550100" came back
+          "703-555-0100") and stores anything else verbatim, so the number is
+          normalised first — see normalize_phone.
+        - `address` as a NESTED object of `address`, `city`, `state`,
+          `zipcode`. VERIFIED 2026-10-01 on sentinel 21660: all four stored,
+          and CSuite derived `primary_citystatezip`,
+          `primary_address_string` and `primary_country` ("US") by itself.
 
         Args:
             first_name: First name (required)
             last_name: Last name (required)
             email: email address -> primary_email
-            phone: phone number -> phone_number -> primary_phone_number.
-                CSuite VALIDATES this field and rejects the whole create
-                with HTTP 400 if it is not a full number — measured
-                2026-09-30: "phone_number: phone [5550100] is not valid".
-                A seven-digit or malformed number now fails the create
-                instead of being quietly dropped.
-            address: NOT SENT. See below; passing one raises.
+            phone: any format; normalised to ten digits or omitted with a
+                warning on the response as `phone_warning`
+            address_line: street -> address.address -> primary_address
+            city: -> address.city -> primary_city
+            state: -> address.state -> primary_state
+            zipcode: -> address.zipcode -> primary_zipcode
             **kwargs: checked against CONFIRMED_INPUT_FIELDS first
 
-        Returns:
-            dict with 'data': {'profile_id': int} on success
-        """
-        # TODO(hubsync-csuite-sandbox-12): the address is not sent yet. The
-        # DOCUMENTED shapes are under test; this method changes once the
-        # result is in.
-        #
-        # ELIMINATED, each by a sandbox write and a read-back:
-        #   primary_address_string, primary_address, primary_city,
-        #   primary_state, primary_zipcode   — dropped, profile/edit 2026-09-30
-        #   address, plain string            — dropped, profile/edit 2026-10-01
-        #   address, nested, on EDIT         — dropped, profile/edit 2026-10-01
-        #
-        # PENDING, documented, and NOT eliminated — see INCONCLUSIVE_PROBES:
-        #   address.address / .city / .state / .zipcode, four keys together
-        #     on profile/edit
-        #   address, nested, on profile/CREATE
-        #
-        # The plan, which sandbox-7 proved works: create the profile
-        # without the address, then write the address with a follow-up
-        # profile/edit once its name is confirmed. profile/edit is a
-        # partial update (measured three times), so a second call costs
-        # nothing but a call.
-        if address:
-            # Not silently ignored. Accepting a value and dropping it is
-            # the exact bug this method is being fixed for, and doing it
-            # ourselves would be worse than CSuite doing it.
-            raise ValueError(
-                "create_individual_profile does not send an address yet: the "
-                "documented shapes are under test on "
-                "hubsync-csuite-sandbox-12 and this method will be changed "
-                "once that result is in. Eliminated by sandbox write and "
-                "read-back so far: the flat primary_* names, and `address` "
-                "on profile/EDIT as a plain string and as a nested object. "
-                "The dotted `address.*` keys and the nested CREATE shape are "
-                "documented and PENDING, not dead. Create the profile "
-                "without an address for now, then set it with profile/edit. "
-                "Nothing was sent.")
+        **All four address parts or none.** A partial nested object is never
+        sent: CSuite derives `primary_address_string` and
+        `primary_citystatezip` from the parts, so a half-filled address
+        produces a malformed one on the record, and an address nobody can
+        trust is worse than an address a person is asked to enter. When any
+        part is missing the create goes ahead without it and the response
+        carries `address_warning`.
 
+        `address2` is never sent — it is not in the confirmed set.
+
+        Returns:
+            dict with 'data': {'profile_id': int} on success, plus
+            `phone_warning` / `address_warning` when something was left out.
+        """
         data = {
             "first_name": first_name,
             "last_name": last_name,
@@ -962,9 +998,9 @@ class CSuiteClient:
         if email:
             data["email"] = email
 
-        # A number CSuite would refuse is left out rather than allowed to
-        # fail the create. The warning travels with the response so the
-        # caller can put it in front of a person — see normalize_phone.
+        # A number CSuite would store as unsearchable text is left out rather
+        # than sent. The warning travels with the response so the caller can
+        # put it in front of a person — see normalize_phone.
         phone_warning = None
         if phone:
             number, phone_warning = normalize_phone(phone)
@@ -973,6 +1009,13 @@ class CSuiteClient:
             else:
                 logger.warning("CSuite profile create: %s", phone_warning)
 
+        address, address_warning = build_address(address_line, city, state,
+                                                zipcode)
+        if address:
+            data["address"] = address
+        elif address_warning:
+            logger.warning("CSuite profile create: %s", address_warning)
+
         # Checked before the payload is built, so an unconfirmed name is a
         # refusal rather than a silent drop.
         check_input_fields(kwargs, "profile/create/individual")
@@ -980,10 +1023,13 @@ class CSuiteClient:
 
         logger.info(f"Creating individual profile: {first_name} {last_name}")
         response = self._request("profile/create/individual", data)
-        if phone_warning and isinstance(response, dict):
-            response["phone_warning"] = phone_warning
+        if isinstance(response, dict):
+            if phone_warning:
+                response["phone_warning"] = phone_warning
+            if address_warning:
+                response["address_warning"] = address_warning
         return response
-    
+
     def create_org_profile(self, organization: str, email: str = None,
                            phone: str = None, **kwargs) -> dict:
         """Create an organization profile in CSuite. **UNVERIFIED.**

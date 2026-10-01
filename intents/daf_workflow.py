@@ -420,6 +420,14 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
                 last_name=data.get("last_name", ""),
                 email=data.get("email", ""),
                 phone=data.get("phone"),
+                # The four parts the inquiry forms collect, all required on
+                # both forms. Sent as a nested `address` object, which is the
+                # confirmed create shape (2026-10-01, sentinel 21660).
+                # address2 is parsed but never sent: not in the confirmed set.
+                address_line=data.get("address_street"),
+                city=data.get("address_city"),
+                state=data.get("address_state"),
+                zipcode=data.get("address_zip"),
             )
             if profile_result.get('success') and profile_result.get('data'):
                 profile_id = profile_result['data'].get('profile_id')
@@ -427,13 +435,14 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
                 results["profile_created"] = True
                 logger.info(f"Profile created: {profile_id}")
                 results["phone_warning"] = profile_result.get("phone_warning")
-                # Never passed to the create — see the quoted call above and
-                # create_individual_profile, which raises on an address.
-                address = submitted_address(data)
-                if address:
-                    results["address_warning"] = (
-                        f"Address not stored in CSuite yet: {address!r}. "
-                        "Enter it manually.")
+                # A complete address is now SENT and stored, so there is
+                # nothing to warn about. The warning only survives for an
+                # INCOMPLETE one, which CSuite would turn into a malformed
+                # primary_address_string — build_address refuses to send a
+                # partial object and says which parts it had.
+                results["address_warning"] = profile_result.get(
+                    "address_warning")
+                if results["address_warning"]:
                     logger.warning("CSuite profile %s created without the "
                                    "submitted address", profile_id)
                 # verify_writes is on, so a dropped field is reported rather
@@ -697,9 +706,9 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
             # named here. Never only in a log.
             lines.append(f"📱 Profile created. {results['phone_warning']}")
         if results.get("address_warning"):
-            # The address is never sent: no input name for it has been found.
-            # Independent of the phone warning — a submission can trip both.
-            lines.append(f"🏠 {results['address_warning']}")
+            # Only an INCOMPLETE address warns now. Independent of the phone
+            # warning — a submission can trip both.
+            lines.append(results["address_warning"])
     elif results.get("profile_skipped"):
         lines.append(
             "⏸️ Profile: **not created — CSuite profile creation is "
