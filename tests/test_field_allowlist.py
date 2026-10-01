@@ -409,3 +409,46 @@ def test_profile_id_slips_through_on_task_create_and_that_is_a_known_gap():
     """
     check_input_fields(["profile_id"], "task/create")   # no raise: the gap
     assert "profile_id" in CONFIRMED_INPUT_FIELDS
+
+
+# ---------------------------------------------------------------------------
+# A read name is not a write name
+# ---------------------------------------------------------------------------
+
+def test_the_task_profile_link_is_recorded_as_output_only():
+    """Observed on a UI-made task, 2026-10-01: o="profile", id=21661.
+
+    Seven earlier sandbox tasks had all three link fields null, which I read
+    as "tasks cannot be linked to a profile". They were unlinked, not
+    unlinkable. The names are kept out of both allowlists because a read name
+    is not a write name — primary_email was a valid display field and an
+    invalid input.
+    """
+    from clients.csuite import (ENDPOINT_ALLOWED_UNVERIFIED,
+                                INCONCLUSIVE_PROBES, OBSERVED_OUTPUT)
+
+    observed = OBSERVED_OUTPUT["task/display"]
+    for field in ("o", "id", "task_object"):
+        assert field in observed
+        assert field not in CONFIRMED_INPUT_FIELDS
+        assert field not in ENDPOINT_ALLOWED_UNVERIFIED
+
+    assert "the task -> profile link (task/create)" in INCONCLUSIVE_PROBES
+
+
+def test_observed_output_never_leaks_into_an_allowlist():
+    from clients.csuite import ENDPOINT_ALLOWED_UNVERIFIED, OBSERVED_OUTPUT
+
+    for endpoint, fields in OBSERVED_OUTPUT.items():
+        for field in fields:
+            assert field not in CONFIRMED_INPUT_FIELDS or \
+                field in ("profile_id",), \
+                f"{field} is an observed OUTPUT name on {endpoint}"
+
+
+@pytest.mark.parametrize("field", ["o", "id", "task_object", "object_id",
+                                   "object_type"])
+def test_a_link_field_is_still_refused_on_task_create(field):
+    """Until a sandbox write and a read-back confirm the input name."""
+    with pytest.raises(UnconfirmedField):
+        check_input_fields([field], "task/create")

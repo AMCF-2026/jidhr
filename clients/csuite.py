@@ -220,6 +220,42 @@ ENDPOINT_CONFIRMED_FIELDS = {
 # argument and `task/display` has no `name` field at all. That is the
 # `primary_email` shape exactly, and it is unresolved — see
 # INCONCLUSIVE_PROBES.
+# OUTPUT names only. Observed on a record, never sent, never proven as inputs.
+#
+# This set exists because of a mistake. On 2026-10-01 I read seven sandbox
+# tasks, found `id`, `o` and `task_object` null on every one, and concluded
+# that "a CSuite task cannot be attached to a profile". Carl then made a task
+# in the CSuite UI against profile 21661 and the link was right there:
+#
+#     o            "profile"
+#     id           21661
+#     task_object  "Profile :: SENTINEL 6 - SANDBOX ONLY, HUBSYNC"
+#
+# The seven were simply unlinked. A feature nobody had used looked like a
+# feature that did not exist, and I generalised from the only sample I had —
+# the same error as reading one address key alone and calling it invalid.
+#
+# These names are recorded so the knowledge is not lost, and kept OUT of
+# CONFIRMED_INPUT_FIELDS and ENDPOINT_ALLOWED_UNVERIFIED because a read name
+# is not a write name. `primary_email` is a valid display field and an invalid
+# input; `o` and `id` may well be `object_type` and `object_id` on the way in.
+# Only a sandbox write and a read-back can settle it.
+OBSERVED_OUTPUT = {
+    "task/display": {
+        "o": 'the linked object TYPE, e.g. "profile" (UI task 1033, '
+             '2026-10-01)',
+        "id": "the linked object's id, e.g. 21661 — NOT the task's own id, "
+              "which is task_id (UI task 1033, 2026-10-01)",
+        "task_object": 'a derived label, e.g. "Profile :: SENTINEL 6 - '
+                       'SANDBOX ONLY, HUBSYNC" (UI task 1033, 2026-10-01)',
+        "task_type_id": "1065 = DIY Form-Contact (UI task 1033, 2026-10-01)",
+        "task_type": "nested {task_type_id, task_type_name}",
+        "task_description": "holds the task's title text; there is no `name` "
+                            "field on any read endpoint",
+    },
+}
+
+
 ENDPOINT_ALLOWED_UNVERIFIED = {
     "task_description": ("task/create",),
     "due_date": ("task/create",),
@@ -303,7 +339,16 @@ INCONCLUSIVE_PROBES = {
     # profile at all, which is what the task was for.
     "name (task/create)":
         "sandbox-17, 2026-10-01: sent by create_task as required, absent from "
-        "every task read endpoint. UNTESTED — no task was created.",
+        "every task read endpoint — the title text is read back as "
+        "`task_description`. UNTESTED as an input: no task has been created "
+        "through the API.",
+    # The profile link exists after all — see OBSERVED_OUTPUT. What is unknown
+    # is what to CALL it on the way in.
+    "the task -> profile link (task/create)":
+        "sandbox-17, 2026-10-01: concluded ABSENT from seven sandbox tasks "
+        "that all had it null, then found populated on a UI-made task as "
+        "o=\"profile\" / id=21661. The capability is VERIFIED; the input "
+        "names are UNKNOWN. create_task has no parameter for it.",
     # The key is CONFIRMED — it stores, with the other three. What is NOT
     # known is the smallest set that works.
     #
@@ -1560,6 +1605,11 @@ class CSuiteClient:
         #
         # The method's own `name` and `employee_id` are not gated, same as the
         # profile create — see the note above about `name`.
+        #
+        # TODO(sandbox-17): this method cannot link a task to anything. A
+        # UI-made task reads back o="profile" / id=21661, so CSuite supports
+        # it; the input names are unknown. Until they are confirmed, every
+        # task this method could create would be free-floating.
         check_input_fields(kwargs, "task/create")
         data.update(kwargs)
         
