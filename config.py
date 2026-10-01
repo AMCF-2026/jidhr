@@ -157,6 +157,20 @@ class Config:
     # Whether an inquiry also creates a CSuite FOLLOW-UP TASK. Off, and
     # separate from the profile and fund switches, so each is a decision of its
     # own.
+    # Whether a returning donor's HubSpot contact gets its csuite_profile_id
+    # filled in. Off, and its own switch because it adds a HubSpot write to a
+    # path that previously made none.
+    #
+    # Why it is needed: when the duplicate guard stops on a profile found by the
+    # CSUITE primary_email search rather than by the HubSpot property, HubSpot
+    # by definition has no link — and the workflow returns before its PATCH
+    # step. So the link never heals, and every repeat inquiry correctly refuses
+    # a second profile while silently leaving HubSpot unlinked. Sandbox-21's
+    # profile 21662 is still in that state.
+    CSUITE_HUBSPOT_BACKFILL_ENABLED = (
+        os.environ.get('CSUITE_HUBSPOT_BACKFILL_ENABLED', 'False')
+        .strip().lower() == 'true')
+
     CSUITE_DAF_TASK_CREATE_ENABLED = (
         os.environ.get('CSUITE_DAF_TASK_CREATE_ENABLED', 'False')
         .strip().lower() == 'true')

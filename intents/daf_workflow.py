@@ -16,6 +16,7 @@ Workflow steps:
 
 import logging
 from clients.audit import AuditUnavailable, record_write
+from clients.csuite import ui_url
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -599,6 +600,7 @@ def _create_followup_task(data, state, results, csuite, wf_type, type_label):
         # confirmation that says "1007" makes the reader look it up.
         results["task_assignee"] = (task_result.get("assignee_name")
                                     or str(assignee))
+        results["csuite_api_base"] = state.get("csuite_api_base")
         results["task_donor"] = name or email or "this donor"
         logger.info("CSuite follow-up task %s created on profile %s, due %s",
                     results["task_id"], profile_id, due)
@@ -607,6 +609,64 @@ def _create_followup_task(data, state, results, csuite, wf_type, type_label):
                                   or "CSuite returned no task id")
         logger.error("CSuite follow-up task NOT created for profile %s: %s",
                      profile_id, results["task_failed"])
+
+
+def _backfill_hubspot_link(data, state, results, hubspot, profile_id):
+    """Fill in a HubSpot contact's empty csuite_profile_id. One PATCH, or none.
+
+    Runs ONLY on the duplicate path, where the guard stopped on exactly one
+    existing profile. The step-3 PATCH block is not reused and the early return
+    is not removed: that block falls back to `create_contact` when the contact
+    is missing, which would create a contact for a donor who already has a
+    CSuite profile — a worse outcome than the gap it would close.
+
+    Writes only when the contact EXISTS and its value is EMPTY. A value already
+    there is never overwritten, even when it disagrees with the match: the
+    stored id is what staff and the donation sync have been using, and two
+    profiles for one donor is a merge decision, not a field update.
+    """
+    if not Config.CSUITE_HUBSPOT_BACKFILL_ENABLED:
+        results["backfill"] = "skipped: HubSpot backfill is turned off"
+        return
+    if not profile_id:
+        results["backfill"] = "skipped: no single profile to link to"
+        return
+
+    contact_id, existing = existing_hubspot_link(data.get("email"), hubspot)
+    if not contact_id:
+        results["backfill"] = (
+            "no HubSpot contact for this address, so nothing was linked — "
+            "create the contact, or link it by hand")
+        return
+    if existing:
+        if str(existing).strip() != str(profile_id).strip():
+            results["backfill_conflict"] = (existing, profile_id)
+            results["backfill"] = (
+                f"HubSpot points at {existing}, CSuite match is {profile_id} "
+                "— nothing was changed. Merge them in CSuite.")
+        else:
+            results["backfill"] = f"already linked to {existing}"
+        return
+
+    try:
+        patched = hubspot.update_contact_by_email(
+            data["email"], {"csuite_profile_id": str(profile_id)})
+    except Exception as e:
+        results["backfill"] = f"HubSpot link NOT written ({e})"
+        logger.error("backfill PATCH failed for contact %s: %s", contact_id, e)
+        return
+
+    if patched and "error" not in patched:
+        results["backfill_wrote"] = str(profile_id)
+        results["backfill_contact_id"] = contact_id
+        results["backfill"] = f"HubSpot now linked to profile {profile_id}"
+        logger.info("backfilled csuite_profile_id=%s onto HubSpot contact %s",
+                    profile_id, contact_id)
+    else:
+        reason = (patched or {}).get("error") or "HubSpot returned no response"
+        results["backfill"] = f"HubSpot link NOT written ({reason})"
+        logger.error("backfill PATCH failed for contact %s: %s", contact_id,
+                     reason)
 
 
 def record_unprocessed_submission(state: dict, reason: str) -> bool:
@@ -680,6 +740,11 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         )
 
     state["step"] = "processing"
+    # The API base URL of the client doing the work, so every UI link in the
+    # confirmation points at the host that actually holds the record. Without
+    # it the links go to production, where a sandbox id is a DIFFERENT real
+    # donor — measured 2026-10-01.
+    state["csuite_api_base"] = getattr(csuite, "base_url", None)
     data = state["submission_data"]
     wf_type = state["type"]
     type_label = "DAF" if wf_type == "daf" else "Endowment"
@@ -731,6 +796,14 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         "task_warning": None,
         "task_assignee": None,
         "task_donor": None,
+        "csuite_api_base": None,
+        # The duplicate-path HubSpot backfill. `backfill` always carries a
+        # sentence; the other two are set only when a PATCH landed or when the
+        # two sides disagree.
+        "backfill": None,
+        "backfill_wrote": None,
+        "backfill_contact_id": None,
+        "backfill_conflict": None,
         # Set when the submission carried an address. CSuite's address input
         # name is unknown — nine candidates eliminated by sandbox write and
         # read-back — so it is not sent, and it is named to a human instead
@@ -767,6 +840,11 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
             # profile_id unset, so the task is skipped with that as the reason.
             _create_followup_task(data, state, results, csuite, wf_type,
                                   type_label)
+            # The link never heals on its own: a profile found by the CSuite
+            # search means HubSpot has none, and this path returns before the
+            # step-3 PATCH.
+            _backfill_hubspot_link(data, state, results, hubspot,
+                                   duplicate.profile_id)
             return _format_confirmation(data, state, results, type_label)
 
         logger.info(f"Creating CSuite profile for {data.get('first_name')} {data.get('last_name')}...")
@@ -1106,7 +1184,8 @@ def _task_lines(data: dict, results: dict) -> list:
     """
     if results.get("task_id"):
         task_id = results["task_id"]
-        link = Config.CSUITE_TASK_URL.format(task_id=task_id)
+        link = ui_url(Config.CSUITE_TASK_URL, results.get("csuite_api_base"),
+                      task_id=task_id)
         donor = results.get("task_donor") or (
             (data.get("first_name", "") + " "
              + data.get("last_name", "")).strip() or "this donor")
@@ -1137,11 +1216,17 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
         # Nothing was created and nothing was PATCHed.
         profile_id = results.get("duplicate_of")
         if profile_id:
-            link = Config.CSUITE_PROFILE_URL.format(profile_id=profile_id)
+            link = ui_url(Config.CSUITE_PROFILE_URL,
+                          state.get("csuite_api_base"), profile_id=profile_id)
             lines.append(f"♻️ **Already in CSuite — no new profile created**")
             lines.append("")
             lines.append(f"👤 Profile {profile_id} — [CSuite]({link})")
             lines.append(f"   Found via: {results['duplicate_reason']}")
+            if results.get("backfill"):
+                icon = ("🔗" if results.get("backfill_wrote")
+                        else "⚠️" if results.get("backfill_conflict")
+                        else "🔗")
+                lines.append(f"{icon} {results['backfill']}")
             lines.extend(_task_lines(data, results))
         else:
             lines.append("🛑 **No profile created — a duplicate could not be "
@@ -1151,6 +1236,8 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
             lines.append("   Nothing was created and nothing was changed. "
                          "CSuite has no way to merge two donor profiles from "
                          "here, so this stops rather than guesses.")
+            if results.get("backfill"):
+                lines.append(f"🔗 {results['backfill']}")
             lines.extend(_task_lines(data, results))
         lines.append("")
         lines.append("Say anything to continue, or start a new workflow.")
@@ -1180,7 +1267,9 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
 
     # Profile
     if results["profile_created"]:
-        profile_link = Config.CSUITE_PROFILE_URL.format(profile_id=state['profile_id'])
+        profile_link = ui_url(Config.CSUITE_PROFILE_URL,
+                              state.get("csuite_api_base"),
+                              profile_id=state['profile_id'])
         lines.append(f"👤 Profile: {name} — [CSuite]({profile_link})")
         if results.get("phone_warning"):
             # CSuite validates phone_number and rejects the whole create on a
@@ -1220,7 +1309,9 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
                      "donor commits, not at inquiry.")
     elif results["fund_created"]:
         fund_name = data.get("fund_name") or f"{data.get('last_name', 'New')} Family Fund"
-        fund_link = Config.CSUITE_FUND_URL.format(funit_id=state['funit_id'])
+        fund_link = ui_url(Config.CSUITE_FUND_URL,
+                           state.get("csuite_api_base"),
+                           funit_id=state['funit_id'])
         lines.append(f"💰 Fund: {fund_name} — [CSuite]({fund_link})")
         if results.get("fund_warning"):
             lines.append(results["fund_warning"])

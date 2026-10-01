@@ -569,6 +569,38 @@ def host_of(url: str) -> str:
     return (parsed.hostname or "").lower()
 
 
+def ui_url(template: str, api_base_url=None, **ids) -> str:
+    """A CSuite UI link on the host that actually holds the record.
+
+    `Config.CSUITE_UI_BASE_URL` is a hardcoded production host, fixed at class
+    definition, so every UI link this repo has ever printed pointed at
+    production — including the links in sandbox confirmations.
+    
+    That is not cosmetic. Measured 2026-10-01: production profile **21662**
+    exists and is an unrelated real ORG, 21626 is an unrelated real individual,
+    and task 1034 is a real task from 2025-08-25. A sandbox link opened by
+    staff lands on a different donor's record, and an edit made there believing
+    it was the sentinel would be real damage done by a confirmation line.
+
+    So the host comes from the base URL of the client that performed the write.
+    The PATH is still INFERRED from the pattern of the others — no CSuite UI
+    path has been opened and confirmed — and that is unchanged by this.
+
+    With no `api_base_url` the template is returned as-is, so a caller that
+    cannot say which environment it was in gets the old behaviour rather than a
+    silently wrong guess.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    url = template.format(**ids)
+    host = host_of(api_base_url) if api_base_url else ""
+    if not host:
+        return url
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme or "https", host, parts.path, parts.query,
+                       parts.fragment))
+
+
 def host_looks_like_sandbox(url: str) -> bool:
     return _SANDBOX_HOST_MARKER in host_of(url)
 

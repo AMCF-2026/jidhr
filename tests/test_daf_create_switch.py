@@ -29,7 +29,14 @@ from intents import daf_workflow
 # ---------------------------------------------------------------------------
 
 class CSuiteNeverCalled:
-    """Any CSuite call at all is the failure this test exists to catch."""
+    """Any CSuite call at all is the failure this test exists to catch.
+
+    `base_url` is a real attribute rather than a trap: the workflow READS it to
+    work out which host the confirmation's UI links should point at, and
+    reading an attribute is not calling out.
+    """
+
+    base_url = "https://amuslimcf-sandbox.fcsuite.com/api/v2"
 
     def __getattr__(self, name):
         raise AssertionError(
