@@ -390,6 +390,11 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         # nothing was sent. Reported to the user as skipped, not as failed,
         # because "Failed to create" would be a false statement.
         "profile_skipped": False,
+        # Set when CSuite would have refused the submitted phone number, so
+        # it was left out and the profile made anyway. Shown to the user, not
+        # only logged: a number dropped in silence is the failure this path
+        # has been carrying since 2026-03-17.
+        "phone_warning": None,
         "errors": [],
     }
 
@@ -416,6 +421,7 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
                 state["profile_id"] = profile_id
                 results["profile_created"] = True
                 logger.info(f"Profile created: {profile_id}")
+                results["phone_warning"] = profile_result.get("phone_warning")
                 # verify_writes is on, so a dropped field is reported rather
                 # than assumed stored. Surfaced to the user, not only logged.
                 if profile_result.get("nothing_stored"):
@@ -626,6 +632,11 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
     if results["profile_created"]:
         profile_link = Config.CSUITE_PROFILE_URL.format(profile_id=state['profile_id'])
         lines.append(f"👤 Profile: {name} — [CSuite]({profile_link})")
+        if results.get("phone_warning"):
+            # CSuite validates phone_number and rejects the whole create on a
+            # value it dislikes, so a number it would refuse is left out and
+            # named here. Never only in a log.
+            lines.append(f"📱 Profile created. {results['phone_warning']}")
     elif results.get("profile_skipped"):
         lines.append(
             "⏸️ Profile: **not created — CSuite profile creation is "

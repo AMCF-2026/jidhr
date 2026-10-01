@@ -221,6 +221,12 @@ KNOWN_INVALID_INPUT_FIELDS = {
     # name — so the HTTP 500 of 2026-09-30 came from sending nine
     # conflicting dotted keys at once, not from the dot itself.
     "address.city": "dropped by profile/edit alone, 2026-10-01",
+    # 2026-10-01, profile/edit on 21626, two isolated single-key edits:
+    # "address" as a plain string ("41 Test Way, Fairfax, VA 22031") and
+    # "address" as a nested object ({"city": "Vienna"}). Both returned
+    # HTTP 200, success: true, 0 of 81 fields changed, modified_ts
+    # unchanged. The key is wrong whatever shape its value takes.
+    "address": "dropped by profile/edit as a string AND nested, 2026-10-01",
 }
 
 
@@ -250,6 +256,49 @@ class UnconfirmedField(ValueError):
             "the field and return 200. Confirm the name with a sandbox write "
             f"and a read-back, then add it to CONFIRMED_INPUT_FIELDS.{detail} "
             "Nothing was sent.")
+
+
+# CSuite VALIDATES phone_number and rejects the whole create when it does
+# not like the value — measured 2026-09-30:
+# `phone_number: phone [5550100] is not valid`, HTTP 400, no profile made.
+# Its predecessor `primary_phone_number` was not validated because it was
+# not recognised at all, so a bad number used to be dropped in silence.
+#
+# That turns one bad digit in a HubSpot form field into a blocked profile,
+# so the value is checked here instead and a number CSuite would refuse is
+# left out of the create. The profile is made either way; the number is
+# reported to a human to enter by hand. Losing the phone is recoverable
+# with one profile/edit; not having the profile is not.
+PHONE_DIGITS = 10
+
+
+def normalize_phone(raw):
+    """(value, warning) — a 10-digit number CSuite will accept, or None.
+
+    `value` is ten digits with no punctuation; CSuite punctuates what it
+    stores (verified 2026-09-30: "7035550100" was stored as
+    "703-555-0100"), so sending the bare digits is sending the value, not a
+    format preference.
+
+    `warning` is None only when `value` is a number. Anything this cannot
+    reduce to ten digits comes back as (None, warning) with the raw value
+    quoted — an extension, an international number, a seven-digit local
+    number, or free text. Never (None, None): a dropped phone number
+    without a warning is the silent loss this whole module exists to stop.
+    """
+    text = "" if raw is None else str(raw)
+    digits = "".join(c for c in text if c.isdigit())
+
+    # US country code. "+1 703 555 0100" and "1-703-555-0100" are the same
+    # number as "703-555-0100", and CSuite wants the ten.
+    if len(digits) == PHONE_DIGITS + 1 and digits.startswith("1"):
+        digits = digits[1:]
+
+    if len(digits) == PHONE_DIGITS:
+        return digits, None
+
+    return None, (f"Phone not stored: {text!r} isn't a 10-digit US number. "
+                  "Enter it manually.")
 
 
 def check_input_fields(names, endpoint: str = "") -> None:
@@ -782,13 +831,20 @@ class CSuiteClient:
         Returns:
             dict with 'data': {'profile_id': int} on success
         """
-        # TODO(hubsync-csuite-sandbox-9): the address is deliberately not
+        # TODO(hubsync-csuite-sandbox-10): the address is deliberately not
         # sent, because CSuite's address INPUT name is still unknown.
         # Eliminated so far, each by a sandbox write and a read-back:
-        # primary_address_string, primary_address, primary_city,
-        # primary_state, primary_zipcode (all dropped, profile/edit,
-        # 2026-09-30), and nine dotted `address.*` keys which returned
-        # HTTP 500 with an empty errors array.
+        #   primary_address_string, primary_address, primary_city,
+        #   primary_state, primary_zipcode  — dropped, profile/edit 2026-09-30
+        #   address.city, alone              — dropped, profile/edit 2026-10-01
+        #   address, as a plain string       — dropped, profile/edit 2026-10-01
+        #   address, as a nested object      — dropped, profile/edit 2026-10-01
+        # and nine dotted `address.*` keys in one payload, which returned
+        # HTTP 500 with an empty errors array — a fault on conflicting keys,
+        # not evidence about any one of them.
+        #
+        # Every obvious candidate is now spent. The next move is the vendor
+        # doc or CSuite support, not another guess.
         #
         # The plan, which sandbox-7 proved works: create the profile
         # without the address, then write the address with a follow-up
@@ -801,10 +857,13 @@ class CSuiteClient:
             # ourselves would be worse than CSuite doing it.
             raise ValueError(
                 "create_individual_profile cannot send an address: CSuite's "
-                "address input name is unknown and every candidate tried so "
-                "far was dropped or faulted. Create the profile without it, "
-                "then set the address with profile/edit once the name is "
-                "confirmed. Nothing was sent.")
+                "address input name is unknown. Eliminated by sandbox write "
+                "and read-back: primary_address_string, primary_address, "
+                "primary_city, primary_state, primary_zipcode, address.city, "
+                "and `address` both as a plain string and as a nested "
+                "object. Create the profile without it, then set the address "
+                "with profile/edit once the name is confirmed. Nothing was "
+                "sent.")
 
         data = {
             "first_name": first_name,
@@ -812,15 +871,28 @@ class CSuiteClient:
         }
         if email:
             data["email"] = email
+
+        # A number CSuite would refuse is left out rather than allowed to
+        # fail the create. The warning travels with the response so the
+        # caller can put it in front of a person — see normalize_phone.
+        phone_warning = None
         if phone:
-            data["phone_number"] = phone
+            number, phone_warning = normalize_phone(phone)
+            if number:
+                data["phone_number"] = number
+            else:
+                logger.warning("CSuite profile create: %s", phone_warning)
+
         # Checked before the payload is built, so an unconfirmed name is a
         # refusal rather than a silent drop.
         check_input_fields(kwargs, "profile/create/individual")
         data.update(kwargs)
 
         logger.info(f"Creating individual profile: {first_name} {last_name}")
-        return self._request("profile/create/individual", data)
+        response = self._request("profile/create/individual", data)
+        if phone_warning and isinstance(response, dict):
+            response["phone_warning"] = phone_warning
+        return response
     
     def create_org_profile(self, organization: str, email: str = None,
                            phone: str = None, **kwargs) -> dict:

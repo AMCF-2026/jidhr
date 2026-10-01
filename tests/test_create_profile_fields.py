@@ -165,3 +165,24 @@ def test_the_single_dotted_key_is_recorded_as_dropped():
     with pytest.raises(UnconfirmedField) as caught:
         Client().edit_profile(21626, **{"address.city": "Fairfax"})
     assert "Proven not to work" in str(caught.value)
+
+
+@pytest.mark.parametrize("shape", ["41 Test Way, Fairfax, VA 22031",
+                                   {"city": "Vienna"}])
+def test_the_address_key_is_wrong_whatever_shape_it_takes(shape):
+    """2026-10-01, two isolated single-key edits of 21626: `address` as a
+    plain string and `address` as a nested object. Both returned 200,
+    success: true, 0 of 81 fields changed, modified_ts unchanged."""
+    assert KNOWN_INVALID_INPUT_FIELDS["address"].startswith("dropped")
+    with pytest.raises(UnconfirmedField):
+        Client().edit_profile(21626, address=shape)
+
+
+def test_the_address_refusal_names_what_has_been_eliminated():
+    """So the next person does not re-spend a capped write on a dead name."""
+    with pytest.raises(ValueError) as caught:
+        Client().create_individual_profile("A", "B", address="1 Test Way")
+    message = str(caught.value)
+    for spent in ("primary_address_string", "primary_city", "address.city",
+                  "nested"):
+        assert spent in message
