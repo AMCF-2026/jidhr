@@ -17,6 +17,7 @@ Workflow steps:
 import logging
 from clients.audit import AuditUnavailable, record_write
 from clients.csuite import ui_url
+from clients.hubspot import hubspot_writes_allowed
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -524,8 +525,25 @@ def already_in_csuite(data: dict, hubspot, csuite):
         rows = (response.get("data") or {}).get("results") or []
         return count, [r.get("profile_id") for r in rows if r.get("profile_id")]
 
-    # A stored csuite_profile_id is a claim, not a fact. 68 production contacts
-    # carry ids that do not resolve in CSuite (measured 2026-09-30), and
+    # In a SANDBOX run the stored id is advisory and nothing more.
+    #
+    # HubSpot is production. Its csuite_profile_id values are PRODUCTION profile
+    # ids, and checking one against sandbox CSuite compares two unrelated
+    # numbering spaces: production profile 8443 is a real donor and sandbox 8443
+    # is something else or nothing. Every such check would report "stale" and be
+    # wrong about it.
+    #
+    # So only the CSuite primary_email search decides, against the environment
+    # actually being used. The id is logged, because knowing it was there is
+    # useful; it is not acted on.
+    if existing and not hubspot_writes_allowed():
+        logger.info("sandbox run: HubSpot's csuite_profile_id %s is a "
+                    "PRODUCTION id and is not checked against sandbox CSuite; "
+                    "the primary_email search decides", existing)
+        existing = None
+
+    # A stored csuite_profile_id is a claim, not a fact. 69 production contacts
+    # carry ids that do not resolve in CSuite (measured 2026-10-01), and
     # trusting one meant the donor silently never got a profile while staff were
     # told they already had one — and a follow-up task was linked to nothing.
     if existing:
@@ -745,6 +763,9 @@ def _backfill_hubspot_link(data, state, results, hubspot, profile_id):
         logger.error("backfill PATCH failed for contact %s: %s", contact_id, e)
         return
 
+    if patched and patched.get("refused") == "sandbox_run":
+        results["backfill"] = "HubSpot not updated (sandbox run)"
+        return
     if patched and "error" not in patched:
         results["backfill_wrote"] = str(profile_id)
         results["backfill_contact_id"] = contact_id
@@ -843,6 +864,9 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         "fund_created": False,
         "hubspot_updated": False,
         "hubspot_created": False,
+        # Set when HubSpot was not written to because this is a sandbox run.
+        # Not a failure: nothing is wrong and nothing needs retrying.
+        "hubspot_refused": False,
         "ticket_closed": False,
         # Set when a ticket was found and the close was attempted but did not
         # succeed. Distinct from ticket_closed being False because no ticket
@@ -1107,6 +1131,11 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
                 else:
                     error = create_result.get("error", "Unknown error")
                     results["errors"].append(f"HubSpot contact creation: {error}")
+            elif hs_result and hs_result.get("refused") == "sandbox_run":
+                # Refused structurally, not failed. Nothing is wrong and
+                # nothing needs retrying.
+                results["hubspot_refused"] = True
+                logger.info("HubSpot not updated: sandbox run")
             else:
                 error = hs_result.get('error', 'Unknown error') if hs_result else 'No response'
                 results["errors"].append(f"HubSpot update: {error}")
@@ -1453,7 +1482,12 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
 
     # HubSpot
     hs_contact_id = state.get("hubspot_contact_id")
-    if results["hubspot_created"] and hs_contact_id:
+    if results.get("hubspot_refused"):
+        # Structural, not a failure. Saying "Could not update" would read as
+        # something to retry, and there is nothing to retry: the write was
+        # refused because this deployment is pointed at sandbox CSuite.
+        lines.append("🎯 HubSpot: not updated (sandbox run)")
+    elif results["hubspot_created"] and hs_contact_id:
         hs_link = Config.HUBSPOT_CONTACT_URL.format(contact_id=hs_contact_id)
         lines.append(f"🎯 HubSpot contact created — [View]({hs_link})")
     elif results["hubspot_updated"] and hs_contact_id:

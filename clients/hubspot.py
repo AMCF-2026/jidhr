@@ -56,6 +56,24 @@ def flatten_error_body(text, limit: int = ERROR_BODY_MAX_CHARS) -> str:
     return flattened if len(flattened) <= limit else flattened[:limit] + "…"
 
 
+def csuite_env() -> str:
+    """The CSuite environment this process is configured for."""
+    return str(getattr(Config, "CSUITE_ENV", "") or "").strip().lower()
+
+
+def hubspot_writes_allowed() -> bool:
+    """False unless CSuite is pointed at production.
+
+    HubSpot has one portal. CSuite has two. A deployment talking to sandbox
+    CSuite has no business writing to the live CRM — see the note in
+    _send_with_status for what that cost on 2026-10-01.
+
+    Deliberately NOT a feature flag. A flag can be set by whoever wants the
+    write to happen, and the thing being prevented is a write somebody wanted.
+    """
+    return csuite_env() == "live"
+
+
 def is_hubspot_write(method: str, endpoint: str) -> bool:
     """True if this call changes something in HubSpot.
 
@@ -149,6 +167,7 @@ class HubSpotClient:
 
     def _get(self, endpoint: str, params: dict = None) -> dict:
         """Make a GET request to HubSpot API"""
+
         if not self.access_token:
             logger.error("HubSpot access token not configured")
             return {"error": "HubSpot access token not configured"}
@@ -181,6 +200,36 @@ class HubSpotClient:
         be added without being audited. Behaviour matches the four methods
         this replaced: same log lines, same error shapes, same returns.
         """
+        # There is ONE HubSpot portal and TWO CSuite environments. So a
+        # deployment running against sandbox CSuite must not write to HubSpot:
+        # a sandbox CSuite id stored on a production contact is a link to a
+        # record that does not exist in production.
+        #
+        # Measured 2026-10-01: sandbox-22b's authorised PATCH wrote sandbox
+        # profile 21663 onto a live HubSpot contact, taking production's count
+        # of broken csuite_profile_id links from 68 to 69. The write did exactly
+        # what it was told; nothing in the code or in the brief knew the two
+        # systems were not paired.
+        #
+        # Structural, not a flag: CSUITE_ENV is the only thing that decides it,
+        # and it is checked here rather than at a call site because every write
+        # funnels through this method. A refusal at one call site is a refusal
+        # one caller honours.
+        if is_hubspot_write(method, endpoint) and not hubspot_writes_allowed():
+            refusal = (f"HubSpot writes are refused while CSUITE_ENV is "
+                       f"{csuite_env()!r}: one HubSpot portal, two CSuite "
+                       "environments, so a sandbox id must not land on a live "
+                       "contact. Nothing was sent.")
+            logger.warning("HubSpot %s %s REFUSED (sandbox run): %s",
+                           method, endpoint, refusal)
+            try:
+                record_write(
+                    "hubspot", method, endpoint, payload=data,
+                    status="skipped", error=refusal, duration_ms=0)
+            except AuditUnavailable as e:
+                logger.warning("refused write not audited: %s", e)
+            return {"error": refusal, "refused": "sandbox_run"}, None
+
         if not self.access_token:
             logger.error("HubSpot access token not configured")
             result = {"error": "HubSpot access token not configured"}
