@@ -471,6 +471,20 @@ class CSuiteClient:
         "profile/edit": ("profile/display", "profile_id"),
     }
 
+    # An optional WriteBudget (sync/sandbox_writes.py). When set, every
+    # write through this client is counted and the one after the limit
+    # raises, before the request is built.
+    #
+    # It lives on the CLIENT rather than on a wrapper because a wrapper does
+    # not hold. 2026-10-01: a run wrapped the client in a proxy that
+    # overrode _request and delegated everything else through __getattr__.
+    # `proxy.create_individual_profile` returned the INNER client's bound
+    # method, whose `self` is the inner client, so the proxy's _request was
+    # never reached. Two writes went out under a cap of one and the run
+    # printed "budget 0 of 1" — a guard that silently does not guard, which
+    # is worse than no guard, because the output looked clean.
+    write_budget = None
+
     # Endpoints where a before-state is worth reading. An edit that stores
     # nothing leaves modified_ts alone, and that is the only part of the
     # result that says so — CSuite answers success either way. A create has
@@ -608,6 +622,15 @@ class CSuiteClient:
         }
         
         audited = is_csuite_write(endpoint)
+
+        # Claimed before the audit row and before the request, so a refusal
+        # costs nothing and leaves nothing behind. Raises; never returns
+        # False, because a cap that can be read past is not a cap.
+        if audited and self.write_budget is not None:
+            self.write_budget.spend(endpoint)
+            logger.info("CSuite write %d/%d: %s", self.write_budget.used,
+                        self.write_budget.limit, endpoint)
+
         reservation = None
         if audited:
             # Pre-flight: no audit row, no request. Every CSuite call is a

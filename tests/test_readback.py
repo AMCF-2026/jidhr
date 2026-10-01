@@ -354,3 +354,96 @@ def test_nothing_stored_is_a_field_dropped_so_callers_still_stop():
     from sync.readback import NothingStored
 
     assert issubclass(NothingStored, FieldDropped)
+
+
+# ---------------------------------------------------------------------------
+# A write budget on the client cannot be delegated past
+# ---------------------------------------------------------------------------
+
+class Counting:
+    """A CSuiteClient whose transport is a list, with a real budget."""
+
+    def __init__(self, limit):
+        from clients.csuite import CSuiteClient
+        from sync.sandbox_writes import WriteBudget
+
+        self.client = CSuiteClient.__new__(CSuiteClient)
+        self.client.api_key = "k"
+        self.client.api_secret = "s"
+        self.client.base_url = SANDBOX_URL
+        self.client.env = "sandbox"
+        self.client.verify_writes = False
+        self.client.write_budget = WriteBudget(limit)
+        self.posted = []
+
+        class Session:
+            def post(_self, url, **kwargs):
+                self.posted.append(url)
+                raise AssertionError("the budget should have refused this")
+
+        self.client.session = Session()
+
+
+def test_a_client_budget_refuses_the_write_after_the_limit(monkeypatch):
+    import clients.csuite as mod
+    from sync.sandbox_writes import WriteBudgetExceeded
+
+    monkeypatch.setattr(mod, "reserve_write",
+                        lambda *a, **kw: {"id": 1})
+    monkeypatch.setattr(mod, "complete_write", lambda *a, **kw: None)
+
+    harness = Counting(0)
+    with pytest.raises(WriteBudgetExceeded):
+        harness.client._request("profile/edit", {"profile_id": 1})
+    assert harness.posted == [], "nothing may be sent once the cap is spent"
+
+
+def test_a_client_budget_ignores_reads(monkeypatch):
+    """Reads do not consume a write cap, and must not be refused by one."""
+    harness = Counting(0)
+
+    class Session:
+        def post(_self, url, **kwargs):
+            class R:
+                status_code = 200
+                text = '{"success":1,"data":{}}'
+
+                def json(self):
+                    return {"success": 1, "data": {}}
+            return R()
+
+    harness.client.session = Session()
+    result = harness.client._request("profile/display", {"profile_id": 1})
+    assert result["success"] is True
+    assert harness.client.write_budget.used == 0
+
+
+def test_delegating_through_a_proxy_still_hits_the_budget(monkeypatch):
+    """The 2026-10-01 failure, as a test.
+
+    A proxy that overrides _request and delegates the rest cannot enforce
+    anything: the delegated bound method's `self` is the inner client. With
+    the budget on the client, the route the call takes stops mattering.
+    """
+    import clients.csuite as mod
+    from sync.sandbox_writes import WriteBudgetExceeded
+
+    monkeypatch.setattr(mod, "reserve_write", lambda *a, **kw: {"id": 1})
+    monkeypatch.setattr(mod, "complete_write", lambda *a, **kw: None)
+
+    harness = Counting(0)
+
+    class Proxy:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def _request(self, endpoint, data=None):   # never reached, as before
+            raise AssertionError("unreachable via a delegated method")
+
+    proxy = Proxy(harness.client)
+    with pytest.raises(WriteBudgetExceeded):
+        proxy.edit_profile(21626, website="https://example.invalid")
+    assert harness.posted == []

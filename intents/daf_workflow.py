@@ -395,6 +395,11 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         # only logged: a number dropped in silence is the failure this path
         # has been carrying since 2026-03-17.
         "phone_warning": None,
+        # Set when the submission carried an address. CSuite's address input
+        # name is unknown — nine candidates eliminated by sandbox write and
+        # read-back — so it is not sent, and it is named to a human instead
+        # of vanishing the way it has since 2026-03-17.
+        "address_warning": None,
         "errors": [],
     }
 
@@ -422,6 +427,15 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
                 results["profile_created"] = True
                 logger.info(f"Profile created: {profile_id}")
                 results["phone_warning"] = profile_result.get("phone_warning")
+                # Never passed to the create — see the quoted call above and
+                # create_individual_profile, which raises on an address.
+                address = submitted_address(data)
+                if address:
+                    results["address_warning"] = (
+                        f"Address not stored in CSuite yet: {address!r}. "
+                        "Enter it manually.")
+                    logger.warning("CSuite profile %s created without the "
+                                   "submitted address", profile_id)
                 # verify_writes is on, so a dropped field is reported rather
                 # than assumed stored. Surfaced to the user, not only logged.
                 if profile_result.get("nothing_stored"):
@@ -581,7 +595,47 @@ _FIELD_MAP = {
     "initial_contribution": "initial_contribution",
     "contribution_amount": "initial_contribution",
     "amount": "initial_contribution",
+    # The DAF Inquiry Form and the Endowment Inquiry Form both carry these
+    # four as REQUIRED fields, so every submission has a full address —
+    # verified against reports/hubspot_form_fields_2026-09-30.csv. They were
+    # not mapped here before, so the address was discarded at the parse step
+    # and nobody downstream could tell it had ever been submitted.
+    #
+    # They are mapped now so the address can be REPORTED. It is still not
+    # sent to CSuite: no input name for it has been found, and nine
+    # candidates have been eliminated by sandbox writes. See
+    # clients/csuite.py::create_individual_profile.
+    "address": "address_street",
+    "street address": "address_street",
+    "address2": "address_street2",
+    "city": "address_city",
+    "state": "address_state",
+    "state/region": "address_state",
+    "zip": "address_zip",
+    "zipcode": "address_zip",
+    "postal code": "address_zip",
 }
+
+# The parsed keys that together make up an address, in the order a person
+# would write them.
+_ADDRESS_PARTS = ("address_street", "address_street2", "address_city",
+                  "address_state", "address_zip")
+
+
+def submitted_address(data: dict) -> str:
+    """The submitted address as one line, or "" if none was submitted.
+
+    For showing to a person so they can enter it in CSuite by hand. Not for
+    sending anywhere: CSuite's address input name is unknown.
+    """
+    street = " ".join(p for p in (data.get("address_street"),
+                                  data.get("address_street2")) if p).strip()
+    city = (data.get("address_city") or "").strip()
+    state = (data.get("address_state") or "").strip()
+    zipcode = (data.get("address_zip") or "").strip()
+
+    tail = " ".join(p for p in (state, zipcode) if p)
+    return ", ".join(p for p in (street, city, tail) if p)
 
 
 def _parse_submission(submission: dict) -> dict:
@@ -591,6 +645,11 @@ def _parse_submission(submission: dict) -> dict:
         "last_name": "",
         "email": "",
         "phone": "",
+        "address_street": "",
+        "address_street2": "",
+        "address_city": "",
+        "address_state": "",
+        "address_zip": "",
         "fund_name": "",
         "initial_contribution": "",
         "submitted_at": submission.get("submittedAt", "Unknown"),
@@ -637,6 +696,10 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
             # value it dislikes, so a number it would refuse is left out and
             # named here. Never only in a log.
             lines.append(f"📱 Profile created. {results['phone_warning']}")
+        if results.get("address_warning"):
+            # The address is never sent: no input name for it has been found.
+            # Independent of the phone warning — a submission can trip both.
+            lines.append(f"🏠 {results['address_warning']}")
     elif results.get("profile_skipped"):
         lines.append(
             "⏸️ Profile: **not created — CSuite profile creation is "
