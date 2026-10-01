@@ -569,6 +569,29 @@ def host_of(url: str) -> str:
     return (parsed.hostname or "").lower()
 
 
+def mark_id(value, env=None) -> str:
+    """A CSuite id as it should be SHOWN to a person.
+
+    `"21663"` in production; **`"21663 (sandbox)"`** when this process is
+    pointed at sandbox CSuite.
+
+    Sandbox-23 made the UI links go to the right host, so a person who clicks
+    one lands in the right system. The NUMBER is the remaining hole: a staff
+    member reading `Profile 21663` in a sandbox confirmation and typing it into
+    production would be acting on a different record, and 21663 is not
+    hypothetical — sandbox-24 found it had already reached the live HubSpot
+    portal as a broken link.
+
+    Marks only when it would otherwise mislead, so live output is byte-identical
+    to before.
+    """
+    if value in (None, ""):
+        return str(value)
+    environment = str(env if env is not None
+                      else getattr(Config, "CSUITE_ENV", "") or "").strip().lower()
+    return f"{value}" if environment == ENV_LIVE else f"{value} (sandbox)"
+
+
 def ui_url(template: str, api_base_url=None, **ids) -> str:
     """A CSuite UI link on the host that actually holds the record.
 
@@ -1347,7 +1370,7 @@ class CSuiteClient:
             logger.error("could not read fund %s back: %s", funit_id, e)
             response["verified"] = None
             response["fund_warning"] = (
-                f"⚠️ Fund {funit_id} was created but could not be read back, "
+                f"⚠️ Fund {mark_id(funit_id)} was created but could not be read back, "
                 "so its group and cash account are unconfirmed. Check it in "
                 "CSuite.")
         except FieldDropped as dropped:
@@ -1356,7 +1379,7 @@ class CSuiteClient:
             response["verified"] = False
             response["fields_dropped"] = dropped.dropped
             response["fund_warning"] = (
-                f"⚠️ Fund {funit_id} was created but CSuite did not store: "
+                f"⚠️ Fund {mark_id(funit_id)} was created but CSuite did not store: "
                 f"{', '.join(sorted(dropped.dropped))}. Check its fund group "
                 "and cash account in CSuite before using it.")
         else:
@@ -1750,14 +1773,14 @@ class CSuiteClient:
             logger.error("could not read task %s back: %s", task_id, e)
             response["verified"] = None
             response["task_warning"] = (
-                f"⚠️ Task {task_id} was created but could not be read back, "
+                f"⚠️ Task {mark_id(task_id)} was created but could not be read back, "
                 "so its link and due date are unconfirmed. Check it in CSuite.")
         except FieldDropped as dropped:
             logger.error("task %s does not hold what was sent: %s", task_id,
                          sorted(dropped.dropped))
             response["verified"] = False
             response["task_warning"] = (
-                f"⚠️ Task {task_id} was created but CSuite did not store: "
+                f"⚠️ Task {mark_id(task_id)} was created but CSuite did not store: "
                 f"{', '.join(sorted(dropped.dropped))}. Check it in CSuite.")
         else:
             response["verified"] = True

@@ -16,7 +16,7 @@ Workflow steps:
 
 import logging
 from clients.audit import AuditUnavailable, record_write
-from clients.csuite import ui_url
+from clients.csuite import mark_id, ui_url
 from clients.hubspot import hubspot_writes_allowed
 from config import Config
 
@@ -561,7 +561,7 @@ def already_in_csuite(data: dict, hubspot, csuite):
                 raise DuplicateProfile(
                     existing,
                     f"HubSpot points at {existing}, CSuite email match is "
-                    f"{ids[0]} — two profiles, merge by hand.",
+                    f"{mark_id(ids[0])} — two profiles, merge by hand.",
                     kind="conflict")
             # Same id, or no single email match to disagree with: as before.
             raise DuplicateProfile(
@@ -573,7 +573,7 @@ def already_in_csuite(data: dict, hubspot, csuite):
             raise DuplicateProfile(
                 ids[0],
                 f"HubSpot's csuite_profile_id is stale; CSuite match is "
-                f"{ids[0]} — fix HubSpot by hand.",
+                f"{mark_id(ids[0])} — fix HubSpot by hand.",
                 kind="stale_with_match")
         raise DuplicateProfile(
             None, f"HubSpot points at profile {existing}, which doesn't exist "
@@ -591,7 +591,7 @@ def already_in_csuite(data: dict, hubspot, csuite):
                                kind="duplicate")
     raise DuplicateProfile(
         None, f"{count} CSuite profiles already carry this email "
-              f"({', '.join(str(i) for i in ids) or 'ids not returned'})",
+              f"({', '.join(mark_id(i) for i in ids) or 'ids not returned'})",
         kind="ambiguous")
 
 
@@ -749,7 +749,8 @@ def _backfill_hubspot_link(data, state, results, hubspot, profile_id):
         if str(existing).strip() != str(profile_id).strip():
             results["backfill_conflict"] = (existing, profile_id)
             results["backfill"] = (
-                f"HubSpot points at {existing}, CSuite match is {profile_id} "
+                f"HubSpot points at {existing}, CSuite match is "
+                f"{mark_id(profile_id)} "
                 "— nothing was changed. Merge them in CSuite.")
         else:
             results["backfill"] = f"already linked to {existing}"
@@ -769,7 +770,8 @@ def _backfill_hubspot_link(data, state, results, hubspot, profile_id):
     if patched and "error" not in patched:
         results["backfill_wrote"] = str(profile_id)
         results["backfill_contact_id"] = contact_id
-        results["backfill"] = f"HubSpot now linked to profile {profile_id}"
+        results["backfill"] = (
+            f"HubSpot now linked to profile {mark_id(profile_id)}")
         logger.info("backfilled csuite_profile_id=%s onto HubSpot contact %s",
                     profile_id, contact_id)
     else:
@@ -1102,8 +1104,8 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
                 results["errors"].append(
                     f"HubSpot already links this contact to CSuite profile "
                     f"{already}, so it was NOT repointed at the new profile "
-                    f"{state['profile_id']}. Two profiles now exist for this "
-                    "donor — merge them in CSuite.")
+                    f"{mark_id(state['profile_id'])}. Two profiles now exist "
+                    "for this donor — merge them in CSuite.")
                 raise _SkipHubSpotUpdate
 
             hs_result = hubspot.update_contact_by_email(data["email"], update_props)
@@ -1318,8 +1320,8 @@ def _task_lines(data: dict, results: dict) -> list:
             (data.get("first_name", "") + " "
              + data.get("last_name", "")).strip() or "this donor")
         assignee = results.get("task_assignee") or "unassigned"
-        out = [f"📝 Follow-up task {task_id} for {assignee} — re: {donor} — "
-               f"due {results['task_due']} — [View]({link})"]
+        out = [f"📝 Follow-up task {mark_id(task_id)} for {assignee} — "
+               f"re: {donor} — due {results['task_due']} — [View]({link})"]
         if results.get("task_warning"):
             out.append(f"   {results['task_warning']}")
         return out
@@ -1367,7 +1369,8 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
             lines.append("")
             link = ui_url(Config.CSUITE_PROFILE_URL,
                           state.get("csuite_api_base"), profile_id=profile_id)
-            lines.append(f"👤 Profile {profile_id} — [CSuite]({link})")
+            lines.append(
+                f"👤 Profile {mark_id(profile_id)} — [CSuite]({link})")
             lines.append(f"⚠️ {results['duplicate_reason']}")
             if results.get("backfill"):
                 lines.append(f"🔗 {results['backfill']}")
@@ -1381,7 +1384,8 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
                           state.get("csuite_api_base"), profile_id=profile_id)
             lines.append(f"♻️ **Already in CSuite — no new profile created**")
             lines.append("")
-            lines.append(f"👤 Profile {profile_id} — [CSuite]({link})")
+            lines.append(
+                f"👤 Profile {mark_id(profile_id)} — [CSuite]({link})")
             lines.append(f"   Found via: {results['duplicate_reason']}")
             if results.get("backfill"):
                 icon = ("🔗" if results.get("backfill_wrote")
