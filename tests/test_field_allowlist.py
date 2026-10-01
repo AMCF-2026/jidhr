@@ -157,11 +157,19 @@ def test_the_gate_does_not_block_a_methods_own_fields():
     assert client.sent[0][1]["organization"] == "Some Org"
 
 
-def test_task_create_is_documented_as_ungated():
-    """No task input name is confirmed, so gating it would refuse `name`."""
+def test_task_create_is_gated_from_2026_10_01():
+    """Gated against CSuite's own task field names, not against the confirmed
+    allowlist — no task input name has ever been read back. A gate on
+    unmeasured names still stops a caller inventing one and having it silently
+    discarded, which is what this method allowed before."""
     client = Client()
-    client.create_task("Do the thing", 1007, anything_at_all="x")
+    with pytest.raises(UnconfirmedField):
+        client.create_task("Do the thing", 1007, anything_at_all="x")
+    assert client.sent == [], "nothing may leave the process"
+
+    client.create_task("Do the thing", 1007, task_type_id=3)
     assert client.endpoints == ["task/create"]
+    assert client.sent[0][1]["task_type_id"] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -342,3 +350,62 @@ def test_no_snapshot_without_an_id_and_none_for_a_create():
     assert client._modified_before("profile/create/individual",
                                    {"profile_id": 1}) is None
     assert client.sent == []
+
+
+# ---------------------------------------------------------------------------
+# Allowed-but-unverified is its own category
+# ---------------------------------------------------------------------------
+
+def test_unverified_names_are_never_mistaken_for_confirmed_ones():
+    """They are CSuite's own task field names, read off task/display — and
+    `primary_email` was a valid display name and an invalid input, so being in
+    the output vocabulary proves nothing about the input."""
+    from clients.csuite import (ENDPOINT_ALLOWED_UNVERIFIED,
+                                KNOWN_INVALID_INPUT_FIELDS)
+
+    assert not (set(ENDPOINT_ALLOWED_UNVERIFIED) & set(CONFIRMED_INPUT_FIELDS))
+    assert not (set(ENDPOINT_ALLOWED_UNVERIFIED)
+                & set(KNOWN_INVALID_INPUT_FIELDS))
+
+
+@pytest.mark.parametrize("field", ["task_description", "due_date",
+                                   "employee_id", "task_type_id"])
+def test_a_task_field_passes_on_task_create_only(field):
+    check_input_fields([field], "task/create")
+    with pytest.raises(UnconfirmedField):
+        check_input_fields([field], "profile/edit")
+
+
+@pytest.mark.parametrize("field", [
+    "primary_email",        # the proven-wrong typo shape
+    "task_name",            # plausible and never seen
+    "name",                 # sent by the method, absent from every read
+    "subject",
+])
+def test_an_unknown_or_proven_wrong_task_key_raises(field):
+    with pytest.raises(UnconfirmedField):
+        check_input_fields([field], "task/create")
+
+
+def test_name_is_deliberately_absent_from_the_task_allowlist():
+    """create_task sends it as required; no task read endpoint returns it.
+    That is the primary_email shape, and it is unresolved."""
+    from clients.csuite import ENDPOINT_ALLOWED_UNVERIFIED, INCONCLUSIVE_PROBES
+
+    assert "name" not in ENDPOINT_ALLOWED_UNVERIFIED
+    assert "name (task/create)" in INCONCLUSIVE_PROBES
+    assert "UNTESTED" in INCONCLUSIVE_PROBES["name (task/create)"]
+
+
+def test_profile_id_slips_through_on_task_create_and_that_is_a_known_gap():
+    """CONFIRMED_INPUT_FIELDS is endpoint-agnostic, so a name confirmed for
+    profile/edit is accepted everywhere.
+
+    A CSuite task has no profile link — `task_object`, `o` and `id` are null on
+    all seven sandbox tasks, and the only profile ids on task/display belong to
+    the EMPLOYEE. So `profile_id` on task/create would be silently discarded,
+    and the gate does not stop it. Pinned here as the gap it is: scoping every
+    confirmed name to its endpoints is a larger change than the task gate was.
+    """
+    check_input_fields(["profile_id"], "task/create")   # no raise: the gap
+    assert "profile_id" in CONFIRMED_INPUT_FIELDS

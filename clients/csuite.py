@@ -201,6 +201,34 @@ ENDPOINT_CONFIRMED_FIELDS = {
                 "profile/create/household"),
 }
 
+# Names allowed on specific endpoints that are **NOT confirmed inputs**.
+#
+# This set exists for one reason: `task/create` had no gate at all, so any
+# name a caller invented went to CSuite to be silently discarded. A gate is
+# better than no gate even when nothing has been read back — but these names
+# must never be mistaken for measured ones, so they live apart from
+# CONFIRMED_INPUT_FIELDS and a test asserts the two never overlap.
+#
+# Where they come from, 2026-10-01: `task/list` and `task/display` on the
+# sandbox's seven tasks return `task_description`, `due_date`, `employee_id`,
+# `task_type_id`, `task_id` and `task_guid`. They are CSuite's own names for
+# task fields, which makes them the only candidates worth allowing — and
+# `primary_email` was a valid display name and an invalid input, so being in
+# the output vocabulary proves nothing about the input.
+#
+# **`name` is deliberately absent.** `create_task` sends it as a required
+# argument and `task/display` has no `name` field at all. That is the
+# `primary_email` shape exactly, and it is unresolved — see
+# INCONCLUSIVE_PROBES.
+ENDPOINT_ALLOWED_UNVERIFIED = {
+    "task_description": ("task/create",),
+    "due_date": ("task/create",),
+    "employee_id": ("task/create",),
+    "task_type_id": ("task/create",),
+    "task_id": ("task/create", "task/edit/complete"),
+    "task_guid": ("task/create", "task/edit/complete"),
+}
+
 # Recognised by CSuite but NOT yet confirmed to store a value, so
 # deliberately absent from the set above.
 #
@@ -266,6 +294,16 @@ KNOWN_INVALID_INPUT_FIELDS = {
 # the probe that looked like a refutation had a confound nobody had ruled
 # out.
 INCONCLUSIVE_PROBES = {
+    # 2026-10-01, read-only. `create_task` sends `name` as a required
+    # argument. `task/list` and `task/display` on all seven sandbox tasks
+    # return NO `name` field — only `task_description`. Either CSuite stores
+    # it somewhere it does not display, or it discards it exactly as it
+    # discarded `primary_email`. One sandbox create would tell us; no write
+    # was spent, because the same read showed a task cannot be attached to a
+    # profile at all, which is what the task was for.
+    "name (task/create)":
+        "sandbox-17, 2026-10-01: sent by create_task as required, absent from "
+        "every task read endpoint. UNTESTED — no task was created.",
     # The key is CONFIRMED — it stores, with the other three. What is NOT
     # known is the smallest set that works.
     #
@@ -420,6 +458,7 @@ def check_input_fields(names, endpoint: str = "") -> None:
         n for n in (names or ())
         if n not in CONFIRMED_INPUT_FIELDS
         and clean not in ENDPOINT_CONFIRMED_FIELDS.get(n, ())
+        and clean not in ENDPOINT_ALLOWED_UNVERIFIED.get(n, ())
     ]
     if unknown:
         logger.error("CSuite %s: unconfirmed field name(s) %s — nothing sent",
@@ -1513,12 +1552,15 @@ class CSuiteClient:
             data["due_date"] = due_date
         if description:
             data["task_description"] = description
-        # NOT gated by check_input_fields. This is task/create, outside the
-        # profile/fund/event surface, and no task input name has been
-        # confirmed by a read-back yet — gating it against
-        # CONFIRMED_INPUT_FIELDS would refuse `name` and `employee_id` and
-        # break the method. It carries the same silent-drop risk; confirming
-        # task field names is its own sandbox task.
+        # Gated from 2026-10-01. Against ENDPOINT_ALLOWED_UNVERIFIED, not
+        # CONFIRMED_INPUT_FIELDS: no task input name has ever been confirmed
+        # by a read-back, so nothing here is measured. A gate against CSuite's
+        # own task field names still stops a caller inventing one and having
+        # it silently discarded, which is what this method allowed before.
+        #
+        # The method's own `name` and `employee_id` are not gated, same as the
+        # profile create — see the note above about `name`.
+        check_input_fields(kwargs, "task/create")
         data.update(kwargs)
         
         logger.info(f"Creating CSuite task: {name}")
