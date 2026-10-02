@@ -62,9 +62,9 @@ def test_the_search_now_returns_the_csuite_property():
 
 
 def test_a_stored_id_is_read():
-    cid, existing = existing_hubspot_link(
+    cid, existing, ok = existing_hubspot_link(
         DATA["email"], HubSpot(contact("70123", csuite_profile_id="19999")))
-    assert (cid, existing) == ("70123", "19999")
+    assert (cid, existing, ok) == ("70123", "19999", True)
 
 
 @pytest.mark.parametrize("stored", [None, "", "   "])
@@ -72,21 +72,28 @@ def test_an_empty_property_reads_as_no_link(stored):
     row = contact("70123")
     if stored is not None:
         row["results"][0]["properties"]["csuite_profile_id"] = stored
-    _, existing = existing_hubspot_link(DATA["email"], HubSpot(row))
+    _, existing, ok = existing_hubspot_link(DATA["email"], HubSpot(row))
     assert existing is None
+    assert ok is True, "an empty property is a successful read"
 
 
 def test_no_contact_is_not_a_link():
     assert existing_hubspot_link(DATA["email"],
-                                 HubSpot({"results": []})) == (None, None)
+                                 HubSpot({"results": []})) == (None, None, True)
 
 
-def test_a_failed_lookup_returns_unknown_not_absent():
-    """"Unknown" and "absent" lead to opposite decisions."""
+def test_a_failed_lookup_is_DISTINGUISHABLE_from_an_absent_contact():
+    """"Unknown" and "absent" lead to opposite decisions, and until 2026-10-02
+    they came back identical — so a HubSpot outage read as "no stored link" and
+    the guard fell through and created a profile."""
     assert existing_hubspot_link(
-        DATA["email"], HubSpot(raises=RuntimeError("boom"))) == (None, None)
+        DATA["email"], HubSpot(raises=RuntimeError("boom"))) == \
+        (None, None, False)
     assert existing_hubspot_link(
-        DATA["email"], HubSpot({"error": "nope"})) == (None, None)
+        DATA["email"], HubSpot({"error": "nope"})) == (None, None, False)
+    # and an absent contact is still a successful read
+    assert existing_hubspot_link(
+        DATA["email"], HubSpot({"results": []})) == (None, None, True)
 
 
 # ---------------------------------------------------------------------------

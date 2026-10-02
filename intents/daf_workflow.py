@@ -537,28 +537,39 @@ def existing_hubspot_link(email: str, hubspot):
     recording what it had been. CSuite has no idempotency key, so the first
     profile stays.
 
-    Returns (None, None) when the contact cannot be read. "Unknown" is not
-    "absent": the caller treats a failed lookup as a reason to stop, not as
-    permission to create.
+    Returns **(contact_id, csuite_profile_id, ok)**. `ok` is False when the
+    lookup FAILED, and that is a different thing from finding no contact.
+
+    The third value exists because the two were conflated and this docstring
+    used to claim otherwise — it said "the caller treats a failed lookup as a
+    reason to stop", and the caller could not, because a failure and an absence
+    came back identical. A HubSpot outage therefore read as "this donor has no
+    stored link", the guard fell through to the CSuite search, and a clean
+    `✅ Profile Created` was printed over a duplicate check that had only run
+    half of itself.
     """
     if not email or hubspot is None:
-        return None, None
+        return None, None, True        # nothing to look up is not a failure
     try:
         found = hubspot.search_contact_by_email(email)
     except Exception as e:
         logger.error("could not read the HubSpot contact for a duplicate "
                      "check: %s", e)
-        return None, None
+        return None, None, False
     if not isinstance(found, dict) or "error" in found:
-        return None, None
+        logger.error("HubSpot contact lookup returned an error for the "
+                     "duplicate check: %s",
+                     str((found or {}).get("error"))[:120]
+                     if isinstance(found, dict) else type(found).__name__)
+        return None, None, False
 
     rows = found.get("results")
     if not (isinstance(rows, list) and rows):
-        return None, None          # no contact yet; nothing to duplicate
+        return None, None, True        # no contact yet; nothing to duplicate
     row = rows[0]
     props = row.get("properties") or {}
     existing = (props.get("csuite_profile_id") or "").strip() or None
-    return row.get("id"), existing
+    return row.get("id"), existing, True
 
 
 class _SkipHubSpotUpdate(Exception):
@@ -640,7 +651,14 @@ def already_in_csuite(data: dict, hubspot, csuite):
     """
     from sync.filter_trust import FilterNotTrusted, search_before_create
 
-    contact_id, existing = existing_hubspot_link(data.get("email"), hubspot)
+    contact_id, existing, ok = existing_hubspot_link(data.get("email"), hubspot)
+    if not ok:
+        # Half the duplicate check just became unavailable. Creating now is how
+        # a second profile for the same donor gets made, and CSuite has no
+        # idempotency key to undo it with.
+        raise DuplicateProfile(
+            None, "the HubSpot contact could not be read, so a duplicate "
+                  "cannot be ruled out", kind="unverifiable")
     email = (data.get("email") or "").strip().lower()
 
     def email_search():
@@ -894,7 +912,11 @@ def _backfill_hubspot_link(data, state, results, hubspot, profile_id):
         results["backfill"] = "skipped: no single profile to link to"
         return
 
-    contact_id, existing = existing_hubspot_link(data.get("email"), hubspot)
+    contact_id, existing, ok = existing_hubspot_link(data.get("email"), hubspot)
+    if not ok:
+        results["backfill"] = ("HubSpot could not be read, so nothing was "
+                               "linked — check it by hand")
+        return
     if not contact_id:
         results["backfill"] = (
             "no HubSpot contact for this address, so nothing was linked — "
@@ -1036,6 +1058,9 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         # A note when the contact has more tickets than were considered.
         "ticket_skipped": None,
         "ticket_note": None,
+        # Set when the ticket step RAISED before choosing a ticket. Distinct
+        # from "none matched", which is a normal outcome.
+        "ticket_error": None,
         # Distinct from profile_created being False after a failed attempt:
         # nothing was sent. Reported to the user as skipped, not as failed,
         # because "Failed to create" would be a false statement.
@@ -1255,7 +1280,13 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
             # above should have stopped this run, so reaching here with a value
             # set means the two disagree — and the stored id wins, because it
             # is the one staff and the donation sync have been using.
-            _, already = existing_hubspot_link(data["email"], hubspot)
+            _, already, link_ok = existing_hubspot_link(data["email"], hubspot)
+            if not link_ok:
+                results["errors"].append(
+                    "HubSpot could not be re-read before the update, so the "
+                    "existing csuite_profile_id could not be checked. Nothing "
+                    "was repointed — verify the link by hand.")
+                raise _SkipHubSpotUpdate
             if already:
                 logger.error("HubSpot contact for this submission already has "
                              "csuite_profile_id %s; refusing to overwrite it "
@@ -1364,6 +1395,13 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
             # A close was attempted for a known ticket and blew up — the user
             # needs to know it is still open.
             results["ticket_close_failed"] = str(e)
+        else:
+            # The crash happened during LOOKUP, before any ticket was chosen.
+            # Without this the reply said "No matching ticket — nothing was
+            # closed", which is a normal outcome and not what happened: nobody
+            # knows whether a ticket matched. An exception must never read as
+            # business as usual.
+            results["ticket_error"] = str(e)
 
     # --- Build confirmation ---
     state["step"] = "done"
@@ -1679,7 +1717,10 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
     # Ticket. Always says which one, or that there was none — a bare
     # "Ticket closed" does not let anyone check it closed the right thing.
     matches = results.get("ticket_matches") or []
-    if results.get("ticket_skipped") == "off":
+    if results.get("ticket_error"):
+        lines.append(f"⚠️ Ticket: ERROR — not closed, see log "
+                     f"({results['ticket_error']})")
+    elif results.get("ticket_skipped") == "off":
         lines.append("🎫 Ticket close: off")
     elif results["ticket_closed"]:
         ticket_id = state["ticket_id"]
