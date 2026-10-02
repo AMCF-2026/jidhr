@@ -366,6 +366,70 @@ def test_the_guard_does_not_create_when_the_hubspot_read_fails(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 5. The replay path never re-runs a write that happened
+# ---------------------------------------------------------------------------
+#
+# "Unverified" means the record exists and nobody could confirm what it holds.
+# Re-running the submission would create a SECOND profile and a second task,
+# and CSuite has no idempotency key to undo either. record_unprocessed_submission
+# is gated on `profile_created` being False, and neither the task step nor the
+# read-back can set that — _create_followup_task never touches it. These pin
+# that, because the gate is one `if` and the cost of it moving is a duplicate
+# donor record in a fund-accounting system.
+
+class UnverifiedTask(NoDuplicates):
+    base_url = "https://amuslimcf.fcsuite.com/api/v2"
+
+    def create_individual_profile(self, **kwargs):
+        return {"success": True, "data": {"profile_id": 21900},
+                "verified": True}
+
+    def create_task(self, **kwargs):
+        return {"success": True, "data": {"task_id": 1099},
+                "verified": None,
+                "task_warning": "⚠️ Task 1099 was created but the read-back "
+                                "failed"}
+
+
+def test_a_created_but_unverified_task_is_not_recorded_for_replay(monkeypatch):
+    rows = []
+    monkeypatch.setattr(daf_workflow, "record_write",
+                        lambda *a, **kw: rows.append(kw) or True)
+
+    reply, _ = run(monkeypatch, csuite=UnverifiedTask(), task=True,
+                   ticket=False)
+
+    assert rows == [], "the task exists; re-running would make a second one"
+    assert "re-processed from HubSpot" not in reply
+    assert "read-back failed" in reply, "but it is still said out loud"
+
+
+class UnverifiedProfile(NoDuplicates):
+    base_url = "https://amuslimcf.fcsuite.com/api/v2"
+
+    def create_individual_profile(self, **kwargs):
+        return {"success": True, "data": {"profile_id": 21900},
+                "verified": None,
+                "verify_warning": "⚠️ profile_id 21900 was written but could "
+                                  "not be read back"}
+
+
+def test_a_created_but_unverified_profile_is_not_recorded_for_replay(
+        monkeypatch):
+    """Same rule one step earlier: the profile exists, so the submission is
+    processed. The warning is the output, not a re-run."""
+    rows = []
+    monkeypatch.setattr(daf_workflow, "record_write",
+                        lambda *a, **kw: rows.append(kw) or True)
+
+    reply, _ = run(monkeypatch, csuite=UnverifiedProfile(), ticket=False)
+
+    assert rows == []
+    assert "re-processed from HubSpot" not in reply
+    assert "could not be read back" in reply
+
+
+# ---------------------------------------------------------------------------
 # Harness
 # ---------------------------------------------------------------------------
 
@@ -403,11 +467,13 @@ class PlainCSuite(NoDuplicates):
                 "verified": True}
 
 
-def run(monkeypatch, csuite=None, hubspot=None, ticket=True):
+def run(monkeypatch, csuite=None, hubspot=None, ticket=True, task=False):
     monkeypatch.setattr("config.Config.CSUITE_ENV", "live")
     monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
     monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
-    monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", False)
+    monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", task)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY", 1004)
+    monkeypatch.setattr(Config, "CSUITE_TASK_TYPE_ID", None)
     monkeypatch.setattr(Config, "CSUITE_HUBSPOT_BACKFILL_ENABLED", False)
     monkeypatch.setattr(Config, "CSUITE_TICKET_CLOSE_ENABLED", ticket)
     state = {"active": True, "workflow_type": "daf", "type": "daf",
