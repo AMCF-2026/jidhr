@@ -201,7 +201,7 @@ def run(monkeypatch, inner, hubspot, backfill=True):
     monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
     monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", True)
     monkeypatch.setattr(Config, "CSUITE_HUBSPOT_BACKFILL_ENABLED", backfill)
-    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID", 1006)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY", 1006)
     monkeypatch.setattr(Config, "CSUITE_TASK_TYPE_ID", None)
     csuite = Creating(inner)
     state = {"active": True, "workflow_type": "daf", "type": "daf",

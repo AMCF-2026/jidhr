@@ -362,18 +362,69 @@ def _log_skipped_create(data: dict, hubspot) -> str:
     return contact_id
 
 
-def matching_tickets(tickets, email) -> list:
-    """Open tickets whose subject or content carries `email`, in full.
+# Words that identify what an open ticket is ABOUT.
+#
+# Needed because the ticket search filters on `hs_pipeline_stage == "1"` and
+# NOTHING else — not pipeline, not ticket type, not the source form. Asset
+# Transfer and DAF Inquiry share the DAF pipeline, so before 2026-10-02 a DAF
+# inquiry could close an Asset Transfer ticket for the same donor; and because
+# there is no pipeline filter either, it could close a stage-"1" ticket from an
+# unrelated pipeline entirely.
+#
+# Matched against the ticket's own text, because that is what the search
+# returns. A ticket PROPERTY identifying the type would be better and its name
+# is unknown — see the report.
+_INQUIRY_WORDS = {
+    "daf": ("daf", "donor advised", "donor-advised"),
+    "endowment": ("endowment", "endowed"),
+}
+
+# Other things the DAF pipeline carries. A ticket naming one of these is NOT an
+# inquiry ticket, whatever else its text happens to say.
+_OTHER_INQUIRY_WORDS = {
+    "asset transfer": ("asset transfer", "asset donation", "stock transfer",
+                       "in-kind", "in kind"),
+    "investment request": ("investment request", "investment change",
+                           "reallocat"),
+}
+
+
+def ticket_subject_kind(text: str):
+    """What an open ticket appears to be about: a key, "other", or None.
+
+    None means it cannot be told, and the caller treats that as a reason not to
+    close it rather than a reason to try.
+    """
+    low = (text or "").lower()
+    for label, words in _OTHER_INQUIRY_WORDS.items():
+        if any(w in low for w in words):
+            return "other"
+    hits = [k for k, words in _INQUIRY_WORDS.items()
+            if any(w in low for w in words)]
+    if len(hits) == 1:
+        return hits[0]
+    return None             # none, or more than one — not determinable
+
+
+def matching_tickets(tickets, email, wf_type=None) -> list:
+    """Open tickets that carry `email` AND are about this inquiry type.
 
     [{"id", "subject"}], newest-first order preserved from HubSpot.
 
-    **The email and nothing else.** Matching on a first or last name closed
-    tickets belonging to other people: "sarah" appears in a different donor's
-    thread, in a vendor's name, in "Sarah to follow up". An address is an
-    identifier; a given name is not.
+    **Two requirements, and both are necessary.**
 
-    No email on the submission returns [] — nothing to match on means nothing
-    to close, not "close the first open ticket".
+    *The email*, in full. Matching a first or last name closed tickets belonging
+    to other people — "sarah" appears in another donor's thread, in a vendor's
+    name, in "Sarah to follow up". An address is an identifier; a given name is
+    not.
+
+    *The inquiry type.* The email alone is not enough, because one donor can
+    have several open tickets: Asset Transfer and DAF Inquiry share the DAF
+    pipeline, and the search filters on stage alone. A DAF inquiry closing a
+    donor's asset-transfer ticket would look exactly like success.
+
+    A ticket whose type cannot be determined is **not** closed. Nothing to match
+    on means nothing to close — the same rule as a submission with no email.
     """
     address = (email or "").strip().lower()
     if not address:
@@ -383,10 +434,20 @@ def matching_tickets(tickets, email) -> list:
     found = []
     for ticket in rows or []:
         props = ticket.get("properties") or {}
-        haystack = f"{props.get('subject') or ''} {props.get('content') or ''}"
-        if address in haystack.lower():
-            found.append({"id": ticket.get("id"),
-                          "subject": props.get("subject") or "(no subject)"})
+        subject = props.get("subject") or ""
+        haystack = f"{subject} {props.get('content') or ''}"
+        if address not in haystack.lower():
+            continue
+        if wf_type is not None:
+            kind = ticket_subject_kind(haystack)
+            if kind != wf_type:
+                logger.info("ticket %s carries the email but reads as %r, not "
+                            "%r — not closing it", ticket.get("id"),
+                            kind, wf_type)
+                continue
+        found.append({"id": ticket.get("id"),
+                      "subject": subject or "(no subject)",
+                      "pipeline": props.get("hs_pipeline")})
     return found
 
 
@@ -638,15 +699,32 @@ def task_due_date(submitted_at=None, business_days: int = 2) -> str:
     return due.isoformat()
 
 
-def task_assignee(wf_type: str):
-    """The employee the follow-up task goes to, or None.
+def form_label(form_id) -> str:
+    """A human name for a form id. The id tells a reader nothing."""
+    return Config.FORM_LABELS.get(form_id) or (
+        f"form {form_id}" if form_id else "an unknown form")
 
-    A per-type variable wins over the shared one, so DAF and endowment can be
-    different people or the same. None means no task — never a guessed id.
+
+def task_assignee_for_form(form_id):
+    """The employee a form's follow-up task goes to, or None.
+
+    **Per form, and never a fallback to a default person.** A DAF inquiry and an
+    endowment inquiry are different people's work, and a shared value sends one
+    of them to the other silently. A fallback would be worse still: a form
+    nobody has assigned would land in whoever's queue happens to be configured,
+    and a task in the wrong queue looks exactly like a task in the right one.
+    `Config.CSUITE_TASK_EMPLOYEE_ID` is deliberately NOT consulted.
+
+    None means no task, and the caller names the form.
     """
-    specific = (Config.CSUITE_DAF_TASK_EMPLOYEE_ID if wf_type == "daf"
-                else Config.CSUITE_ENDOWMENT_TASK_EMPLOYEE_ID)
-    return specific or Config.CSUITE_TASK_EMPLOYEE_ID
+    return {
+        Config.DAF_INQUIRY_FORM_ID:
+            Config.CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY,
+        Config.ENDOWMENT_INQUIRY_FORM_ID:
+            Config.CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY,
+        # Asset Transfer and Investment Request are deliberately absent: this
+        # workflow does not handle them, so no task is created for them.
+    }.get(form_id)
 
 
 def _create_followup_task(data, state, results, csuite, wf_type, type_label):
@@ -669,10 +747,11 @@ def _create_followup_task(data, state, results, csuite, wf_type, type_label):
             else f"the profile is ambiguous — {results['duplicate_reason']}")
         return
 
-    assignee = task_assignee(wf_type)
+    form_id = state.get("form_id")
+    assignee = task_assignee_for_form(form_id)
     if not assignee:
         results["task_skipped"] = (
-            "no assignee configured (set CSUITE_TASK_EMPLOYEE_ID)")
+            f"no assignee set for {form_label(form_id)}")
         return
 
     name = (data.get("first_name", "") + " " + data.get("last_name", "")).strip()
@@ -1161,7 +1240,7 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
     # wrong one is not reversible by this workflow.
     try:
         matches = matching_tickets(hubspot.get_open_tickets(),
-                                   data.get("email"))
+                                   data.get("email"), wf_type=wf_type)
         results["ticket_matches"] = matches
 
         if not matches:

@@ -180,14 +180,14 @@ def test_two_email_matches_close_nothing_and_both_are_listed(monkeypatch):
     """The brief's third case. Closing the wrong one is not reversible here."""
     reply, hubspot, state = run(monkeypatch, tickets(
         ticket("T-A", subject="DAF inquiry", content=EMAIL),
-        ticket("T-B", subject=f"Follow-up for {EMAIL}")))
+        ticket("T-B", subject=f"DAF follow-up for {EMAIL}")))
 
     assert hubspot.closed == [], "ambiguity must not be resolved by guessing"
     assert state["ticket_id"] is None
     assert "2 open tickets" in reply
     assert "none was closed" in reply
     for tid, subject in (("T-A", "DAF inquiry"),
-                         ("T-B", f"Follow-up for {EMAIL}")):
+                         ("T-B", f"DAF follow-up for {EMAIL}")):
         assert tid in reply and subject in reply
 
 
@@ -213,7 +213,8 @@ def test_a_failed_close_still_reports_the_ticket_as_open(monkeypatch):
 
     monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
     monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
-    hubspot = Refusing(tickets(ticket("T-E", subject=EMAIL)))
+    hubspot = Refusing(tickets(
+        ticket("T-E", subject=f"DAF inquiry — {EMAIL}")))
     state = {"active": True, "workflow_type": "daf", "type": "daf",
              "step": "confirm", "form_id": Config.DAF_INQUIRY_FORM_ID,
              "submission_data": {"first_name": "Sarah", "last_name": "Ahmed",
@@ -234,3 +235,121 @@ def test_the_closed_line_always_names_the_ticket(monkeypatch):
 
     assert "T-E" in reply
     assert "Ahmed DAF inquiry" in reply
+
+
+# ---------------------------------------------------------------------------
+# The email alone is not enough: the inquiry TYPE must match too
+# ---------------------------------------------------------------------------
+
+from intents.daf_workflow import ticket_subject_kind   # noqa: E402
+
+
+def test_a_DAF_inquiry_does_not_close_an_ASSET_TRANSFER_ticket(monkeypatch):
+    """The case the brief names, and the one the old matcher got wrong.
+
+    Asset Transfer and DAF Inquiry share the DAF pipeline, and the ticket search
+    filters on `hs_pipeline_stage == "1"` and nothing else — not pipeline, not
+    type, not form. So one donor with both tickets open had a coin-flip, and
+    closing the wrong one looked exactly like success.
+    """
+    reply, hubspot, state = run(monkeypatch, tickets(
+        ticket("T-ASSET", subject="Asset transfer of stock",
+               content=f"donor {EMAIL}"),
+        ticket("T-DAF", subject="DAF inquiry", content=f"donor {EMAIL}")))
+
+    assert hubspot.closed == ["T-DAF"], "only the DAF ticket may close"
+    assert state["ticket_id"] == "T-DAF"
+    assert "T-ASSET" not in reply
+
+
+def test_an_asset_transfer_ticket_ALONE_closes_nothing(monkeypatch):
+    """Not "no single match" — no match at all. A DAF inquiry has no business
+    closing it even when it is the only open ticket for that donor."""
+    reply, hubspot, _ = run(monkeypatch, tickets(
+        ticket("T-ASSET", subject="Asset transfer", content=EMAIL)))
+
+    assert hubspot.closed == []
+    assert "No matching ticket" in reply
+
+
+def test_an_endowment_inquiry_does_not_close_a_DAF_ticket(monkeypatch):
+    """Both are inquiry types on the same donor; neither may close the other."""
+    monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
+    monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
+    hubspot = HubSpot(tickets(
+        ticket("T-DAF", subject="DAF inquiry", content=EMAIL),
+        ticket("T-ENDOW", subject="Endowment inquiry", content=EMAIL)))
+    state = {"active": True, "workflow_type": "daf", "type": "endowment",
+             "step": "confirm", "form_id": Config.ENDOWMENT_INQUIRY_FORM_ID,
+             "submission_data": {"first_name": "Sarah", "last_name": "Ahmed",
+                                 "email": EMAIL},
+             "profile_id": None, "funit_id": None, "ticket_id": None}
+    daf_workflow._step_create("yes", state, hubspot, CSuite())
+
+    assert hubspot.closed == ["T-ENDOW"]
+
+
+def test_a_ticket_whose_type_cannot_be_told_is_not_closed(monkeypatch):
+    """Nothing to match on means nothing to close — the same rule as a
+    submission with no email."""
+    reply, hubspot, _ = run(monkeypatch, tickets(
+        ticket("T-VAGUE", subject="Follow up", content=f"call {EMAIL}")))
+
+    assert hubspot.closed == []
+    assert "No matching ticket" in reply
+
+
+def test_a_ticket_naming_BOTH_types_is_not_closed(monkeypatch):
+    """Ambiguous is not a licence to pick."""
+    reply, hubspot, _ = run(monkeypatch, tickets(
+        ticket("T-BOTH", subject="DAF or endowment?", content=EMAIL)))
+
+    assert hubspot.closed == []
+    assert "No matching ticket" in reply
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("DAF inquiry", "daf"),
+    ("New donor advised fund", "daf"),
+    ("donor-advised fund question", "daf"),
+    ("Endowment inquiry", "endowment"),
+    ("endowed gift", "endowment"),
+    ("Asset transfer", "other"),
+    ("asset donation of stock", "other"),
+    ("in-kind gift", "other"),
+    ("Investment request", "other"),
+    ("reallocation request", "other"),
+    ("Follow up", None),
+    ("", None),
+    ("DAF and endowment", None),
+])
+def test_what_each_subject_reads_as(text, expected):
+    assert ticket_subject_kind(text) == expected
+
+
+def test_an_asset_word_beats_an_incidental_daf_mention():
+    """"Asset transfer for the Smith DAF" is an asset ticket. A DAF inquiry
+    closing it would be the exact failure this guards."""
+    assert ticket_subject_kind("Asset transfer for the Smith DAF") == "other"
+
+
+def test_the_pipeline_is_now_requested_even_though_nothing_filters_on_it():
+    """So a future fix can narrow by pipeline. Filtering on an unconfirmed
+    pipeline id would silently match nothing, so nothing does yet."""
+    import inspect
+
+    from clients.hubspot import HubSpotClient
+
+    src = inspect.getsource(HubSpotClient.get_open_tickets)
+    assert "hs_pipeline'" in src or '"hs_pipeline"' in src
+    assert "only filter is the STAGE" in src
+
+
+def test_the_matcher_still_requires_the_email(monkeypatch):
+    """The type is an ADDITIONAL requirement, not a replacement."""
+    reply, hubspot, _ = run(monkeypatch, tickets(
+        ticket("T-DAF", subject="DAF inquiry for somebody else",
+               content="other@example.invalid")))
+
+    assert hubspot.closed == []
+    assert "No matching ticket" in reply

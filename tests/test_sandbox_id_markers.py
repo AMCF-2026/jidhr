@@ -107,7 +107,7 @@ def run(monkeypatch, env, csuite=None, hubspot=None, task=True):
     monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
     monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", task)
     monkeypatch.setattr(Config, "CSUITE_HUBSPOT_BACKFILL_ENABLED", True)
-    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID", 1006)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY", 1006)
     monkeypatch.setattr(Config, "CSUITE_TASK_TYPE_ID", None)
     state = {"active": True, "workflow_type": "daf", "type": "daf",
              "step": "confirm", "form_id": Config.DAF_INQUIRY_FORM_ID,
@@ -261,7 +261,7 @@ def test_the_live_line_names_the_assignee_not_a_bare_employee_id(monkeypatch):
     monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
     monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", True)
     monkeypatch.setattr(Config, "CSUITE_HUBSPOT_BACKFILL_ENABLED", False)
-    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID", 1007)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY", 1007)
     monkeypatch.setattr(Config, "CSUITE_TASK_TYPE_ID", None)
 
     class Real(CSuiteClient):
@@ -272,6 +272,7 @@ def test_the_live_line_names_the_assignee_not_a_bare_employee_id(monkeypatch):
 
         def __init__(self):
             self.endpoints = []
+            self.task_sent = {}
 
         def _request(self, endpoint, data=None):
             self.endpoints.append(endpoint)
@@ -282,17 +283,24 @@ def test_the_live_line_names_the_assignee_not_a_bare_employee_id(monkeypatch):
                     "profile_id": 21700, "first_name": "S", "last_name": "A",
                     "primary_email": "s@example.invalid"}}
             if endpoint == "task/display":
-                return {"success": True, "data": {
-                    "task_id": 1050, "task_description": "DAF inquiry "
-                    "follow-up: S A — s@example.invalid",
-                    "employee_id": 1007, "due_date": "2026-10-05",
-                    "o": "profile", "id": 21700,
+                # Echoes what was sent, under its display names. Hardcoding a
+                # due_date made this test fail the day the clock rolled over —
+                # task_due_date is computed from today, so a fixed date in a
+                # fake is a date that goes stale.
+                from sync.readback import TASK_SENT_TO_STORED
+                record = {
+                    "task_id": 1050,
                     "assigned_employee": {"employee_id": 1007,
                                           "employee_profile_id": 1039,
-                                          "employee_name": "Zouita, Kods"}}}
+                                          "employee_name": "Zouita, Kods"}}
+                for field, target in TASK_SENT_TO_STORED.items():
+                    if field in self.task_sent:
+                        record[target] = self.task_sent[field]
+                return {"success": True, "data": record}
             if endpoint == "profile/create/individual":
                 return {"success": True, "data": {"profile_id": 21700}}
             if endpoint == "task/create":
+                self.task_sent = dict(data or {})
                 return {"success": True, "data": {"task_id": 1050}}
             raise AssertionError(endpoint)
 
@@ -319,7 +327,7 @@ def test_without_a_read_back_name_it_falls_back_to_the_id(monkeypatch):
     monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
     monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", True)
     monkeypatch.setattr(Config, "CSUITE_HUBSPOT_BACKFILL_ENABLED", False)
-    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID", 1007)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY", 1007)
     monkeypatch.setattr(Config, "CSUITE_TASK_TYPE_ID", None)
 
     class NoName(CSuite):

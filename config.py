@@ -175,6 +175,35 @@ class Config:
         os.environ.get('CSUITE_DAF_TASK_CREATE_ENABLED', 'False')
         .strip().lower() == 'true')
 
+    # Who the follow-up task is assigned to, PER FORM. **No default, and no
+    # fallback to a default person.**
+    #
+    # A shared assignee was wrong in a way that is easy to miss: a DAF inquiry
+    # and an endowment inquiry are different people's work, and a single value
+    # silently sent one of them to the other. Worse, a *fallback* would send a
+    # form nobody has assigned to whoever happens to be in the shared slot — a
+    # task landing in the wrong queue looks exactly like a task landing in the
+    # right one.
+    #
+    # Unset means NO TASK and a line naming the form. That is the only safe
+    # default, because there is no way to guess who owns a form.
+    CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY = _int_or_zero(
+        os.environ.get('CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY', '0')) or None
+    CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY = _int_or_zero(
+        os.environ.get('CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY', '0')) or None
+
+    # Human names for the forms, for the "no assignee set for X" line. A form
+    # id in a message tells a reader nothing.
+    FORM_LABELS = {
+        DAF_INQUIRY_FORM_ID: "DAF Inquiry",
+        ENDOWMENT_INQUIRY_FORM_ID: "Endowment Inquiry",
+        ASSET_DONATION_FORM_ID: "Asset Transfer",
+        INVESTMENT_REQUEST_FORM_ID: "Investment Request",
+    }
+
+    # Superseded by the per-form variables above. Kept only so a deployment
+    # that still sets it gets a clear answer rather than a silent change of
+    # behaviour — see task_assignee_for_form, which ignores it.
     # Who the follow-up task is assigned to. **No default.**
     #
     # A constant here would be the DEFAULT_CASH_ACCOUNT_ID mistake again: 1069

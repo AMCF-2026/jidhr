@@ -121,7 +121,7 @@ def run(monkeypatch, csuite=None, hubspot=None, backfill=False, task=False):
     monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
     monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", task)
     monkeypatch.setattr(Config, "CSUITE_HUBSPOT_BACKFILL_ENABLED", backfill)
-    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID", 1006)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY", 1006)
     monkeypatch.setattr(Config, "CSUITE_TASK_TYPE_ID", None)
     sub = {"submittedAt": "2026-10-01", "values": [
         {"name": "firstname", "value": "HUBSYNC SENTINEL 100"},

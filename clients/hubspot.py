@@ -1641,6 +1641,15 @@ class HubSpotClient:
         Used by: Shazeen's "what tickets are closed" query,
                  Kods' workflow to close tickets after DAF creation
         """
+        # NOTE: the only filter is the STAGE. Not the pipeline, not the ticket
+        # type, not the source form — so this returns stage-"1" tickets from
+        # every pipeline in the portal. Callers must narrow it themselves; see
+        # intents.daf_workflow.matching_tickets, which requires both the
+        # donor's email and the inquiry type.
+        #
+        # `hs_pipeline` is requested so a caller CAN narrow by pipeline. Nothing
+        # does yet: the DAF pipeline's id has not been confirmed, and filtering
+        # on an unconfirmed id would silently match nothing.
         return self._post("crm/v3/objects/tickets/search", {
             "filterGroups": [{
                 "filters": [{
@@ -1649,8 +1658,9 @@ class HubSpotClient:
                     "value": "1"
                 }]
             }],
-            "properties": ['subject', 'content', 'hs_pipeline_stage',
-                          'hs_ticket_priority', 'createdate'],
+            "properties": ['subject', 'content', 'hs_pipeline',
+                          'hs_pipeline_stage', 'hs_ticket_priority',
+                          'createdate'],
             "limit": limit
         })
 

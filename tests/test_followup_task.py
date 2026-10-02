@@ -24,7 +24,8 @@ import pytest
 
 from config import Config
 from intents import daf_workflow
-from intents.daf_workflow import (_parse_submission, task_assignee,
+from intents.daf_workflow import (_parse_submission, form_label,
+                                  task_assignee_for_form,
                                   task_due_date)
 from tests.csuite_doubles import HasDuplicate, NoDuplicates, contact
 
@@ -92,9 +93,11 @@ def run(monkeypatch, csuite=None, hubspot=None, enabled=True, assignee=1007,
     monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
     monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
     monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", enabled)
-    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID", assignee)
-    monkeypatch.setattr(Config, "CSUITE_DAF_TASK_EMPLOYEE_ID", None)
-    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_TASK_EMPLOYEE_ID", None)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY",
+                        assignee)
+    monkeypatch.setattr(Config,
+                        "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY",
+                        assignee)
     monkeypatch.setattr(Config, "CSUITE_TASK_TYPE_ID", task_type)
     state = {"active": True, "workflow_type": "daf", "type": wf_type,
              "step": "confirm", "form_id": Config.DAF_INQUIRY_FORM_ID,
@@ -138,21 +141,36 @@ def test_an_unparseable_assignee_is_none_not_zero(monkeypatch, raw):
         importlib.reload(config)
 
 
-def test_a_per_type_assignee_wins_over_the_shared_one(monkeypatch):
+def test_each_form_has_its_own_assignee(monkeypatch):
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY", 1004)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY", 1009)
+
+    assert task_assignee_for_form(Config.DAF_INQUIRY_FORM_ID) == 1004
+    assert task_assignee_for_form(Config.ENDOWMENT_INQUIRY_FORM_ID) == 1009
+
+
+def test_there_is_NO_fallback_to_a_default_person(monkeypatch):
+    """A task in the wrong queue looks exactly like a task in the right one."""
     monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID", 1007)
-    monkeypatch.setattr(Config, "CSUITE_DAF_TASK_EMPLOYEE_ID", 1006)
-    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_TASK_EMPLOYEE_ID", None)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY", None)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY", None)
 
-    assert task_assignee("daf") == 1006
-    assert task_assignee("endowment") == 1007, "falls back to the shared one"
+    assert task_assignee_for_form(Config.DAF_INQUIRY_FORM_ID) is None
+    assert task_assignee_for_form(Config.ENDOWMENT_INQUIRY_FORM_ID) is None
 
 
-def test_daf_and_endowment_may_share_a_value(monkeypatch):
-    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID", None)
-    monkeypatch.setattr(Config, "CSUITE_DAF_TASK_EMPLOYEE_ID", 1007)
-    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_TASK_EMPLOYEE_ID", 1007)
+@pytest.mark.parametrize("form_id,label", [
+    (Config.ASSET_DONATION_FORM_ID, "Asset Transfer"),
+    (Config.INVESTMENT_REQUEST_FORM_ID, "Investment Request"),
+])
+def test_an_unhandled_form_has_no_assignee_and_a_readable_label(form_id, label):
+    assert task_assignee_for_form(form_id) is None
+    assert form_label(form_id) == label
 
-    assert task_assignee("daf") == task_assignee("endowment") == 1007
+
+def test_an_unknown_form_id_still_reads_sensibly():
+    assert form_label(None) == "an unknown form"
+    assert form_label("abc-123") == "form abc-123"
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +324,7 @@ def test_an_exception_in_the_task_does_not_sink_the_profile(monkeypatch):
 
 @pytest.mark.parametrize("kwargs,fragment", [
     ({"enabled": False}, "follow-up tasks are turned off"),
-    ({"assignee": None}, "no assignee configured"),
+    ({"assignee": None}, "no assignee set for DAF Inquiry"),
 ])
 def test_the_skipped_line_states_the_reason(monkeypatch, kwargs, fragment):
     csuite = CSuite()
@@ -451,3 +469,67 @@ def test_the_duplicate_path_shows_the_read_back_warning_too(monkeypatch):
     assert "Already in CSuite" in reply
     assert "📝 Follow-up task 1041 for" in reply
     assert "did not store: id" in reply
+
+
+# ---------------------------------------------------------------------------
+# Per-form assignee, through the workflow
+# ---------------------------------------------------------------------------
+
+def test_an_unmapped_form_names_the_form_and_makes_no_task(monkeypatch):
+    """Asset Transfer and Investment Request are not handled by this workflow."""
+    monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
+    monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
+    monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", True)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY", 1004)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY", 1009)
+    monkeypatch.setattr(Config, "CSUITE_TASK_TYPE_ID", None)
+
+    csuite = CSuite()
+    state = {"active": True, "workflow_type": "daf", "type": "daf",
+             "step": "confirm", "form_id": Config.ASSET_DONATION_FORM_ID,
+             "submission_data": _parse_submission(submission()),
+             "profile_id": None, "funit_id": None, "ticket_id": None}
+    reply = daf_workflow._step_create("yes", state, HubSpot(), csuite)
+
+    assert "task" not in csuite.kinds, "no task for a form nobody owns"
+    assert "📝 No task: no assignee set for Asset Transfer" in reply
+
+
+def test_a_configured_form_still_gets_its_own_person(monkeypatch):
+    monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
+    monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
+    monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", True)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY", 1004)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY", 1009)
+    monkeypatch.setattr(Config, "CSUITE_TASK_TYPE_ID", None)
+
+    for form_id, expected in ((Config.DAF_INQUIRY_FORM_ID, 1004),
+                              (Config.ENDOWMENT_INQUIRY_FORM_ID, 1009)):
+        csuite = CSuite()
+        state = {"active": True, "workflow_type": "daf", "type": "daf",
+                 "step": "confirm", "form_id": form_id,
+                 "submission_data": _parse_submission(submission()),
+                 "profile_id": None, "funit_id": None, "ticket_id": None}
+        daf_workflow._step_create("yes", state, HubSpot(), csuite)
+        assert csuite.task_kwargs["employee_id"] == expected, form_id
+
+
+def test_the_shared_variable_is_ignored_entirely(monkeypatch):
+    """It is superseded. A deployment still setting it must not get a task
+    assigned to that person by accident."""
+    monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
+    monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
+    monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", True)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID", 1007)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY", None)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY", None)
+
+    csuite = CSuite()
+    state = {"active": True, "workflow_type": "daf", "type": "daf",
+             "step": "confirm", "form_id": Config.DAF_INQUIRY_FORM_ID,
+             "submission_data": _parse_submission(submission()),
+             "profile_id": None, "funit_id": None, "ticket_id": None}
+    reply = daf_workflow._step_create("yes", state, HubSpot(), csuite)
+
+    assert "task" not in csuite.kinds
+    assert "no assignee set for DAF Inquiry" in reply
