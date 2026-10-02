@@ -103,6 +103,20 @@ def is_hubspot_write(method: str, endpoint: str) -> bool:
 _HUBSPOT_PORTAL_TZ = ZoneInfo("America/New_York")
 
 
+class TicketLookupFailed(Exception):
+    """A ticket association or batch read FAILED.
+
+    Not the same thing as "this contact has no tickets", and the two used to
+    arrive identical: both were an empty list. donor_prep can live with that —
+    a failed lookup there means no "Open Items" section, which is the cautious
+    reading. The DAF/Endowment inquiry workflow cannot: an empty list makes it
+    print "No matching ticket — nothing was closed", which is exactly the line
+    a clean run prints when the donor genuinely has no open ticket. So the
+    failure is raised and the caller decides — see
+    get_contact_tickets(raise_on_failure=...).
+    """
+
+
 class HubSpotClient:
     """Client for HubSpot API"""
     
@@ -1723,7 +1737,8 @@ class HubSpotClient:
     # cannot spin.
     MAX_ASSOCIATION_PAGES = 5
 
-    def get_contact_tickets(self, contact_id, properties=None) -> list:
+    def get_contact_tickets(self, contact_id, properties=None,
+                            raise_on_failure: bool = False) -> list:
         """Tickets associated with ONE contact. Returns a list, never None.
 
         Two calls: v4 associations to learn which ticket ids belong to this
@@ -1737,11 +1752,28 @@ class HubSpotClient:
         tickets were shown as that donor's, and handed to Claude as context
         for talking points. Association-scoped or nothing.
 
-        An empty list means "no tickets found for this contact" OR "the
-        lookup failed" — both are logged, and both render as no Open Items
-        section, which is the safe reading. It never falls back to
-        unassociated tickets.
+        With `raise_on_failure=False` (the default) an empty list means "no
+        tickets found for this contact" OR "the lookup failed" — both are
+        logged, and for donor_prep both render as no Open Items section, which
+        is the safe reading there. It never falls back to unassociated tickets.
+
+        With `raise_on_failure=True` a failed association read or a failed
+        batch/read raises TicketLookupFailed instead, and only a genuine
+        absence returns []. The inquiry workflow passes True, because there an
+        empty list is a sentence — "No matching ticket — nothing was closed" —
+        and a failure must not be allowed to say it.
         """
+        try:
+            return self._contact_tickets(contact_id, properties)
+        except TicketLookupFailed as e:
+            if raise_on_failure:
+                raise
+            logger.error("ticket lookup for contact %s failed; reporting no "
+                         "tickets: %s", contact_id, e)
+            return []
+
+    def _contact_tickets(self, contact_id, properties=None) -> list:
+        """The body of get_contact_tickets. Raises TicketLookupFailed."""
         if not contact_id:
             return []
 
@@ -1759,12 +1791,17 @@ class HubSpotClient:
                 "properties": props,
             })
             if not isinstance(result, dict) or result.get("error"):
+                detail = ((result or {}).get("error")
+                          if isinstance(result, dict) else result)
                 logger.error(
                     "HubSpot ticket batch/read failed for contact %s: %s",
-                    contact_id,
-                    (result or {}).get("error") if isinstance(result, dict)
-                    else result)
-                break
+                    contact_id, detail)
+                # Raised, not broken out of. Returning the pages gathered so
+                # far means the donor's ticket can be the one in the page that
+                # failed, and a short list is indistinguishable from a
+                # complete one.
+                raise TicketLookupFailed(
+                    f"ticket batch/read for contact {contact_id}: {detail}")
             tickets.extend(result.get("results") or [])
 
         logger.info("Contact %s has %d associated ticket(s)",
@@ -1772,7 +1809,11 @@ class HubSpotClient:
         return tickets
 
     def _associated_ticket_ids(self, contact_id) -> list:
-        """Ticket ids associated with a contact, following v4 paging."""
+        """Ticket ids associated with a contact, following v4 paging.
+
+        Raises TicketLookupFailed if any page cannot be read. An empty list
+        from here means HubSpot answered and the contact has no tickets.
+        """
         endpoint = f"crm/v4/objects/contacts/{contact_id}/associations/tickets"
         ticket_ids = []
         after = None
@@ -1784,12 +1825,13 @@ class HubSpotClient:
 
             response = self._get(endpoint, params)
             if not isinstance(response, dict) or response.get("error"):
+                detail = ((response or {}).get("error")
+                          if isinstance(response, dict) else response)
                 logger.error(
                     "HubSpot ticket associations failed for contact %s: %s",
-                    contact_id,
-                    (response or {}).get("error")
-                    if isinstance(response, dict) else response)
-                return []
+                    contact_id, detail)
+                raise TicketLookupFailed(
+                    f"ticket associations for contact {contact_id}: {detail}")
 
             for row in response.get("results") or []:
                 if not isinstance(row, dict):

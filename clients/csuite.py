@@ -836,6 +836,23 @@ class CSuiteClient:
             return None
         return record.get("modified_ts")
 
+    @staticmethod
+    def _unverified_warning(id_field: str, record_id) -> str:
+        """The line for a write that happened but could not be checked.
+
+        `verified = None` means "not checked", which is neither the success
+        `verified = True` reports nor the loss `verified = False` reports. It
+        used to travel on the response and nowhere else: the DAF workflow read
+        `nothing_stored` and `fields_dropped` and never `verified`, so a create
+        whose read-back failed printed a clean "✅ Profile Created" with no hint
+        that nobody had confirmed CSuite kept the donor's email, phone or
+        address. create_task and create_fund already carried their own
+        warnings; this is the profile one.
+        """
+        return (f"⚠️ {id_field} {mark_id(record_id)} was written but could not be "
+                "read back, so whether CSuite stored the values is unknown. "
+                "Check it in CSuite.")
+
     def _verify_write(self, endpoint: str, sent: dict, response: dict,
                       modified_before=None) -> dict:
         """Read the record back; annotate `response` if anything was lost.
@@ -859,6 +876,10 @@ class CSuiteClient:
             logger.warning("no %s to read back after %s; write not verified",
                            id_field, endpoint)
             response["verified"] = None
+            response["verify_warning"] = (
+                f"⚠️ CSuite accepted the {endpoint} but returned no {id_field}, "
+                "so nothing could be read back and what was stored is "
+                "unknown. Check it in CSuite.")
             return response
 
         # Imported here, not at module scope: sync.readback is a pure
@@ -889,6 +910,8 @@ class CSuiteClient:
             logger.error("could not read %s %s back after CSuite %s: %s",
                          id_field, record_id, endpoint, e)
             response["verified"] = None
+            response["verify_warning"] = self._unverified_warning(
+                id_field, record_id)
             return response
         except FieldDropped as dropped:
             logger.error("CSuite %s on %s %s DID NOT STORE: %s", endpoint,
@@ -900,6 +923,8 @@ class CSuiteClient:
             logger.error("read-back after CSuite %s on %s failed: %s",
                          endpoint, record_id, e)
             response["verified"] = None
+            response["verify_warning"] = self._unverified_warning(
+                id_field, record_id)
             return response
 
         response["verified"] = True
@@ -1389,6 +1414,14 @@ class CSuiteClient:
                 f"⚠️ Fund {mark_id(funit_id)} was created but CSuite did not store: "
                 f"{', '.join(sorted(dropped.dropped))}. Check its fund group "
                 "and cash account in CSuite before using it.")
+        except Exception as e:
+            # As in create_task: a failed read-back is not a failed create.
+            logger.error("read-back of fund %s failed: %s", funit_id, e)
+            response["verified"] = None
+            response["fund_warning"] = (
+                f"⚠️ Fund {mark_id(funit_id)} was created but the read-back failed, "
+                "so its group and cash account are unconfirmed. Check it in "
+                "CSuite.")
         else:
             response["verified"] = True
         return response
@@ -1789,6 +1822,17 @@ class CSuiteClient:
             response["task_warning"] = (
                 f"⚠️ Task {mark_id(task_id)} was created but CSuite did not store: "
                 f"{', '.join(sorted(dropped.dropped))}. Check it in CSuite.")
+        except Exception as e:
+            # The read-back failing is not the create failing. Without this the
+            # exception left create_task, the workflow's task handler caught it,
+            # and the reply said "Follow-up task NOT created" about a task that
+            # exists in CSuite — so nobody would look for it, and the next run
+            # would make a second one.
+            logger.error("read-back of task %s failed: %s", task_id, e)
+            response["verified"] = None
+            response["task_warning"] = (
+                f"⚠️ Task {mark_id(task_id)} was created but the read-back failed, "
+                "so its link and due date are unconfirmed. Check it in CSuite.")
         else:
             response["verified"] = True
             # The assignee's NAME, so a confirmation can say "Zouita, Kods"

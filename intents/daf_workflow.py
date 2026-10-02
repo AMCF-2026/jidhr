@@ -452,9 +452,14 @@ def open_inquiry_tickets(hubspot, contact_id, wf_type):
     if not spec:
         return [], f"no ticket pipeline is configured for {wf_type!r}"
 
+    # raise_on_failure=True: a failed association or batch read must NOT come
+    # back as an empty list here, because an empty list means "this donor has
+    # no open inquiry ticket" and prints as a clean line. The ticket step's
+    # handler turns the raise into "⚠️ Ticket: ERROR — not closed, see log".
     tickets = hubspot.get_contact_tickets(
         contact_id,
-        properties=["subject", "content", "hs_pipeline", "hs_pipeline_stage"])
+        properties=["subject", "content", "hs_pipeline", "hs_pipeline_stage"],
+        raise_on_failure=True)
     if not tickets:
         return [], None
 
@@ -1205,6 +1210,15 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
                         f"store: {', '.join(dropped)}")
                     logger.error("CSuite kept %s but dropped %s", profile_id,
                                  dropped)
+                elif profile_result.get("verify_warning"):
+                    # The read-back could not be done at all. That is neither
+                    # "stored" nor "dropped", and until 2026-10-02 it was
+                    # neither said nor logged by this step — the profile line
+                    # printed as a clean success because only nothing_stored
+                    # and fields_dropped were ever read.
+                    results["errors"].append(profile_result["verify_warning"])
+                    logger.error("CSuite profile %s was not verified",
+                                 profile_id)
             else:
                 error = profile_result.get('error', 'Unknown error')
                 results["errors"].append(f"Profile creation: {error}")

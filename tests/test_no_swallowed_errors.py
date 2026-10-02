@@ -66,7 +66,8 @@ class HubSpot:
             raise RuntimeError("hubspot patch exploded")
         return {"id": "70123"}
 
-    def get_contact_tickets(self, contact_id, properties=None):
+    def get_contact_tickets(self, contact_id, properties=None,
+                            raise_on_failure=False):
         if "tickets" in self.raise_on:
             raise RuntimeError("hubspot tickets exploded")
         return self.tickets

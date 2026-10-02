@@ -54,7 +54,8 @@ class HubSpot:
     def update_contact_by_email(self, email, properties):
         return {"id": self.contact_id}
 
-    def get_contact_tickets(self, contact_id, properties=None):
+    def get_contact_tickets(self, contact_id, properties=None,
+                            raise_on_failure=False):
         self.asked_for.append(contact_id)
         return self.tickets
 
@@ -343,7 +344,8 @@ def test_a_malformed_ticket_entry_does_not_raise(rows):
     """
     candidates, note = open_inquiry_tickets(
         type("HS", (), {"get_contact_tickets":
-                        lambda self, c, properties=None: rows})(),
+                        lambda self, c, properties=None,
+                        raise_on_failure=False: rows})(),
         "70123", "daf")
     assert candidates == []
 
