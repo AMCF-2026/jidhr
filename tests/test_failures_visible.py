@@ -405,9 +405,15 @@ class TestTicketClose:
             {"first_name": "A", "last_name": "B", "email": "a@b.org"},
             state, results, "DAF")
 
-    def test_a_successful_close_reads_as_closed(self):
+    def test_a_successful_close_names_the_ticket_it_closed(self):
+        """From 2026-10-01 the line carries the id and subject.
+
+        A bare "Ticket closed" does not let anyone check it closed the right
+        thing — and until the same change it could have been the wrong thing,
+        because a donor's first name was enough to match.
+        """
         out = self._run(True)
-        assert "📋 Ticket closed" in out
+        assert "📋 Ticket T-99 closed" in out
         assert "✅" in out
 
     def test_a_failed_close_says_so_with_the_ticket_id(self):

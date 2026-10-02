@@ -56,6 +56,30 @@ def flatten_error_body(text, limit: int = ERROR_BODY_MAX_CHARS) -> str:
     return flattened if len(flattened) <= limit else flattened[:limit] + "…"
 
 
+def csuite_env() -> str:
+    """The CSuite environment this process is configured for.
+
+    Through the module, not the class imported at load — see the note on
+    clients.audit.current_csuite_env. A reloaded config must not leave two
+    callers disagreeing about which environment this is.
+    """
+    import config
+    return str(getattr(config.Config, "CSUITE_ENV", "") or "").strip().lower()
+
+
+def hubspot_writes_allowed() -> bool:
+    """False unless CSuite is pointed at production.
+
+    HubSpot has one portal. CSuite has two. A deployment talking to sandbox
+    CSuite has no business writing to the live CRM — see the note in
+    _send_with_status for what that cost on 2026-10-01.
+
+    Deliberately NOT a feature flag. A flag can be set by whoever wants the
+    write to happen, and the thing being prevented is a write somebody wanted.
+    """
+    return csuite_env() == "live"
+
+
 def is_hubspot_write(method: str, endpoint: str) -> bool:
     """True if this call changes something in HubSpot.
 
@@ -77,6 +101,20 @@ def is_hubspot_write(method: str, endpoint: str) -> bool:
 # converting to UTC epoch-ms — that's what HubSpot users see in the UI
 # when they pick a schedule time.
 _HUBSPOT_PORTAL_TZ = ZoneInfo("America/New_York")
+
+
+class TicketLookupFailed(Exception):
+    """A ticket association or batch read FAILED.
+
+    Not the same thing as "this contact has no tickets", and the two used to
+    arrive identical: both were an empty list. donor_prep can live with that —
+    a failed lookup there means no "Open Items" section, which is the cautious
+    reading. The DAF/Endowment inquiry workflow cannot: an empty list makes it
+    print "No matching ticket — nothing was closed", which is exactly the line
+    a clean run prints when the donor genuinely has no open ticket. So the
+    failure is raised and the caller decides — see
+    get_contact_tickets(raise_on_failure=...).
+    """
 
 
 class HubSpotClient:
@@ -149,6 +187,7 @@ class HubSpotClient:
 
     def _get(self, endpoint: str, params: dict = None) -> dict:
         """Make a GET request to HubSpot API"""
+
         if not self.access_token:
             logger.error("HubSpot access token not configured")
             return {"error": "HubSpot access token not configured"}
@@ -181,6 +220,36 @@ class HubSpotClient:
         be added without being audited. Behaviour matches the four methods
         this replaced: same log lines, same error shapes, same returns.
         """
+        # There is ONE HubSpot portal and TWO CSuite environments. So a
+        # deployment running against sandbox CSuite must not write to HubSpot:
+        # a sandbox CSuite id stored on a production contact is a link to a
+        # record that does not exist in production.
+        #
+        # Measured 2026-10-01: sandbox-22b's authorised PATCH wrote sandbox
+        # profile 21663 onto a live HubSpot contact, taking production's count
+        # of broken csuite_profile_id links from 68 to 69. The write did exactly
+        # what it was told; nothing in the code or in the brief knew the two
+        # systems were not paired.
+        #
+        # Structural, not a flag: CSUITE_ENV is the only thing that decides it,
+        # and it is checked here rather than at a call site because every write
+        # funnels through this method. A refusal at one call site is a refusal
+        # one caller honours.
+        if is_hubspot_write(method, endpoint) and not hubspot_writes_allowed():
+            refusal = (f"HubSpot writes are refused while CSUITE_ENV is "
+                       f"{csuite_env()!r}: one HubSpot portal, two CSuite "
+                       "environments, so a sandbox id must not land on a live "
+                       "contact. Nothing was sent.")
+            logger.warning("HubSpot %s %s REFUSED (sandbox run): %s",
+                           method, endpoint, refusal)
+            try:
+                record_write(
+                    "hubspot", method, endpoint, payload=data,
+                    status="skipped", error=refusal, duration_ms=0)
+            except AuditUnavailable as e:
+                logger.warning("refused write not audited: %s", e)
+            return {"error": refusal, "refused": "sandbox_run"}, None
+
         if not self.access_token:
             logger.error("HubSpot access token not configured")
             result = {"error": "HubSpot access token not configured"}
@@ -299,8 +368,22 @@ class HubSpotClient:
             "limit": limit
         })
     
-    def search_contact_by_email(self, email: str) -> dict:
-        """Search for a contact by exact email match"""
+    # Properties every caller of search_contact_by_email gets back.
+    #
+    # It used to request none, so a caller could not tell whether a contact
+    # already carried a CSuite id — and the DAF workflow then PATCHed a new one
+    # over the top without reading it (2026-10-01). Asking for them costs
+    # nothing: the search is already being made.
+    CONTACT_SEARCH_PROPERTIES = ("email", "firstname", "lastname",
+                                 "csuite_profile_id", "csuite_fund_id")
+
+    def search_contact_by_email(self, email: str, properties=None) -> dict:
+        """Search for a contact by exact email match.
+
+        Returns CONTACT_SEARCH_PROPERTIES unless `properties` says otherwise,
+        so a caller can see an existing csuite_profile_id before overwriting
+        it.
+        """
         return self._post("crm/v3/objects/contacts/search", {
             "filterGroups": [{
                 "filters": [{
@@ -309,6 +392,9 @@ class HubSpotClient:
                     "value": email
                 }]
             }],
+            "properties": list(properties
+                               if properties is not None
+                               else self.CONTACT_SEARCH_PROPERTIES),
             "limit": 1
         })
 
@@ -1569,6 +1655,16 @@ class HubSpotClient:
         Used by: Shazeen's "what tickets are closed" query,
                  Kods' workflow to close tickets after DAF creation
         """
+        # The only filter is the STAGE, and stage "1" belongs to the DAF
+        # Pipeline alone — VERIFIED 2026-10-02 against production, where every
+        # other pipeline uses long numeric stage ids. So this returns the DAF
+        # Pipeline's "New" tickets: 177 of them at the time of writing, against
+        # a default limit of 10.
+        #
+        # It is NOT a way to find one donor's ticket. Asset Transfer tickets
+        # live in the same pipeline and stage, and endowment tickets are in a
+        # pipeline this never reaches. Use get_contact_tickets() for anything
+        # donor-specific — see intents.daf_workflow.open_inquiry_tickets.
         return self._post("crm/v3/objects/tickets/search", {
             "filterGroups": [{
                 "filters": [{
@@ -1577,8 +1673,9 @@ class HubSpotClient:
                     "value": "1"
                 }]
             }],
-            "properties": ['subject', 'content', 'hs_pipeline_stage',
-                          'hs_ticket_priority', 'createdate'],
+            "properties": ['subject', 'content', 'hs_pipeline',
+                          'hs_pipeline_stage', 'hs_ticket_priority',
+                          'createdate'],
             "limit": limit
         })
 
@@ -1640,7 +1737,8 @@ class HubSpotClient:
     # cannot spin.
     MAX_ASSOCIATION_PAGES = 5
 
-    def get_contact_tickets(self, contact_id, properties=None) -> list:
+    def get_contact_tickets(self, contact_id, properties=None,
+                            raise_on_failure: bool = False) -> list:
         """Tickets associated with ONE contact. Returns a list, never None.
 
         Two calls: v4 associations to learn which ticket ids belong to this
@@ -1654,11 +1752,28 @@ class HubSpotClient:
         tickets were shown as that donor's, and handed to Claude as context
         for talking points. Association-scoped or nothing.
 
-        An empty list means "no tickets found for this contact" OR "the
-        lookup failed" — both are logged, and both render as no Open Items
-        section, which is the safe reading. It never falls back to
-        unassociated tickets.
+        With `raise_on_failure=False` (the default) an empty list means "no
+        tickets found for this contact" OR "the lookup failed" — both are
+        logged, and for donor_prep both render as no Open Items section, which
+        is the safe reading there. It never falls back to unassociated tickets.
+
+        With `raise_on_failure=True` a failed association read or a failed
+        batch/read raises TicketLookupFailed instead, and only a genuine
+        absence returns []. The inquiry workflow passes True, because there an
+        empty list is a sentence — "No matching ticket — nothing was closed" —
+        and a failure must not be allowed to say it.
         """
+        try:
+            return self._contact_tickets(contact_id, properties)
+        except TicketLookupFailed as e:
+            if raise_on_failure:
+                raise
+            logger.error("ticket lookup for contact %s failed; reporting no "
+                         "tickets: %s", contact_id, e)
+            return []
+
+    def _contact_tickets(self, contact_id, properties=None) -> list:
+        """The body of get_contact_tickets. Raises TicketLookupFailed."""
         if not contact_id:
             return []
 
@@ -1676,12 +1791,17 @@ class HubSpotClient:
                 "properties": props,
             })
             if not isinstance(result, dict) or result.get("error"):
+                detail = ((result or {}).get("error")
+                          if isinstance(result, dict) else result)
                 logger.error(
                     "HubSpot ticket batch/read failed for contact %s: %s",
-                    contact_id,
-                    (result or {}).get("error") if isinstance(result, dict)
-                    else result)
-                break
+                    contact_id, detail)
+                # Raised, not broken out of. Returning the pages gathered so
+                # far means the donor's ticket can be the one in the page that
+                # failed, and a short list is indistinguishable from a
+                # complete one.
+                raise TicketLookupFailed(
+                    f"ticket batch/read for contact {contact_id}: {detail}")
             tickets.extend(result.get("results") or [])
 
         logger.info("Contact %s has %d associated ticket(s)",
@@ -1689,7 +1809,11 @@ class HubSpotClient:
         return tickets
 
     def _associated_ticket_ids(self, contact_id) -> list:
-        """Ticket ids associated with a contact, following v4 paging."""
+        """Ticket ids associated with a contact, following v4 paging.
+
+        Raises TicketLookupFailed if any page cannot be read. An empty list
+        from here means HubSpot answered and the contact has no tickets.
+        """
         endpoint = f"crm/v4/objects/contacts/{contact_id}/associations/tickets"
         ticket_ids = []
         after = None
@@ -1701,12 +1825,13 @@ class HubSpotClient:
 
             response = self._get(endpoint, params)
             if not isinstance(response, dict) or response.get("error"):
+                detail = ((response or {}).get("error")
+                          if isinstance(response, dict) else response)
                 logger.error(
                     "HubSpot ticket associations failed for contact %s: %s",
-                    contact_id,
-                    (response or {}).get("error")
-                    if isinstance(response, dict) else response)
-                return []
+                    contact_id, detail)
+                raise TicketLookupFailed(
+                    f"ticket associations for contact {contact_id}: {detail}")
 
             for row in response.get("results") or []:
                 if not isinstance(row, dict):

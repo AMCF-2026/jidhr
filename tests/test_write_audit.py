@@ -102,10 +102,20 @@ def hubspot_client(monkeypatch, response=None, exc=None):
     return client, calls
 
 
-def csuite_client(monkeypatch, payload=None, exc=None, status_code=200):
+def csuite_client(monkeypatch, payload=None, exc=None, status_code=200,
+                  budget=10):
+    """A CSuite client wired to a fake transport.
+
+    `budget` is explicit because Config.CSUITE_WRITE_BUDGET defaults to 0 and
+    a real client therefore cannot write until someone raises it on purpose.
+    A test that exercises a write has to say so, which is the point.
+    """
+    from sync.sandbox_writes import WriteBudget
+
     client = CSuiteClient()
     client.api_key = "k"
     client.api_secret = "s"
+    client.write_budget = WriteBudget(budget) if budget is not None else None
     calls = []
 
     def post(url, **kwargs):

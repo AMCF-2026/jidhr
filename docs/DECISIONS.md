@@ -512,3 +512,89 @@ process of elimination is reported as a candidate for confirmation, never
 acted on. The underlying gap is closed separately — `complete_write` now
 records the created id — but the rule does not depend on that, because
 the next missing id will be missing for a different reason.
+
+## 2026-10-01 — A field name in a brief is used verbatim; disagreement is a STOP
+
+On 2026-09-30 a brief said to send `email` to
+`profile/create/individual`. I sent **`primary_email`** instead, and left a
+comment justifying it: `primary_email` is what `profile/list` filters on,
+what the mirror stores, and what this repo's `create_individual_profile`
+had always sent. The reasoning was coherent and it was wrong. CSuite
+returned HTTP 200 with a `profile_id` and discarded the field. It cost a
+sandbox profile, a write from a capped budget, and a wrong paragraph in a
+report that had to be corrected the next day.
+
+The brief was right because a brief is a statement about the far system,
+not a suggestion about ours. Code conventions, mirror column names and
+what the repo has always done are evidence about this repository; none of
+them is evidence about what CSuite accepts. The only things that are:
+a write, and a read-back.
+
+**The rule: a field name written in a brief is sent exactly as written.**
+If I believe one is wrong, I stop, report why, and ask — before any call.
+I do not substitute a different name, and I do not substitute one and
+explain it in a comment, which is worse: it reads as agreement and buries
+the disagreement where nobody is looking for it.
+
+Three corollaries, each paid for:
+
+- **A 200 is not confirmation.** CSuite validates the names it recognises
+  and silently drops the rest. Every name in
+  `CONFIRMED_INPUT_FIELDS` is there because a value sent under it was
+  read back off a record, and nothing else qualifies a name.
+- **An output name is not an input name.** `primary_email`,
+  `primary_phone_number` and four flat `primary_*` address names are all
+  valid `profile/display` fields and all invalid inputs. The display list
+  reads like a field list and is not one.
+- **A failed request proves nothing about its individual fields.** Nine
+  dotted `address.*` keys drew one HTTP 500 with an empty errors array on
+  2026-09-30. None of the nine was recorded as invalid, because the
+  request failed as a whole and no key was shown to be wrong.
+  `KNOWN_INVALID_INPUT_FIELDS` holds measurements, and an unproven entry
+  in it would cost more than the empty space does.
+
+## 2026-10-01 — An inquiry creates a profile. A fund waits for the commitment.
+
+An inquiry form submission creates a CSuite **profile only**. A fund is
+opened when the donor commits, not when they enquire.
+
+An enquiry is a conversation. A fund in the ledger for a conversation that
+went nowhere is a finance record somebody has to explain, reconcile and
+eventually close, and the DAF and Endowment inquiry forms are the top of a
+funnel rather than the bottom. The profile is different: a person who
+enquired is a person worth having on file either way, and a duplicate
+profile is a nuisance where a stray fund is an accounting entry.
+
+`CSUITE_DAF_FUND_CREATE_ENABLED` carries this, default off, parsed the same
+fail-closed way as `CSUITE_WRITE_BUDGET` — only the exact string `"true"`
+turns it on. With it off the workflow builds **no fund payload at all**, so
+there is no call to fail and nothing to report as failed; the reply says the
+fund is not opened yet and why. `funit/create` and its read-back are kept
+intact behind the flag, because the commitment stage will need both.
+
+Three consequences worth writing down:
+
+- **An inquiry costs exactly one CSuite write.** `CSUITE_WRITE_BUDGET=1` is
+  now the right size for one run, where it used to be 2.
+- **`csuite_fund_id` is omitted from the HubSpot PATCH, never sent as null.**
+  HubSpot reads an explicit empty value as "clear this property", so a null
+  would wipe a fund id the commitment stage had set.
+- **The confirmation no longer says "DAF Created"** over a run that opened no
+  fund. A profile is not a DAF.
+
+### The same day, a second rule: a run that creates nothing says so
+
+A write refused by the budget raises inside `_request` **before**
+`reserve_write`, which is correct — nothing was sent, so nothing should be
+audited as sent. But it meant nothing recorded that the submission had been
+seen at all, and `_initiate_workflow` only ever reads `submissions[0]`. One
+newer submission and the refused one was out of reach of the workflow, with
+no trace anywhere. The reply, meanwhile, read **"⚠️ DAF Created (with
+warnings)"** over a run that had created nothing.
+
+So: a run that creates nothing reports **NOT Created**, and a submission it
+could not process is recorded by **HubSpot form id and submission id** — in
+`write_audit`, with status `skipped`, carrying no donor data, since HubSpot
+already holds the details. If even that cannot be stored the reply says so in
+as many words and tells the reader to find it by hand. A failure that is
+silent about what happens next is the failure that gets assumed handled.

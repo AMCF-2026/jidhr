@@ -1519,8 +1519,48 @@ def _expires_clause(record_type: str) -> str | None:
     return None if hours is None else f"{hours} hours"
 
 
+class MirrorEnvironmentRefused(RuntimeError):
+    """A mirror refresh was attempted from a non-production CSuite."""
+
+
+def mirror_writes_allowed() -> bool:
+    """False unless CSuite is pointed at production.
+
+    `csuite_mirror` is ONE table with no environment column, and production
+    reports read it. A refresh run against sandbox CSuite would write sandbox
+    rows into the table those reports use, silently and indistinguishably —
+    there is no column that could tell them apart afterwards.
+
+    Same fail-closed rule as the HubSpot transport seam, and for the same
+    reason: one store, two source environments. Not a flag, because the thing
+    being prevented is a refresh somebody wanted to run.
+    """
+    import config
+    return str(getattr(config.Config, "CSUITE_ENV", "")
+               or "").strip().lower() == "live"
+
+
+def assert_mirror_environment() -> None:
+    """Raise unless this process may write to csuite_mirror."""
+    if mirror_writes_allowed():
+        return
+    import config
+    env = getattr(config.Config, "CSUITE_ENV", None)
+    raise MirrorEnvironmentRefused(
+        f"csuite_mirror refuses a refresh while CSUITE_ENV is {env!r}. The "
+        "mirror has one table, no environment column, and production reports "
+        "read it — sandbox rows written here could not be told apart "
+        "afterwards. Nothing was written.")
+
+
 def _upsert(record_type: str, rows, run_id, expires) -> int:
-    """Write rows in batches. Returns how many were sent."""
+    """Write rows in batches. Returns how many were sent.
+
+    Refuses outside production. This is the seam every path that puts rows in
+    csuite_mirror funnels through, so the check here is the one that holds even
+    if a caller is added that does not go through refresh().
+    """
+    assert_mirror_environment()
     template = _UPSERT_ROW_TTL if expires else _UPSERT_ROW_FOREVER
 
     written = 0
@@ -1879,6 +1919,12 @@ def refresh(record_types=None, pace_ms=None, dry_run: bool = False,
         budget: total CSuite calls this run may make, as a CallBudget or a
             plain int. Shared across every record type.
     """
+    # Checked before anything is fetched, so a refused run costs no CSuite
+    # calls. The writer checks again — see _upsert — because a refusal at one
+    # entry point is a refusal one caller honours.
+    if not dry_run:
+        assert_mirror_environment()
+
     if budget is not None and not isinstance(budget, CallBudget):
         budget = CallBudget(int(budget))
     types = expand_types(record_types)

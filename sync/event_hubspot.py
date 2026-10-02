@@ -65,6 +65,14 @@ DEFAULT_TZ = ZoneInfo("America/New_York")
 # already written four events using it, so changing it would orphan them.
 EXTERNAL_PREFIX = "csuite-"
 
+# Sent on every create. HubSpot's documentation lists externalAccountId
+# as required, and it is None on all seven events already in the portal —
+# so whatever the prior sync did, it satisfied the API without one. Set
+# explicitly anyway: it is the field that says which upstream system a
+# marketing event came from, and "the previous app got away with it" is
+# not a reason to leave it blank.
+EXTERNAL_ACCOUNT_ID = "amuslimcf-csuite"
+
 # The fields sent to HubSpot, and therefore the only fields whose change
 # should trigger an update. goal_amount and available_seats move without
 # HubSpot ever seeing them; hashing the whole record would mean updating
@@ -248,6 +256,9 @@ class Mapped:
     syncable: bool = True
     review_reason: str | None = None
     archived: bool = False
+    # Kept so a not-syncable record can be listed by name in a report.
+    # An id on its own is not a work list.
+    source_name: str = ""
 
     @property
     def status(self) -> str:
@@ -268,6 +279,7 @@ def map_event_date(row: dict, organizer: str) -> Mapped:
         content_hash=content_hash(row),
         review_reason=reason,
         archived=archived,
+        source_name=event_title(row),
     )
 
     if moment is None:
@@ -277,6 +289,7 @@ def map_event_date(row: dict, organizer: str) -> Mapped:
     payload = {
         "eventName": event_title(row) or f"CSuite event date {event_date_id}",
         "externalEventId": mapped.external_event_id,
+        "externalAccountId": EXTERNAL_ACCOUNT_ID,
         "eventOrganizer": organizer,
         "startDateTime": as_offset(moment),
     }

@@ -20,6 +20,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _int_or_zero(raw):
+    """A non-negative int, or 0. A typo must fail closed, never open."""
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
 class Config:
     """Application configuration"""
     
@@ -94,6 +103,166 @@ class Config:
     CSUITE_SANDBOX_BASE_URL = os.environ.get(
         'CSUITE_SANDBOX_BASE_URL',
         'https://amuslimcf-sandbox.fcsuite.com/api/v2')
+
+    # Kill switch on the one live caller of profile/create/individual
+    # (intents/daf_workflow.py). OFF unless the variable says otherwise.
+    #
+    # The method has sent `primary_email`, `primary_phone_number` and
+    # `primary_address_string` since 2026-03-17. CSuite does not recognise
+    # `primary_email` as an input: it returns 200 with a profile_id and
+    # discards the value (measured 2026-09-30). The other two are the same
+    # shape of guess and `phone_number` is now known to be the real name
+    # for one of them. So every profile this path creates is missing the
+    # email, and probably the phone and address too, and nothing in the
+    # response says so.
+    #
+    # Default OFF rather than a warning, because the failure is silent by
+    # construction and a warning would be the thing that gets missed. The
+    # rest of the workflow still runs — see _step_create.
+    # A hard cap on CSuite writes per client, enforced inside
+    # CSuiteClient._request. **0 means no CSuite write can leave the process.**
+    #
+    # Default 0 rather than unlimited. CSUITE_DAF_CREATE_ENABLED decides
+    # whether the workflow TRIES to create; this decides whether anything can
+    # actually be sent, and two independent switches is the point — on
+    # 2026-10-01 a guard that looked like it was counting writes was not on
+    # the path the calls took, and two records were created under a cap of
+    # one.
+    #
+    # To enable the first live runs, set BOTH:
+    #     CSUITE_DAF_CREATE_ENABLED=true
+    #     CSUITE_WRITE_BUDGET=2        # one profile + one fund = one run
+    # Raise it deliberately, one run at a time, and read the first create
+    # back before allowing a second. An empty or unparseable value is 0, not
+    # unlimited: a typo must fail closed.
+    CSUITE_WRITE_BUDGET = _int_or_zero(
+        os.environ.get('CSUITE_WRITE_BUDGET', '0'))
+
+    # Whether an inquiry also OPENS A FUND. Off, and separate from
+    # CSUITE_DAF_CREATE_ENABLED on purpose.
+    #
+    # Decision 2026-10-01: an inquiry form submission creates a CSuite profile
+    # only. A fund is opened when the donor commits, not when they enquire —
+    # an enquiry is a conversation, and a fund in the ledger for a
+    # conversation that goes nowhere is a finance record somebody has to
+    # explain. The funit/create path and its read-back are kept intact behind
+    # this flag for the commitment stage.
+    #
+    # Same fail-closed parsing as CSUITE_WRITE_BUDGET: only the exact string
+    # "true" enables it.
+    CSUITE_DAF_FUND_CREATE_ENABLED = (
+        os.environ.get('CSUITE_DAF_FUND_CREATE_ENABLED', 'False')
+        .strip().lower() == 'true')
+
+    # Whether the workflow closes the donor's HubSpot ticket. Off.
+    #
+    # It cannot be proved in the sandbox: a sandbox run refuses every HubSpot
+    # write at the transport seam, so the first real proof has to be production.
+    # That is a reason to be careful, not a reason to leave it unguarded.
+    CSUITE_TICKET_CLOSE_ENABLED = (
+        os.environ.get('CSUITE_TICKET_CLOSE_ENABLED', 'False')
+        .strip().lower() == 'true')
+
+    # Ticket pipelines and their "New" stage. VERIFIED 2026-10-02 from
+    # GET crm/v3/pipelines/tickets against production.
+    #
+    # Stage "1" is the DAF Pipeline's "New" and exists in NO other pipeline —
+    # every other pipeline uses long numeric stage ids. So the old
+    # `hs_pipeline_stage == "1"` filter was implicitly DAF-only, which is
+    # narrower than it looked and still wrong: Asset Transfer tickets live in
+    # the DAF Pipeline too, and endowment tickets are in a pipeline of their own
+    # that the filter never reached.
+    TICKET_PIPELINES = {
+        "daf": {"pipeline": "0", "label": "DAF Pipeline", "new_stage": "1"},
+        "endowment": {"pipeline": "1395576547",
+                      "label": "Endowment Inquiry",
+                      "new_stage": "2250175191"},
+    }
+
+    # Whether an inquiry also creates a CSuite FOLLOW-UP TASK. Off, and
+    # separate from the profile and fund switches, so each is a decision of its
+    # own.
+    # Whether a returning donor's HubSpot contact gets its csuite_profile_id
+    # filled in. Off, and its own switch because it adds a HubSpot write to a
+    # path that previously made none.
+    #
+    # Why it is needed: when the duplicate guard stops on a profile found by the
+    # CSUITE primary_email search rather than by the HubSpot property, HubSpot
+    # by definition has no link — and the workflow returns before its PATCH
+    # step. So the link never heals, and every repeat inquiry correctly refuses
+    # a second profile while silently leaving HubSpot unlinked. Sandbox-21's
+    # profile 21662 is still in that state.
+    CSUITE_HUBSPOT_BACKFILL_ENABLED = (
+        os.environ.get('CSUITE_HUBSPOT_BACKFILL_ENABLED', 'False')
+        .strip().lower() == 'true')
+
+    CSUITE_DAF_TASK_CREATE_ENABLED = (
+        os.environ.get('CSUITE_DAF_TASK_CREATE_ENABLED', 'False')
+        .strip().lower() == 'true')
+
+    # Who the follow-up task is assigned to, PER FORM. **No default, and no
+    # fallback to a default person.**
+    #
+    # A shared assignee was wrong in a way that is easy to miss: a DAF inquiry
+    # and an endowment inquiry are different people's work, and a single value
+    # silently sent one of them to the other. Worse, a *fallback* would send a
+    # form nobody has assigned to whoever happens to be in the shared slot — a
+    # task landing in the wrong queue looks exactly like a task landing in the
+    # right one.
+    #
+    # Unset means NO TASK and a line naming the form. That is the only safe
+    # default, because there is no way to guess who owns a form.
+    CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY = _int_or_zero(
+        os.environ.get('CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY', '0')) or None
+    CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY = _int_or_zero(
+        os.environ.get('CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY', '0')) or None
+
+    # Human names for the forms, for the "no assignee set for X" line. A form
+    # id in a message tells a reader nothing.
+    FORM_LABELS = {
+        DAF_INQUIRY_FORM_ID: "DAF Inquiry",
+        ENDOWMENT_INQUIRY_FORM_ID: "Endowment Inquiry",
+        ASSET_DONATION_FORM_ID: "Asset Transfer",
+        INVESTMENT_REQUEST_FORM_ID: "Investment Request",
+    }
+
+    # Superseded by the per-form variables above. Kept only so a deployment
+    # that still sets it gets a clear answer rather than a silent change of
+    # behaviour — see task_assignee_for_form, which ignores it.
+    # Who the follow-up task is assigned to. **No default.**
+    #
+    # A constant here would be the DEFAULT_CASH_ACCOUNT_ID mistake again: 1069
+    # sat in this file for months before anyone checked it meant the same
+    # account in both environments. Employee ids are worse, because they differ
+    # per environment in a way that is invisible — 1006 is Carl in the SANDBOX
+    # and is not present in production at all, while 1007 is Kods in both
+    # (measured 2026-10-01).
+    #
+    # Unset means the task is SKIPPED with a stated reason, never assigned to a
+    # guess. The two may share a value.
+    CSUITE_TASK_EMPLOYEE_ID = _int_or_zero(
+        os.environ.get('CSUITE_TASK_EMPLOYEE_ID', '0')) or None
+    CSUITE_DAF_TASK_EMPLOYEE_ID = _int_or_zero(
+        os.environ.get('CSUITE_DAF_TASK_EMPLOYEE_ID', '0')) or None
+    CSUITE_ENDOWMENT_TASK_EMPLOYEE_ID = _int_or_zero(
+        os.environ.get('CSUITE_ENDOWMENT_TASK_EMPLOYEE_ID', '0')) or None
+
+    # The CSuite task type. **No default, and unset is fine.**
+    #
+    # INFERRED optional: five of the seven sandbox tasks carry no
+    # task_type_id at all, and in PRODUCTION not one of the seven tasks carries
+    # a type. So a task without one is normal, and `task_type_id` is omitted
+    # entirely when this is unset rather than guessed at.
+    #
+    # 1065 is "DIY Form-Contact" in the SANDBOX (VERIFIED 2026-10-01, task
+    # 1033). It is NOT confirmed in production — there is no task-type list
+    # endpoint this key may read, and no production task uses any type.
+    CSUITE_TASK_TYPE_ID = _int_or_zero(
+        os.environ.get('CSUITE_TASK_TYPE_ID', '0')) or None
+
+    CSUITE_DAF_CREATE_ENABLED = (
+        os.environ.get('CSUITE_DAF_CREATE_ENABLED', 'False')
+        .strip().lower() == 'true')
     
     # CSuite UI base URL (for deep-linking to profiles, funds, etc.)
     CSUITE_UI_BASE_URL = "https://amuslimcf.fcsuite.com/erp"
@@ -102,6 +271,9 @@ class Config:
     CSUITE_GRANT_URL = f"{CSUITE_UI_BASE_URL}/grant/display?grant_id={{grant_id}}"
     CSUITE_DONATION_URL = f"{CSUITE_UI_BASE_URL}/donation/display?donation_id={{donation_id}}"
     CSUITE_CHECK_URL = f"{CSUITE_UI_BASE_URL}/check/display?check_id={{check_id}}"
+    # INFERRED from the pattern of the others; the task UI path has not been
+    # opened and confirmed.
+    CSUITE_TASK_URL = f"{CSUITE_UI_BASE_URL}/task/display?task_id={{task_id}}"
     
     # Fund Group IDs (from funit/list/fgroup endpoint)
     FUND_GROUP_SYSTEM = 1000

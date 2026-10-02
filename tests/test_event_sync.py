@@ -346,3 +346,195 @@ def test_the_script_refuses_to_create_its_own_tables():
     source = inspect.getsource(cli)
     assert "CREATE TABLE" not in source.upper()
     assert "EXIT_NO_MIGRATION" in source
+
+
+# ---------------------------------------------------------------------------
+# Safety options (2026-09-30)
+# ---------------------------------------------------------------------------
+
+class FakeHubSpot:
+    """Records calls; answers creates from a scripted list of outcomes."""
+
+    def __init__(self, create_results=None):
+        self.calls = []
+        self.create_results = list(create_results or [])
+
+    def _post(self, endpoint, data=None):
+        self.calls.append(("POST", endpoint, data))
+        if self.create_results:
+            return self.create_results.pop(0)
+        return {"objectId": f"hs-{len(self.calls)}"}
+
+    def _patch(self, endpoint, data=None):
+        self.calls.append(("PATCH", endpoint, data))
+        return {"objectId": "hs-patched"}
+
+    @property
+    def creates(self):
+        return [c for c in self.calls if c[0] == "POST"]
+
+    @property
+    def updates(self):
+        return [c for c in self.calls if c[0] == "PATCH"]
+
+
+@pytest.fixture
+def no_db(monkeypatch):
+    """_save_map writes to Postgres; these tests are about HubSpot."""
+    monkeypatch.setattr(cli, "_save_map", lambda *a, **k: None)
+
+
+def plan_of(creates=0, updates=0):
+    rows = [row(event_date_id=1000 + i) for i in range(creates)]
+    result = cli.plan(rows, {}, {}, "AMCF")
+    for i in range(updates):
+        mapped = eh.map_event_date(row(event_date_id=2000 + i), "AMCF")
+        result["updates"].append((mapped, hs(f"hs-{i}", mapped.external_event_id),
+                                  "content hash changed"))
+    return result
+
+
+# --- externalAccountId -----------------------------------------------
+
+def test_every_create_payload_carries_the_external_account_id():
+    mapped = eh.map_event_date(row(), "AMCF")
+    assert mapped.payload["externalAccountId"] == "amcf-csuite" or \
+        mapped.payload["externalAccountId"] == eh.EXTERNAL_ACCOUNT_ID
+    assert eh.EXTERNAL_ACCOUNT_ID == "amuslimcf-csuite"
+
+
+def test_the_external_account_id_is_on_the_wire(no_db):
+    hubspot = FakeHubSpot()
+    cli.apply_plan(hubspot, plan_of(creates=2))
+    for _method, _endpoint, payload in hubspot.creates:
+        assert payload["externalAccountId"] == "amuslimcf-csuite"
+
+
+# --- stop on the first bad create ------------------------------------
+
+def test_apply_stops_on_the_first_ambiguous_create(no_db):
+    """No idempotency key, so an error says nothing about the next call.
+
+    Running eighty more creates to find out produces eighty more things
+    to clean up by hand.
+    """
+    hubspot = FakeHubSpot(create_results=[
+        {"objectId": "hs-1"},
+        {"error": "500 Internal Server Error"},   # ambiguous
+        {"objectId": "hs-3"},
+    ])
+    with pytest.raises(cli.FirstFailureStop) as caught:
+        cli.apply_plan(hubspot, plan_of(creates=5))
+
+    assert len(hubspot.creates) == 2, "it kept creating after a failure"
+    outcomes = caught.value.outcomes
+    assert [o["outcome"] for o in outcomes] == ["created", "unknown"]
+    assert "Stopped before any further create" in caught.value.reason
+
+
+def test_the_stop_carries_what_happened_before_it(no_db):
+    """A partial run that reports nothing is worse than one that says
+    where it got to."""
+    hubspot = FakeHubSpot(create_results=[{"objectId": "hs-1"},
+                                          {"objectId": None}])
+    with pytest.raises(cli.FirstFailureStop) as caught:
+        cli.apply_plan(hubspot, plan_of(creates=4))
+    assert caught.value.outcomes[0]["hubspot_id"] == "hs-1"
+
+
+def test_a_create_that_succeeds_does_not_stop_the_run(no_db):
+    hubspot = FakeHubSpot()
+    outcomes = cli.apply_plan(hubspot, plan_of(creates=3))
+    assert len(hubspot.creates) == 3
+    assert all(o["outcome"] == "created" for o in outcomes)
+
+
+def test_the_ambiguous_record_is_recorded_unknown_not_retried(no_db):
+    saved = []
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cli, "_save_map",
+                      lambda mapped, hid, status, error=None:
+                      saved.append((mapped.csuite_eventdate_id, status)))
+        hubspot = FakeHubSpot(create_results=[{"error": "timeout"}])
+        with pytest.raises(cli.FirstFailureStop):
+            cli.apply_plan(hubspot, plan_of(creates=3))
+    assert saved[-1][1] == "unknown"
+
+
+# --- --limit ----------------------------------------------------------
+
+@pytest.mark.parametrize("limit, expected", [(1, 1), (2, 2), (5, 5)])
+def test_limit_caps_the_number_of_creates(no_db, limit, expected):
+    hubspot = FakeHubSpot()
+    cli.apply_plan(hubspot, plan_of(creates=8), limit=limit)
+    assert len(hubspot.creates) == expected
+
+
+def test_updates_count_toward_the_limit_too(no_db):
+    """The point of a limit is to bound the blast radius of a run, and an
+    update to the wrong event is not free."""
+    hubspot = FakeHubSpot()
+    cli.apply_plan(hubspot, plan_of(creates=2, updates=3), limit=3)
+    assert len(hubspot.creates) + len(hubspot.updates) == 3
+    assert len(hubspot.creates) == 2, "creates run first"
+    assert len(hubspot.updates) == 1
+
+
+def test_records_beyond_the_limit_are_deferred_not_lost(no_db):
+    hubspot = FakeHubSpot()
+    outcomes = cli.apply_plan(hubspot, plan_of(creates=4), limit=1)
+    deferred = [o for o in outcomes if o["outcome"] == "deferred"]
+    assert len(deferred) == 3
+    assert "--limit 1 reached" in deferred[0]["why"]
+
+
+def test_no_limit_means_no_cap(no_db):
+    hubspot = FakeHubSpot()
+    cli.apply_plan(hubspot, plan_of(creates=6), limit=None)
+    assert len(hubspot.creates) == 6
+
+
+def test_a_limit_of_zero_writes_nothing(no_db):
+    hubspot = FakeHubSpot()
+    outcomes = cli.apply_plan(hubspot, plan_of(creates=3), limit=0)
+    assert hubspot.calls == []
+    assert all(o["outcome"] == "deferred" for o in outcomes)
+
+
+def test_the_limit_flag_exists_and_is_documented():
+    import io as _io
+    import contextlib
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        with pytest.raises(SystemExit):
+            cli.main(["--help"])
+    help_text = buf.getvalue()
+    assert "--limit" in help_text
+    assert "Updates count toward N" in help_text
+
+
+# --- the undated list in the report ----------------------------------
+
+def test_the_report_lists_every_undated_event_by_id_and_name():
+    """98 of them in production. A count is not a work list."""
+    class Fetched:
+        rows = []
+        calls = 1
+        total_429s = 0
+
+    undated = [row(event_date_id=3000 + i, event_date=None,
+                   event_description=f"Undated event {i}") for i in range(4)]
+    result = cli.plan(undated, {}, {}, "AMCF")
+    report = cli.render(result, Fetched(), 1, applied=False, organizer="AMCF")
+
+    assert "| csuite_eventdate_id | name | reason |" in report
+    for i in range(4):
+        assert f"`{3000 + i}`" in report
+        assert f"Undated event {i}" in report
+
+
+def test_an_undated_event_keeps_its_name_for_the_list():
+    mapped = eh.map_event_date(
+        row(event_date=None, event_description="AMCF Open House"), "AMCF")
+    assert mapped.syncable is False
+    assert mapped.source_name == "AMCF Open House"
