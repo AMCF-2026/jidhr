@@ -406,49 +406,89 @@ def ticket_subject_kind(text: str):
     return None             # none, or more than one — not determinable
 
 
-def matching_tickets(tickets, email, wf_type=None) -> list:
-    """Open tickets that carry `email` AND are about this inquiry type.
+# How many associated tickets to consider before giving up and saying so.
+MAX_TICKETS_CONSIDERED = 200
 
-    [{"id", "subject"}], newest-first order preserved from HubSpot.
 
-    **Two requirements, and both are necessary.**
+def open_inquiry_tickets(hubspot, contact_id, wf_type):
+    """(candidates, note) — this donor's open tickets for THIS inquiry type.
 
-    *The email*, in full. Matching a first or last name closed tickets belonging
-    to other people — "sarah" appears in another donor's thread, in a vendor's
-    name, in "Sarah to follow up". An address is an identifier; a given name is
-    not.
+    Association-scoped, then filtered by pipeline and stage. Replaces "every
+    open ticket in the portal, then look for the donor's email in the text",
+    which could not work — all three measured against production 2026-10-02:
 
-    *The inquiry type.* The email alone is not enough, because one donor can
-    have several open tickets: Asset Transfer and DAF Inquiry share the DAF
-    pipeline, and the search filters on stage alone. A DAF inquiry closing a
-    donor's asset-transfer ticket would look exactly like success.
+    * **177 open DAF-pipeline tickets exist and the old call fetched 10.** The
+      right ticket was usually not among them, so "No matching ticket" was often
+      false.
+    * **Only 43 of 100 sampled tickets have any content at all**, and only those
+      contain an email. 57 were titled "New ticket created from form submission"
+      and 32 "DAF Form Submission -", with no donor name.
+    * **Endowment tickets were unreachable.** They live in pipeline 1395576547;
+      the filter asked for stage "1", which only the DAF Pipeline has.
 
-    A ticket whose type cannot be determined is **not** closed. Nothing to match
-    on means nothing to close — the same rule as a submission with no email.
+    `clients/hubspot.get_contact_tickets` already does the association lookup —
+    it was added after donor_prep showed five strangers' tickets as one donor's.
+    This workflow had the same bug by a different route.
     """
-    address = (email or "").strip().lower()
-    if not address:
-        return []
+    if not contact_id:
+        return [], "no HubSpot contact, so no ticket could be identified"
 
-    rows = tickets.get("results") if isinstance(tickets, dict) else None
-    found = []
-    for ticket in rows or []:
+    spec = Config.TICKET_PIPELINES.get(wf_type)
+    if not spec:
+        return [], f"no ticket pipeline is configured for {wf_type!r}"
+
+    tickets = hubspot.get_contact_tickets(
+        contact_id,
+        properties=["subject", "content", "hs_pipeline", "hs_pipeline_stage"])
+    if not tickets:
+        return [], None
+
+    note = None
+    if len(tickets) > MAX_TICKETS_CONSIDERED:
+        note = (f"this contact has {len(tickets)} tickets; only the first "
+                f"{MAX_TICKETS_CONSIDERED} were considered")
+        logger.warning("contact %s has %d tickets, considering %d",
+                       contact_id, len(tickets), MAX_TICKETS_CONSIDERED)
+        tickets = tickets[:MAX_TICKETS_CONSIDERED]
+
+    candidates = []
+    for ticket in tickets:
         props = ticket.get("properties") or {}
-        subject = props.get("subject") or ""
-        haystack = f"{subject} {props.get('content') or ''}"
-        if address not in haystack.lower():
+        if str(props.get("hs_pipeline")) != spec["pipeline"]:
             continue
-        if wf_type is not None:
-            kind = ticket_subject_kind(haystack)
-            if kind != wf_type:
-                logger.info("ticket %s carries the email but reads as %r, not "
-                            "%r — not closing it", ticket.get("id"),
-                            kind, wf_type)
-                continue
-        found.append({"id": ticket.get("id"),
-                      "subject": subject or "(no subject)",
-                      "pipeline": props.get("hs_pipeline")})
-    return found
+        if str(props.get("hs_pipeline_stage")) != spec["new_stage"]:
+            continue
+
+        # Second guard, not the primary one. Association, pipeline and stage
+        # already say this is an open inquiry ticket for this donor. The text is
+        # only what tells an Asset Transfer Notification apart from a DAF Form
+        # Submission — because NO ticket property distinguishes them, confirmed
+        # 2026-10-02 by reading every ticket property definition in the portal.
+        # So it EXCLUDES other request types and never requires a match.
+        subject = props.get("subject") or ""
+        blob = f"{subject} {props.get('content') or ''}"
+        if ticket_subject_kind(blob) == "other":
+            logger.info("ticket %s is in the right pipeline but reads as "
+                        "another request type — not closing it",
+                        ticket.get("id"))
+            continue
+
+        candidates.append({"id": ticket.get("id"),
+                           "subject": subject or "(no subject)",
+                           "pipeline": props.get("hs_pipeline")})
+    return candidates, note
+
+
+class _SkipTicketClose(Exception):
+    """Internal: the ticket step is switched off."""
+
+
+# matching_tickets() was removed on 2026-10-02. It searched every open ticket in
+# the portal for the donor's email in the text, and production says that could
+# not work: of 100 sampled open DAF-pipeline tickets, 57 were titled "New ticket
+# created from form submission", 32 "DAF Form Submission -", and only 43 had any
+# content at all. open_inquiry_tickets() uses the contact association instead,
+# which is what actually identifies a donor's ticket.
 
 
 def existing_hubspot_link(email: str, hubspot):
@@ -750,8 +790,9 @@ def _create_followup_task(data, state, results, csuite, wf_type, type_label):
     form_id = state.get("form_id")
     assignee = task_assignee_for_form(form_id)
     if not assignee:
+        results["task_form_label"] = form_label(form_id)
         results["task_skipped"] = (
-            f"no assignee set for {form_label(form_id)}")
+            f"no assignee set for {results['task_form_label']}")
         return
 
     name = (data.get("first_name", "") + " " + data.get("last_name", "")).strip()
@@ -956,6 +997,10 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         # Every open ticket carrying the donor's email. One is closed; more
         # than one is listed for a human to pick; none is reported as none.
         "ticket_matches": [],
+        # "off" when the flag is down — which is not the same as "none found".
+        # A note when the contact has more tickets than were considered.
+        "ticket_skipped": None,
+        "ticket_note": None,
         # Distinct from profile_created being False after a failed attempt:
         # nothing was sent. Reported to the user as skipped, not as failed,
         # because "Failed to create" would be a false statement.
@@ -988,6 +1033,7 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         "task_subject": None,
         "task_failed": None,
         "task_skipped": None,
+        "task_form_label": None,
         "task_warning": None,
         "task_assignee": None,
         "task_donor": None,
@@ -1239,9 +1285,14 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
     # lists them, because "which of these two" is a judgement and closing the
     # wrong one is not reversible by this workflow.
     try:
-        matches = matching_tickets(hubspot.get_open_tickets(),
-                                   data.get("email"), wf_type=wf_type)
+        if not Config.CSUITE_TICKET_CLOSE_ENABLED:
+            results["ticket_skipped"] = "off"
+            raise _SkipTicketClose
+
+        matches, note = open_inquiry_tickets(
+            hubspot, state.get("hubspot_contact_id"), wf_type)
         results["ticket_matches"] = matches
+        results["ticket_note"] = note
 
         if not matches:
             logger.info("no open ticket carries the submitted email; closing "
@@ -1271,6 +1322,8 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
                 results["ticket_close_failed"] = reason
                 logger.warning(
                     f"Ticket {ticket_id} was NOT closed: {reason}")
+    except _SkipTicketClose:
+        logger.info("ticket close is off (CSUITE_TICKET_CLOSE_ENABLED)")
     except Exception as e:
         logger.error(f"Ticket lookup/close error: {e}", exc_info=True)
         if state.get("ticket_id") and not results["ticket_closed"]:
@@ -1409,7 +1462,18 @@ def _task_lines(data: dict, results: dict) -> list:
         return [f"⚠️ Follow-up task NOT created ({results['task_failed']}) — "
                 "add it by hand in CSuite."]
     if results.get("task_skipped"):
-        return [f"📝 No task: {results['task_skipped']}"]
+        reason = results["task_skipped"]
+        # An endowment inquiry with nobody to assign to is the one case worth
+        # spelling out: Ola has no CSuite employee_id — no production or sandbox
+        # task names her and there is no employee list endpoint to look her up
+        # in (2026-10-02). So this is the normal endowment outcome today, not an
+        # oversight, and a bare "No task: no assignee set for Endowment Inquiry"
+        # reads like something that failed.
+        if (results.get("task_form_label") == "Endowment Inquiry"
+                and reason.startswith("no assignee set")):
+            return ["⚠️ Endowment inquiry: profile created, NO task — "
+                    "assignee not set."]
+        return [f"📝 No task: {reason}"]
     return []
 
 
@@ -1588,7 +1652,9 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
     # Ticket. Always says which one, or that there was none — a bare
     # "Ticket closed" does not let anyone check it closed the right thing.
     matches = results.get("ticket_matches") or []
-    if results["ticket_closed"]:
+    if results.get("ticket_skipped") == "off":
+        lines.append("🎫 Ticket close: off")
+    elif results["ticket_closed"]:
         ticket_id = state["ticket_id"]
         ticket_link = Config.HUBSPOT_TICKET_URL.format(ticket_id=ticket_id)
         subject = state.get("ticket_subject") or "(no subject)"
@@ -1614,6 +1680,8 @@ def _format_confirmation(data: dict, state: dict, results: dict, type_label: str
                          f"— [View]({link})")
     else:
         lines.append("📋 No matching ticket — nothing was closed.")
+    if results.get("ticket_note"):
+        lines.append(f"   {results['ticket_note']}")
 
     # Errors
     if results["errors"]:

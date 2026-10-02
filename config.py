@@ -154,6 +154,31 @@ class Config:
         os.environ.get('CSUITE_DAF_FUND_CREATE_ENABLED', 'False')
         .strip().lower() == 'true')
 
+    # Whether the workflow closes the donor's HubSpot ticket. Off.
+    #
+    # It cannot be proved in the sandbox: a sandbox run refuses every HubSpot
+    # write at the transport seam, so the first real proof has to be production.
+    # That is a reason to be careful, not a reason to leave it unguarded.
+    CSUITE_TICKET_CLOSE_ENABLED = (
+        os.environ.get('CSUITE_TICKET_CLOSE_ENABLED', 'False')
+        .strip().lower() == 'true')
+
+    # Ticket pipelines and their "New" stage. VERIFIED 2026-10-02 from
+    # GET crm/v3/pipelines/tickets against production.
+    #
+    # Stage "1" is the DAF Pipeline's "New" and exists in NO other pipeline —
+    # every other pipeline uses long numeric stage ids. So the old
+    # `hs_pipeline_stage == "1"` filter was implicitly DAF-only, which is
+    # narrower than it looked and still wrong: Asset Transfer tickets live in
+    # the DAF Pipeline too, and endowment tickets are in a pipeline of their own
+    # that the filter never reached.
+    TICKET_PIPELINES = {
+        "daf": {"pipeline": "0", "label": "DAF Pipeline", "new_stage": "1"},
+        "endowment": {"pipeline": "1395576547",
+                      "label": "Endowment Inquiry",
+                      "new_stage": "2250175191"},
+    }
+
     # Whether an inquiry also creates a CSuite FOLLOW-UP TASK. Off, and
     # separate from the profile and fund switches, so each is a decision of its
     # own.

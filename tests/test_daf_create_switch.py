@@ -198,7 +198,10 @@ def test_off_leaves_the_rest_of_the_workflow_alone(monkeypatch):
     reply, state = run(monkeypatch, False, CSuiteNeverCalled(), hubspot)
 
     assert state["funit_id"] is None
-    assert hubspot.ticket_sweeps == 1, "step 4 still runs"
+    # The ticket step is flag-gated from 2026-10-02 and off by default, so it
+    # does nothing — and says so, rather than going quiet.
+    assert hubspot.ticket_sweeps == 0
+    assert "🎫 Ticket close: off" in reply
     assert "Failed" not in reply, "nothing failed; nothing was attempted"
 
 

@@ -1641,15 +1641,16 @@ class HubSpotClient:
         Used by: Shazeen's "what tickets are closed" query,
                  Kods' workflow to close tickets after DAF creation
         """
-        # NOTE: the only filter is the STAGE. Not the pipeline, not the ticket
-        # type, not the source form — so this returns stage-"1" tickets from
-        # every pipeline in the portal. Callers must narrow it themselves; see
-        # intents.daf_workflow.matching_tickets, which requires both the
-        # donor's email and the inquiry type.
+        # The only filter is the STAGE, and stage "1" belongs to the DAF
+        # Pipeline alone — VERIFIED 2026-10-02 against production, where every
+        # other pipeline uses long numeric stage ids. So this returns the DAF
+        # Pipeline's "New" tickets: 177 of them at the time of writing, against
+        # a default limit of 10.
         #
-        # `hs_pipeline` is requested so a caller CAN narrow by pipeline. Nothing
-        # does yet: the DAF pipeline's id has not been confirmed, and filtering
-        # on an unconfirmed id would silently match nothing.
+        # It is NOT a way to find one donor's ticket. Asset Transfer tickets
+        # live in the same pipeline and stage, and endowment tickets are in a
+        # pipeline this never reaches. Use get_contact_tickets() for anything
+        # donor-specific — see intents.daf_workflow.open_inquiry_tickets.
         return self._post("crm/v3/objects/tickets/search", {
             "filterGroups": [{
                 "filters": [{
