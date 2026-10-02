@@ -790,9 +790,8 @@ def _create_followup_task(data, state, results, csuite, wf_type, type_label):
     form_id = state.get("form_id")
     assignee = task_assignee_for_form(form_id)
     if not assignee:
-        results["task_form_label"] = form_label(form_id)
         results["task_skipped"] = (
-            f"no assignee set for {results['task_form_label']}")
+            f"no assignee set for {form_label(form_id)}")
         return
 
     name = (data.get("first_name", "") + " " + data.get("last_name", "")).strip()
@@ -1033,7 +1032,6 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         "task_subject": None,
         "task_failed": None,
         "task_skipped": None,
-        "task_form_label": None,
         "task_warning": None,
         "task_assignee": None,
         "task_donor": None,
@@ -1462,18 +1460,11 @@ def _task_lines(data: dict, results: dict) -> list:
         return [f"⚠️ Follow-up task NOT created ({results['task_failed']}) — "
                 "add it by hand in CSuite."]
     if results.get("task_skipped"):
-        reason = results["task_skipped"]
-        # An endowment inquiry with nobody to assign to is the one case worth
-        # spelling out: Ola has no CSuite employee_id — no production or sandbox
-        # task names her and there is no employee list endpoint to look her up
-        # in (2026-10-02). So this is the normal endowment outcome today, not an
-        # oversight, and a bare "No task: no assignee set for Endowment Inquiry"
-        # reads like something that failed.
-        if (results.get("task_form_label") == "Endowment Inquiry"
-                and reason.startswith("no assignee set")):
-            return ["⚠️ Endowment inquiry: profile created, NO task — "
-                    "assignee not set."]
-        return [f"📝 No task: {reason}"]
+        # The endowment-specific "assignee not set" warning was removed on
+        # 2026-10-02: CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY is now set, so
+        # that gap is closed and the line would only ever appear if someone
+        # unset it — which the generic line already covers.
+        return [f"📝 No task: {results['task_skipped']}"]
     return []
 
 

@@ -535,15 +535,35 @@ def test_the_shared_variable_is_ignored_entirely(monkeypatch):
     assert "no assignee set for DAF Inquiry" in reply
 
 
-def test_an_endowment_inquiry_with_no_assignee_says_so_plainly(monkeypatch):
-    """Today's normal endowment outcome, not an oversight: Ola has no CSuite
-    employee_id — no production or sandbox task names her, and there is no
-    employee list endpoint to look her up in (2026-10-02). A bare "No task: no
-    assignee set for Endowment Inquiry" reads like something that failed."""
+def test_an_endowment_inquiry_now_gets_its_own_assignee(monkeypatch):
+    """CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY is set (1002), so the endowment
+    path makes a task like any other. The special "assignee not set" warning was
+    dropped with this gap."""
     monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
     monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
     monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", True)
     monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY", 1004)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY", 1002)
+    monkeypatch.setattr(Config, "CSUITE_TASK_TYPE_ID", None)
+
+    csuite = CSuite()
+    state = {"active": True, "workflow_type": "daf", "type": "endowment",
+             "step": "confirm", "form_id": Config.ENDOWMENT_INQUIRY_FORM_ID,
+             "submission_data": _parse_submission(submission()),
+             "profile_id": None, "funit_id": None, "ticket_id": None}
+    reply = daf_workflow._step_create("yes", state, HubSpot(), csuite)
+
+    assert csuite.task_kwargs["employee_id"] == 1002
+    assert "Endowment inquiry: profile created, NO task" not in reply
+    assert "📝 Follow-up task" in reply
+
+
+def test_an_UNSET_endowment_assignee_still_falls_back_to_the_generic_line(
+        monkeypatch):
+    """The fail-closed behaviour stays: unsetting it is still safe and visible."""
+    monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
+    monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
+    monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", True)
     monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY", None)
     monkeypatch.setattr(Config, "CSUITE_TASK_TYPE_ID", None)
 
@@ -554,27 +574,5 @@ def test_an_endowment_inquiry_with_no_assignee_says_so_plainly(monkeypatch):
              "profile_id": None, "funit_id": None, "ticket_id": None}
     reply = daf_workflow._step_create("yes", state, HubSpot(), csuite)
 
-    assert "⚠️ Endowment inquiry: profile created, NO task — assignee not " \
-        "set." in reply
-    assert state["profile_id"] == 21700, "the profile WAS created"
     assert "task" not in csuite.kinds
-    assert "No task: no assignee" not in reply, "the plain line replaces it"
-
-
-def test_a_DAF_inquiry_with_no_assignee_keeps_the_generic_line(monkeypatch):
-    """Only the endowment case is spelled out; the others stay uniform."""
-    monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
-    monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
-    monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", True)
-    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY", None)
-    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY", None)
-    monkeypatch.setattr(Config, "CSUITE_TASK_TYPE_ID", None)
-
-    state = {"active": True, "workflow_type": "daf", "type": "daf",
-             "step": "confirm", "form_id": Config.DAF_INQUIRY_FORM_ID,
-             "submission_data": _parse_submission(submission()),
-             "profile_id": None, "funit_id": None, "ticket_id": None}
-    reply = daf_workflow._step_create("yes", state, HubSpot(), CSuite())
-
-    assert "📝 No task: no assignee set for DAF Inquiry" in reply
-    assert "Endowment inquiry:" not in reply
+    assert "📝 No task: no assignee set for Endowment Inquiry" in reply
