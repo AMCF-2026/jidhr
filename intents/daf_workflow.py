@@ -389,20 +389,35 @@ _OTHER_INQUIRY_WORDS = {
 }
 
 
+def ticket_inquiry_words(text: str) -> set:
+    """Every inquiry type the text names. Empty set when it names none.
+
+    Separate from ticket_subject_kind because a text that names TWO types is
+    not "undeterminable" in a way that can be ignored — it names one that is
+    not ours, and that is a reason to leave the ticket alone.
+    """
+    low = (text or "").lower()
+    return {k for k, words in _INQUIRY_WORDS.items()
+            if any(w in low for w in words)}
+
+
+def ticket_names_other_request(text: str) -> bool:
+    """Does the text name a request type this workflow does not handle?"""
+    low = (text or "").lower()
+    return any(w in low
+               for words in _OTHER_INQUIRY_WORDS.values() for w in words)
+
+
 def ticket_subject_kind(text: str):
     """What an open ticket appears to be about: a key, "other", or None.
 
-    None means it cannot be told, and the caller treats that as a reason not to
-    close it rather than a reason to try.
+    None means it cannot be told from the text alone.
     """
-    low = (text or "").lower()
-    for label, words in _OTHER_INQUIRY_WORDS.items():
-        if any(w in low for w in words):
-            return "other"
-    hits = [k for k, words in _INQUIRY_WORDS.items()
-            if any(w in low for w in words)]
+    if ticket_names_other_request(text):
+        return "other"
+    hits = ticket_inquiry_words(text)
     if len(hits) == 1:
-        return hits[0]
+        return next(iter(hits))
     return None             # none, or more than one — not determinable
 
 
@@ -453,6 +468,15 @@ def open_inquiry_tickets(hubspot, contact_id, wf_type):
 
     candidates = []
     for ticket in tickets:
+        # A malformed element must not raise. The ticket step's handler would
+        # swallow an AttributeError into a log line and the reply would say
+        # "No matching ticket — nothing was closed", which is the wrong cause
+        # reported as a clean result. Regression from 2026-10-02: the rewrite
+        # dropped this and the test that covered it.
+        if not isinstance(ticket, dict):
+            logger.warning("skipping a malformed ticket entry: %r",
+                           type(ticket).__name__)
+            continue
         props = ticket.get("properties") or {}
         if str(props.get("hs_pipeline")) != spec["pipeline"]:
             continue
@@ -464,13 +488,25 @@ def open_inquiry_tickets(hubspot, contact_id, wf_type):
         # only what tells an Asset Transfer Notification apart from a DAF Form
         # Submission — because NO ticket property distinguishes them, confirmed
         # 2026-10-02 by reading every ticket property definition in the portal.
-        # So it EXCLUDES other request types and never requires a match.
+        #
+        # It EXCLUDES and never requires: an uninformative subject is fine,
+        # because 89 of 100 production tickets have one. Two things exclude —
+        # a request type this workflow does not handle, and a text naming a
+        # DIFFERENT inquiry type, which includes naming both. "DAF or
+        # endowment?" names one that is not ours, and that is reason enough to
+        # leave it for a human.
         subject = props.get("subject") or ""
         blob = f"{subject} {props.get('content') or ''}"
-        if ticket_subject_kind(blob) == "other":
+        if ticket_names_other_request(blob):
             logger.info("ticket %s is in the right pipeline but reads as "
                         "another request type — not closing it",
                         ticket.get("id"))
+            continue
+        named = ticket_inquiry_words(blob)
+        if named - {wf_type}:
+            logger.info("ticket %s names inquiry type(s) %s, not just %r — "
+                        "not closing it", ticket.get("id"), sorted(named),
+                        wf_type)
             continue
 
         candidates.append({"id": ticket.get("id"),

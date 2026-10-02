@@ -294,3 +294,113 @@ def test_the_closed_line_names_the_ticket(monkeypatch):
 
     assert "📋 Ticket T-E closed" in reply
     assert "DAF Form Submission - Sarah Ahmed" in reply
+
+
+# ---------------------------------------------------------------------------
+# Regressions the sandbox-29 rewrite introduced, found by diffing collected
+# test ids against b008718 and restored here
+# ---------------------------------------------------------------------------
+
+def test_a_ticket_naming_BOTH_inquiry_types_is_not_closed(monkeypatch):
+    """Lost in the rewrite and restored.
+
+    b008718 asserted this and the association rewrite silently reversed it: the
+    text guard only excluded "other", so "DAF or endowment?" fell through as
+    merely undeterminable and WAS closed.
+
+    It names one type that is not ours, and that is reason enough to leave it for
+    a human — the same rule as two candidate tickets.
+    """
+    reply, hs, _ = run(monkeypatch, [ticket("T-BOTH", subject="DAF or endowment?")])
+
+    assert hs.closed == []
+    assert "No matching ticket" in reply
+
+
+def test_a_ticket_naming_the_OTHER_inquiry_type_is_not_closed(monkeypatch):
+    """An endowment-worded ticket sitting in the DAF pipeline."""
+    reply, hs, _ = run(monkeypatch, [
+        ticket("T-ENDOW-WORDED", subject="Endowment inquiry")])
+
+    assert hs.closed == []
+    assert "No matching ticket" in reply
+
+
+@pytest.mark.parametrize("rows", [
+    ["not a dict"],
+    [None],
+    [{"id": "T1"}],                       # no properties key
+    [{"id": "T1", "properties": None}],
+    [42, {"id": "T1", "properties": {}}],
+])
+def test_a_malformed_ticket_entry_does_not_raise(rows):
+    """Lost in the rewrite and restored, and the failure was worse than a crash.
+
+    The ticket step's handler swallows an exception into a log line, so an
+    AttributeError here produced "No matching ticket — nothing was closed" — the
+    wrong cause reported as a clean result, which is the exact failure shape this
+    body of work exists to remove.
+    """
+    candidates, note = open_inquiry_tickets(
+        type("HS", (), {"get_contact_tickets":
+                        lambda self, c, properties=None: rows})(),
+        "70123", "daf")
+    assert candidates == []
+
+
+def test_a_good_ticket_survives_a_malformed_neighbour(monkeypatch):
+    """One bad entry must not discard the rest."""
+    reply, hs, _ = run(monkeypatch, [
+        "nonsense", ticket("T-DAF", subject="DAF Form Submission - Sarah")])
+
+    assert hs.closed == ["T-DAF"]
+
+
+def test_a_ticket_with_no_subject_is_still_identifiable(monkeypatch):
+    """Restored from b008718. 57 production tickets have an unhelpful subject
+    and some could have none at all; the listing still has to name them."""
+    reply, hs, _ = run(monkeypatch, [
+        ticket("T-A", subject=""), ticket("T-B", subject="")])
+
+    assert hs.closed == [], "two candidates close nothing"
+    assert "(no subject)" in reply
+
+
+def test_a_contact_with_no_tickets_at_all_says_no_matching_ticket(monkeypatch):
+    """Restored from b008718's test_no_open_tickets_at_all_says_so."""
+    reply, hs, _ = run(monkeypatch, [])
+
+    assert hs.closed == []
+    assert "📋 No matching ticket — nothing was closed." in reply
+
+
+def test_a_submission_without_an_email_closes_nothing(monkeypatch):
+    """Restored in substance, and it holds for a different reason now.
+
+    The email is no longer the matching key — the contact association is. With no
+    email the workflow never reaches its HubSpot step, so no contact id is ever
+    resolved, and open_inquiry_tickets has nothing to look up.
+
+    (My first attempt at this test gave an email but made the contact search
+    return nothing while the PATCH succeeded — a shape the real client cannot
+    produce, since update_contact_by_email does its own search. It passed for the
+    wrong reason until it didn't.)
+    """
+    monkeypatch.setattr("config.Config.CSUITE_ENV", "live")
+    monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
+    monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
+    monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", False)
+    monkeypatch.setattr(Config, "CSUITE_HUBSPOT_BACKFILL_ENABLED", False)
+    monkeypatch.setattr(Config, "CSUITE_TICKET_CLOSE_ENABLED", True)
+
+    hs = HubSpot([ticket("T-DAF", subject="DAF Form Submission")])
+    state = {"active": True, "workflow_type": "daf", "type": "daf",
+             "step": "confirm", "form_id": Config.DAF_INQUIRY_FORM_ID,
+             "submission_data": {"first_name": "Sarah", "last_name": "Ahmed",
+                                 "email": ""},
+             "profile_id": None, "funit_id": None, "ticket_id": None}
+    reply = daf_workflow._step_create("yes", state, hs, CSuite())
+
+    assert hs.closed == []
+    assert hs.asked_for == [], "no contact id, so nothing was looked up"
+    assert "No matching ticket" in reply
