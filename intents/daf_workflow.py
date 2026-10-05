@@ -139,6 +139,12 @@ def default_workflow_state() -> dict:
         "type": None,        # "daf" or "endowment"
         "step": None,        # "confirm", "processing", "done"
         "submission_data": {},
+        # The whole fetched page, so "skip" can move to the next one instead
+        # of cancelling, and the index of the one being shown.
+        "submissions": [],
+        "submission_index": 0,
+        # {submission_id: profile_id} for the ones already done.
+        "processed": {},
         "profile_id": None,
         "funit_id": None,
         "ticket_id": None,
@@ -205,6 +211,143 @@ def handle(query: str, ctx) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Submission display and processed history
+# ---------------------------------------------------------------------------
+
+# HubSpot's portal time zone, and the one the staff reading these replies are
+# in. A submission time is only useful to a person if it is in their own day.
+_DISPLAY_TZ = "America/New_York"
+
+
+def _submitted_moment(value):
+    """`value` as an aware datetime, or None if it cannot be read."""
+    from datetime import date, datetime, timezone
+
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day,
+                        tzinfo=timezone.utc)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return datetime.fromtimestamp(float(value) / 1000, timezone.utc)
+    if isinstance(value, str) and value.strip():
+        text = value.strip()
+        if text.isdigit():
+            return datetime.fromtimestamp(int(text) / 1000, timezone.utc)
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(
+            tzinfo=timezone.utc)
+    return None
+
+
+def format_submitted_at(value) -> str:
+    """A submission time a person can read: "Tue Sep 29, 2026 2:02 PM ET".
+
+    Until 2026-10-05 the confirmation printed HubSpot's raw value, so a
+    reviewer deciding whether to create a donor record saw
+    "Submitted: 1790704953446". Nothing formatted it anywhere — the only code
+    that interpreted the value was task_due_date.
+
+    Anything unreadable comes back as its own string rather than as a guess or
+    a blank: a timestamp nobody can parse is still evidence, and "Unknown" in
+    place of a value that was there would be worse than the raw number.
+    """
+    moment = _submitted_moment(value)
+    if moment is None:
+        # Only a string is echoed back; a dict or a list is noise, not
+        # evidence, and "{}" in front of a reviewer explains nothing.
+        text = value.strip() if isinstance(value, str) else ""
+        return text or "Unknown"
+
+    from zoneinfo import ZoneInfo
+    local = moment.astimezone(ZoneInfo(_DISPLAY_TZ))
+    # %-d and %-I are not portable, so the unpadded parts are built by hand.
+    hour = local.hour % 12 or 12
+    return (f"{local:%a %b} {local.day}, {local.year} "
+            f"{hour}:{local:%M} {local:%p} ET")
+
+
+def _processed_map(form_id):
+    """({submission_id: profile_id}, warning or None). Never raises.
+
+    A failure here is NOT an empty history: an empty history offers every
+    submission again, and the only thing then between a second offer and a
+    second donor record is the duplicate guard. So the warning is returned and
+    the caller prints it.
+    """
+    from clients.audit import ProcessedHistoryUnavailable, processed_submissions
+
+    try:
+        return processed_submissions(form_id), None
+    except ProcessedHistoryUnavailable as e:
+        logger.error("processed history unavailable for form %s: %s",
+                     form_id, e)
+        return {}, (f"⚠️ Already-processed submissions could not be checked "
+                    f"({e}). This one may have been done already — the "
+                    f"duplicate guard will still refuse a second profile.")
+    except Exception as e:                      # pragma: no cover - defensive
+        logger.error("processed history lookup failed for form %s: %s",
+                     form_id, e, exc_info=True)
+        return {}, ("⚠️ Already-processed submissions could not be checked "
+                    f"({e}).")
+
+
+def _is_processed(parsed: dict, processed: dict) -> bool:
+    """Has this submission got a successful live create on record?
+
+    A submission with no identifier is treated as NOT processed. It cannot be
+    matched either way, and offering it again is the recoverable mistake —
+    the duplicate guard stops a second create, whereas hiding it loses a donor.
+    """
+    submission_id = str((parsed or {}).get("submission_id") or "")
+    return bool(submission_id) and submission_id in (processed or {})
+
+
+def _next_unprocessed(submissions, processed, start: int = 0):
+    """The index of the first unprocessed submission at or after `start`."""
+    for index in range(max(start, 0), len(submissions or [])):
+        if not _is_processed(submissions[index], processed):
+            return index
+    return None
+
+
+def _donor_label(parsed: dict) -> str:
+    """A name for a message. Falls back to the email, then to the id."""
+    name = f"{(parsed or {}).get('first_name', '')} " \
+           f"{(parsed or {}).get('last_name', '')}".strip()
+    return name or (parsed or {}).get("email") or "unnamed"
+
+
+def _render_submission(parsed: dict, wf_type: str, note: str = None) -> str:
+    """The review block for one submission. Shared by initiation and skip."""
+    type_label = "DAF" if wf_type == "daf" else "Endowment"
+    fund_name = parsed.get("fund_name") or "Not specified"
+    contribution = parsed.get("initial_contribution") or "Not specified"
+    lines = [f"📋 **New {type_label} Inquiry**", ""]
+    if note:
+        lines += [note, ""]
+    lines += [
+        f"👤 **Name:** {parsed.get('first_name', '')} "
+        f"{parsed.get('last_name', '')}",
+        f"📧 **Email:** {parsed.get('email', 'N/A')}",
+        f"📱 **Phone:** {parsed.get('phone', 'N/A')}",
+        f"💰 **Requested Fund Name:** {fund_name}",
+        f"💵 **Initial Contribution:** {contribution}",
+        f"📅 **Submitted:** {format_submitted_at(parsed.get('submitted_at'))}",
+        "",
+        "---",
+        "**Shall I create the CSuite profile and fund?**",
+        '• Say *"Yes"* or *"Create it"* to proceed',
+        '• Say *"Skip"* to move to the next submission',
+        '• Say *"Cancel"* to stop',
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Initiation: pull latest submission and present for review
 # ---------------------------------------------------------------------------
 
@@ -237,19 +380,28 @@ def _initiate_workflow(query: str, state: dict, hubspot) -> str:
     if not submissions:
         return f"📭 No pending {wf_type.upper()} inquiry submissions found."
 
-    # Take the most recent submission
-    sub = submissions[0]
-    parsed = _parse_submission(sub)
+    form_id = (Config.DAF_INQUIRY_FORM_ID if wf_type == "daf"
+               else Config.ENDOWMENT_INQUIRY_FORM_ID)
+    type_label = "DAF" if wf_type == "daf" else "Endowment"
 
+    # The whole page is parsed, not just [0]. Until 2026-10-05 this took
+    # submissions[0] unconditionally and nothing recorded a success, so a
+    # submission that had just been processed was offered again — and would
+    # have been offered forever, until a newer submission displaced it.
+    parsed_all = [_parse_submission(sub) for sub in submissions]
+    processed, history_warning = _processed_map(form_id)
+
+    index = _next_unprocessed(parsed_all, processed)
+    if index is None:
+        return _all_processed_message(parsed_all, processed, type_label)
+
+    parsed = parsed_all[index]
     if not parsed.get("email"):
         return (
             f"⚠️ Latest {wf_type.upper()} submission is missing an email address. "
             "Cannot create a CSuite profile without one. Check HubSpot forms for details."
         )
 
-    # Store in workflow state
-    form_id = (Config.DAF_INQUIRY_FORM_ID if wf_type == "daf"
-               else Config.ENDOWMENT_INQUIRY_FORM_ID)
     state.update({
         "active": True,
         "workflow_type": "daf",
@@ -257,33 +409,80 @@ def _initiate_workflow(query: str, state: dict, hubspot) -> str:
         "step": "confirm",
         "form_id": form_id,
         "submission_data": parsed,
+        "submissions": parsed_all,
+        "submission_index": index,
+        "processed": processed,
         "profile_id": None,
         "funit_id": None,
         "ticket_id": None,
     })
 
-    type_label = "DAF" if wf_type == "daf" else "Endowment"
-    fund_name = parsed.get("fund_name", "Not specified")
-    contribution = parsed.get("initial_contribution", "Not specified")
+    note = history_warning
+    if index > 0:
+        skipped = _skipped_note(parsed_all, processed, index, type_label)
+        note = f"{note}\n{skipped}" if note else skipped
+    return _render_submission(parsed, wf_type, note=note)
 
-    return f"""📋 **New {type_label} Inquiry**
 
-👤 **Name:** {parsed.get('first_name', '')} {parsed.get('last_name', '')}
-📧 **Email:** {parsed.get('email', 'N/A')}
-📱 **Phone:** {parsed.get('phone', 'N/A')}
-💰 **Requested Fund Name:** {fund_name}
-💵 **Initial Contribution:** {contribution}
-📅 **Submitted:** {parsed.get('submitted_at', 'Unknown')}
+def _skipped_note(parsed_all, processed, index: int, type_label: str) -> str:
+    """Why the one being shown is not the newest."""
+    done = [p for p in parsed_all[:index] if _is_processed(p, processed)]
+    if not done:
+        return ""
+    newest = done[0]
+    profile_id = (processed or {}).get(str(newest.get("submission_id")))
+    if len(done) == 1:
+        subject = f"The newest {type_label} submission has already been"
+    else:
+        subject = f"The {len(done)} newest {type_label} submissions have " \
+                  f"already been"
+    return (f"⏭️ {subject} processed — {_donor_label(newest)} is profile "
+            f"{profile_id}. Showing the next one.")
 
----
-**Shall I create the CSuite profile and fund?**
-• Say *"Yes"* or *"Create it"* to proceed
-• Say *"Skip"* or *"Cancel"* to abort"""
+
+def _all_processed_message(parsed_all, processed, type_label: str) -> str:
+    """Every fetched submission already has a live profile. Say which."""
+    newest = parsed_all[0]
+    profile_id = (processed or {}).get(str(newest.get("submission_id")))
+    lines = [f"📭 Latest {type_label} submission ({_donor_label(newest)}) "
+             f"already processed: profile {profile_id}."]
+    if len(parsed_all) > 1:
+        lines.append(f"The other {len(parsed_all) - 1} fetched "
+                     f"submission{'' if len(parsed_all) == 2 else 's'} "
+                     "have been processed too, so there is nothing to do.")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
 # Active workflow conversation handler
 # ---------------------------------------------------------------------------
+
+def _skip_to_next(state: dict) -> str:
+    """Show the next unprocessed submission, or end when there are none."""
+    submissions = state.get("submissions") or []
+    processed = state.get("processed") or {}
+    wf_type = state.get("type") or "daf"
+    type_label = "DAF" if wf_type == "daf" else "Endowment"
+    current = state.get("submission_index")
+    current = current if isinstance(current, int) else 0
+
+    index = _next_unprocessed(submissions, processed, start=current + 1)
+    if index is None:
+        _reset_state(state)
+        remaining = max(len(submissions) - current - 1, 0)
+        tail = ("" if remaining else
+                f" That was the last of the {len(submissions)} fetched.")
+        return (f"⏭️ Skipped. No further unprocessed {type_label} "
+                f"submissions in this batch.{tail} Say "
+                '*"process daf inquiry"* to re-check HubSpot.')
+
+    parsed = submissions[index]
+    state.update({"submission_index": index, "submission_data": parsed,
+                  "step": "confirm", "profile_id": None, "funit_id": None,
+                  "ticket_id": None})
+    position = f"⏭️ Skipped. Submission {index + 1} of {len(submissions)}."
+    return _render_submission(parsed, wf_type, note=position)
+
 
 def _handle_active_workflow(query: str, state: dict, hubspot, csuite) -> str:
     """Route based on current workflow step."""
@@ -297,10 +496,12 @@ def _handle_active_workflow(query: str, state: dict, hubspot, csuite) -> str:
         _reset_state(state)
         return "👍 Workflow cancelled."
 
-    # Skip (move to next submission — for now just cancels)
+    # Skip: move to the NEXT unprocessed submission in the page already
+    # fetched. It used to reset the workflow, which meant "skip" and "cancel"
+    # did the same thing and the next submission was unreachable — saying
+    # "process daf inquiry" again just re-offered the one that was skipped.
     if any(w in q for w in ['skip', 'next']):
-        _reset_state(state)
-        return "⏭️ Skipped. Say *\"process daf inquiry\"* again to check for more submissions."
+        return _skip_to_next(state)
 
     if step == "confirm":
         return _step_create(q, state, hubspot, csuite)
@@ -755,7 +956,8 @@ def already_in_csuite(data: dict, hubspot, csuite):
         kind="ambiguous")
 
 
-def task_due_date(submitted_at=None, business_days: int = 2) -> str:
+def task_due_date(submitted_at=None, business_days: int = 2,
+                  today=None) -> str:
     """`business_days` working days from `submitted_at`, as YYYY-MM-DD.
 
     Saturdays and Sundays are skipped. Public holidays are NOT — this repo has
@@ -763,8 +965,19 @@ def task_due_date(submitted_at=None, business_days: int = 2) -> str:
     due dates. A task due on a holiday is late by a day; a task due on a
     Saturday is late by two and looks like a mistake.
 
+    **Counted from the later of the submission date and today**, so a
+    submission processed out of a backlog never ships a task that is already
+    overdue. Task 1033 was created on 2026-10-05 and came out due 2026-10-01,
+    because the donor submitted on 09-29 and the only input was that date: a
+    reminder with a due date in the past reads as neglected work rather than
+    new work, and nobody can tell the two apart afterwards.
+
+    Submitting today is unaffected — max() of the same day is that day.
+
     `submitted_at` may be a HubSpot epoch-milliseconds value, an ISO string, a
-    date, or None for today.
+    date, or None. `today` is injectable so a test can pin the clock; the
+    weekend arithmetic was being tested against the real one and broke twice
+    when the date rolled over.
     """
     from datetime import date, datetime, timedelta, timezone
 
@@ -787,8 +1000,11 @@ def task_due_date(submitted_at=None, business_days: int = 2) -> str:
                 start = datetime.fromisoformat(text.replace("Z", "+00:00")).date()
             except ValueError:
                 start = None
+    now = today if isinstance(today, date) else date.today()
     if start is None:
-        start = date.today()
+        start = now
+    # Never count from a date that has already passed.
+    start = max(start, now)
 
     due, added = start, 0
     while added < business_days:
@@ -1164,6 +1380,15 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         logger.info(f"Creating CSuite profile for {data.get('first_name')} {data.get('last_name')}...")
         try:
             profile_result = csuite.create_individual_profile(
+                # Recorded on the audit row, never sent to CSuite: it is what
+                # lets a later run ask "has this submission been done?". The
+                # failure path has carried these two since 2026-10-01; the
+                # success path carried nothing, which is why a processed
+                # submission was offered again.
+                audit_meta={
+                    "hubspot_form_id": state.get("form_id"),
+                    "hubspot_submission_id": data.get("submission_id"),
+                },
                 first_name=data.get("first_name", ""),
                 last_name=data.get("last_name", ""),
                 email=data.get("email", ""),

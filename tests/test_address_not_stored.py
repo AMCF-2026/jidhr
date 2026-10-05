@@ -150,7 +150,8 @@ def test_the_workflow_passes_the_four_parsed_address_parts(monkeypatch):
 
     assert len(csuite.calls) == 1
     call = csuite.calls[0]
-    assert set(call) == {"first_name", "last_name", "email", "phone",
+    assert set(call) == {"audit_meta", "first_name", "last_name", "email",
+                         "phone",
                          "address_line", "city", "state", "zipcode"}
     assert call["address_line"] == "51 Test Way"
     assert call["city"] == "Fairfax"

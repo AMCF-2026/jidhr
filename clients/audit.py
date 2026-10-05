@@ -519,3 +519,96 @@ def record_write(target_system: str, http_method: str, endpoint: str,
         raise AuditUnavailable(
             f"could not record the audit row for {http_method} {endpoint}: "
             f"{e}") from e
+
+
+# ---------------------------------------------------------------------------
+# Which submissions have already been processed
+# ---------------------------------------------------------------------------
+#
+# 2026-10-05: a live DAF run created profile 21696 for a donor, and
+# "process daf inquiry" offered the same submission again straight afterwards.
+# Nothing recorded that a submission had SUCCEEDED — only the failure path
+# wrote an identifiable row (see intents.daf_workflow.record_unprocessed_submission),
+# so there was no way to ask "is this one done?".
+#
+# Successful creates now carry the same two identifiers in payload_meta, and
+# this reads them back.
+
+PROFILE_CREATE_ENDPOINT = "profile/create/individual"
+
+# Only a create recorded as having gone to PRODUCTION counts as processed.
+# A sandbox create of the same submission must not hide a donor who still
+# needs a real profile.
+_PROCESSED_SQL = """
+    SELECT payload_meta->'ids'->>'hubspot_submission_id' AS submission_id,
+           target_id
+      FROM write_audit
+     WHERE target_system = 'csuite'
+       AND endpoint = %s
+       AND status = 'success'
+       AND csuite_env = 'live'
+       AND payload_meta->'ids'->>'hubspot_form_id' = %s
+       AND payload_meta->'ids'->>'hubspot_submission_id' IS NOT NULL
+"""
+
+
+class ProcessedHistoryUnavailable(RuntimeError):
+    """Whether a submission has been processed could not be determined.
+
+    Deliberately NOT the same as "nothing has been processed". An empty
+    answer means every fetched submission gets offered again, and the only
+    thing then standing between a second offer and a second donor record is
+    the duplicate guard. The caller says this out loud rather than printing a
+    list that looks complete.
+    """
+
+
+def processed_submissions(form_id, endpoint: str = PROFILE_CREATE_ENDPOINT
+                          ) -> dict:
+    """{submission_id: profile_id} for successful LIVE creates on `form_id`.
+
+    Raises ProcessedHistoryUnavailable when the question cannot be answered,
+    including when write_audit has no csuite_env column — without it there is
+    no way to tell a production create from a sandbox one, and guessing in
+    either direction is wrong: guess "live" and a donor who needs a real
+    profile is never offered again, guess "sandbox" and the 2026-10-05 repeat
+    offer comes back.
+    """
+    if not form_id:
+        return {}
+
+    try:
+        from clients.database import execute_query, is_configured
+    except Exception as e:  # pragma: no cover - import failure is fatal here
+        raise ProcessedHistoryUnavailable(
+            f"audit store unavailable: {e}") from e
+
+    if not is_configured():
+        raise ProcessedHistoryUnavailable(
+            "DATABASE_URL is not set, so no processing history can be read.")
+
+    if not _csuite_env_column_exists():
+        raise ProcessedHistoryUnavailable(
+            "write_audit has no csuite_env column, so a production create "
+            "cannot be told from a sandbox one. Run "
+            "migrations/002_write_audit_csuite_env.sql to enable processed "
+            "tracking.")
+
+    try:
+        rows = execute_query(_PROCESSED_SQL, (endpoint, str(form_id)),
+                             fetch=True)
+    except Exception as e:
+        raise ProcessedHistoryUnavailable(
+            f"could not read the processing history for form {form_id}: "
+            f"{e}") from e
+
+    processed = {}
+    for row in rows or []:
+        submission_id = (row or {}).get("submission_id")
+        if submission_id in (None, ""):
+            continue
+        # First row wins: if one submission somehow has two successful
+        # creates, the earlier profile is the one to name — and that the
+        # duplicate exists is a separate problem this must not paper over.
+        processed.setdefault(str(submission_id), row.get("target_id"))
+    return processed
