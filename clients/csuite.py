@@ -930,15 +930,29 @@ class CSuiteClient:
         response["verified"] = True
         return response
 
-    def _request(self, endpoint: str, data: dict = None) -> dict:
+    def _request(self, endpoint: str, data: dict = None,
+                 audit_meta: dict = None) -> dict:
         """Make authenticated POST request to CSuite API
         
         All CSuite API calls are POST with HMAC-SHA256 signature.
-        
+
+        `audit_meta` is recorded on the audit row and **never sent to
+        CSuite**. It exists so a write can be traced back to what asked for
+        it — the HubSpot form and submission behind a profile create — without
+        putting a name CSuite would reject into the request body. Only key
+        names and id-shaped values survive into payload_meta; see
+        clients.audit.payload_meta.
+
         Returns:
             dict with keys: success (bool), data (dict/None), error (str/None),
                            errors (list), messages (list)
         """
+        # Built once, used for the audit row only. The request body below is
+        # `data`, unchanged.
+        audit_payload = dict(data or {})
+        if audit_meta:
+            audit_payload.update(
+                {k: v for k, v in audit_meta.items() if v not in (None, "")})
         if not self.api_key or not self.api_secret:
             logger.error("CSuite API credentials not configured")
             if is_csuite_write(endpoint):
@@ -946,7 +960,7 @@ class CSuiteClient:
                 # missing audit row here costs nothing.
                 try:
                     record_write(
-                        "csuite", "POST", endpoint, payload=data,
+                        "csuite", "POST", endpoint, payload=audit_payload,
                         status="skipped",
                         error="CSuite API credentials not configured",
                         duration_ms=0)
@@ -983,7 +997,7 @@ class CSuiteClient:
             # see is_csuite_write.
             try:
                 reservation = reserve_write(
-                    "csuite", "POST", endpoint, payload=data)
+                    "csuite", "POST", endpoint, payload=audit_payload)
             except AuditUnavailable as e:
                 # Raised, not returned — see the matching note in
                 # clients/hubspot._send_with_status.
@@ -1167,6 +1181,7 @@ class CSuiteClient:
                                    email: str = None, phone: str = None,
                                    address_line: str = None, city: str = None,
                                    state: str = None, zipcode: str = None,
+                                   audit_meta: dict = None,
                                    **kwargs) -> dict:
         """Create an individual profile in CSuite.
 
@@ -1224,7 +1239,17 @@ class CSuiteClient:
             "last_name": last_name,
         }
         if email:
-            data["email"] = email
+            # Trimmed and lowercased before it is sent, which is what
+            # sync.readback.normalise_email has always said it was for:
+            # "Applied before sending AND before searching". Until 2026-10-05
+            # it was applied to neither on this path — the form value went out
+            # as the donor typed it, and the duplicate guard searched for the
+            # lowercase form. `primary_email` matching is exact and
+            # case-sensitive (the same address uppercased returns 0), so one
+            # capital letter in a submitted address meant the next inquiry
+            # from that donor found nothing and created a second profile.
+            from sync.readback import normalise_email
+            data["email"] = normalise_email(email) or email
 
         # A number CSuite would store as unsearchable text is left out rather
         # than sent. The warning travels with the response so the caller can
@@ -1250,7 +1275,15 @@ class CSuiteClient:
         data.update(kwargs)
 
         logger.info(f"Creating individual profile: {first_name} {last_name}")
-        response = self._request("profile/create/individual", data)
+        # Passed only when there is something to record, so a narrower
+        # _request override — a proxy, a double — is not forced to know about
+        # an argument that never reaches CSuite. The audit payload itself is
+        # proven against the real _request, not through this call.
+        if audit_meta:
+            response = self._request("profile/create/individual", data,
+                                     audit_meta=audit_meta)
+        else:
+            response = self._request("profile/create/individual", data)
         if isinstance(response, dict):
             if phone_warning:
                 response["phone_warning"] = phone_warning

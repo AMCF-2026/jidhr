@@ -274,8 +274,9 @@ def test_the_live_line_names_the_assignee_not_a_bare_employee_id(monkeypatch):
             self.endpoints = []
             self.task_sent = {}
 
-        def _request(self, endpoint, data=None):
+        def _request(self, endpoint, data=None, audit_meta=None):
             self.endpoints.append(endpoint)
+            self.audit_meta = audit_meta
             if endpoint == "profile/list":
                 return NoDuplicates()._request(endpoint, data)
             if endpoint == "profile/display":

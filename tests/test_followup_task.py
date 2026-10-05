@@ -187,25 +187,84 @@ def test_an_unknown_form_id_still_reads_sensibly():
     ("2026-10-07", "2026-10-09"),   # Wed -> Fri
 ])
 def test_two_business_days_skips_saturday_and_sunday(submitted, expected):
-    assert task_due_date(submitted) == expected
+    """The weekend arithmetic, with the clock pinned to the submission date so
+    the clamp added on 2026-10-05 is not what is being measured here. These
+    cases were asserted against the real clock and broke twice when it rolled
+    over."""
+    assert task_due_date(submitted,
+                         today=date.fromisoformat(submitted)) == expected
 
 
 def test_the_due_date_is_never_a_weekend():
     for day in range(1, 29):
-        due = task_due_date(f"2026-10-{day:02d}")
+        submitted = f"2026-10-{day:02d}"
+        due = task_due_date(submitted, today=date.fromisoformat(submitted))
         assert date.fromisoformat(due).weekday() < 5, due
 
 
 def test_a_hubspot_epoch_milliseconds_value_is_understood():
     # 2026-10-01 00:00:00 UTC
-    assert task_due_date(1790812800000) == "2026-10-05"
-    assert task_due_date("1790812800000") == "2026-10-05"
+    pinned = date(2026, 10, 1)
+    assert task_due_date(1790812800000, today=pinned) == "2026-10-05"
+    assert task_due_date("1790812800000", today=pinned) == "2026-10-05"
 
 
 def test_an_unreadable_submitted_at_falls_back_to_today():
     for value in (None, "", "Unknown", "not a date", {}):
         due = date.fromisoformat(task_due_date(value))
         assert due > date.today()
+        assert due.weekday() < 5
+
+
+# ---------------------------------------------------------------------------
+# A backlog submission never ships a task that is already overdue
+# ---------------------------------------------------------------------------
+
+def two_business_days_from(start):
+    """Deliberately a SECOND implementation, so the assertions below are not
+    task_due_date compared with itself."""
+    from datetime import timedelta
+    due, added = start, 0
+    while added < 2:
+        due += timedelta(days=1)
+        if due.weekday() < 5:
+            added += 1
+    return due.isoformat()
+
+
+def test_a_backlog_submission_is_due_from_today_not_from_submission():
+    """The 2026-10-05 run: Genc submitted 09-29, the task was created on 10-05
+    and came out due 10-01 — overdue before it existed."""
+    genc = 1790704953446                       # 2026-09-29 14:02 ET
+
+    assert task_due_date(genc, today=date(2026, 10, 5)) == "2026-10-07"
+    assert task_due_date(genc, today=date(2026, 10, 5)) == \
+        two_business_days_from(date(2026, 10, 5))
+
+
+def test_submitting_today_is_unchanged_by_the_clamp():
+    """max() of the same day is that day, so the common case is untouched."""
+    for day in (1, 2, 5, 6, 7):
+        pinned = date(2026, 10, day)
+        assert task_due_date(pinned.isoformat(), today=pinned) == \
+            two_business_days_from(pinned)
+
+
+def test_a_future_dated_submission_still_counts_from_itself():
+    """Only the past is clamped. A submission dated ahead of today keeps its
+    own start, because moving it earlier would be inventing a due date."""
+    assert task_due_date("2026-10-09", today=date(2026, 10, 5)) == \
+        two_business_days_from(date(2026, 10, 9))
+
+
+def test_a_due_date_is_never_before_today():
+    for days_back in range(0, 40):
+        from datetime import timedelta
+        pinned = date(2026, 10, 5)
+        submitted = pinned - timedelta(days=days_back)
+        due = date.fromisoformat(
+            task_due_date(submitted.isoformat(), today=pinned))
+        assert due > pinned, f"{submitted} produced {due}"
         assert due.weekday() < 5
 
 
@@ -221,7 +280,11 @@ def test_the_task_links_to_the_new_profile(monkeypatch):
     kw = csuite.task_kwargs
     assert kw["linked_profile_id"] == 21700 == state["profile_id"]
     assert kw["employee_id"] == 1007
-    assert kw["due_date"] == "2026-10-05"
+    # The exact arithmetic is pinned in the unit tests above. Here the point
+    # is that a due date reaches create_task and is a usable one — the
+    # submission is dated 2026-10-01, so after the clamp it depends on today.
+    assert kw["due_date"] == two_business_days_from(
+        max(date(2026, 10, 1), date.today()))
     assert kw["task_type_id"] is None, "unset means omitted, not guessed"
 
 
@@ -283,9 +346,10 @@ def test_the_success_line_names_the_task_the_assignee_and_the_donor(monkeypatch)
     """A line that says only "Follow-up task created" does not let anyone check
     it went to the right person about the right donor."""
     reply, _ = run(monkeypatch)
+    due = two_business_days_from(max(date(2026, 10, 1), date.today()))
 
-    assert "📝 Follow-up task 1040 for 1007 — re: Sarah Ahmed — due " \
-        "2026-10-05 — [View](" in reply
+    assert f"📝 Follow-up task 1040 for 1007 — re: Sarah Ahmed — due " \
+        f"{due} — [View](" in reply
     assert "task_id=1040" in reply
 
 
