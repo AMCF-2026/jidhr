@@ -203,7 +203,7 @@ def test_a_dry_run_still_runs_when_the_flag_is_on(monkeypatch):
 
 def test_plain_sync_donations_says_it_is_off_without_saying_it_failed(
         monkeypatch):
-    def refuse(dry_run=False, quick=False):
+    def refuse(dry_run=False, quick=False, resolve_shown=0):
         raise DonationSyncDisabled("CSUITE_DONATION_SYNC_ENABLED is off")
 
     monkeypatch.setattr(sync_commands, "run_donation_sync", refuse)
@@ -222,7 +222,7 @@ def test_sync_all_cannot_walk_past_the_gate(monkeypatch):
     _sync_donations."""
     asked = {}
 
-    def refuse(dry_run=False, quick=False):
+    def refuse(dry_run=False, quick=False, resolve_shown=0):
         asked["dry_run"] = dry_run
         raise DonationSyncDisabled("off")
 
@@ -242,7 +242,7 @@ def test_sync_all_cannot_walk_past_the_gate(monkeypatch):
 
 def test_a_real_failure_still_reads_as_a_failure(monkeypatch):
     """The ⏸️ line must not have swallowed the ❌ one."""
-    def boom(dry_run=False, quick=False):
+    def boom(dry_run=False, quick=False, resolve_shown=0):
         raise RuntimeError("CSuite returned 500")
 
     monkeypatch.setattr(sync_commands, "run_donation_sync", boom)
@@ -256,14 +256,16 @@ def test_a_real_failure_still_reads_as_a_failure(monkeypatch):
 def test_a_dry_run_through_chat_is_not_refused(monkeypatch):
     asked = {}
 
-    def record(dry_run=False, quick=False):
-        asked.update(dry_run=dry_run, quick=quick)
+    def record(dry_run=False, quick=False, resolve_shown=0):
+        asked.update(dry_run=dry_run, quick=quick,
+                     resolve_shown=resolve_shown)
         return {"updated": 3, "skipped_no_email": 1,
                 "skipped_not_found": 2, "errors": 0, "details": []}
 
     monkeypatch.setattr(sync_commands, "run_donation_sync", record)
     reply = sync_commands.handle("sync donations dry run", None)
 
-    assert asked == {"dry_run": True, "quick": True}
+    assert asked == {"dry_run": True, "quick": True,
+                     "resolve_shown": 25}
     assert "DRY RUN" in reply
     assert "⏸️" not in reply

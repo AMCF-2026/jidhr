@@ -98,7 +98,9 @@ def _sync_donations(query_lower: str) -> str:
     dry_run = 'dry run' in query_lower or 'test' in query_lower
 
     try:
-        results = run_donation_sync(dry_run=dry_run, quick=dry_run)
+        results = run_donation_sync(dry_run=dry_run, quick=dry_run,
+                                    resolve_shown=LINK_ROWS_SHOWN
+                                    if dry_run else 0)
         return _format_donation_sync_results(results, dry_run)
     except DonationSyncDisabled as e:
         # Not an error line. Nothing failed and nothing was attempted, and a
@@ -183,23 +185,105 @@ def _run_all_syncs() -> str:
 # Formatters
 # ---------------------------------------------------------------------------
 
+# How many link rows the dry-run table shows. The counts above it are the real
+# totals; this caps only what is printed, so a long run stays readable.
+LINK_ROWS_SHOWN = 25
+
+
 def _format_donation_sync_results(results: dict, dry_run: bool) -> str:
     prefix = "🧪 **DRY RUN (Sample)** - " if dry_run else ""
+    verb = "would be updated" if dry_run else "updated"
 
     response = f"""{prefix}✅ **Donation Sync Complete**
 
 📊 **Results:**
-• **{results['updated']}** contacts {"would be updated" if dry_run else "updated"} with donation data
+• **{results['updated']}** contacts {verb} with donation data
 • **{results['skipped_no_email']}** profiles skipped (no email in CSuite)
 • **{results['skipped_not_found']}** profiles skipped (not found in HubSpot)
 • **{results['errors']}** errors
 
 💡 Fields: `lifetime_giving`, `last_donation_date`, `last_donation_amount`, `donation_count`, `csuite_profile_id`"""
 
+    response += _format_link_outcomes(results, dry_run)
+
     if dry_run:
-        response += "\n\n⚡ *This dry run used sample data (500 profiles, 500 donations). Run `sync donations` without 'dry run' for full sync.*"
+        response += ("\n\n⚡ *This dry run used sample data (500 profiles, "
+                     "500 donations). Run `sync donations` without 'dry run' "
+                     "for full sync.*")
 
     return response
+
+
+def _format_link_outcomes(results: dict, dry_run: bool) -> str:
+    """What happened to csuite_profile_id, and the per-contact table.
+
+    Separated out because it is the part a person has to read before enabling
+    the sync: `csuite_profile_id` is the field the DAF duplicate guard trusts,
+    and this sync is the other thing that writes it.
+    """
+    keys = ("link_written", "link_unchanged", "link_conflict", "link_differs",
+            "link_stale", "link_unverifiable")
+    if not any(key in results for key in keys):
+        return ""            # an older result dict; nothing to add
+
+    labels = [
+        ("link_written", "written (contact had none)"),
+        ("link_unchanged", "already correct — not rewritten"),
+        ("link_conflict", "**left alone — points at a different live "
+                          "profile**"),
+        ("link_stale", "**left alone — stored id is not in CSuite**"),
+        ("link_unverifiable", "left alone — CSuite would not confirm the "
+                              "stored id"),
+        ("link_differs", "left alone — differs from the stored id, which this "
+                         "preview did not check"),
+    ]
+    lines = ["", "",
+             "🔗 **csuite_profile_id**  "
+             "*(the four donation fields are written either way)*"]
+    for key, label in labels:
+        count = results.get(key, 0)
+        if count:
+            lines.append(f"• **{count}** {label}")
+    if not any(results.get(key) for key, _ in labels):
+        lines.append("• nothing to link")
+
+    if results.get("link_stale"):
+        lines.append("   ⚠️ A stale id is NOT repointed — overwriting it "
+                     "destroys the only record of what it pointed at.")
+
+    rows = results.get("link_rows") or []
+    if dry_run and rows:
+        shown = rows[:LINK_ROWS_SHOWN]
+        resolved = any("proposed_exists" in row for row in shown)
+        lines += [
+            "",
+            f"**Proposed links — first {len(shown)} of {len(rows)}**"
+            + ("  \n*(existence checked for the rows shown)*" if resolved
+               else ""),
+            "",
+            "| contact | current | proposed | proposed in CSuite? | action |",
+            "|---|---|---|---|---|",
+        ]
+        for row in shown:
+            current = row.get("current") or "—"
+            if row.get("current_exists"):
+                current = f"{current} ({row['current_exists']})"
+            lines.append(
+                f"| `{row['contact_id']}` | {current} | "
+                f"`{row['proposed']}` | "
+                f"{row.get('proposed_exists', 'not checked')} | "
+                f"{row.get('action', '')} |")
+        if len(rows) > len(shown):
+            lines.append("")
+            lines.append(f"… and **{len(rows) - len(shown)}** more rows not "
+                         "shown. The counts above are the full totals.")
+
+    if results.get("profile_reads"):
+        lines.append("")
+        lines.append(f"*{results['profile_reads']} CSuite profile read(s) "
+                     "were made to answer this.*")
+
+    return "\n".join(lines)
 
 
 def _format_event_sync_results(results: dict, dry_run: bool) -> str:
