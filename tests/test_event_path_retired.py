@@ -259,9 +259,10 @@ def chat(monkeypatch):
     calls = []
 
     def fake_run(hubspot=None, dry_run=True, limit=None, organizer=None,
-                 pace_ms=None):
-        calls.append({"dry_run": dry_run, "limit": limit})
-        return {"dry_run": dry_run, "limit": limit, "created": 0,
+                 pace_ms=None, **options):
+        calls.append({"dry_run": dry_run, "limit": limit, **options})
+        return {"dry_run": dry_run, "limit": limit, "withheld": 0,
+                "withheld_rows": [], "created": 0,
                 "updated": 0, "unchanged": 0, "deferred": 0, "unknown": 0,
                 "failed": 0, "skipped": 0, "review": 0, "review_rows": [],
                 "csuite_calls": 2, "hubspot_calls": 1,
@@ -277,7 +278,8 @@ def chat(monkeypatch):
 def test_a_plain_request_previews(chat, phrase):
     reply = sync_commands.handle(phrase, None)
 
-    assert chat == [{"dry_run": True, "limit": None}]
+    assert chat == [{"dry_run": True, "limit": None,
+                     "updates_only": False, "include_ids": []}]
     assert "DRY RUN" in reply
     assert "Nothing was written to HubSpot" in reply
 
@@ -285,7 +287,8 @@ def test_a_plain_request_previews(chat, phrase):
 def test_a_live_run_needs_the_word_apply(chat):
     reply = sync_commands.handle("sync events apply", None)
 
-    assert chat == [{"dry_run": False, "limit": ea.CHAT_DEFAULT_LIMIT}]
+    assert chat == [{"dry_run": False, "limit": ea.CHAT_DEFAULT_LIMIT,
+                     "updates_only": False, "include_ids": []}]
     assert "APPLIED" in reply
 
 
@@ -314,7 +317,8 @@ def test_a_preview_is_never_capped(chat):
     """A cap on a preview would hide rows from the person deciding."""
     sync_commands.handle("sync events limit 2", None)
 
-    assert chat[0] == {"dry_run": True, "limit": None}
+    assert chat[0]["dry_run"] is True
+    assert chat[0]["limit"] is None
 
 
 def test_sync_all_caps_the_event_run(chat, monkeypatch):
@@ -329,7 +333,8 @@ def test_sync_all_caps_the_event_run(chat, monkeypatch):
 
     sync_commands.handle("sync all", None)
 
-    assert {"dry_run": False, "limit": ea.CHAT_DEFAULT_LIMIT} in chat
+    assert any(c["dry_run"] is False
+               and c["limit"] == ea.CHAT_DEFAULT_LIMIT for c in chat)
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +369,9 @@ def test_review_reads_as_needing_a_person():
                                        "no timezone — assumed ET")]))
 
     assert "need a human" in reply
-    assert "nothing was written to these" in reply
+    assert "also counted above" in reply, \
+        "review overlaps the buckets above and must say so"
+    assert "All of these are withheld." in reply
     assert "AMCF Open House" in reply
     assert "no timezone — assumed ET" in reply
 
@@ -478,7 +485,7 @@ def test_a_failed_hubspot_listing_refuses_to_plan():
         patch.setattr(ea.eh, "fetch_event_dates",
                       lambda client, pace_ms=None: eh.Fetched(
                           rows=[event_row(1464)], calls=1, total_429s=0,
-                          error=None))
+                          error=None, complete=True))
         patch.setattr(ea.eh, "hubspot_index",
                       lambda hubspot: ({}, 1, "HubSpot returned 500"))
         patch.setattr("clients.csuite.CSuiteClient", lambda: object())
