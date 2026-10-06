@@ -128,16 +128,31 @@ def test_a_plain_preview_is_still_sampled(chat, phrase):
     "sync donations full dry run",
 ])
 def test_a_full_preview_is_handed_to_the_cli_not_run_inline(chat, phrase):
-    """It cannot finish in a web request: ~7,604 HubSpot searches at a 5/s
-    cap is ~25 minutes against a 180s gunicorn timeout, and the worker dies
-    about an eighth of the way in taking its other requests with it."""
+    """It cannot finish in a web request: ~7,604 HubSpot searches paced at
+    4/s is ~32 minutes against a 180s gunicorn timeout, and the worker dies
+    about a tenth of the way in taking its other requests with it."""
     reply = sync_commands.handle(phrase, None)
 
     assert chat == {}, "nothing may be read: the sync is not started at all"
     assert "scripts/donation_preview.py --full" in reply
-    assert "5 requests per second" in reply
+    assert "5 requests per second" in reply, "the documented cap"
+    assert "~32 minutes" in reply, "the time at the pace the code actually uses"
     assert "180 seconds" in reply
     assert "writes nothing" in reply
+
+
+def test_the_quoted_duration_matches_the_pace_the_code_uses():
+    """The figure said ~25 minutes, which is the time at the 5/s CAP. The
+    code paces at 4/s, so the honest figure is ~32. A number quoted from the
+    limit rather than from the setting is a number that drifts."""
+    from sync.donations import HUBSPOT_SEARCH_PER_SECOND
+
+    searches = 7604
+    minutes = searches / HUBSPOT_SEARCH_PER_SECOND / 60
+
+    assert 30 <= minutes <= 34, minutes
+    assert f"~{round(minutes / 2) * 2} minutes" in \
+        sync_commands.DONATION_FULL_PREVIEW_REPLY
 
 
 def test_the_handover_still_offers_the_sample_that_does_run(chat):

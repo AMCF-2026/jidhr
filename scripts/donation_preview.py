@@ -16,11 +16,12 @@ types, separately from the per-app burst limit and regardless of tier:
   https://developers.hubspot.com/docs/developer-tooling/platform/usage-guidelines
   https://developers.hubspot.com/docs/api/usage-details
 
-So the HubSpot half alone cannot finish in under about 25 minutes if it is to
-stay legal, and gunicorn kills a request at 180 seconds — the worker dies
-about 12% of the way in, taking its other in-flight requests with it, and the
-work is discarded. "sync donations dry run full" in chat now prints this
-command instead of attempting it.
+This paces at 4/s to stay clear of that cap, so the HubSpot half alone takes
+about 32 minutes (7,604 / 4 = 1,901 seconds); even pacing right at the cap it
+would be about 25. gunicorn kills a request at 180 seconds, so run from chat
+it would die roughly a tenth of the way in, take its worker's other in-flight
+requests with it, and discard everything it had read. "sync donations dry run
+full" in chat prints this command instead of attempting it.
 
 The same planner either way: this calls the same DonationSync.sync and the
 same report formatter the chat command uses, so a preview here and a preview

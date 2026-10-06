@@ -105,10 +105,11 @@ def _sync_donations(query_lower: str) -> str:
         # Not run here. A full preview reads ~18,800 profiles and ~26,600
         # donations, then searches HubSpot once per donor with an email —
         # 7,604 of them. HubSpot caps the Search API at 5 requests per second
-        # across all object types, so the HubSpot half alone cannot finish in
-        # under ~25 minutes, and gunicorn kills a request at 180s. The worker
-        # dies about an eighth of the way in, taking its other in-flight
-        # requests with it, and the work is thrown away.
+        # across all object types and this paces at 4 to stay clear of it, so
+        # the HubSpot half alone takes ~32 minutes (7,604 / 4 = 1,901s). Even
+        # pacing right at the cap it would be ~25. gunicorn kills a request at
+        # 180s, so the worker dies about a tenth of the way in, taking its
+        # other in-flight requests with it, and the work is thrown away.
         logger.info("full donation preview requested; handing over to the CLI")
         return DONATION_FULL_PREVIEW_REPLY
     logger.info("Running donation sync (dry_run=%s, full=%s)...",
@@ -263,10 +264,11 @@ DONATION_FULL_PREVIEW_REPLY = (
     "📚 **A full preview has to run from the command line.**\n\n"
     "It reads ~18,800 CSuite profiles and ~26,600 donations, then searches "
     "HubSpot once per donor with an email — about 7,604 searches. HubSpot "
-    "caps its Search API at **5 requests per second**, so that half alone "
-    "takes ~25 minutes, and a web request is killed at 180 seconds. Run from "
-    "chat it would die about an eighth of the way in, take the worker's other "
-    "requests down with it, and throw away everything it had read.\n\n"
+    "caps its Search API at **5 requests per second** and this paces at 4 to "
+    "stay clear of it, so that half alone takes **~32 minutes**, and a web "
+    "request is killed at 180 seconds. Run from chat it would die about a "
+    "tenth of the way in, take the worker's other requests down with it, and "
+    "throw away everything it had read.\n\n"
     "```\n"
     "python scripts/donation_preview.py --full --out donation_preview.md\n"
     "```\n\n"
