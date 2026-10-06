@@ -227,8 +227,9 @@ def test_sync_all_cannot_walk_past_the_gate(monkeypatch):
         raise DonationSyncDisabled("off")
 
     monkeypatch.setattr(sync_commands, "run_donation_sync", refuse)
-    monkeypatch.setattr(sync_commands, "run_event_sync",
-                        lambda dry_run=False: {"created": 0})
+    monkeypatch.setattr(sync_commands.event_apply, "run",
+                        lambda **kw: {"created": 0, "updated": 0,
+                                      "unchanged": 0, "review": 0})
     monkeypatch.setattr(sync_commands, "run_newsletter_sync",
                         lambda dry_run=False: {"subscribed": 0})
 

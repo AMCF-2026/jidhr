@@ -919,21 +919,37 @@ class HubSpotClient:
         - eventOrganizer: str
         - customProperties: list of {name, value}
         """
-        external_account_id = "jidhr-amcf"
         external_event_id = event_data.get("externalEventId")
         if not external_event_id:
             return {"error": "externalEventId is required"}
 
+        # The caller supplies externalAccountId. This method used to inject
+        # "jidhr-amcf" itself, which is how sync/event_hubspot.py came to
+        # declare a DIFFERENT value ("amuslimcf-csuite") without anyone
+        # noticing: the one that was actually sent lived here, inside the
+        # client, invisible to every caller and to the module whose job was to
+        # own it. HubSpot keys an event on the pair, so two values meant two
+        # namespaces — see sync.event_hubspot.EXTERNAL_ACCOUNT_ID.
+        if not event_data.get("externalAccountId"):
+            return {"error": "externalAccountId is required — pass "
+                             "sync.event_hubspot.EXTERNAL_ACCOUNT_ID"}
+
         # PUT requires externalEventId in both URL and body
         endpoint = f"marketing/v3/marketing-events/events/{external_event_id}"
-        event_data["externalAccountId"] = external_account_id
         event_data["externalEventId"] = external_event_id
 
         return self._put(endpoint, event_data)
     
-    def search_marketing_event_by_external_id(self, external_id: str) -> dict:
-        """Search for marketing event by external ID"""
-        return self._get(f"marketing/v3/marketing-events/external/{external_id}")
+    # search_marketing_event_by_external_id was removed on 2026-10-06. It
+    # called GET marketing/v3/marketing-events/external/{id}, which returns
+    # 404 for every id on this portal including ids that exist (verified
+    # 2026-09-30, re-verified 2026-10-06). Its only caller treated the error
+    # as "the event does not exist", so the chat sync re-PUT all 11 events on
+    # every run and skipped nothing. The working shape is
+    # GET marketing/v3/marketing-events/events/{externalEventId} with
+    # externalAccountId as a QUERY parameter; the sync does not need it,
+    # because sync.event_hubspot.hubspot_index lists the portal once and
+    # indexes it locally.
     
     # =========================================================================
     # MARKETING EMAILS

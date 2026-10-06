@@ -8,8 +8,8 @@ invokes the requested sync, and formats the result for the user.
 """
 
 import logging
-from sync import (DonationSyncDisabled, run_donation_sync,
-                  run_event_sync, run_newsletter_sync)
+from sync import DonationSyncDisabled, run_donation_sync, run_newsletter_sync
+from sync import event_apply
 
 logger = logging.getLogger(__name__)
 
@@ -120,16 +120,45 @@ def _sync_donations(query_lower: str) -> str:
         return f"❌ Donation sync failed: {e}"
 
 
+# The words that make an event sync WRITE. Everything else previews.
+#
+# It used to be the other way round: "sync events" wrote, and only "dry run"
+# or "test" in the message held it back. A one-line chat message is a thin
+# thing to hang eleven marketing events on, and the dry run is free.
+EVENT_APPLY_PHRASE = "apply"
+
+
+def _event_limit(query_lower: str):
+    """The record cap for a live run: "limit N", or "no limit", or the
+    default. Updates count toward it as well as creates."""
+    import re
+
+    if "no limit" in query_lower or "unlimited" in query_lower:
+        return None
+    found = re.search(r"limit\s+(\d+)", query_lower)
+    if found:
+        return max(int(found.group(1)), 0)
+    return event_apply.CHAT_DEFAULT_LIMIT
+
+
 def _sync_events(query_lower: str) -> str:
-    """Run event sync (CSuite → HubSpot)."""
-    logger.info("Running event sync...")
-    dry_run = 'dry run' in query_lower or 'test' in query_lower
+    """Plan an event sync, and write only if the message says to.
+
+    One implementation, shared with scripts/event_sync.py — sync/events.py was
+    retired on 2026-10-06. It had its own payload shape, no notion of an
+    update, a dedup check that called a HubSpot endpoint which 404s for every
+    id, and a different externalAccountId from the module whose job was to own
+    that value.
+    """
+    apply = EVENT_APPLY_PHRASE in query_lower
+    limit = _event_limit(query_lower) if apply else None
+    logger.info("Running event sync (apply=%s, limit=%s)...", apply, limit)
 
     try:
-        results = run_event_sync(dry_run=dry_run)
-        return _format_event_sync_results(results, dry_run)
+        results = event_apply.run(dry_run=not apply, limit=limit)
+        return _format_event_sync_results(results)
     except Exception as e:
-        logger.error(f"Event sync error: {e}")
+        logger.error(f"Event sync error: {e}", exc_info=True)
         return f"❌ Event sync failed: {e}"
 
 
@@ -167,8 +196,18 @@ def _run_all_syncs() -> str:
         responses.append(f"❌ Donations: {e}")
 
     try:
-        event_results = run_event_sync(dry_run=False)
-        responses.append(f"✅ Events: {event_results['created']} created")
+        # Capped, like a chat live run: "sync all" is one line too.
+        event_results = event_apply.run(
+            dry_run=False, limit=event_apply.CHAT_DEFAULT_LIMIT)
+        if event_results.get("error"):
+            responses.append(f"❌ Events: {event_results['error']}")
+        else:
+            responses.append(
+                f"✅ Events: {event_results['created']} created, "
+                f"{event_results['updated']} updated, "
+                f"{event_results['unchanged']} unchanged"
+                + (f", {event_results['review']} need a human"
+                   if event_results.get("review") else ""))
     except Exception as e:
         responses.append(f"❌ Events: {e}")
 
@@ -184,6 +223,9 @@ def _run_all_syncs() -> str:
 # ---------------------------------------------------------------------------
 # Formatters
 # ---------------------------------------------------------------------------
+
+# How many "needs a human" rows the event report prints before summarising.
+EVENT_REVIEW_ROWS_SHOWN = 10
 
 # How many link rows the dry-run table shows. The counts above it are the real
 # totals; this caps only what is printed, so a long run stays readable.
@@ -286,24 +328,90 @@ def _format_link_outcomes(results: dict, dry_run: bool) -> str:
     return "\n".join(lines)
 
 
-def _format_event_sync_results(results: dict, dry_run: bool) -> str:
-    prefix = "🧪 **DRY RUN** - " if dry_run else ""
+def _format_event_sync_results(results: dict) -> str:
+    """Six outcomes, six lines. None of them stands in for another.
 
-    response = f"""{prefix}✅ **Event Sync Complete**
+    The old formatter reported `created` and `skipped_exists` and had no words
+    for an update, for a record it deferred, for a create that came back
+    without an id, or for one a person has to look at. A sync that can only
+    say "created 7" cannot tell you it changed nothing, and that was true of
+    it on every run after the first.
+    """
+    if results.get("error"):
+        return f"❌ **Event sync stopped.**\n\n{results['error']}"
 
-📊 **Results:**
-• **{results['created']}** events created in HubSpot
-• **{results['skipped_exists']}** events skipped (already exist)
-• **{results['skipped_past']}** events skipped (past events)
-• **{results['skipped_archived']}** events skipped (archived)
-• **{results['errors']}** errors"""
+    dry_run = results.get("dry_run", True)
+    head = ("🧪 **Event Sync — DRY RUN**" if dry_run
+            else "✅ **Event Sync — APPLIED**")
+    lines = [head, ""]
 
-    if results.get('details'):
-        response += "\n\n📅 **Events:**"
-        for detail in results['details'][:5]:
-            response += f"\n• {detail}"
+    verb = "would be " if dry_run else ""
+    lines += [
+        "📊 **Outcomes:**",
+        f"• **{results.get('created', 0)}** {verb}created",
+        f"• **{results.get('updated', 0)}** {verb}updated",
+        f"• **{results.get('unchanged', 0)}** unchanged — nothing to send",
+    ]
+    if not dry_run:
+        lines.append(
+            f"• **{results.get('deferred', 0)}** deferred — the "
+            f"`limit` was reached, so they were not attempted")
+        lines.append(
+            f"• **{results.get('unknown', 0)}** unknown — the create came "
+            f"back with no id, so it may or may not have landed. "
+            f"**Never retried**; the next run resolves it by lookup")
+        lines.append(f"• **{results.get('failed', 0)}** failed")
+    lines.append(
+        f"• **{results.get('review', 0)}** need a human — nothing was "
+        f"written to these")
+    lines.append(
+        f"• **{results.get('skipped', 0)}** not syncable (no event date in "
+        f"CSuite)")
 
-    return response
+    rows = results.get("review_rows") or []
+    if rows:
+        lines += ["", "🔎 **Needs a human:**"]
+        for eventdate_id, name, reason in rows[:EVENT_REVIEW_ROWS_SHOWN]:
+            label = (name or "(no name)")[:60]
+            lines.append(f"• `{eventdate_id}` {label} — {reason}")
+        if len(rows) > EVENT_REVIEW_ROWS_SHOWN:
+            lines.append(f"• … and **{len(rows) - EVENT_REVIEW_ROWS_SHOWN}** "
+                         "more; the count above is the total")
+
+    if results.get("stopped"):
+        lines += ["", f"🛑 **Stopped:** {results['stopped']}",
+                  "Nothing further was created. Re-run after checking "
+                  "HubSpot — the next run resolves the ambiguous record by "
+                  "lookup rather than retrying it."]
+
+    lines += ["", f"📞 {results.get('csuite_calls', 0)} CSuite call(s), "
+                  f"{results.get('hubspot_calls', 0)} HubSpot read call(s), "
+                  f"{results.get('event_dates_read', 0)} event date(s) read"]
+
+    if dry_run:
+        # Says what was actually written. The CLI printed "nothing was
+        # written to HubSpot or to hubsync" while record_run had just
+        # inserted a run_log row — a message that contradicted the code one
+        # line above it.
+        written = ("One `hubsync.run_log` row was written, recording that "
+                   "this preview happened."
+                   if results.get("run_logged")
+                   else "Nothing was written anywhere — `hubsync` is not "
+                        "available, so not even the run log.")
+        lines += ["", f"ℹ️ **Nothing was written to HubSpot.** {written}", "",
+                  'Say *"sync events apply"* to write it, '
+                  f'capped at {event_apply.CHAT_DEFAULT_LIMIT} records — '
+                  'add *"limit 20"* or *"no limit"* to change that.']
+    elif results.get("limit") is not None:
+        lines += ["", f"ℹ️ Capped at {results['limit']} record(s) this run. "
+                      'Say *"no limit"* to lift it.']
+
+    if not results.get("migration_applied"):
+        lines += ["", "⚠️ `hubsync.event_map` does not exist, so this run had "
+                      "no duplicate guard and no memory of previous runs. "
+                      "Apply `migrations/001_hubsync_event_map.sql`."]
+
+    return "\n".join(lines)
 
 
 def _format_newsletter_sync_results(results: dict, dry_run: bool) -> str:
