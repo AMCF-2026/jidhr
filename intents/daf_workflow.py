@@ -796,46 +796,12 @@ class DuplicateProfile(Exception):
         super().__init__(f"profile {profile_id} already exists ({source})")
 
 
-# A stored id is not evidence that a profile exists.
-PROFILE_EXISTS = "exists"
-PROFILE_MISSING = "missing"
-PROFILE_UNREADABLE = "unreadable"
-
-
-def csuite_profile_state(csuite, profile_id):
-    """(state, record) for a profile id. One READ; no write budget is touched.
-
-    Three outcomes, because two of them lead to opposite decisions:
-
-    * PROFILE_EXISTS — read back, with a profile_id in it.
-    * PROFILE_MISSING — a clean "not found". The id is stale.
-    * PROFILE_UNREADABLE — anything else. **Not** the same as missing: a
-      transport fault or a 500 says nothing about whether the profile is there,
-      and treating it as missing would invite creating a duplicate.
-    """
-    try:
-        response = csuite._request("profile/display", {"profile_id": profile_id})
-    except Exception as e:
-        logger.error("could not read CSuite profile %s: %s", profile_id, e)
-        return PROFILE_UNREADABLE, None
-
-    if not isinstance(response, dict):
-        return PROFILE_UNREADABLE, None
-
-    record = response.get("data")
-    if isinstance(record, list) and record:
-        record = record[0]
-    if isinstance(record, dict) and record.get("profile_id"):
-        return PROFILE_EXISTS, record
-
-    # CSuite answers a missing profile with success=0 and "Profile not found".
-    # Anything else — a 5xx, a network fault, an unparseable body — is not a
-    # statement that the profile is absent.
-    error = str(response.get("error") or "")
-    errors = " ".join(str(e) for e in (response.get("errors") or []))
-    if "not found" in (error + " " + errors).lower():
-        return PROFILE_MISSING, None
-    return PROFILE_UNREADABLE, None
+# Moved to sync/profile_state.py on 2026-10-06, so the donation sync asks the
+# same question the same way before it overwrites a contact's
+# csuite_profile_id. Re-exported here because this is where every caller and
+# every test has imported it from since 2026-10-02.
+from sync.profile_state import (PROFILE_EXISTS, PROFILE_MISSING,  # noqa: E402
+                                PROFILE_UNREADABLE, csuite_profile_state)
 
 
 def already_in_csuite(data: dict, hubspot, csuite):
