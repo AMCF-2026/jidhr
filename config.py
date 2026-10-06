@@ -154,6 +154,20 @@ class Config:
         os.environ.get('CSUITE_DAF_FUND_CREATE_ENABLED', 'False')
         .strip().lower() == 'true')
 
+    # Whether "sync newsletter" may WRITE to HubSpot. Off.
+    #
+    # It POSTs communication-preferences/v3/subscribe once per CSuite profile
+    # with a newsletter opt-in — a subscription change on a real person's
+    # contact record, which is a compliance-adjacent write, not a data field.
+    # Like the donation sync it had no flag, no cap and no dry-run default;
+    # found on 2026-10-06 when a test that called "sync all" unpatched spent
+    # 70 seconds paging CSuite on the way to doing it for real.
+    #
+    # A DRY RUN ignores this flag and writes nothing.
+    CSUITE_NEWSLETTER_SYNC_ENABLED = (
+        os.environ.get('CSUITE_NEWSLETTER_SYNC_ENABLED', 'False')
+        .strip().lower() == 'true')
+
     # Whether "sync donations" may WRITE to HubSpot. Off.
     #
     # It writes five properties per matched contact, one of which is

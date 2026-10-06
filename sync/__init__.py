@@ -12,7 +12,10 @@ Available syncs:
 
 from sync.donations import (DonationSync, DonationSyncDisabled,
                             donation_sync_allowed, run_donation_sync)
-from sync.newsletter import NewsletterSync, run_newsletter_sync
+from sync.newsletter import (NewsletterSync,
+                             NewsletterSyncDisabled,
+                             newsletter_sync_allowed,
+                             run_newsletter_sync)
 
 __all__ = [
     'DonationSync',
@@ -20,6 +23,8 @@ __all__ = [
     'donation_sync_allowed',
     'EventSync', 
     'NewsletterSync',
+    'NewsletterSyncDisabled',
+    'newsletter_sync_allowed',
     'run_donation_sync',
     'run_newsletter_sync',
 ]

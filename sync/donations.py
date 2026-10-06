@@ -326,6 +326,10 @@ class DonationSync:
             'link_differs': 0,        # differs, and not checked (dry run)
             'link_stale': 0,          # stored id resolves to nothing
             'link_unverifiable': 0,   # CSuite would not say
+            # One HubSpot contact claimed by more than one CSuite profile.
+            # Nothing at all is written to it — see the loop.
+            'shared_email': 0,
+            'shared_email_rows': [],
             # One row per contact a live run would PATCH. Dry run only.
             'link_rows': [],
             'profile_reads': 0,
@@ -367,11 +371,73 @@ class DonationSync:
         
         states = ProfileStateCache(self.csuite)
 
+        # Which CSuite profiles would land on the same HubSpot contact.
+        #
+        # Matching is profile.primary_email -> contact.email, and CSuite
+        # permits two profiles with the same address. Both then resolve to ONE
+        # contact, and the loop below used to process them one after the other:
+        # the second PATCH overwrote the first donor's figures with the
+        # second's, so the contact ended up showing one profile's giving and
+        # nothing recorded that the other existed. Measured on 2026-10-06 with
+        # contact 542578284242, profiles 21333 ($5,000, 4 gifts) and 21325
+        # ($250, 1 gift): the contact finished with $250 and a donation_count
+        # of 1, because 21325 happened to be processed second.
+        #
+        # Which one won depended on the order donations came back from CSuite.
+        #
+        # They are NOT summed. Two profiles sharing an address may be one
+        # person entered twice or two people in a household, and this sync
+        # cannot tell. Summing would invent a donor; writing one of them
+        # silently picks a winner. So the contact is left alone and listed.
+        from collections import defaultdict
+
+        from sync.readback import normalise_email
+
+        sharers = defaultdict(list)
+        for candidate in aggregates:
+            key = normalise_email(profile_emails.get(candidate))
+            if key:
+                sharers[key].append(candidate)
+        shared_handled = set()
+
         for profile_id, agg in aggregates.items():
             email = profile_emails.get(profile_id)
             
             if not email:
                 results['skipped_no_email'] += 1
+                continue
+
+            key = normalise_email(email)
+            claimants = sharers.get(key) or [profile_id]
+            if len(claimants) > 1:
+                # Counted once per CONTACT, not once per profile: the thing
+                # needing a human is the contact.
+                if key in shared_handled:
+                    continue
+                shared_handled.add(key)
+                contact, contact_error = self._read_contact(email)
+                if contact_error:
+                    results['errors'] += 1
+                    logger.error("could not read the HubSpot contact shared "
+                                 "by profiles %s: %s", claimants,
+                                 contact_error)
+                    continue
+                if contact is None:
+                    results['skipped_not_found'] += 1
+                    continue
+                results['shared_email'] += 1
+                results['shared_email_rows'].append({
+                    "contact_id": contact["id"],
+                    "profiles": [str(p) for p in claimants],
+                    "current": ((contact.get("properties") or {})
+                                .get("csuite_profile_id") or "").strip(),
+                })
+                logger.warning(
+                    "contact %s is claimed by %d CSuite profiles (%s): "
+                    "NOTHING was written to it. Donation totals are not "
+                    "summed — merge or separate the profiles in CSuite.",
+                    contact["id"], len(claimants),
+                    ", ".join(str(p) for p in claimants))
                 continue
 
             # The contact is READ before anything is decided, so the stored

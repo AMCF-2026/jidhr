@@ -18,6 +18,23 @@ from config import Config
 logger = logging.getLogger(__name__)
 
 
+class NewsletterSyncDisabled(RuntimeError):
+    """A live newsletter sync was asked for while the flag is off.
+
+    Raised, not returned as a result with zero subscriptions: "0 subscribed"
+    is also what a successful run over a CSuite with no opt-ins looks like —
+    which is exactly what this sync returned on 2026-10-06, and the reason
+    nobody noticed it was running live from "sync all".
+    """
+
+
+def newsletter_sync_allowed() -> bool:
+    """Is a WRITING newsletter sync permitted? Reads config at call time."""
+    import config
+    return bool(getattr(config.Config, "CSUITE_NEWSLETTER_SYNC_ENABLED",
+                        False))
+
+
 class NewsletterSync:
     """Sync newsletter opt-in from CSuite to HubSpot"""
     
@@ -101,6 +118,19 @@ class NewsletterSync:
         # Use limit for dry run or quick mode
         profile_limit = 500 if (dry_run or quick) else None
         
+        # The gate is HERE, not in the chat handler: "sync all" calls
+        # run_newsletter_sync(dry_run=False) directly and never comes through
+        # it. Every writing path passes through this method. Same placement,
+        # and the same reasoning, as DonationSync.sync.
+        if not dry_run and not newsletter_sync_allowed():
+            logger.warning(
+                "newsletter sync REFUSED: CSUITE_NEWSLETTER_SYNC_ENABLED is "
+                "off. Nothing was read and nothing was written.")
+            raise NewsletterSyncDisabled(
+                "CSUITE_NEWSLETTER_SYNC_ENABLED is off, so no HubSpot "
+                "subscription was changed. Say \"sync newsletter dry run\" "
+                "to preview it, or set the flag to run it for real.")
+
         logger.info(f"Starting newsletter sync... (dry_run={dry_run}, quick={quick})")
         
         # Step 1: Get opted-in profiles from CSuite
