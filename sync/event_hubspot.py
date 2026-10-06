@@ -71,7 +71,26 @@ EXTERNAL_PREFIX = "csuite-"
 # explicitly anyway: it is the field that says which upstream system a
 # marketing event came from, and "the previous app got away with it" is
 # not a reason to leave it blank.
-EXTERNAL_ACCOUNT_ID = "amuslimcf-csuite"
+# VERIFIED 2026-10-06 against production, by reading one event back under
+# three different values:
+#
+#   GET .../events/csuite-1464?externalAccountId=jidhr-amcf        -> FOUND
+#   GET .../events/csuite-1464?externalAccountId=amuslimcf-csuite  -> 404
+#   GET .../events/csuite-1464?externalAccountId=<made up>         -> 404
+#
+# So HubSpot resolves a marketing event by the PAIR (externalAccountId,
+# externalEventId), and all 11 csuite-* events in the portal live under
+# "jidhr-amcf" — the value clients/hubspot.create_marketing_event used to
+# inject on its own, out of sight of every caller. This file previously
+# declared "amuslimcf-csuite"; an --apply run under that value would not have
+# found the existing events and, per HubSpot's documented upsert behaviour
+# ("otherwise a new event will be created"), would most likely have made 11
+# duplicates.
+#
+# The field is write-only as far as this portal is concerned: no read endpoint
+# returns it. It cannot be confirmed by looking at a record, only by the
+# lookup above.
+EXTERNAL_ACCOUNT_ID = "jidhr-amcf"
 
 # The fields sent to HubSpot, and therefore the only fields whose change
 # should trigger an update. goal_amount and available_seats move without

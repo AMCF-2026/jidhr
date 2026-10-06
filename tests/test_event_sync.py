@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from sync import event_apply as ea
 from sync import event_hubspot as eh
 from scripts import event_sync as cli
 
@@ -381,7 +382,7 @@ class FakeHubSpot:
 @pytest.fixture
 def no_db(monkeypatch):
     """_save_map writes to Postgres; these tests are about HubSpot."""
-    monkeypatch.setattr(cli, "_save_map", lambda *a, **k: None)
+    monkeypatch.setattr(ea, "_save_map", lambda *a, **k: None)
 
 
 def plan_of(creates=0, updates=0):
@@ -400,14 +401,18 @@ def test_every_create_payload_carries_the_external_account_id():
     mapped = eh.map_event_date(row(), "AMCF")
     assert mapped.payload["externalAccountId"] == "amcf-csuite" or \
         mapped.payload["externalAccountId"] == eh.EXTERNAL_ACCOUNT_ID
-    assert eh.EXTERNAL_ACCOUNT_ID == "amuslimcf-csuite"
+    # VERIFIED 2026-10-06: the 11 csuite-* marketing events in the portal
+    # resolve under this value and 404 under any other, so it is the pair
+    # HubSpot keys them on. The module declared "amuslimcf-csuite" until then
+    # while clients/hubspot.create_marketing_event quietly injected this one.
+    assert eh.EXTERNAL_ACCOUNT_ID == "jidhr-amcf"
 
 
 def test_the_external_account_id_is_on_the_wire(no_db):
     hubspot = FakeHubSpot()
     cli.apply_plan(hubspot, plan_of(creates=2))
     for _method, _endpoint, payload in hubspot.creates:
-        assert payload["externalAccountId"] == "amuslimcf-csuite"
+        assert payload["externalAccountId"] == "jidhr-amcf"
 
 
 # --- stop on the first bad create ------------------------------------
@@ -452,7 +457,7 @@ def test_a_create_that_succeeds_does_not_stop_the_run(no_db):
 def test_the_ambiguous_record_is_recorded_unknown_not_retried(no_db):
     saved = []
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(cli, "_save_map",
+        patch.setattr(ea, "_save_map",
                       lambda mapped, hid, status, error=None:
                       saved.append((mapped.csuite_eventdate_id, status)))
         hubspot = FakeHubSpot(create_results=[{"error": "timeout"}])
