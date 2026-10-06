@@ -160,6 +160,27 @@ def _event_limit(query_lower: str):
     return event_apply.CHAT_DEFAULT_LIMIT
 
 
+def _event_options(query_lower: str) -> dict:
+    """The brakes a chat message can ask for.
+
+    Defaults are the cautious ones: creates are future-only, and anything
+    plan() flagged for review is withheld whatever the message says. "no
+    limit" lifts the record cap, never the withholding.
+    """
+    import re
+
+    return {
+        "updates_only": "updates only" in query_lower,
+        # Deliberately NOT exposed in chat: future_only. A chat message is
+        # one line, and "create 74 marketing events for things that already
+        # happened" is not a decision one line should be able to make. The
+        # CLI has --past-creates for that.
+        # Past creates need their id naming, one at a time. On 2026-10-06
+        # that was 74 of 77 creates, 73 of them archived in CSuite.
+        "include_ids": re.findall(r"include\s+(\d+)", query_lower),
+    }
+
+
 def _sync_events(query_lower: str) -> str:
     """Plan an event sync, and write only if the message says to.
 
@@ -173,8 +194,9 @@ def _sync_events(query_lower: str) -> str:
     limit = _event_limit(query_lower) if apply else None
     logger.info("Running event sync (apply=%s, limit=%s)...", apply, limit)
 
+    options = _event_options(query_lower)
     try:
-        results = event_apply.run(dry_run=not apply, limit=limit)
+        results = event_apply.run(dry_run=not apply, limit=limit, **options)
         return _format_event_sync_results(results)
     except Exception as e:
         logger.error(f"Event sync error: {e}", exc_info=True)
@@ -291,6 +313,9 @@ SHARED_EMAIL_ROWS_SHOWN = 10
 
 # How many "needs a human" rows the event report prints before summarising.
 EVENT_REVIEW_ROWS_SHOWN = 10
+
+# How many withheld rows the event report prints before summarising.
+EVENT_WITHHELD_ROWS_SHOWN = 10
 
 # How many link rows the dry-run table shows. The counts above it are the real
 # totals; this caps only what is printed, so a long run stays readable.
@@ -474,6 +499,9 @@ def _format_event_sync_results(results: dict) -> str:
         f"• **{results.get('updated', 0)}** {verb}updated",
         f"• **{results.get('unchanged', 0)}** unchanged — nothing to send",
     ]
+    lines.append(
+        f"• **{results.get('withheld', 0)}** withheld — planned, counted, "
+        f"and deliberately NOT written")
     if not dry_run:
         lines.append(
             f"• **{results.get('deferred', 0)}** deferred — the "
@@ -483,12 +511,36 @@ def _format_event_sync_results(results: dict) -> str:
             f"back with no id, so it may or may not have landed. "
             f"**Never retried**; the next run resolves it by lookup")
         lines.append(f"• **{results.get('failed', 0)}** failed")
+    # `review` is an overlay: plan() appends to it IN ADDITION to a
+    # record's create/update bucket, so it double-counts against the lines
+    # above. Measured 2026-10-06, all 79 review entries were also creates
+    # (73) or updates (6). Saying so is the difference between a reader
+    # reconciling the numbers and a reader hunting for 19 missing records.
     lines.append(
-        f"• **{results.get('review', 0)}** need a human — nothing was "
-        f"written to these")
+        f"• **{results.get('review', 0)}** need a human — *also counted "
+        f"above*, not a separate group. All of these are withheld.")
     lines.append(
         f"• **{results.get('skipped', 0)}** not syncable (no event date in "
         f"CSuite)")
+
+    withheld = results.get("withheld_rows") or []
+    if withheld:
+        lines += ["", "🚫 **Withheld — nothing was written to these:**"]
+        from collections import Counter
+        kinds = Counter(
+            "needs a human" if str(why).startswith("needs a human")
+            else "starts in the past" if "starts in the past" in str(why)
+            else "updates only" if "updates only" in str(why)
+            else "other"
+            for _id, why in withheld)
+        for kind, count in kinds.most_common():
+            lines.append(f"• **{count}** {kind}")
+        for record_id, why in withheld[:EVENT_WITHHELD_ROWS_SHOWN]:
+            lines.append(f"   `{record_id}` — {str(why)[:96]}")
+        if len(withheld) > EVENT_WITHHELD_ROWS_SHOWN:
+            lines.append(f"   … and **"
+                         f"{len(withheld) - EVENT_WITHHELD_ROWS_SHOWN}** more; "
+                         "the count above is the total")
 
     rows = results.get("review_rows") or []
     if rows:
@@ -524,7 +576,16 @@ def _format_event_sync_results(results: dict) -> str:
                   'Say *"sync events apply"* to write it, '
                   f'capped at {event_apply.CHAT_DEFAULT_LIMIT} records — '
                   'add *"limit 20"* or *"no limit"* to change that.']
-    elif results.get("limit") is not None:
+    if results.get("updates_only"):
+        lines += ["", "ℹ️ **Updates only** — every create was withheld."]
+    elif not results.get("future_only", True):
+        lines += ["", "⚠️ **future_only is off** — past events can be "
+                      "created."]
+    if results.get("include_ids"):
+        lines += ["", "ℹ️ Past creates allowed by id: "
+                      + ", ".join(f"`{i}`" for i in results["include_ids"])]
+
+    if results.get("limit") is not None and not results.get("dry_run", True):
         lines += ["", f"ℹ️ Capped at {results['limit']} record(s) this run. "
                       'Say *"no limit"* to lift it.']
 

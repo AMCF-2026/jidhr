@@ -180,7 +180,46 @@ class FirstFailureStop(Exception):
         self.reason = reason
 
 
-def apply_plan(hubspot, result, limit=None) -> list:
+def review_ids(result) -> dict:
+    """{csuite_eventdate_id: reason} for everything plan() flagged.
+
+    `review` is an OVERLAY, not a bucket: plan() appends to it in addition
+    to a record's create/update bucket, so every entry in it also appears
+    somewhere else. Measured 2026-10-06: all 79 review entries were also
+    creates (73) or updates (6). A report that lists review alongside the
+    disjoint counts therefore double-counts, and an apply that acts on a
+    record it has just called "needs a human" contradicts its own report.
+    """
+    return {mapped.csuite_eventdate_id: reason
+            for mapped, reason in (result.get("review") or [])
+            if mapped.csuite_eventdate_id}
+
+
+def today_in_portal_tz(today=None):
+    """Today in America/New_York — the zone every mapped time is built in."""
+    from datetime import date, datetime
+    from zoneinfo import ZoneInfo
+
+    if isinstance(today, date):
+        return today
+    return datetime.now(ZoneInfo("America/New_York")).date()
+
+
+def starts_in_the_past(mapped, today) -> bool:
+    """Is this record's planned start before `today`? Unknown counts as no."""
+    from datetime import datetime
+
+    start = (mapped.payload or {}).get("startDateTime")
+    if not start:
+        return False
+    try:
+        return datetime.fromisoformat(str(start)).date() < today
+    except ValueError:
+        return False
+
+
+def apply_plan(hubspot, result, limit=None, updates_only: bool = False,
+               include_ids=(), future_only: bool = True, today=None) -> list:
     """Create and update in HubSpot. Never deletes. Returns outcomes.
 
     Stops on the FIRST create that fails or comes back ambiguous, and
@@ -192,26 +231,95 @@ def apply_plan(hubspot, result, limit=None) -> list:
     `limit` caps how many records this run writes. Updates count toward
     it as well as creates: the point of a limit is to bound the blast
     radius of a run, and an update to the wrong event is not free.
+
+    **UPDATES GO FIRST.** An update touches a record that already exists
+    and whose previous value is recoverable from HubSpot's own history; a
+    create adds a row somebody has to delete by hand. When a limit is
+    spent, it should buy the reversible half.
+
+    Four things are WITHHELD — planned, counted, reported, never written:
+
+    * anything in `review`. Measured 2026-10-06, an unrestricted apply
+      would have created 73 HubSpot events for CSuite dates it had just
+      called "needs a human", and PATCHed a 2026-12-31 event from its real
+      10:00 start to midnight because CSuite has no start_time for it.
+    * every create, when `updates_only`.
+    * a create whose planned start is in the past, unless its id is in
+      `include_ids`. 74 of 77 creates were past on 2026-10-06, 73 of them
+      archived: marketing events for things that already happened.
+    * nothing else. Withholding is never silent.
     """
     outcomes = []
     written = 0
+    flagged = review_ids(result)
+    today = today_in_portal_tz(today)
+    include = {str(i) for i in (include_ids or ())}
 
     def budget_left():
         return limit is None or written < limit
 
-    for mapped, why in result["creates"]:
+    def withhold(mapped, why):
+        outcomes.append({"id": mapped.csuite_eventdate_id,
+                         "outcome": "withheld", "why": why})
+
+    def defer(mapped):
+        outcomes.append({"id": mapped.csuite_eventdate_id,
+                         "outcome": "deferred",
+                         "why": f"--limit {limit} reached"})
+
+    # --- updates first: the reversible half ---
+    for mapped, existing, why in result["updates"]:
+        reason = flagged.get(mapped.csuite_eventdate_id)
+        if reason:
+            withhold(mapped, f"needs a human: {reason}")
+            continue
         if not budget_left():
+            defer(mapped)
+            continue
+        hubspot_id = str(existing.get("objectId") or "")
+        # PATCH by externalEventId is the documented update path for
+        # marketing events; the objectId is stored for people, not used
+        # as the write key.
+        updated = hubspot._patch(
+            f"{CREATE_ENDPOINT}/{mapped.external_event_id}", mapped.payload)
+        error = (updated or {}).get("error")
+        if error:
+            _save_map(mapped, hubspot_id, "error", error)
             outcomes.append({"id": mapped.csuite_eventdate_id,
-                             "outcome": "deferred",
-                             "why": f"--limit {limit} reached"})
+                             "outcome": "failed", "why": why,
+                             "error": str(error)[:200]})
+        else:
+            _save_map(mapped, hubspot_id, "synced")
+            outcomes.append({"id": mapped.csuite_eventdate_id,
+                             "outcome": "updated", "hubspot_id": hubspot_id,
+                             "why": why})
+            written += 1
+
+    # --- then creates ---
+    for mapped, why in result["creates"]:
+        record_id = str(mapped.csuite_eventdate_id)
+        reason = flagged.get(mapped.csuite_eventdate_id)
+        if reason:
+            withhold(mapped, f"needs a human: {reason}")
+            continue
+        if updates_only:
+            withhold(mapped, "updates only — no event was created")
+            continue
+        if future_only and record_id not in include \
+                and starts_in_the_past(mapped, today):
+            start = (mapped.payload or {}).get("startDateTime")
+            withhold(mapped, f"starts in the past ({str(start)[:10]}) — "
+                             f"include it with its id to create it anyway")
+            continue
+        if not budget_left():
+            defer(mapped)
             continue
         created = hubspot._post(CREATE_ENDPOINT, mapped.payload)
         event_id = (created or {}).get("objectId") or (created or {}).get("id")
         error = (created or {}).get("error")
 
         if event_id:
-            _save_map(mapped, event_id,
-                      "review" if mapped.review_reason else "synced")
+            _save_map(mapped, event_id, "synced")
             outcomes.append({"id": mapped.csuite_eventdate_id,
                              "outcome": "created", "hubspot_id": str(event_id),
                              "why": why})
@@ -232,32 +340,6 @@ def apply_plan(hubspot, result, limit=None) -> list:
             f"create for {mapped.external_event_id} returned no id "
             f"({error or 'no objectId in response'}). Stopped before any "
             "further create.")
-
-    for mapped, existing, why in result["updates"]:
-        if not budget_left():
-            outcomes.append({"id": mapped.csuite_eventdate_id,
-                             "outcome": "deferred",
-                             "why": f"--limit {limit} reached"})
-            continue
-        hubspot_id = str(existing.get("objectId") or "")
-        # PATCH by externalEventId is the documented update path for
-        # marketing events; the objectId is stored for people, not used
-        # as the write key.
-        updated = hubspot._patch(
-            f"{CREATE_ENDPOINT}/{mapped.external_event_id}", mapped.payload)
-        error = (updated or {}).get("error")
-        if error:
-            _save_map(mapped, hubspot_id, "error", error)
-            outcomes.append({"id": mapped.csuite_eventdate_id,
-                             "outcome": "failed", "why": why,
-                             "error": str(error)[:200]})
-        else:
-            _save_map(mapped, hubspot_id,
-                      "review" if mapped.review_reason else "synced")
-            outcomes.append({"id": mapped.csuite_eventdate_id,
-                             "outcome": "updated", "hubspot_id": hubspot_id,
-                             "why": why})
-            written += 1
 
     # Unchanged rows still get their timestamp refreshed, so "last seen"
     # and "last changed" are different questions with different answers.
@@ -319,8 +401,59 @@ def record_run(result, fetched, hs_calls, applied, outcomes=None) -> None:
 
 
 
+def _date_read_ceiling():
+    """The view_limit event/list/dates is asked for, or None if it pages."""
+    from clients.csuite_fetch import ENDPOINT_CONTRACTS
+
+    contract = ENDPOINT_CONTRACTS.get(eh.EVENT_DATES_ENDPOINT)
+    if contract is None or contract.paginate:
+        return None
+    return contract.view_limit
+
+
+def _predict(result, updates_only=False, include_ids=(), future_only=True,
+             today=None) -> dict:
+    """What apply would write, decided by apply's own rules."""
+    flagged = review_ids(result)
+    today = today_in_portal_tz(today)
+    include = {str(i) for i in (include_ids or ())}
+    created = updated = 0
+    withheld_rows = []
+
+    for mapped, _existing, _why in result["updates"]:
+        reason = flagged.get(mapped.csuite_eventdate_id)
+        if reason:
+            withheld_rows.append((mapped.csuite_eventdate_id,
+                                  f"needs a human: {reason}"))
+        else:
+            updated += 1
+
+    for mapped, _why in result["creates"]:
+        record_id = str(mapped.csuite_eventdate_id)
+        reason = flagged.get(mapped.csuite_eventdate_id)
+        if reason:
+            withheld_rows.append((record_id, f"needs a human: {reason}"))
+        elif updates_only:
+            withheld_rows.append((record_id,
+                                  "updates only — no event was created"))
+        elif future_only and record_id not in include \
+                and starts_in_the_past(mapped, today):
+            start = (mapped.payload or {}).get("startDateTime")
+            withheld_rows.append(
+                (record_id, f"starts in the past ({str(start)[:10]}) — "
+                            "include it with its id to create it anyway"))
+        else:
+            created += 1
+
+    return {"created": created, "updated": updated,
+            "unchanged": len(result["unchanged"]),
+            "withheld": len(withheld_rows), "withheld_rows": withheld_rows}
+
+
 def run(hubspot=None, dry_run: bool = True, limit=None,
-        organizer: str = DEFAULT_ORGANIZER, pace_ms=None) -> dict:
+        organizer: str = DEFAULT_ORGANIZER, pace_ms=None,
+        updates_only: bool = False, include_ids=(),
+        future_only: bool = True, today=None) -> dict:
     """Plan an event sync and, unless `dry_run`, apply it.
 
     Returns a dict the caller can render: counts, outcomes, the plan itself,
@@ -334,6 +467,8 @@ def run(hubspot=None, dry_run: bool = True, limit=None,
            "run_logged": False, "migration_applied": False,
            "created": 0, "updated": 0, "unchanged": 0, "deferred": 0,
            "unknown": 0, "failed": 0, "skipped": 0, "review": 0,
+           "withheld": 0, "withheld_rows": [], "updates_only": updates_only,
+           "future_only": future_only, "include_ids": list(include_ids or ()),
            "csuite_calls": 0, "hubspot_calls": 0, "event_dates_read": 0,
            "review_rows": [], "plan": None}
 
@@ -355,6 +490,31 @@ def run(hubspot=None, dry_run: bool = True, limit=None,
         out["error"] = f"CSuite read failed: {fetched.error}"
         return out
 
+    # A short read looks exactly like a shrunken CSuite: dates that were not
+    # returned have no event_map row either, so they read as "not syncable"
+    # or as brand new. Nothing downstream can tell the difference, so the
+    # only safe answer is to refuse to plan at all.
+    if not fetched.complete:
+        out["error"] = ("the CSuite event-date read did not complete, so "
+                        "what is missing cannot be told from what does not "
+                        "exist. Nothing was planned.")
+        return out
+
+    # event/list/dates does NOT paginate — one call, view_limit 1000 (see
+    # clients.csuite_fetch.ENDPOINT_CONTRACTS). So a response AT the limit is
+    # indistinguishable from a response that was cut off at it, and there is
+    # no second page to ask for. 186 rows on 2026-10-06 left plenty of room;
+    # the day it does not, this refuses rather than silently dropping events.
+    ceiling = _date_read_ceiling()
+    if ceiling and len(fetched.rows) >= ceiling:
+        out["error"] = (
+            f"CSuite returned {len(fetched.rows)} event dates, at or above "
+            f"the {ceiling}-row request limit for an endpoint that does not "
+            f"paginate — the response may be truncated and there is no way "
+            f"to ask for the rest. Nothing was planned. Raise view_limit for "
+            f"event/list/dates in clients.csuite_fetch.ENDPOINT_CONTRACTS.")
+        return out
+
     index, hs_calls, hs_error = eh.hubspot_index(hubspot)
     out["hubspot_calls"] = hs_calls
     if hs_error:
@@ -374,23 +534,34 @@ def run(hubspot=None, dry_run: bool = True, limit=None,
                           for m, reason in result["review"]]
 
     if dry_run:
-        out["created"] = len(result["creates"])
-        out["updated"] = len(result["updates"])
-        out["unchanged"] = len(result["unchanged"])
+        # Predicted with the SAME rules apply would use, so the preview and
+        # the run cannot disagree about what would be written. Before this a
+        # preview said "77 would be created" and an apply would have written
+        # 3 of them.
+        planned = _predict(result, updates_only=updates_only,
+                           include_ids=include_ids, future_only=future_only,
+                           today=today)
+        out.update(planned)
         if have_tables:
             record_run(result, fetched, hs_calls, applied=False)
             out["run_logged"] = True
         return out
 
     try:
-        outcomes = apply_plan(hubspot, result, limit=limit)
+        outcomes = apply_plan(hubspot, result, limit=limit,
+                              updates_only=updates_only,
+                              include_ids=include_ids,
+                              future_only=future_only, today=today)
     except FirstFailureStop as stop:
         outcomes, out["stopped"] = stop.outcomes, stop.reason
 
     out["outcomes"] = outcomes
     for name in ("created", "updated", "unchanged", "deferred", "unknown",
-                 "failed"):
+                 "failed", "withheld"):
         out[name] = sum(1 for o in outcomes if o.get("outcome") == name)
+    out["withheld_rows"] = [(o["id"], o.get("why"))
+                            for o in outcomes
+                            if o.get("outcome") == "withheld"]
     record_run(result, fetched, hs_calls, applied=True, outcomes=outcomes)
     out["run_logged"] = True
     return out

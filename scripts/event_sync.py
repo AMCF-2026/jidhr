@@ -132,6 +132,21 @@ def main(argv=None) -> int:
                              "run. Updates count toward N as well as "
                              "creates: the point is to bound how much one "
                              "run can change.")
+    parser.add_argument("--updates-only", action="store_true",
+                        help="With --apply, write no creates at all. Every "
+                             "create is withheld and counted. Use this to "
+                             "correct events HubSpot already has without "
+                             "adding any.")
+    parser.add_argument("--include-id", action="append", default=[],
+                        metavar="ID", dest="include_ids",
+                        help="Create this past-dated event anyway, by CSuite "
+                             "event_date_id. Repeatable. Past creates are "
+                             "withheld by default — on 2026-10-06 that was "
+                             "74 of 77, and 73 of those were archived in "
+                             "CSuite.")
+    parser.add_argument("--past-creates", action="store_true",
+                        help="Allow EVERY past-dated create. The blunt "
+                             "instrument; prefer --include-id.")
     parser.add_argument("--pace-ms", type=int, default=None)
     args = parser.parse_args(argv)
 
@@ -200,7 +215,10 @@ def main(argv=None) -> int:
         return EXIT_OK
 
     try:
-        outcomes = apply_plan(hubspot, result, limit=args.limit)
+        outcomes = apply_plan(hubspot, result, limit=args.limit,
+                              updates_only=args.updates_only,
+                              include_ids=args.include_ids,
+                              future_only=not args.past_creates)
         stopped = None
     except FirstFailureStop as stop:
         outcomes, stopped = stop.outcomes, stop.reason

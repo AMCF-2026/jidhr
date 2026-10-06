@@ -9,7 +9,7 @@ before the request is built.
 Every event in this file is invented.
 """
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -385,6 +385,13 @@ def no_db(monkeypatch):
     monkeypatch.setattr(ea, "_save_map", lambda *a, **k: None)
 
 
+# The fixture rows are dated 2026-10-08. apply_plan withholds a create whose
+# start is in the past, so the clock is pinned before that date — otherwise
+# these tests quietly change meaning once it rolls past, which is the drift
+# that has already broken this suite twice.
+PINNED_TODAY = date(2026, 10, 1)
+
+
 def plan_of(creates=0, updates=0):
     rows = [row(event_date_id=1000 + i) for i in range(creates)]
     result = cli.plan(rows, {}, {}, "AMCF")
@@ -410,7 +417,7 @@ def test_every_create_payload_carries_the_external_account_id():
 
 def test_the_external_account_id_is_on_the_wire(no_db):
     hubspot = FakeHubSpot()
-    cli.apply_plan(hubspot, plan_of(creates=2))
+    cli.apply_plan(hubspot, plan_of(creates=2), today=PINNED_TODAY)
     for _method, _endpoint, payload in hubspot.creates:
         assert payload["externalAccountId"] == "jidhr-amcf"
 
@@ -429,7 +436,7 @@ def test_apply_stops_on_the_first_ambiguous_create(no_db):
         {"objectId": "hs-3"},
     ])
     with pytest.raises(cli.FirstFailureStop) as caught:
-        cli.apply_plan(hubspot, plan_of(creates=5))
+        cli.apply_plan(hubspot, plan_of(creates=5), today=PINNED_TODAY)
 
     assert len(hubspot.creates) == 2, "it kept creating after a failure"
     outcomes = caught.value.outcomes
@@ -443,13 +450,13 @@ def test_the_stop_carries_what_happened_before_it(no_db):
     hubspot = FakeHubSpot(create_results=[{"objectId": "hs-1"},
                                           {"objectId": None}])
     with pytest.raises(cli.FirstFailureStop) as caught:
-        cli.apply_plan(hubspot, plan_of(creates=4))
+        cli.apply_plan(hubspot, plan_of(creates=4), today=PINNED_TODAY)
     assert caught.value.outcomes[0]["hubspot_id"] == "hs-1"
 
 
 def test_a_create_that_succeeds_does_not_stop_the_run(no_db):
     hubspot = FakeHubSpot()
-    outcomes = cli.apply_plan(hubspot, plan_of(creates=3))
+    outcomes = cli.apply_plan(hubspot, plan_of(creates=3), today=PINNED_TODAY)
     assert len(hubspot.creates) == 3
     assert all(o["outcome"] == "created" for o in outcomes)
 
@@ -462,7 +469,7 @@ def test_the_ambiguous_record_is_recorded_unknown_not_retried(no_db):
                       saved.append((mapped.csuite_eventdate_id, status)))
         hubspot = FakeHubSpot(create_results=[{"error": "timeout"}])
         with pytest.raises(cli.FirstFailureStop):
-            cli.apply_plan(hubspot, plan_of(creates=3))
+            cli.apply_plan(hubspot, plan_of(creates=3), today=PINNED_TODAY)
     assert saved[-1][1] == "unknown"
 
 
@@ -471,7 +478,7 @@ def test_the_ambiguous_record_is_recorded_unknown_not_retried(no_db):
 @pytest.mark.parametrize("limit, expected", [(1, 1), (2, 2), (5, 5)])
 def test_limit_caps_the_number_of_creates(no_db, limit, expected):
     hubspot = FakeHubSpot()
-    cli.apply_plan(hubspot, plan_of(creates=8), limit=limit)
+    cli.apply_plan(hubspot, plan_of(creates=8), limit=limit, today=PINNED_TODAY)
     assert len(hubspot.creates) == expected
 
 
@@ -479,15 +486,19 @@ def test_updates_count_toward_the_limit_too(no_db):
     """The point of a limit is to bound the blast radius of a run, and an
     update to the wrong event is not free."""
     hubspot = FakeHubSpot()
-    cli.apply_plan(hubspot, plan_of(creates=2, updates=3), limit=3)
+    cli.apply_plan(hubspot, plan_of(creates=2, updates=3), limit=3, today=PINNED_TODAY)
     assert len(hubspot.creates) + len(hubspot.updates) == 3
-    assert len(hubspot.creates) == 2, "creates run first"
-    assert len(hubspot.updates) == 1
+    # UPDATES run first as of 2026-10-06: an update touches a record that
+    # already exists and whose previous value HubSpot still holds, while a
+    # create adds a row somebody has to delete by hand. A spent limit should
+    # buy the reversible half.
+    assert len(hubspot.updates) == 3, "updates run first"
+    assert len(hubspot.creates) == 0
 
 
 def test_records_beyond_the_limit_are_deferred_not_lost(no_db):
     hubspot = FakeHubSpot()
-    outcomes = cli.apply_plan(hubspot, plan_of(creates=4), limit=1)
+    outcomes = cli.apply_plan(hubspot, plan_of(creates=4), limit=1, today=PINNED_TODAY)
     deferred = [o for o in outcomes if o["outcome"] == "deferred"]
     assert len(deferred) == 3
     assert "--limit 1 reached" in deferred[0]["why"]
@@ -495,13 +506,13 @@ def test_records_beyond_the_limit_are_deferred_not_lost(no_db):
 
 def test_no_limit_means_no_cap(no_db):
     hubspot = FakeHubSpot()
-    cli.apply_plan(hubspot, plan_of(creates=6), limit=None)
+    cli.apply_plan(hubspot, plan_of(creates=6), limit=None, today=PINNED_TODAY)
     assert len(hubspot.creates) == 6
 
 
 def test_a_limit_of_zero_writes_nothing(no_db):
     hubspot = FakeHubSpot()
-    outcomes = cli.apply_plan(hubspot, plan_of(creates=3), limit=0)
+    outcomes = cli.apply_plan(hubspot, plan_of(creates=3), limit=0, today=PINNED_TODAY)
     assert hubspot.calls == []
     assert all(o["outcome"] == "deferred" for o in outcomes)
 
