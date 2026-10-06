@@ -23,6 +23,9 @@ from sync.profile_state import (PROFILE_EXISTS, PROFILE_MISSING,
 
 logger = logging.getLogger(__name__)
 
+# How many profiles and donations a `quick` run looks at.
+SAMPLE_SIZE = 500
+
 
 class DonationSyncDisabled(RuntimeError):
     """A live donation sync was asked for while the flag is off.
@@ -333,17 +336,33 @@ class DonationSync:
             # One row per contact a live run would PATCH. Dry run only.
             'link_rows': [],
             'profile_reads': 0,
+            # False when the run paged everything, so a report cannot call a
+            # sample a total.
+            'sampled': True,
+            # What was actually looked at, so a footer can state the cost
+            # rather than estimate it.
+            'profiles_read': 0,
+            'donations_read': 0,
         }
         
-        # Use limits for dry run or quick mode
-        profile_limit = 500 if (dry_run or quick) else None
-        donation_limit = 500 if (dry_run or quick) else None
+        # Sampling is `quick`'s job, and only `quick`'s.
+        #
+        # It used to be `dry_run or quick`, which made every preview a sample
+        # of 500 profiles and 500 donations and left no way to preview the run
+        # that would actually happen. The counts that matter before enabling
+        # this — how many contacts are claimed by two CSuite profiles, how
+        # many stored links are stale — cannot be read off a sample of 500 out
+        # of ~18,800. A preview you have to extrapolate from is not a preview.
+        profile_limit = SAMPLE_SIZE if quick else None
+        donation_limit = SAMPLE_SIZE if quick else None
+        results['sampled'] = bool(quick)
         
         logger.info(f"Starting donation sync... (dry_run={dry_run}, quick={quick})")
         
         # Step 1: Get profile email mapping
         logger.info("Step 1: Getting profile emails from CSuite...")
         profile_emails = self.get_profile_emails(limit=profile_limit)
+        results['profiles_read'] = len(profile_emails or {})
         
         if not profile_emails:
             logger.error("No profile emails found")
@@ -359,6 +378,7 @@ class DonationSync:
             results['details'].append("No donations found in CSuite")
             return results
         
+        results['donations_read'] = len(donations)
         logger.info(f"Found {len(donations)} donations")
         
         # Step 3: Aggregate by profile
