@@ -127,11 +127,23 @@ def test_a_plain_preview_is_still_sampled(chat, phrase):
     "sync donations dry run full",
     "sync donations full dry run",
 ])
-def test_full_unwires_the_sampling(chat, phrase):
-    sync_commands.handle(phrase, None)
+def test_a_full_preview_is_handed_to_the_cli_not_run_inline(chat, phrase):
+    """It cannot finish in a web request: ~7,604 HubSpot searches at a 5/s
+    cap is ~25 minutes against a 180s gunicorn timeout, and the worker dies
+    about an eighth of the way in taking its other requests with it."""
+    reply = sync_commands.handle(phrase, None)
 
-    assert chat["dry_run"] is True
-    assert chat["quick"] is False
+    assert chat == {}, "nothing may be read: the sync is not started at all"
+    assert "scripts/donation_preview.py --full" in reply
+    assert "5 requests per second" in reply
+    assert "180 seconds" in reply
+    assert "writes nothing" in reply
+
+
+def test_the_handover_still_offers_the_sample_that_does_run(chat):
+    reply = sync_commands.handle("sync donations dry run full", None)
+
+    assert 'sync donations dry run' in reply
 
 
 def test_full_without_dry_run_is_not_a_full_live_run(chat):
@@ -163,15 +175,16 @@ def test_a_sampled_preview_says_the_counts_are_not_totals():
     assert "these counts are not totals" in reply
 
 
-def test_a_sampled_preview_states_the_cost_of_the_full_one():
-    """So the person knows what they are asking for before they ask."""
+def test_a_sampled_preview_names_the_cli_for_the_real_figures():
+    """It points at the script, not at a chat phrase that only prints the
+    script's name."""
     reply = sync_commands._format_donation_sync_results(
         results_with(sampled=True), dry_run=True)
 
-    assert 'sync donations dry run full' in reply
+    assert "scripts/donation_preview.py --full" in reply
     assert "18,800" in reply
-    assert "takes minutes" in reply
-    assert "makes no writes" in reply
+    assert "tens of minutes" in reply
+    assert "writes nothing" in reply
 
 
 def test_a_full_preview_reports_what_it_read_and_claims_totals():
@@ -188,7 +201,7 @@ def test_a_full_preview_does_not_advertise_itself():
     reply = sync_commands._format_donation_sync_results(
         results_with(sampled=False), dry_run=True)
 
-    assert "dry run full" not in reply
+    assert "donation_preview.py" not in reply
 
 
 def test_both_previews_still_name_the_flag():
@@ -201,3 +214,65 @@ def test_both_previews_still_name_the_flag():
 def test_the_sample_size_is_not_duplicated_in_the_report():
     """The footer's number and the sync's limit have to be the same number."""
     assert sync_commands.DONATION_SAMPLE_SIZE == SAMPLE_SIZE
+
+
+# ---------------------------------------------------------------------------
+# The CLI
+# ---------------------------------------------------------------------------
+
+def test_the_cli_exists_and_defaults_to_a_sample():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "donation_preview", "scripts/donation_preview.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert hasattr(module, "main")
+    assert module.EXIT_PARTIAL == 2
+    # The reason it is a script rather than a chat command, stated where
+    # someone reading the script will find it.
+    assert "5 requests per second" in module.__doc__
+    assert "developers.hubspot.com" in module.__doc__
+
+
+def test_the_cli_uses_the_same_formatter_as_chat():
+    """One report, so a preview here and a preview in chat cannot disagree."""
+    source = open("scripts/donation_preview.py").read()
+
+    assert "_format_donation_sync_results" in source
+    assert "from sync.donations import DonationSync" in source
+
+
+def test_the_cli_header_marks_a_partial_read():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "donation_preview", "scripts/donation_preview.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    header = module.header({"profiles_read": 4200, "donations_read": 9100,
+                            "csuite_calls": 42, "hubspot_searches": 100,
+                            "csuite_rate_limit_waits": 3,
+                            "hubspot_rate_limit_waits": 7,
+                            "partial": True}, full=True)
+
+    assert "FULL" in header
+    assert "NO — see below" in header
+    assert "Nothing was written" in header
+    assert "4,200" in header and "9,100" in header
+
+
+def test_the_cli_header_says_a_complete_read_is_complete():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "donation_preview", "scripts/donation_preview.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    header = module.header({"profiles_read": 18823, "partial": False}, False)
+
+    assert "SAMPLE" in header
+    assert "| Read complete | yes |" in header
