@@ -101,6 +101,16 @@ def _sync_donations(query_lower: str) -> str:
     # and writes nothing, which is the only way to see the real counts before
     # turning the flag on.
     full = dry_run and 'full' in query_lower
+    if full:
+        # Not run here. A full preview reads ~18,800 profiles and ~26,600
+        # donations, then searches HubSpot once per donor with an email —
+        # 7,604 of them. HubSpot caps the Search API at 5 requests per second
+        # across all object types, so the HubSpot half alone cannot finish in
+        # under ~25 minutes, and gunicorn kills a request at 180s. The worker
+        # dies about an eighth of the way in, taking its other in-flight
+        # requests with it, and the work is thrown away.
+        logger.info("full donation preview requested; handing over to the CLI")
+        return DONATION_FULL_PREVIEW_REPLY
     logger.info("Running donation sync (dry_run=%s, full=%s)...",
                 dry_run, full)
 
@@ -246,6 +256,25 @@ def _run_all_syncs() -> str:
 # Formatters
 # ---------------------------------------------------------------------------
 
+# What chat says instead of attempting a full preview inline. The numbers are
+# measured, not estimated: 18,823 profiles and 26,597 donations in the mirror
+# on 2026-10-06, of which 7,604 donor profiles carry an email.
+DONATION_FULL_PREVIEW_REPLY = (
+    "📚 **A full preview has to run from the command line.**\n\n"
+    "It reads ~18,800 CSuite profiles and ~26,600 donations, then searches "
+    "HubSpot once per donor with an email — about 7,604 searches. HubSpot "
+    "caps its Search API at **5 requests per second**, so that half alone "
+    "takes ~25 minutes, and a web request is killed at 180 seconds. Run from "
+    "chat it would die about an eighth of the way in, take the worker's other "
+    "requests down with it, and throw away everything it had read.\n\n"
+    "```\n"
+    "python scripts/donation_preview.py --full --out donation_preview.md\n"
+    "```\n\n"
+    "It writes nothing, prints progress as it goes, and uses the same planner "
+    "and the same report as this command.\n\n"
+    '• Say *"sync donations dry run"* for the 500-row sample, which does run '
+    "here.")
+
 # Roughly how many CSuite profiles a full preview pages, so the hint can state
 # the cost before someone asks for it. Measured 18,797 on 2026-10-01 via the
 # unfiltered profile/list total; it only has to be the right order of
@@ -288,15 +317,35 @@ def _format_donation_sync_results(results: dict, dry_run: bool) -> str:
         # should have: a plain "sync donations" is refused unless the flag is
         # set, and telling someone to type it invites them to read the
         # refusal as a fault.
-        if results.get("sampled", True):
+        if results.get("partial") and results.get("sampled", True):
+            response += (
+                f"\n\n🛑 *PARTIAL READ — the sample stopped early "
+                f"({results.get('partial_reason') or 'reason not recorded'}). "
+                "Not even a sample of the size asked for.*")
+        elif results.get("sampled", True):
             response += (
                 f"\n\n⚡ *Sampled: {DONATION_SAMPLE_SIZE} profiles, "
                 f"{DONATION_SAMPLE_SIZE} donations — not the whole database, "
                 f"so these counts are not totals.*\n"
-                '💡 *Say "sync donations dry run full" to page every '
-                f"profile — roughly {DONATION_PROFILE_ESTIMATE:,} of them, "
-                "which takes minutes and makes no writes. The shared-email "
-                "and stale-link counts cannot be read off a sample.*")
+                "💡 *For the real figures — the shared-email and stale-link "
+                "counts cannot be read off a sample — run "
+                "`python scripts/donation_preview.py --full`. That reads "
+                f"roughly {DONATION_PROFILE_ESTIMATE:,} profiles and takes "
+                "tens of minutes, which is why it is not a chat command. It "
+                "writes nothing.*")
+        elif results.get("partial"):
+            # The one thing this footer must never do. A sweep that stopped
+            # short still has a profiles_read figure, and before 2026-10-06 a
+            # failed page read as the end of the data — so "the whole
+            # database, so these counts are totals" would have been printed
+            # over a read that a 429 cut off.
+            response += (
+                f"\n\n🛑 *PARTIAL READ — {results.get('profiles_read', 0):,} "
+                f"profiles and {results.get('donations_read', 0):,} donations "
+                f"were read before CSuite stopped answering "
+                f"({results.get('partial_reason') or 'reason not recorded'}). "
+                "**These counts are NOT totals** and the missing rows are "
+                "not estimated. Re-run when CSuite is answering.*")
         else:
             response += (
                 f"\n\n📚 *Full preview: {results.get('profiles_read', 0):,} "

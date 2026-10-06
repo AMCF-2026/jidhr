@@ -212,6 +212,9 @@ def read(found=None, raises=None):
     instance = DonationSync.__new__(DonationSync)
     instance.csuite = CSuite()
     instance.hubspot = HubSpot(found=found, raises=raises)
+    # _read_contact paces itself against HubSpot's 5/s search cap, so it needs
+    # the counters a real __init__ would have set. sync() resets them itself.
+    instance.reset_counters()
     return instance._read_contact("d@example.invalid")
 
 

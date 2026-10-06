@@ -14,6 +14,7 @@ HubSpot Properties Updated:
 """
 
 import logging
+import time
 from datetime import datetime
 from collections import defaultdict
 from clients.csuite import CSuiteClient
@@ -25,6 +26,105 @@ logger = logging.getLogger(__name__)
 
 # How many profiles and donations a `quick` run looks at.
 SAMPLE_SIZE = 500
+
+# HubSpot's Search API is capped at **5 requests per second across all object
+# types**, separately from the per-app burst limit (100/10s on Free and
+# Starter, 190/10s on Professional and Enterprise) and regardless of tier.
+# Documented at
+#   https://developers.hubspot.com/docs/developer-tooling/platform/usage-guidelines
+#   https://developers.hubspot.com/docs/api/usage-details
+# Search responses carry no rate-limit headers, so there is nothing to read
+# back: the only way to stay under it is to pace the calls.
+#
+# This sync searches once per donor profile with an email — 7,604 of them
+# measured against the mirror on 2026-10-06 — so unpaced it would exceed the
+# cap within the first second and keep exceeding it for 25 minutes.
+#
+# 4/s, not 5/s, deliberately: the limit is enforced per second with no credit
+# for an idle second, and anything else in the portal doing a search at the
+# same moment shares the same cap.
+HUBSPOT_SEARCH_PER_SECOND = 4.0
+
+# A 429 on a search is waited out and retried, three times. Longer than
+# CSuite's 30/60/120 would be pointless — a secondly limiter clears in a
+# second — but a flat retry with no pause just spends another request.
+SEARCH_BACKOFFS = (1.0, 2.0, 4.0)
+
+
+def hubspot_error(response):
+    """The error in a HubSpot response, or None.
+
+    HubSpot answers a rate-limited search with HTTP 429 and a JSON body:
+    {"status": "error", "errorType": "RATE_LIMIT", ...}. clients/hubspot's
+    _parse_response returns that body verbatim, so it carries NO "error" key
+    and no status_code — which meant _read_contact saw a dict with no
+    "results" and reported "no such contact". A throttled search read as a
+    donor who is not in HubSpot.
+    """
+    if not isinstance(response, dict):
+        return f"unreadable response: {type(response).__name__}"
+    if "error" in response:
+        return str(response["error"])[:200]
+    if response.get("status") == "error" or response.get("errorType"):
+        return (f"{response.get('errorType') or 'error'}: "
+                f"{str(response.get('message') or '')[:160]}")
+    status = response.get("status_code")
+    if isinstance(status, int) and status >= 400:
+        return f"HTTP {status}"
+    return None
+
+
+def is_rate_limited(response) -> bool:
+    if not isinstance(response, dict):
+        return False
+    if response.get("errorType") == "RATE_LIMIT":
+        return True
+    if response.get("status_code") == 429:
+        return True
+    return "rate limit" in str(response.get("error") or "").lower()
+
+
+class SearchPacer:
+    """Keeps searches under HUBSPOT_SEARCH_PER_SECOND, and retries a 429."""
+
+    def __init__(self, per_second: float = HUBSPOT_SEARCH_PER_SECOND,
+                 sleeper=None, clock=None):
+        self.interval = 1.0 / per_second if per_second else 0.0
+        self._sleep = sleeper or time.sleep
+        self._clock = clock or time.monotonic
+        self._last = None
+        self.waits = 0
+        self.rate_limit_waits = 0
+
+    def wait(self):
+        if self.interval <= 0:
+            return
+        if self._last is not None:
+            due = self._last + self.interval - self._clock()
+            if due > 0:
+                self.waits += 1
+                self._sleep(due)
+        self._last = self._clock()
+
+    def backoff(self, attempt: int) -> bool:
+        """Pause before retry `attempt`. False when the retries are spent."""
+        if attempt >= len(SEARCH_BACKOFFS):
+            return False
+        self.rate_limit_waits += 1
+        self._sleep(SEARCH_BACKOFFS[attempt])
+        self._last = self._clock()
+        return True
+
+
+class PartialReadRefused(RuntimeError):
+    """A CSuite sweep did not finish, so a live run was abandoned.
+
+    A short donation list produces UNDERSTATED lifetime_giving totals, and
+    writing those over the correct ones is worse than not writing at all —
+    the contact then reads as a smaller donor than they are, with nothing
+    saying the figure is wrong. A preview carries on and is labelled partial;
+    a write does not.
+    """
 
 
 class DonationSyncDisabled(RuntimeError):
@@ -76,55 +176,82 @@ class LinkDecision:
 class DonationSync:
     """Sync donation data from CSuite to HubSpot"""
     
-    def __init__(self):
+    def __init__(self, pace_ms=None, progress=None):
         self.csuite = CSuiteClient()
         self.hubspot = HubSpotClient()
+        self.pace_ms = pace_ms
+        # A callable taking one line of text, or None. The CLI prints it; the
+        # chat path has nowhere to put it.
+        self.progress = progress
+        self.reset_counters()
+
+    def reset_counters(self):
+        self.csuite_calls = 0
+        self.hubspot_searches = 0
+        # Counted per system. "We were throttled" is not useful; "CSuite
+        # throttled us twice and HubSpot forty times" says which pacing to
+        # change.
+        self.rate_limit_waits = 0            # CSuite
+        self.profiles_complete = True
+        self.donations_complete = True
+        self.profiles_error = None
+        self.donations_error = None
+        self.searches = SearchPacer()        # carries its own HubSpot waits
+
+    def _report(self, line: str):
+        if self.progress:
+            self.progress(line)
     
     def get_profile_emails(self, limit: int = None) -> dict:
-        """Get mapping of profile_id → email from CSuite
-        
+        """{profile_id: primary_email} from CSuite, with `complete` recorded.
+
+        Until 2026-10-06 this was a hand-rolled `while True` whose only
+        failure branch was `if not result.get("success"): break` — so a page
+        that FAILED was indistinguishable from the end of the data. A 429
+        ended the sweep, the caller got a short dict, and nothing said so.
+        ~18,800 profiles paged 100 at a time is 189 unpaced calls.
+
+        clients.csuite_fetch.fetch_all already solves this: it paces, waits
+        out a 429 (Retry-After if CSuite sends one, else 30s/60s/120s, three
+        waits) and reports `complete`. sync/mirror.py refuses to write
+        anything at all when it sees complete=False, and this now does the
+        same.
+
         Args:
-            limit: Max number of profiles to fetch (None = all)
+            limit: stop after roughly this many profiles (None = all)
         """
+        from clients.csuite_fetch import fetch_all
+
+        pages = max(1, -(-limit // 100)) if limit else None
+        result = fetch_all(self.csuite, "profile/list", pace_ms=self.pace_ms,
+                           **({"max_pages": pages} if pages else {}))
+
+        # A capped sweep stops early on purpose, so "did not reach the end"
+        # is only a failure when nothing asked it to stop.
+        self.profiles_complete = bool(result.complete or pages)
+        self.profiles_error = None if self.profiles_complete else (
+            result.error or "the profile sweep did not finish")
+        if not self.profiles_complete:
+            logger.error("CSuite profile sweep INCOMPLETE after %d row(s): "
+                         "%s", len(result.records), self.profiles_error)
+
+        rows = result.records[:limit] if limit else result.records
         profile_emails = {}
-        offset = 0
-        batch_size = 100
-        total_fetched = 0
-        
-        while True:
-            result = self.csuite.get_profiles(limit=batch_size, offset=offset)
-            
-            if not result.get("success"):
-                logger.error(f"Failed to get profiles at offset {offset}")
-                break
-            
-            data = result.get("data", {})
-            profiles = data.get("results", [])
-            
-            if not profiles:
-                break
-            
-            total_fetched += len(profiles)
-            
-            for profile in profiles:
-                profile_id = profile.get("profile_id")
-                email = profile.get("primary_email")
-                if profile_id and email:
-                    profile_emails[profile_id] = email.lower().strip()
-            
-            # Check if we've hit the limit on TOTAL profiles fetched
-            if limit and total_fetched >= limit:
-                break
-            
-            # Check if we got fewer than batch_size (last page)
-            if len(profiles) < batch_size:
-                break
-            
-            offset += batch_size
-        
-        logger.info(f"Fetched {total_fetched} profiles, {len(profile_emails)} have emails")
+        for profile in rows:
+            profile_id = profile.get("profile_id")
+            email = profile.get("primary_email")
+            if profile_id is not None and email:
+                profile_emails[profile_id] = email
+
+        self.csuite_calls += result.calls
+        self.rate_limit_waits += result.total_429s
+        logger.info("Fetched %d profiles (%d with emails) in %d call(s), "
+                    "%d rate-limit wait(s)", len(rows), len(profile_emails),
+                    result.calls, result.total_429s)
+        self._report(f"profiles: {len(rows):,} read, "
+                     f"{len(profile_emails):,} with an email")
         return profile_emails
-    
+
     def aggregate_donations(self, donations: list) -> dict:
         """Aggregate donations by profile_id
         
@@ -201,14 +328,24 @@ class DonationSync:
         things: (None, None) is "no such contact", (None, "…") is "the lookup
         failed". A failed read must not be counted as an absent contact — see
         clients/hubspot.TicketLookupFailed for the same distinction."""
-        try:
-            found = self.hubspot.search_contact_by_email(email)
-        except Exception as e:
-            return None, str(e)
-        if not isinstance(found, dict):
-            return None, f"unreadable response: {type(found).__name__}"
-        if "error" in found:
-            return None, str(found["error"])[:200]
+        found = None
+        for attempt in range(len(SEARCH_BACKOFFS) + 1):
+            self.searches.wait()
+            try:
+                found = self.hubspot.search_contact_by_email(email)
+            except Exception as e:
+                return None, str(e)
+            self.hubspot_searches += 1
+            if not is_rate_limited(found):
+                break
+            if not self.searches.backoff(attempt):
+                return None, ("HubSpot rate limited the contact search and "
+                              "did not relent after "
+                              f"{len(SEARCH_BACKOFFS)} waits")
+
+        error = hubspot_error(found)
+        if error:
+            return None, error
         rows = found.get("results")
         if not (isinstance(rows, list) and rows):
             return None, None
@@ -343,7 +480,16 @@ class DonationSync:
             # rather than estimate it.
             'profiles_read': 0,
             'donations_read': 0,
+            # True when a CSuite sweep did not reach the end. A partial read
+            # is never reported as a total.
+            'partial': False,
+            'partial_reason': None,
+            'csuite_calls': 0,
+            'hubspot_searches': 0,
+            'csuite_rate_limit_waits': 0,
+            'hubspot_rate_limit_waits': 0,
         }
+        self.reset_counters()
         
         # Sampling is `quick`'s job, and only `quick`'s.
         #
@@ -367,6 +513,16 @@ class DonationSync:
         if not profile_emails:
             logger.error("No profile emails found")
             results['details'].append("No profiles with emails found in CSuite")
+            results['csuite_calls'] = self.csuite_calls
+            if not self.profiles_complete:
+                # "No profiles" and "we never finished asking" are different
+                # answers, and only one of them means CSuite is empty.
+                results['partial'] = True
+                results['partial_reason'] = self.profiles_error
+                if not dry_run:
+                    raise PartialReadRefused(
+                        f"the CSuite profile sweep did not finish "
+                        f"({self.profiles_error}). Nothing was written.")
             return results
         
         # Step 2: Get donations
@@ -379,6 +535,23 @@ class DonationSync:
             return results
         
         results['donations_read'] = len(donations)
+
+        # Both sweeps have run. If either stopped short, say so now — before
+        # any aggregate is computed from a list that is missing rows.
+        if not (self.profiles_complete and self.donations_complete):
+            reason = "; ".join(
+                part for part in (self.profiles_error, self.donations_error)
+                if part)
+            results['partial'] = True
+            results['partial_reason'] = reason
+            logger.error("CSuite read INCOMPLETE: %s", reason)
+            if not dry_run:
+                # Nothing has been written yet: the write loop is below.
+                raise PartialReadRefused(
+                    f"a CSuite sweep did not finish ({reason}), so the "
+                    "donation totals would be understated. Nothing was "
+                    "written. Re-run when CSuite is answering.")
+            self._report(f"PARTIAL: {reason}")
         logger.info(f"Found {len(donations)} donations")
         
         # Step 3: Aggregate by profile
@@ -529,6 +702,10 @@ class DonationSync:
                 logger.debug(f"Updated {email}: ${agg['total']:.2f} lifetime")
         
         results['profile_reads'] = states.reads
+        results['csuite_calls'] = self.csuite_calls
+        results['hubspot_searches'] = self.hubspot_searches
+        results['csuite_rate_limit_waits'] = self.rate_limit_waits
+        results['hubspot_rate_limit_waits'] = self.searches.rate_limit_waits
 
         # Summary
         mode = "[DRY RUN] " if dry_run else ""
@@ -541,43 +718,33 @@ class DonationSync:
         return results
     
     def get_donations_with_limit(self, limit: int = None) -> list:
-        """Get donations with optional limit"""
-        all_donations = []
-        offset = 0
-        batch_size = 100
-        
-        while True:
-            result = self.csuite.get_donations(limit=batch_size, offset=offset)
-            
-            if not result.get("success"):
-                logger.error(f"Failed to get donations at offset {offset}")
-                break
-            
-            data = result.get("data", {})
-            donations = data.get("results", [])
-            
-            if not donations:
-                break
-            
-            all_donations.extend(donations)
-            
-            # Check if we've hit the limit
-            if limit and len(all_donations) >= limit:
-                all_donations = all_donations[:limit]
-                break
-            
-            # Check if we got fewer than batch_size (last page)
-            if len(donations) < batch_size:
-                break
-            
-            offset += batch_size
-            
-            # Log progress every 500 donations
-            if offset % 500 == 0:
-                logger.info(f"Fetched {offset} donations so far...")
-        
-        logger.info(f"Retrieved {len(all_donations)} donations")
-        return all_donations
+        """Donations from CSuite, with `complete` recorded.
+
+        Same change as get_profile_emails, and it matters more here: a
+        partial donation set produces UNDERSTATED lifetime_giving totals,
+        which a live run would then write over the correct ones. ~26,600
+        donations is 266 paged calls.
+        """
+        from clients.csuite_fetch import fetch_all
+
+        pages = max(1, -(-limit // 100)) if limit else None
+        result = fetch_all(self.csuite, "donation/list", pace_ms=self.pace_ms,
+                           **({"max_pages": pages} if pages else {}))
+
+        self.donations_complete = bool(result.complete or pages)
+        self.donations_error = None if self.donations_complete else (
+            result.error or "the donation sweep did not finish")
+        if not self.donations_complete:
+            logger.error("CSuite donation sweep INCOMPLETE after %d row(s): "
+                         "%s", len(result.records), self.donations_error)
+
+        rows = result.records[:limit] if limit else result.records
+        self.csuite_calls += result.calls
+        self.rate_limit_waits += result.total_429s
+        logger.info("Fetched %d donations in %d call(s), %d rate-limit "
+                    "wait(s)", len(rows), result.calls, result.total_429s)
+        self._report(f"donations: {len(rows):,} read")
+        return rows
 
 
 def run_donation_sync(dry_run: bool = False, quick: bool = False,

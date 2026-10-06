@@ -11,6 +11,7 @@ Available syncs:
 """
 
 from sync.donations import (DonationSync, DonationSyncDisabled,
+                            PartialReadRefused,
                             donation_sync_allowed, run_donation_sync)
 from sync.newsletter import (NewsletterSync,
                              NewsletterSyncDisabled,
@@ -20,6 +21,7 @@ from sync.newsletter import (NewsletterSync,
 __all__ = [
     'DonationSync',
     'DonationSyncDisabled',
+    'PartialReadRefused',
     'donation_sync_allowed',
     'EventSync', 
     'NewsletterSync',
