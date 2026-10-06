@@ -8,7 +8,8 @@ invokes the requested sync, and formats the result for the user.
 """
 
 import logging
-from sync import DonationSyncDisabled, run_donation_sync, run_newsletter_sync
+from sync import (DonationSyncDisabled, NewsletterSyncDisabled,
+                  run_donation_sync, run_newsletter_sync)
 from sync import event_apply
 
 logger = logging.getLogger(__name__)
@@ -170,6 +171,15 @@ def _sync_newsletter(query_lower: str) -> str:
     try:
         results = run_newsletter_sync(dry_run=dry_run, quick=dry_run)
         return _format_newsletter_sync_results(results, dry_run)
+    except NewsletterSyncDisabled as e:
+        logger.info("newsletter sync is off: %s", e)
+        return ("⏸️ **Newsletter sync is turned off.**\n\n"
+                "No HubSpot subscription was read or changed. It POSTs a "
+                "subscription change per opted-in CSuite profile, which is a "
+                "change to a real person's communication preferences.\n\n"
+                "• Say *\"sync newsletter dry run\"* to preview it safely.\n"
+                "• Set `CSUITE_NEWSLETTER_SYNC_ENABLED=true` to run it for "
+                "real.")
     except Exception as e:
         logger.error(f"Newsletter sync error: {e}")
         return f"❌ Newsletter sync failed: {e}"
@@ -214,6 +224,11 @@ def _run_all_syncs() -> str:
     try:
         newsletter_results = run_newsletter_sync(dry_run=False)
         responses.append(f"✅ Newsletter: {newsletter_results['subscribed']} subscribed")
+    except NewsletterSyncDisabled:
+        # Same reason as donations: "sync all" is the path that walks past a
+        # gate placed in the chat handler.
+        responses.append("⏸️ Newsletter: skipped — "
+                         "CSUITE_NEWSLETTER_SYNC_ENABLED is off")
     except Exception as e:
         responses.append(f"❌ Newsletter: {e}")
 
@@ -223,6 +238,9 @@ def _run_all_syncs() -> str:
 # ---------------------------------------------------------------------------
 # Formatters
 # ---------------------------------------------------------------------------
+
+# How many shared-email contacts the donation report prints before summarising.
+SHARED_EMAIL_ROWS_SHOWN = 10
 
 # How many "needs a human" rows the event report prints before summarising.
 EVENT_REVIEW_ROWS_SHOWN = 10
@@ -249,9 +267,16 @@ def _format_donation_sync_results(results: dict, dry_run: bool) -> str:
     response += _format_link_outcomes(results, dry_run)
 
     if dry_run:
-        response += ("\n\n⚡ *This dry run used sample data (500 profiles, "
-                     "500 donations). Run `sync donations` without 'dry run' "
-                     "for full sync.*")
+        # It used to say "Run `sync donations` without 'dry run' for full
+        # sync", which was an instruction that no longer works and never
+        # should have: a plain "sync donations" is refused unless the flag is
+        # set, and telling someone to type it invites them to read the
+        # refusal as a fault.
+        response += (
+            "\n\n⚡ *Sampled: 500 profiles, 500 donations — not the whole "
+            "database.*\n"
+            "🔒 *A live run needs `CSUITE_DONATION_SYNC_ENABLED=true`. "
+            "Without it `sync donations` is refused and nothing is written.*")
 
     return response
 
@@ -264,7 +289,7 @@ def _format_link_outcomes(results: dict, dry_run: bool) -> str:
     and this sync is the other thing that writes it.
     """
     keys = ("link_written", "link_unchanged", "link_conflict", "link_differs",
-            "link_stale", "link_unverifiable")
+            "link_stale", "link_unverifiable", "shared_email")
     if not any(key in results for key in keys):
         return ""            # an older result dict; nothing to add
 
@@ -292,6 +317,24 @@ def _format_link_outcomes(results: dict, dry_run: bool) -> str:
     if results.get("link_stale"):
         lines.append("   ⚠️ A stale id is NOT repointed — overwriting it "
                      "destroys the only record of what it pointed at.")
+
+    shared = results.get("shared_email_rows") or []
+    if results.get("shared_email"):
+        lines += ["", f"👥 **{results['shared_email']} contact(s) claimed by "
+                      f"more than one CSuite profile — nothing was written "
+                      f"to them**"]
+        for row in shared[:SHARED_EMAIL_ROWS_SHOWN]:
+            current = row.get("current") or "none"
+            lines.append(f"• `{row['contact_id']}` ← profiles "
+                         f"{', '.join(row['profiles'])} "
+                         f"(stored link: {current})")
+        if len(shared) > SHARED_EMAIL_ROWS_SHOWN:
+            lines.append(f"• … and **{len(shared) - SHARED_EMAIL_ROWS_SHOWN}** "
+                         "more; the count above is the total")
+        lines.append("   ⚠️ Totals are **not summed** — two profiles on one "
+                     "address may be one person entered twice or two people "
+                     "in a household, and this sync cannot tell. Merge or "
+                     "separate them in CSuite.")
 
     rows = results.get("link_rows") or []
     if dry_run and rows:
