@@ -71,6 +71,19 @@ class FakeHubSpot:
         self.calls.append(("POST", endpoint))
         return {"error": "nope"} if self.fail else {"objectId": "hs-new"}
 
+    def _send_with_status(self, method, endpoint, data=None):
+        """apply_plan writes through this seam now, because the STATUS CODE
+        is the only reliable success signal: HubSpot answers a 404 with a
+        JSON body that carries no "error" key, so a 404 used to read as a
+        success and be recorded as "synced"."""
+        result = self._post(endpoint, data) if method in ("POST", "PUT") \
+            else self._patch(endpoint, data)
+        if isinstance(result, dict) and result.get("status") == "error":
+            return result, 404          # a definite HTTP failure
+        if isinstance(result, dict) and result.get("error"):
+            return result, None         # a transport fault: AMBIGUOUS
+        return result, 200
+
 
 def plan_of(creates=(), updates=()):
     result = {"creates": [], "updates": [], "unchanged": [], "skipped": [],
@@ -135,15 +148,18 @@ def test_a_create_also_writes_its_mapping_row(stored):
     assert stored[0]["params"][1] == "hs-new"
 
 
-def test_a_failed_write_still_records_the_error_row(stored):
-    """The error branch calls _save_map too, so it had the same NameError."""
-    outcomes = ea.apply_plan(FakeHubSpot(fail=True),
-                             plan_of(updates=[mapped_of(event_date_id=1466)]),
-                             today=PINNED_TODAY)
+def test_a_failed_write_still_records_its_row_then_stops(stored):
+    """The failure branch calls _save_map too, so it had the same NameError.
+    It also STOPS the run now: one failed write is evidence about the next."""
+    with pytest.raises(ea.WriteFailed) as caught:
+        ea.apply_plan(FakeHubSpot(fail=True),
+                      plan_of(updates=[mapped_of(event_date_id=1466)]),
+                      today=PINNED_TODAY)
 
-    assert [o["outcome"] for o in outcomes] == ["failed"]
+    assert [o["outcome"] for o in caught.value.outcomes] == ["unknown"]
     assert len(stored) == 1
-    assert stored[0]["params"][6] == "nope", "the error text is recorded"
+    assert stored[0]["params"][5] == "unknown"
+    assert "ambiguous" in caught.value.reason
 
 
 def test_an_ambiguous_create_records_unknown_before_stopping(stored):
@@ -219,8 +235,9 @@ def test_every_save_map_call_site_is_covered_by_these_tests():
     import inspect
 
     sites = inspect.getsource(ea.apply_plan).count("_save_map(")
-    assert sites == 6, (
+    assert sites == 8, (
         f"apply_plan has {sites} _save_map call sites; the tests above cover "
-        "update-synced, update-error, create-synced, create-unknown, "
-        "unchanged and skipped-review. A new one needs a test — this is the "
-        "function whose body 2,622 tests never executed.")
+        "update-synced, update-ambiguous, update-failed, create-synced, "
+        "create-failed, create-unknown, unchanged and skipped-review. A new "
+        "one needs a test — this is the function whose body 2,622 tests "
+        "never executed.")

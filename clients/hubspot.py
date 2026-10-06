@@ -103,6 +103,70 @@ def is_hubspot_write(method: str, endpoint: str) -> bool:
 _HUBSPOT_PORTAL_TZ = ZoneInfo("America/New_York")
 
 
+# ---------------------------------------------------------------------------
+# Marketing event URLs, in ONE place
+# ---------------------------------------------------------------------------
+#
+# Measured against this portal with GETs on 2026-10-06:
+#
+#   GET  marketing/v3/marketing-events                    -> 200, the listing
+#   GET  marketing/v3/marketing-events/events             -> 405 (exists, not GET)
+#   GET  marketing/v3/marketing-events/events/upsert      -> 405 (exists, not GET)
+#   GET  marketing/v3/marketing-events/{objectId}         -> 200, one event
+#   GET  marketing/v3/marketing-events/events/{extId}     -> 200 WITH
+#                                                            externalAccountId,
+#                                                            validation error
+#                                                            without it
+#
+# So the external-id path REQUIRES externalAccountId, and objectId paths work.
+#
+# scripts/event_sync.py built its PATCH url as
+# f"{CREATE_ENDPOINT}/{external_event_id}" — no `/events/` segment — which is
+# not a path that exists. Every update it ever sent 404'd. The read path had
+# the right shape because it was measured; the write path was assumed. One
+# builder now, so a shape that is proven for a read is the shape used for a
+# write.
+
+MARKETING_EVENTS_BASE = "marketing/v3/marketing-events"
+
+
+def marketing_event_url(external_event_id=None) -> str:
+    """The URL for one marketing event by externalEventId, or the collection.
+
+    `externalAccountId` is NOT in here: it travels in the query string on a
+    read and in the body on a write, and putting it in the path would make
+    that difference invisible.
+    """
+    if external_event_id in (None, ""):
+        return MARKETING_EVENTS_BASE
+    return f"{MARKETING_EVENTS_BASE}/events/{external_event_id}"
+
+
+def hubspot_error(response):
+    """The error in a HubSpot response, or None.
+
+    HubSpot answers a 404 or a 429 with a JSON body — {"status": "error",
+    "category": ..., "message": ...} — and _parse_response returns that
+    verbatim, so it carries NO "error" key and no status_code. Anything
+    checking `response.get("error")` therefore reads a failure as a success.
+    That is how a 404 PATCH came to be recorded as "synced".
+    """
+    if not isinstance(response, dict):
+        return f"unreadable response: {type(response).__name__}"
+    if "error" in response:
+        return str(response["error"])[:200]
+    if response.get("status") == "error" or response.get("errorType") \
+            or response.get("category"):
+        kind = (response.get("errorType") or response.get("category")
+                or "error")
+        detail = str(response.get("message") or "")[:160]
+        return f"{kind}: {detail}"
+    status = response.get("status_code")
+    if isinstance(status, int) and status >= 400:
+        return f"HTTP {status}"
+    return None
+
+
 class TicketLookupFailed(Exception):
     """A ticket association or batch read FAILED.
 
@@ -935,7 +999,7 @@ class HubSpotClient:
                              "sync.event_hubspot.EXTERNAL_ACCOUNT_ID"}
 
         # PUT requires externalEventId in both URL and body
-        endpoint = f"marketing/v3/marketing-events/events/{external_event_id}"
+        endpoint = marketing_event_url(external_event_id)
         event_data["externalEventId"] = external_event_id
 
         return self._put(endpoint, event_data)

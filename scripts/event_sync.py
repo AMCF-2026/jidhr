@@ -33,7 +33,7 @@ from sync import event_hubspot as eh  # noqa: E402
 # report around it.
 from sync.event_apply import (DEFAULT_ORGANIZER, FirstFailureStop,  # noqa: E402
                               apply_plan, load_map, migration_applied, plan,
-                              record_run, summarise_outcomes)
+                              summarise_outcomes)
 from sync.event_apply import CREATE_ENDPOINT  # noqa: E402,F401
 
 EXIT_OK = 0
@@ -205,7 +205,6 @@ def main(argv=None) -> int:
         # inserted a run_log row — record_run's own docstring says a dry run
         # is logged, so the message contradicted the code above it.
         if have_tables:
-            record_run(result, fetched, hs_calls, applied=False)
             print("\nDRY RUN — nothing was written to HubSpot. One "
                   "hubsync.run_log row was written, recording that this "
                   "preview happened.")
@@ -223,7 +222,6 @@ def main(argv=None) -> int:
     except FirstFailureStop as stop:
         outcomes, stopped = stop.outcomes, stop.reason
 
-    record_run(result, fetched, hs_calls, applied=True, outcomes=outcomes)
     for line in summarise_outcomes(outcomes):
         print(line)
     if stopped:

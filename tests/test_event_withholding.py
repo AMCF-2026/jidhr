@@ -79,6 +79,19 @@ class FakeHubSpot:
         self.updates.append((endpoint, payload))
         return {"objectId": "hs-1"}
 
+    def _send_with_status(self, method, endpoint, data=None):
+        """apply_plan writes through this seam now, because the STATUS CODE
+        is the only reliable success signal: HubSpot answers a 404 with a
+        JSON body that carries no "error" key, so a 404 used to read as a
+        success and be recorded as "synced"."""
+        result = self._post(endpoint, data) if method in ("POST", "PUT") \
+            else self._patch(endpoint, data)
+        if isinstance(result, dict) and result.get("status") == "error":
+            return result, 404          # a definite HTTP failure
+        if isinstance(result, dict) and result.get("error"):
+            return result, None         # a transport fault: AMBIGUOUS
+        return result, 200
+
 
 @pytest.fixture(autouse=True)
 def no_db(monkeypatch):
@@ -146,7 +159,9 @@ def test_an_unflagged_update_is_still_written():
     clean = mapped_of(event_date_id=1462, event_date="2026-12-01")
     hubspot, outcomes = apply(plan_with(updates=[clean]))
 
-    assert len(hubspot.updates) == 1
+    # One PUT; the create/update distinction lives in the outcome, not in
+    # the verb — apply upserts both through /events/{externalEventId}.
+    assert len(hubspot.creates) + len(hubspot.updates) == 1
     assert outcome_of(outcomes, 1462)["outcome"] == "updated"
 
 
@@ -183,8 +198,8 @@ def test_a_limit_of_one_buys_the_update_not_the_create():
     hubspot, outcomes = apply(plan_with(creates=[create], updates=[update]),
                               limit=1)
 
-    assert len(hubspot.updates) == 1
-    assert hubspot.creates == []
+    assert len(hubspot.creates) + len(hubspot.updates) == 1, "exactly one PUT"
+    assert outcome_of(outcomes, 1462)["outcome"] == "updated"
     assert outcome_of(outcomes, 1528)["outcome"] == "deferred"
 
 
@@ -199,8 +214,8 @@ def test_updates_only_withholds_every_create():
     hubspot, outcomes = apply(plan_with(creates=[create], updates=[update]),
                               updates_only=True)
 
-    assert hubspot.creates == []
-    assert len(hubspot.updates) == 1
+    assert len(hubspot.creates) + len(hubspot.updates) == 1
+    assert outcome_of(outcomes, 1462)["outcome"] == "updated"
     assert outcome_of(outcomes, 1528)["outcome"] == "withheld"
     assert "updates only" in outcome_of(outcomes, 1528)["why"]
 
@@ -381,7 +396,9 @@ def test_the_preview_counts_what_apply_would_write(monkeypatch):
                         lambda client, pace_ms=None: fetched(rows))
     monkeypatch.setattr(ea.eh, "hubspot_index", lambda hubspot: ({}, 1, None))
     monkeypatch.setattr("clients.csuite.CSuiteClient", lambda: object())
-    monkeypatch.setattr(ea, "record_run", lambda *a, **k: None)
+    # run() opens a run_log row and closes it in a finally now.
+    monkeypatch.setattr(ea, "open_run", lambda applied: None)
+    monkeypatch.setattr(ea, "close_run", lambda *a, **k: None)
 
     result = ea.run(hubspot=object(), dry_run=True, today=PINNED_TODAY)
 
