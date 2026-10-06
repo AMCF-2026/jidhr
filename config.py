@@ -154,6 +154,29 @@ class Config:
         os.environ.get('CSUITE_DAF_FUND_CREATE_ENABLED', 'False')
         .strip().lower() == 'true')
 
+    # Whether "sync donations" may WRITE to HubSpot. Off.
+    #
+    # It writes five properties per matched contact, one of which is
+    # `csuite_profile_id` — the field the DAF duplicate guard reads to decide
+    # whether a donor already has a CSuite profile. This sync repoints it on
+    # every matched contact on every run, from an email match, without reading
+    # what was there: the DAF path was changed on 2026-10-02 so it would never
+    # overwrite a stored id, and this is the path that still does. 68
+    # production contacts carry ids that do not resolve in CSuite.
+    #
+    # It is also uncapped. CSUITE_WRITE_BUDGET governs CSuite writes inside
+    # CSuiteClient._request and has no bearing on a HubSpot PATCH, so a live
+    # run PATCHes every donor profile that matches a contact, with no limit
+    # and no read-back.
+    #
+    # A DRY RUN ignores this flag: it makes no HubSpot writes at all and is
+    # the thing anyone should be able to run before asking for the real one.
+    #
+    # Same fail-closed parsing as the rest: only the exact string "true".
+    CSUITE_DONATION_SYNC_ENABLED = (
+        os.environ.get('CSUITE_DONATION_SYNC_ENABLED', 'False')
+        .strip().lower() == 'true')
+
     # Whether the workflow closes the donor's HubSpot ticket. Off.
     #
     # It cannot be proved in the sandbox: a sandbox run refuses every HubSpot

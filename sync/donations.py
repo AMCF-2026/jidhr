@@ -22,6 +22,27 @@ from clients.hubspot import HubSpotClient
 logger = logging.getLogger(__name__)
 
 
+class DonationSyncDisabled(RuntimeError):
+    """A live donation sync was asked for while the flag is off.
+
+    Raised, not returned as a result with zero updates. "0 contacts updated"
+    is also what a successful run over an empty CSuite looks like, and a
+    refusal that reads as a clean run is the failure mode this repo has spent
+    three weeks removing.
+    """
+
+
+def donation_sync_allowed() -> bool:
+    """Is a WRITING donation sync permitted? Reads config at call time.
+
+    Not at import: Config is re-read by tests and by anything that reloads the
+    module, and a flag captured at import is a flag that answers for the
+    environment as it was, not as it is.
+    """
+    import config
+    return bool(getattr(config.Config, "CSUITE_DONATION_SYNC_ENABLED", False))
+
+
 class DonationSync:
     """Sync donation data from CSuite to HubSpot"""
     
@@ -155,6 +176,24 @@ class DonationSync:
         Returns:
             dict: Sync results with stats
         """
+        # The gate is HERE, not in the chat handler, because the chat handler
+        # is not the only way in: "sync all" calls run_donation_sync(
+        # dry_run=False) directly (intents/sync_commands._run_all_syncs), so a
+        # check in _sync_donations alone would be bypassed by typing "sync
+        # all". Every path that can write passes through this method.
+        #
+        # A dry run is deliberately NOT gated: it writes nothing to HubSpot,
+        # and the preview is what the decision to enable should be made on.
+        if not dry_run and not donation_sync_allowed():
+            logger.warning(
+                "donation sync REFUSED: CSUITE_DONATION_SYNC_ENABLED is off. "
+                "Nothing was read and nothing was written. Run it with "
+                "'dry run' to preview, which is not gated.")
+            raise DonationSyncDisabled(
+                "CSUITE_DONATION_SYNC_ENABLED is off, so no HubSpot writes "
+                "were made. Say \"sync donations dry run\" to preview it "
+                "safely, or set the flag to run it for real.")
+
         results = {
             'updated': 0,
             'skipped_no_email': 0,

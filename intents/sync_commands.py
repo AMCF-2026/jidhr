@@ -8,7 +8,8 @@ invokes the requested sync, and formats the result for the user.
 """
 
 import logging
-from sync import run_donation_sync, run_event_sync, run_newsletter_sync
+from sync import (DonationSyncDisabled, run_donation_sync,
+                  run_event_sync, run_newsletter_sync)
 
 logger = logging.getLogger(__name__)
 
@@ -85,13 +86,33 @@ def handle(query: str, ctx) -> str:
 # ---------------------------------------------------------------------------
 
 def _sync_donations(query_lower: str) -> str:
-    """Run donation sync (CSuite → HubSpot)."""
+    """Run donation sync (CSuite → HubSpot).
+
+    A plain "sync donations" WRITES, and is gated on
+    CSUITE_DONATION_SYNC_ENABLED. "sync donations dry run" is not gated — it
+    makes no HubSpot writes, and it is what the decision to enable should rest
+    on. The gate itself lives in DonationSync.sync, because "sync all" reaches
+    the same code without coming through here.
+    """
     logger.info("Running donation sync...")
     dry_run = 'dry run' in query_lower or 'test' in query_lower
 
     try:
         results = run_donation_sync(dry_run=dry_run, quick=dry_run)
         return _format_donation_sync_results(results, dry_run)
+    except DonationSyncDisabled as e:
+        # Not an error line. Nothing failed and nothing was attempted, and a
+        # ❌ would send someone looking for a fault that is not there.
+        logger.info("donation sync is off: %s", e)
+        return ("⏸️ **Donation sync is turned off.**\n\n"
+                "No HubSpot contact was read or changed. It writes five "
+                "properties per matched contact, including "
+                "`csuite_profile_id`, which the DAF duplicate guard reads — "
+                "so it stays off until that is scoped.\n\n"
+                "• Say *\"sync donations dry run\"* to preview it safely "
+                "(500 profiles, 500 donations, no writes).\n"
+                "• Set `CSUITE_DONATION_SYNC_ENABLED=true` to run it for "
+                "real.")
     except Exception as e:
         logger.error(f"Donation sync error: {e}")
         return f"❌ Donation sync failed: {e}"
@@ -134,6 +155,12 @@ def _run_all_syncs() -> str:
     try:
         donation_results = run_donation_sync(dry_run=False)
         responses.append(f"✅ Donations: {donation_results['updated']} updated")
+    except DonationSyncDisabled:
+        # "sync all" is the path that would have walked straight past a gate
+        # placed in _sync_donations. Named distinctly so a skipped sync is not
+        # read as a failed one, or as a sync that ran and found nothing.
+        responses.append("⏸️ Donations: skipped — "
+                         "CSUITE_DONATION_SYNC_ENABLED is off")
     except Exception as e:
         responses.append(f"❌ Donations: {e}")
 
