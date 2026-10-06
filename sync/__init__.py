@@ -9,12 +9,15 @@ Available syncs:
 - newsletter: Newsletter opt-ins to HubSpot subscriptions
 """
 
-from sync.donations import DonationSync, run_donation_sync
+from sync.donations import (DonationSync, DonationSyncDisabled,
+                            donation_sync_allowed, run_donation_sync)
 from sync.events import EventSync, run_event_sync
 from sync.newsletter import NewsletterSync, run_newsletter_sync
 
 __all__ = [
     'DonationSync',
+    'DonationSyncDisabled',
+    'donation_sync_allowed',
     'EventSync', 
     'NewsletterSync',
     'run_donation_sync',
