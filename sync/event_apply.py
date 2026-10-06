@@ -17,6 +17,12 @@ reviewed the schema of.
 
 import json
 import logging
+# _save_map stamps last_synced_at with datetime.now(timezone.utc). Both names
+# were imported at the top of scripts/event_sync.py and were NOT carried over
+# when _save_map moved here on 2026-10-06, so every apply crashed with
+# "name 'datetime' is not defined" — after the HubSpot call had gone out.
+# The whole test suite stubs _save_map, so line 163 had never executed.
+from datetime import datetime, timezone
 
 from clients import database
 from clients.hubspot import HubSpotClient
