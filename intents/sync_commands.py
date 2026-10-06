@@ -95,11 +95,18 @@ def _sync_donations(query_lower: str) -> str:
     on. The gate itself lives in DonationSync.sync, because "sync all" reaches
     the same code without coming through here.
     """
-    logger.info("Running donation sync...")
     dry_run = 'dry run' in query_lower or 'test' in query_lower
+    # A preview was always a 500-profile sample, because quick was wired to
+    # dry_run. "full" unwires them: it pages every profile and every donation
+    # and writes nothing, which is the only way to see the real counts before
+    # turning the flag on.
+    full = dry_run and 'full' in query_lower
+    logger.info("Running donation sync (dry_run=%s, full=%s)...",
+                dry_run, full)
 
     try:
-        results = run_donation_sync(dry_run=dry_run, quick=dry_run,
+        results = run_donation_sync(dry_run=dry_run,
+                                    quick=dry_run and not full,
                                     resolve_shown=LINK_ROWS_SHOWN
                                     if dry_run else 0)
         return _format_donation_sync_results(results, dry_run)
@@ -239,6 +246,15 @@ def _run_all_syncs() -> str:
 # Formatters
 # ---------------------------------------------------------------------------
 
+# Roughly how many CSuite profiles a full preview pages, so the hint can state
+# the cost before someone asks for it. Measured 18,797 on 2026-10-01 via the
+# unfiltered profile/list total; it only has to be the right order of
+# magnitude, and the full run reports what it actually read.
+DONATION_PROFILE_ESTIMATE = 18800
+
+# Kept in step with sync.donations.SAMPLE_SIZE, imported rather than repeated.
+from sync.donations import SAMPLE_SIZE as DONATION_SAMPLE_SIZE  # noqa: E402
+
 # How many shared-email contacts the donation report prints before summarising.
 SHARED_EMAIL_ROWS_SHOWN = 10
 
@@ -272,10 +288,22 @@ def _format_donation_sync_results(results: dict, dry_run: bool) -> str:
         # should have: a plain "sync donations" is refused unless the flag is
         # set, and telling someone to type it invites them to read the
         # refusal as a fault.
+        if results.get("sampled", True):
+            response += (
+                f"\n\n⚡ *Sampled: {DONATION_SAMPLE_SIZE} profiles, "
+                f"{DONATION_SAMPLE_SIZE} donations — not the whole database, "
+                f"so these counts are not totals.*\n"
+                '💡 *Say "sync donations dry run full" to page every '
+                f"profile — roughly {DONATION_PROFILE_ESTIMATE:,} of them, "
+                "which takes minutes and makes no writes. The shared-email "
+                "and stale-link counts cannot be read off a sample.*")
+        else:
+            response += (
+                f"\n\n📚 *Full preview: {results.get('profiles_read', 0):,} "
+                f"profiles and {results.get('donations_read', 0):,} donations "
+                f"read — the whole database, so these counts are totals.*")
         response += (
-            "\n\n⚡ *Sampled: 500 profiles, 500 donations — not the whole "
-            "database.*\n"
-            "🔒 *A live run needs `CSUITE_DONATION_SYNC_ENABLED=true`. "
+            "\n🔒 *A live run needs `CSUITE_DONATION_SYNC_ENABLED=true`. "
             "Without it `sync donations` is refused and nothing is written.*")
 
     return response

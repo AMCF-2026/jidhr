@@ -178,10 +178,31 @@ def test_a_dry_run_is_allowed_while_the_flag_is_off(monkeypatch):
             reached["limit"] = limit
             return {}
 
-    result = Readable().sync(dry_run=True)
+    result = Readable().sync(dry_run=True, quick=True)
 
-    assert reached["limit"] == 500, "a dry run is sampled"
+    assert reached["limit"] == 500, "a quick run is sampled"
     assert result["updated"] == 0
+
+
+def test_a_full_dry_run_pages_everything_and_is_still_ungated(monkeypatch):
+    """Sampling is `quick`'s job now. A dry run with quick=False pages the
+    whole database and still writes nothing, which is the preview the
+    decision to enable should rest on."""
+    arm(monkeypatch, False)
+    reached = {}
+
+    class Readable(DonationSync):
+        def __init__(self):
+            pass
+
+        def get_profile_emails(self, limit=None):
+            reached["limit"] = limit
+            return {}
+
+    result = Readable().sync(dry_run=True, quick=False)
+
+    assert reached["limit"] is None, "no cap means every profile"
+    assert result["sampled"] is False
 
 
 def test_a_dry_run_still_runs_when_the_flag_is_on(monkeypatch):
