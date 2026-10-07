@@ -40,7 +40,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from clients.csuite import is_csuite_write
@@ -262,6 +262,87 @@ def content_hash(row: dict) -> str:
     canonical = json.dumps(subset, sort_keys=True, default=str,
                            separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# Which fields a marketing-event PUT accepts. Everything else a GET returns —
+# objectId, id, createdAt, updatedAt, attendees, registrants, noShows,
+# cancellations, eventCancelled, eventCompleted, customProperties — is
+# derived or read-only and is not sent back.
+WRITABLE_EVENT_FIELDS = ("eventName", "eventDescription", "eventOrganizer",
+                         "eventType", "eventUrl", "startDateTime",
+                         "endDateTime")
+
+# The only two this sync owns. An update overwrites these and nothing else.
+#
+# 2026-10-07: an update built from scratch cleared endDateTime and eventType
+# and replaced eventOrganizer (an owner id, 159996166) with an organisation
+# NAME and a rich eventDescription with "Location: Virtual". PUT to
+# /events/{externalEventId} is an upsert, so every field the body omits is
+# cleared. One field was corrected and four were lost.
+#
+# CSuite has nothing to say about the other four: its event-date record
+# carries exactly these fields — archived, available_seats, event_date,
+# event_date_id, event_description, event_id, event_name, event_type_code,
+# funit_id, goal_amount, location, newsletter, online_ticket_sales,
+# private_event, start_time — and no end time of any kind. So an update
+# merges onto what HubSpot already holds rather than asserting a whole record.
+SYNC_OWNED_FIELDS = ("startDateTime", "endDateTime")
+
+
+def portal_duration(existing) -> timedelta | None:
+    """How long the HubSpot record says the event lasts, or None."""
+    start = (existing or {}).get("startDateTime")
+    end = (existing or {}).get("endDateTime")
+    if not start or not end:
+        return None
+    try:
+        began = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+        ended = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    span = ended - began
+    return span if span > timedelta(0) else None
+
+
+def merge_for_update(existing: dict, mapped) -> tuple:
+    """(body, note) — the portal record with only the dates overwritten.
+
+    Read-merge-write. The body starts from what HubSpot holds, so every field
+    this sync does not own survives byte for byte, and only startDateTime and
+    endDateTime are asserted.
+
+    CSuite has no end time, so endDateTime keeps the PORTAL's duration applied
+    to the corrected start. `note` says so, because a duration carried over
+    from a record whose start was wrong is an assumption, not a measurement.
+    """
+    body = {field: existing[field]
+            for field in WRITABLE_EVENT_FIELDS
+            if field in (existing or {}) and existing[field] is not None}
+
+    # Required on every write to the external-id path.
+    body["externalEventId"] = mapped.external_event_id
+    body["externalAccountId"] = EXTERNAL_ACCOUNT_ID
+
+    start = (mapped.payload or {}).get("startDateTime")
+    if not start:
+        return None, "the mapped record has no startDateTime"
+    body["startDateTime"] = start
+
+    note = None
+    span = portal_duration(existing)
+    if span is None:
+        body.pop("endDateTime", None)
+        if (existing or {}).get("endDateTime"):
+            note = ("HubSpot's end time could not be read, so none was sent "
+                    "— HubSpot will clear it")
+    else:
+        began = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+        ended = began + span
+        body["endDateTime"] = as_offset(ended)
+        hours = span.total_seconds() / 3600
+        note = (f"end time is ASSUMED: CSuite has no end time, so HubSpot's "
+                f"own {hours:g}h duration was applied to the corrected start")
+    return body, note
 
 
 @dataclass

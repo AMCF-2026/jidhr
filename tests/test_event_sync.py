@@ -223,11 +223,35 @@ def test_an_archived_event_is_flagged_and_left_alone():
 
 
 def test_nothing_in_the_sync_deletes_from_hubspot():
+    """No delete verb anywhere in the sync."""
     import inspect
     source = inspect.getsource(eh) + inspect.getsource(cli)
     assert "_delete(" not in source
     assert '"DELETE"' not in source
-    assert "eventCancelled" not in source
+
+
+def test_the_sync_can_never_cancel_a_hubspot_event():
+    """Behavioural, not a source grep. A grep for "eventCancelled" caught a
+    COMMENT documenting it as read-only, which is the opposite of a problem;
+    this asserts the field can never reach a body instead.
+
+    It matters more since updates became read-merge-write: the body starts
+    from the portal record, so anything in WRITABLE_EVENT_FIELDS is carried
+    through — including, if it were listed, a cancellation."""
+    for field in ("eventCancelled", "eventCompleted"):
+        assert field not in eh.WRITABLE_EVENT_FIELDS
+
+    mapped = eh.map_event_date(row(), "AMCF")
+    assert "eventCancelled" not in mapped.payload
+
+    portal = {"objectId": "hs-1", "externalEventId": mapped.external_event_id,
+              "eventName": "E", "eventCancelled": True,
+              "eventCompleted": True,
+              "startDateTime": "2026-10-08T00:00:00Z",
+              "endDateTime": "2026-10-08T02:00:00Z"}
+    body, _note = eh.merge_for_update(portal, mapped)
+    assert "eventCancelled" not in body, "a merge carried a cancellation"
+    assert "eventCompleted" not in body
 
 
 # ---------------------------------------------------------------------------

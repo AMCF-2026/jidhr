@@ -558,6 +558,33 @@ def _format_event_sync_results(results: dict) -> str:
                   "HubSpot — the next run resolves the ambiguous record by "
                   "lookup rather than retrying it."]
 
+    # Writes, stated rather than inferred. The report used to end with read
+    # counts only, so a run that withheld everything read identically to one
+    # that wrote nothing by luck — and the write_audit ids make the reply
+    # checkable against the table instead of merely believable.
+    if results.get("dry_run", True):
+        lines += ["", "✍️ **0 HubSpot writes — nothing was sent.**"]
+    else:
+        attempted = results.get("writes_attempted", 0)
+        succeeded = results.get("writes_succeeded", 0)
+        ids = results.get("write_audit_ids") or []
+        trail = (" (write_audit " + ", ".join(str(i) for i in ids) + ")"
+                 if ids else " (no write_audit ids — the audit could not be "
+                             "read back)")
+        line = (f"✍️ **{attempted} HubSpot write(s) attempted, {succeeded} "
+                f"succeeded**{trail}")
+        if attempted and succeeded < attempted:
+            line += f"  \n   ⚠️ {attempted - succeeded} did not succeed."
+        lines += ["", line]
+
+    notes = [(record_id, note) for record_id, note in
+             (results.get("duration_notes") or [])]
+    if notes:
+        lines += ["", "🕒 **End times are assumed** — CSuite carries no end "
+                      "time, so HubSpot's own duration was reapplied:"]
+        for record_id, note in notes[:EVENT_WITHHELD_ROWS_SHOWN]:
+            lines.append(f"   `{record_id}` — {note}")
+
     lines += ["", f"📞 {results.get('csuite_calls', 0)} CSuite call(s), "
                   f"{results.get('hubspot_calls', 0)} HubSpot read call(s), "
                   f"{results.get('event_dates_read', 0)} event date(s) read"]
