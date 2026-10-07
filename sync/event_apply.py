@@ -362,7 +362,26 @@ def apply_plan(hubspot, result, limit=None, updates_only: bool = False,
         if not budget_left():
             defer(mapped)
             continue
-        hubspot_id = str(existing.get("objectId") or "")
+        # An update must be for an event the portal listing actually has.
+        #
+        # plan() only ever appends to `updates` when the externalEventId was
+        # found in hubspot_index, so this holds by construction today. It is
+        # checked anyway because the write is a PUT, and PUT to
+        # /events/{externalEventId} is an UPSERT: an "update" for an id the
+        # portal does not hold would quietly CREATE it. That is the one
+        # outcome the create/update split exists to decide deliberately, and
+        # it would arrive here as a surprise — from a hand-built plan, or
+        # from a future change to plan() that nothing else would catch.
+        portal_id = str((existing or {}).get("objectId") or "")
+        portal_ext = str((existing or {}).get("externalEventId") or "")
+        if not portal_id or portal_ext != str(mapped.external_event_id):
+            withhold(mapped,
+                     f"update withheld: {mapped.external_event_id} is not in "
+                     f"the HubSpot listing, and the write is an upsert — "
+                     f"sending it would create the event, not update it")
+            continue
+
+        hubspot_id = portal_id
         written_id, error, ambiguous = _write_event(hubspot, mapped)
         if ambiguous:
             # An update is an upsert, so a re-send is not a duplicate risk —

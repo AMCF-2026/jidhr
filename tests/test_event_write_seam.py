@@ -329,3 +329,125 @@ def test_run_reports_a_stop_rather_than_raising(monkeypatch):
 
     assert result["stopped"] and "HTTP 404" in result["stopped"]
     assert closed["status"] == "failed", "a stopped run is not complete"
+
+
+# ---------------------------------------------------------------------------
+# An update must be for an event the portal actually has
+# ---------------------------------------------------------------------------
+#
+# The write is a PUT to /events/{externalEventId}, and that is an UPSERT. So
+# an "update" for an id the portal does not hold would quietly CREATE it —
+# the one outcome the create/update split exists to decide deliberately.
+# plan() only appends to `updates` when the id was found in hubspot_index, so
+# this holds by construction; it is checked anyway because nothing else would
+# catch a hand-built plan or a future change to plan().
+
+def plan_with_update(existing):
+    mapped = mapped_of(event_date_id=1464)
+    return {"creates": [], "updates": [(mapped, existing, "hash changed")],
+            "unchanged": [], "skipped": [], "review": []}, mapped
+
+
+def test_an_update_not_in_the_portal_is_withheld():
+    seam = Seam()
+    plan, _mapped = plan_with_update({})          # nothing came back
+
+    outcomes = ea.apply_plan(seam, plan, today=PINNED_TODAY)
+
+    assert seam.sent == [], "an upsert would have created it"
+    assert outcomes[0]["outcome"] == "withheld"
+    assert "not in the HubSpot listing" in outcomes[0]["why"]
+    assert "would create the event" in outcomes[0]["why"]
+
+
+def test_an_update_with_no_objectid_is_withheld():
+    seam = Seam()
+    plan, _mapped = plan_with_update({"externalEventId": "csuite-1464"})
+
+    outcomes = ea.apply_plan(seam, plan, today=PINNED_TODAY)
+
+    assert seam.sent == []
+    assert outcomes[0]["outcome"] == "withheld"
+
+
+def test_an_update_whose_portal_row_is_a_different_event_is_withheld():
+    """A mismatched pairing is worse than a missing one: it would write this
+    event's payload under that event's id."""
+    seam = Seam()
+    plan, _mapped = plan_with_update({"objectId": "hs-9",
+                                      "externalEventId": "csuite-9999"})
+
+    outcomes = ea.apply_plan(seam, plan, today=PINNED_TODAY)
+
+    assert seam.sent == []
+    assert outcomes[0]["outcome"] == "withheld"
+
+
+def test_an_update_that_IS_in_the_portal_is_sent():
+    """The guard has to let the real case through."""
+    seam = Seam()
+    plan, mapped = plan_with_update({"objectId": "hs-1464",
+                                     "externalEventId": "csuite-1464"})
+
+    outcomes = ea.apply_plan(seam, plan, today=PINNED_TODAY)
+
+    assert len(seam.sent) == 1
+    assert outcomes[0]["outcome"] == "updated"
+    assert outcomes[0]["hubspot_id"] in ("hs-1464", "hs-new")
+
+
+def test_plan_never_produces_an_update_outside_the_listing():
+    """The structural half of the same claim."""
+    rows = [row(1464), row(1528, event_date="2026-12-15")]
+    index = {"csuite-1464": {"objectId": "hs-1464",
+                             "externalEventId": "csuite-1464"}}
+
+    result = ea.plan(rows, {}, index, "AMCF")
+
+    for _mapped, existing, _why in result["updates"]:
+        assert existing.get("objectId"), "plan() produced a blind update"
+    assert [str(m.csuite_eventdate_id)
+            for m, _w in result["creates"]] == ["1528"]
+
+
+# ---------------------------------------------------------------------------
+# An 'unknown' outcome stops the run, on both paths
+# ---------------------------------------------------------------------------
+
+def test_an_unknown_create_stops_the_run():
+    seam = Seam([({"error": "timeout"}, None),
+                 ({"objectId": "hs-2"}, 200)])
+    creates = [mapped_of(event_date_id=1528, event_date="2026-12-15"),
+               mapped_of(event_date_id=1529, event_date="2026-12-16")]
+
+    with pytest.raises(ea.FirstFailureStop) as caught:
+        ea.apply_plan(seam, plan_of(creates=creates), today=PINNED_TODAY)
+
+    assert len(seam.sent) == 1, "the second create must not be attempted"
+    assert caught.value.outcomes[-1]["outcome"] == "unknown"
+
+
+def test_an_unknown_update_stops_the_run():
+    seam = Seam([({"error": "connection reset"}, None),
+                 ({"objectId": "hs-2"}, 200)])
+    updates = [mapped_of(event_date_id=1466), mapped_of(event_date_id=1464)]
+
+    with pytest.raises(ea.WriteFailed) as caught:
+        ea.apply_plan(seam, plan_of(updates=updates), today=PINNED_TODAY)
+
+    assert len(seam.sent) == 1
+    assert caught.value.outcomes[-1]["outcome"] == "unknown"
+    assert "ambiguous" in caught.value.reason
+
+
+def test_an_unknown_update_stops_before_the_creates():
+    seam = Seam([({"error": "timeout"}, None)])
+    plan = plan_of(creates=[mapped_of(event_date_id=1528,
+                                      event_date="2026-12-15")],
+                   updates=[mapped_of(event_date_id=1466)])
+
+    with pytest.raises(ea.WriteFailed):
+        ea.apply_plan(seam, plan, today=PINNED_TODAY)
+
+    assert len(seam.sent) == 1
+    assert "csuite-1466" in seam.sent[0][1], "the update, not the create"
