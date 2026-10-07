@@ -17,9 +17,16 @@ reviewed the schema of.
 
 import json
 import logging
+# _save_map stamps last_synced_at with datetime.now(timezone.utc). Both names
+# were imported at the top of scripts/event_sync.py and were NOT carried over
+# when _save_map moved here on 2026-10-06, so every apply crashed with
+# "name 'datetime' is not defined" — after the HubSpot call had gone out.
+# The whole test suite stubs _save_map, so line 163 had never executed.
+from datetime import datetime, timezone
 
 from clients import database
-from clients.hubspot import HubSpotClient
+from clients.hubspot import (HubSpotClient, hubspot_error,
+                             marketing_event_url)
 from sync import event_hubspot as eh
 
 logger = logging.getLogger(__name__)
@@ -36,7 +43,73 @@ CHAT_DEFAULT_LIMIT = 5
 # update. Not the PUT-upsert shape clients/hubspot.create_marketing_event
 # uses — the create/update split is what lets a run report "unchanged",
 # which an upsert cannot.
+# Kept for the listing url and for callers that import it. The WRITE url
+# comes from clients.hubspot.marketing_event_url, which is the same builder
+# the read uses — see the measurements in its docstring.
 CREATE_ENDPOINT = "marketing/v3/marketing-events"
+
+
+class WriteFailed(Exception):
+    """A HubSpot write came back non-2xx, or without an id.
+
+    Carries the outcomes so far, like FirstFailureStop: a run that stops has
+    still done something, and a report that omits it is worse than one that
+    says where it got to.
+    """
+
+    def __init__(self, outcomes, reason):
+        super().__init__(reason)
+        self.outcomes = outcomes
+        self.reason = reason
+
+
+def _write_event(hubspot, mapped):
+    """PUT one marketing event. Returns (hubspot_id, error, ambiguous).
+
+    PUT to /events/{externalEventId} is an UPSERT, and it is the only write
+    shape proven on this portal: write_audit rows 46-52 are seven 200s from
+    it on 2026-10-02. The create/update distinction is decided from event_map
+    and the portal listing, not from the verb, so one shape serves both.
+
+    Goes through _send_with_status rather than _patch/_post because the
+    STATUS CODE is the only reliable success signal. HubSpot answers a 404
+    with a JSON body that _parse_response returns verbatim, carrying no
+    "error" key — so `result.get("error")` was None on a 404 and the row was
+    recorded as "synced". That is what happened to the updates attempted in
+    production on 2026-10-06, against a url with no `/events/` segment that
+    could never have existed.
+
+    THREE outcomes, not two:
+
+    * a definite failure — a status we got, outside 2xx, or a 2xx whose body
+      is an error. It did not land. `error` is set.
+    * ambiguous — no status at all (a transport fault, a refusal), or a 2xx
+      with no id in the body. It MAY have landed, and with no idempotency key
+      a retry is how one event becomes two. `ambiguous` is set.
+    * success — a 2xx with an id.
+
+    Collapsing the middle case into the first is what would make a retried
+    create duplicate an event, which is the one mistake this job must not
+    make.
+    """
+    url = marketing_event_url(mapped.external_event_id)
+    result, status = hubspot._send_with_status("PUT", url, mapped.payload)
+
+    if status is None:
+        # No status means we never learned what happened.
+        return None, None, (hubspot_error(result)
+                            or "no HTTP status came back from HubSpot")
+    if not 200 <= int(status) < 300:
+        return None, (f"HTTP {status}: "
+                      f"{hubspot_error(result) or 'no detail'}"), None
+    error = hubspot_error(result)
+    if error:
+        return None, f"HTTP {status} but the body is an error: {error}", None
+    event_id = (result or {}).get("objectId") or (result or {}).get("id")
+    if not event_id:
+        return None, None, f"HTTP {status} with no id in the body"
+    return str(event_id), None, None
+
 
 _TABLES_SQL = """
     SELECT table_name FROM information_schema.tables
@@ -63,15 +136,28 @@ _UPSERT_MAP_SQL = """
            updated_at = NOW()
 """
 
-_RUN_SQL = """
-    INSERT INTO hubsync.run_log (
-        job, applied, finished_at, csuite_calls, hubspot_calls,
-        event_dates_read, created_count, updated_count, unchanged_count,
-        skipped_count, review_count, failed_count, status, error_summary,
-        outcomes)
-    VALUES ('event_sync', %s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s::jsonb)
+# A run_log row is OPENED before anything happens and CLOSED in a finally.
+#
+# It used to be a single INSERT at the very end, with status 'complete'
+# hardcoded. So a run that crashed left no row at all: the failed apply on
+# 2026-10-06 is absent from the ledger entirely, and the only reason anyone
+# knows it happened is that a person saw the error in chat. A table whose
+# rows only appear when nothing went wrong is a table that cannot answer
+# "what happened last night".
+_RUN_OPEN_SQL = """
+    INSERT INTO hubsync.run_log (job, applied, status)
+    VALUES ('event_sync', %s, 'running')
     RETURNING id
+"""
+
+_RUN_CLOSE_SQL = """
+    UPDATE hubsync.run_log
+       SET finished_at = NOW(), status = %s, error_summary = %s,
+           csuite_calls = %s, hubspot_calls = %s, event_dates_read = %s,
+           created_count = %s, updated_count = %s, unchanged_count = %s,
+           skipped_count = %s, review_count = %s, failed_count = %s,
+           outcomes = %s::jsonb
+     WHERE id = %s
 """
 
 
@@ -276,24 +362,57 @@ def apply_plan(hubspot, result, limit=None, updates_only: bool = False,
         if not budget_left():
             defer(mapped)
             continue
-        hubspot_id = str(existing.get("objectId") or "")
-        # PATCH by externalEventId is the documented update path for
-        # marketing events; the objectId is stored for people, not used
-        # as the write key.
-        updated = hubspot._patch(
-            f"{CREATE_ENDPOINT}/{mapped.external_event_id}", mapped.payload)
-        error = (updated or {}).get("error")
+        # An update must be for an event the portal listing actually has.
+        #
+        # plan() only ever appends to `updates` when the externalEventId was
+        # found in hubspot_index, so this holds by construction today. It is
+        # checked anyway because the write is a PUT, and PUT to
+        # /events/{externalEventId} is an UPSERT: an "update" for an id the
+        # portal does not hold would quietly CREATE it. That is the one
+        # outcome the create/update split exists to decide deliberately, and
+        # it would arrive here as a surprise — from a hand-built plan, or
+        # from a future change to plan() that nothing else would catch.
+        portal_id = str((existing or {}).get("objectId") or "")
+        portal_ext = str((existing or {}).get("externalEventId") or "")
+        if not portal_id or portal_ext != str(mapped.external_event_id):
+            withhold(mapped,
+                     f"update withheld: {mapped.external_event_id} is not in "
+                     f"the HubSpot listing, and the write is an upsert — "
+                     f"sending it would create the event, not update it")
+            continue
+
+        hubspot_id = portal_id
+        written_id, error, ambiguous = _write_event(hubspot, mapped)
+        if ambiguous:
+            # An update is an upsert, so a re-send is not a duplicate risk —
+            # but we do not know the current state, so we stop and let the
+            # next run read it back rather than carrying on blind.
+            _save_map(mapped, hubspot_id, "unknown", ambiguous)
+            outcomes.append({"id": mapped.csuite_eventdate_id,
+                             "outcome": "unknown", "why": why,
+                             "error": str(ambiguous)[:200]})
+            raise WriteFailed(
+                outcomes,
+                f"update of {mapped.external_event_id} came back ambiguous "
+                f"({ambiguous}). Stopped before any further write.")
         if error:
             _save_map(mapped, hubspot_id, "error", error)
             outcomes.append({"id": mapped.csuite_eventdate_id,
                              "outcome": "failed", "why": why,
                              "error": str(error)[:200]})
-        else:
-            _save_map(mapped, hubspot_id, "synced")
-            outcomes.append({"id": mapped.csuite_eventdate_id,
-                             "outcome": "updated", "hubspot_id": hubspot_id,
-                             "why": why})
-            written += 1
+            # STOP. Five updates in production all went to a url with no
+            # `/events/` segment and all 404'd; the run reported none of it
+            # and would have carried on to the creates. One failure is
+            # evidence about the next call, not an isolated event.
+            raise WriteFailed(
+                outcomes,
+                f"update of {mapped.external_event_id} failed ({error}). "
+                "Stopped before any further write.")
+        _save_map(mapped, written_id or hubspot_id, "synced")
+        outcomes.append({"id": mapped.csuite_eventdate_id,
+                         "outcome": "updated",
+                         "hubspot_id": written_id or hubspot_id, "why": why})
+        written += 1
 
     # --- then creates ---
     for mapped, why in result["creates"]:
@@ -314,9 +433,16 @@ def apply_plan(hubspot, result, limit=None, updates_only: bool = False,
         if not budget_left():
             defer(mapped)
             continue
-        created = hubspot._post(CREATE_ENDPOINT, mapped.payload)
-        event_id = (created or {}).get("objectId") or (created or {}).get("id")
-        error = (created or {}).get("error")
+        event_id, error, ambiguous = _write_event(hubspot, mapped)
+        if error:
+            _save_map(mapped, None, "error", error)
+            outcomes.append({"id": mapped.csuite_eventdate_id,
+                             "outcome": "failed", "why": why,
+                             "error": str(error)[:200]})
+            raise WriteFailed(
+                outcomes,
+                f"create of {mapped.external_event_id} failed ({error}). "
+                "Stopped before any further write.")
 
         if event_id:
             _save_map(mapped, event_id, "synced")
@@ -329,16 +455,18 @@ def apply_plan(hubspot, result, limit=None, updates_only: bool = False,
         # Ambiguous: no id came back. It may or may not have landed, and
         # there is no idempotency key to make a retry safe. Record
         # 'unknown', and STOP the run — see apply_plan's docstring.
-        _save_map(mapped, None, "unknown", error or "no objectId in response")
+        _save_map(mapped, None, "unknown",
+                  ambiguous or "no objectId in response")
         outcomes.append({"id": mapped.csuite_eventdate_id,
                          "outcome": "unknown",
                          "why": "create returned no id — NOT retried; the "
                                 "next run resolves it by lookup",
-                         "error": str(error)[:200] if error else None})
+                         "error": str(ambiguous)[:200] if ambiguous
+                         else None})
         raise FirstFailureStop(
             outcomes,
             f"create for {mapped.external_event_id} returned no id "
-            f"({error or 'no objectId in response'}). Stopped before any "
+            f"({ambiguous or 'no objectId in response'}). Stopped before any "
             "further create.")
 
     # Unchanged rows still get their timestamp refreshed, so "last seen"
@@ -359,12 +487,52 @@ def apply_plan(hubspot, result, limit=None, updates_only: bool = False,
     return outcomes
 
 
+def open_run(applied: bool):
+    """Claim a run_log row marked 'running'. Returns its id, or None.
+
+    Never raises: a run must not be prevented by its own bookkeeping. A None
+    id means the close below has nothing to update and says so in the log.
+    """
+    try:
+        found = database.execute_query(_RUN_OPEN_SQL, (applied,), fetch=True)
+    except Exception as e:
+        logger.error("could not open a run_log row: %s", e)
+        return None
+    row = (found or [{}])[0]
+    return row.get("id") if isinstance(row, dict) else None
+
+
+def close_run(run_id, status: str, counts: dict, outcomes=None,
+              error_summary=None) -> None:
+    """Stamp the outcome on the row opened above. Never raises.
+
+    `counts` are what was WRITTEN (or, on a dry run, predicted) — not the raw
+    plan. A row reading created_count 77 for a run that wrote three events is
+    a row that lies, and both rows in run_log said exactly that.
+    """
+    if run_id is None:
+        logger.warning("no run_log row to close (status would be %s)", status)
+        return
+    try:
+        database.execute_query(_RUN_CLOSE_SQL, (
+            status, str(error_summary)[:1000] if error_summary else None,
+            counts.get("csuite_calls", 0), counts.get("hubspot_calls", 0),
+            counts.get("event_dates_read", 0), counts.get("created", 0),
+            counts.get("updated", 0), counts.get("unchanged", 0),
+            counts.get("skipped", 0), counts.get("review", 0),
+            counts.get("failed", 0) + counts.get("unknown", 0),
+            json.dumps(outcomes or [], default=str), run_id,
+        ), fetch=False)
+    except Exception as e:
+        logger.error("could not close run_log row %s: %s", run_id, e)
+
+
 def summarise_outcomes(outcomes) -> list:
     from collections import Counter
     counts = Counter(o["outcome"] for o in outcomes)
     lines = ["", "--apply results:"]
-    for name in ("created", "updated", "unchanged", "unknown", "failed",
-                 "skipped"):
+    for name in ("created", "updated", "unchanged", "withheld", "deferred",
+                 "unknown", "failed", "skipped"):
         if counts.get(name):
             lines.append(f"  {name:10} {counts[name]}")
     for o in outcomes:
@@ -372,33 +540,6 @@ def summarise_outcomes(outcomes) -> list:
             lines.append(f"  ! {o['id']}: {o.get('why')} "
                          f"{o.get('error') or ''}")
     return lines
-
-
-def record_run(result, fetched, hs_calls, applied, outcomes=None) -> None:
-    """One run_log row per run, dry ones included.
-
-    A dry run is logged too: "we looked and would have done nothing" is
-    worth being able to prove later.
-    """
-    from collections import Counter
-    counts = Counter(o["outcome"] for o in (outcomes or []))
-    try:
-        database.execute_query(_RUN_SQL, (
-            applied, fetched.calls, hs_calls, len(fetched.rows),
-            counts.get("created", 0) if applied else len(result["creates"]),
-            counts.get("updated", 0) if applied else len(result["updates"]),
-            counts.get("unchanged", 0) if applied else len(result["unchanged"]),
-            len(result["skipped"]), len(result["review"]),
-            counts.get("failed", 0) + counts.get("unknown", 0),
-            "complete", None,
-            json.dumps(outcomes or [], default=str),
-        ), fetch=True)
-    except Exception as e:
-        # A library module logs; it does not write to a CLI's stderr. The
-        # run still happened, and failing it over bookkeeping would be worse.
-        logger.error("could not write the run log: %s", e)
-
-
 
 
 def _date_read_ceiling():
@@ -482,6 +623,28 @@ def run(hubspot=None, dry_run: bool = True, limit=None,
                         "migrations/001_hubsync_event_map.sql first.")
         return out
 
+    # Opened BEFORE anything happens, closed in the finally below, so a run
+    # that dies still leaves a row saying it started and failed.
+    run_id = open_run(applied=not dry_run) if have_tables else None
+    out["run_id"] = run_id
+    try:
+        return _run_body(out, hubspot, dry_run, limit, organizer, pace_ms,
+                         updates_only, include_ids, future_only, today,
+                         have_tables)
+    finally:
+        if run_id is not None:
+            status = "failed" if (out.get("error") or out.get("stopped")) \
+                else "complete"
+            close_run(run_id, status, out, outcomes=out.get("outcomes"),
+                      error_summary=out.get("error") or out.get("stopped"))
+            out["run_logged"] = True
+
+
+def _run_body(out, hubspot, dry_run, limit, organizer, pace_ms, updates_only,
+              include_ids, future_only, today, have_tables):
+    """The body of run(). Returns `out`; never writes the run_log row."""
+    from clients.csuite import CSuiteClient
+
     hubspot = hubspot or HubSpotClient()
     fetched = eh.fetch_event_dates(CSuiteClient(), pace_ms=pace_ms)
     out["csuite_calls"] = fetched.calls
@@ -542,9 +705,6 @@ def run(hubspot=None, dry_run: bool = True, limit=None,
                            include_ids=include_ids, future_only=future_only,
                            today=today)
         out.update(planned)
-        if have_tables:
-            record_run(result, fetched, hs_calls, applied=False)
-            out["run_logged"] = True
         return out
 
     try:
@@ -552,7 +712,7 @@ def run(hubspot=None, dry_run: bool = True, limit=None,
                               updates_only=updates_only,
                               include_ids=include_ids,
                               future_only=future_only, today=today)
-    except FirstFailureStop as stop:
+    except (FirstFailureStop, WriteFailed) as stop:
         outcomes, out["stopped"] = stop.outcomes, stop.reason
 
     out["outcomes"] = outcomes
@@ -562,6 +722,4 @@ def run(hubspot=None, dry_run: bool = True, limit=None,
     out["withheld_rows"] = [(o["id"], o.get("why"))
                             for o in outcomes
                             if o.get("outcome") == "withheld"]
-    record_run(result, fetched, hs_calls, applied=True, outcomes=outcomes)
-    out["run_logged"] = True
     return out

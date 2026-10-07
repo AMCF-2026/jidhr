@@ -370,6 +370,19 @@ class FakeHubSpot:
         self.calls.append(("PATCH", endpoint, data))
         return {"objectId": "hs-patched"}
 
+    def _send_with_status(self, method, endpoint, data=None):
+        """apply_plan writes through this seam now, because the STATUS CODE
+        is the only reliable success signal: HubSpot answers a 404 with a
+        JSON body that carries no "error" key, so a 404 used to read as a
+        success and be recorded as "synced"."""
+        result = self._post(endpoint, data) if method in ("POST", "PUT") \
+            else self._patch(endpoint, data)
+        if isinstance(result, dict) and result.get("status") == "error":
+            return result, 404          # a definite HTTP failure
+        if isinstance(result, dict) and result.get("error"):
+            return result, None         # a transport fault: AMBIGUOUS
+        return result, 200
+
     @property
     def creates(self):
         return [c for c in self.calls if c[0] == "POST"]
@@ -487,13 +500,17 @@ def test_updates_count_toward_the_limit_too(no_db):
     update to the wrong event is not free."""
     hubspot = FakeHubSpot()
     cli.apply_plan(hubspot, plan_of(creates=2, updates=3), limit=3, today=PINNED_TODAY)
-    assert len(hubspot.creates) + len(hubspot.updates) == 3
+    # Three PUTs. Which were updates is decided by apply_plan, not by the
+    # verb: everything upserts through /events/{externalEventId} now.
+    assert len(hubspot.calls) == 3
+    outcomes = cli.apply_plan(FakeHubSpot(), plan_of(creates=2, updates=3),
+                              limit=3, today=PINNED_TODAY)
     # UPDATES run first as of 2026-10-06: an update touches a record that
     # already exists and whose previous value HubSpot still holds, while a
     # create adds a row somebody has to delete by hand. A spent limit should
     # buy the reversible half.
-    assert len(hubspot.updates) == 3, "updates run first"
-    assert len(hubspot.creates) == 0
+    assert [o["outcome"] for o in outcomes].count("updated") == 3
+    assert [o["outcome"] for o in outcomes].count("created") == 0
 
 
 def test_records_beyond_the_limit_are_deferred_not_lost(no_db):
