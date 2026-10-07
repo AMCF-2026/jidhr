@@ -168,6 +168,23 @@ class Config:
         os.environ.get('CSUITE_NEWSLETTER_SYNC_ENABLED', 'False')
         .strip().lower() == 'true')
 
+    # Whether the registrations sync may WRITE to HubSpot. Off.
+    #
+    # Phase 1 builds no write path at all, so this enables nothing yet: a
+    # live run is refused twice, once for the flag and once for the missing
+    # path. The flag exists so phase 2 has somewhere to hang, and so the
+    # default is already the safe one when it does.
+    #
+    # What it would eventually permit: POST attendance/{extId}/REGISTERED/
+    # create, by contact id, for registrants who already have a HubSpot
+    # contact. Measured 2026-10-07 across the eleven mapped events — 83 of
+    # 100 unique registrant emails have one, 17 do not, and the 17 are
+    # withheld rather than created, because creating a contact is a decision
+    # about who AMCF may email.
+    REGISTRATIONS_SYNC_ENABLED = (
+        os.environ.get('REGISTRATIONS_SYNC_ENABLED', 'False')
+        .strip().lower() == 'true')
+
     # Whether "sync donations" may WRITE to HubSpot. Off.
     #
     # It writes five properties per matched contact, one of which is
