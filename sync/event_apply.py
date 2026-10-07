@@ -63,7 +63,7 @@ class WriteFailed(Exception):
         self.reason = reason
 
 
-def _write_event(hubspot, mapped):
+def _write_event(hubspot, mapped, body=None):
     """PUT one marketing event. Returns (hubspot_id, error, ambiguous).
 
     PUT to /events/{externalEventId} is an UPSERT, and it is the only write
@@ -93,7 +93,8 @@ def _write_event(hubspot, mapped):
     make.
     """
     url = marketing_event_url(mapped.external_event_id)
-    result, status = hubspot._send_with_status("PUT", url, mapped.payload)
+    result, status = hubspot._send_with_status(
+        "PUT", url, body if body is not None else mapped.payload)
 
     if status is None:
         # No status means we never learned what happened.
@@ -305,7 +306,8 @@ def starts_in_the_past(mapped, today) -> bool:
 
 
 def apply_plan(hubspot, result, limit=None, updates_only: bool = False,
-               include_ids=(), future_only: bool = True, today=None) -> list:
+               include_ids=(), future_only: bool = True, today=None,
+               stats=None) -> list:
     """Create and update in HubSpot. Never deletes. Returns outcomes.
 
     Stops on the FIRST create that fails or comes back ambiguous, and
@@ -337,6 +339,12 @@ def apply_plan(hubspot, result, limit=None, updates_only: bool = False,
     """
     outcomes = []
     written = 0
+    # Attempts, not successes. A run that tried five and landed one must not
+    # read like a run that tried one. The caller owns the dict so the count
+    # survives a raise — a run that stops mid-way has still written things.
+    attempted = stats if stats is not None else {}
+    attempted.setdefault("writes_attempted", 0)
+    attempted.setdefault("writes_succeeded", 0)
     flagged = review_ids(result)
     today = today_in_portal_tz(today)
     include = {str(i) for i in (include_ids or ())}
@@ -382,7 +390,19 @@ def apply_plan(hubspot, result, limit=None, updates_only: bool = False,
             continue
 
         hubspot_id = portal_id
-        written_id, error, ambiguous = _write_event(hubspot, mapped)
+
+        # READ-MERGE-WRITE. The body starts from the portal record this plan
+        # already holds, so every field the sync does not own survives byte
+        # for byte. Building it from scratch cleared endDateTime and
+        # eventType and overwrote eventOrganizer and eventDescription on
+        # csuite-1466 on 2026-10-07.
+        body, duration_note = eh.merge_for_update(existing, mapped)
+        if body is None:
+            withhold(mapped, f"update withheld: {duration_note}")
+            continue
+
+        attempted["writes_attempted"] += 1
+        written_id, error, ambiguous = _write_event(hubspot, mapped, body=body)
         if ambiguous:
             # An update is an upsert, so a re-send is not a duplicate risk —
             # but we do not know the current state, so we stop and let the
@@ -409,9 +429,11 @@ def apply_plan(hubspot, result, limit=None, updates_only: bool = False,
                 f"update of {mapped.external_event_id} failed ({error}). "
                 "Stopped before any further write.")
         _save_map(mapped, written_id or hubspot_id, "synced")
+        attempted["writes_succeeded"] += 1
         outcomes.append({"id": mapped.csuite_eventdate_id,
                          "outcome": "updated",
-                         "hubspot_id": written_id or hubspot_id, "why": why})
+                         "hubspot_id": written_id or hubspot_id, "why": why,
+                         "note": duration_note})
         written += 1
 
     # --- then creates ---
@@ -433,6 +455,10 @@ def apply_plan(hubspot, result, limit=None, updates_only: bool = False,
         if not budget_left():
             defer(mapped)
             continue
+        # A create has no portal record to merge onto, so the mapped payload
+        # IS the whole record — which is correct for something that does not
+        # exist yet.
+        attempted["writes_attempted"] += 1
         event_id, error, ambiguous = _write_event(hubspot, mapped)
         if error:
             _save_map(mapped, None, "error", error)
@@ -446,6 +472,7 @@ def apply_plan(hubspot, result, limit=None, updates_only: bool = False,
 
         if event_id:
             _save_map(mapped, event_id, "synced")
+            attempted["writes_succeeded"] += 1
             outcomes.append({"id": mapped.csuite_eventdate_id,
                              "outcome": "created", "hubspot_id": str(event_id),
                              "why": why})
@@ -485,6 +512,28 @@ def apply_plan(hubspot, result, limit=None, updates_only: bool = False,
                              "outcome": "skipped", "why": reason})
 
     return outcomes
+
+
+_AUDIT_IDS_SQL = """
+    SELECT id FROM write_audit
+     WHERE target_system = 'hubspot'
+       AND endpoint LIKE 'marketing/v3/marketing-events%%'
+       AND created_at >= %s
+     ORDER BY id
+"""
+
+
+def _write_audit_ids(since) -> list:
+    """The write_audit ids this run produced, so a chat reply can be checked
+    against the table rather than believed. Never raises."""
+    if since is None:
+        return []
+    try:
+        rows = database.execute_query(_AUDIT_IDS_SQL, (since,), fetch=True)
+    except Exception as e:
+        logger.warning("could not read back the write_audit ids: %s", e)
+        return []
+    return [r["id"] if isinstance(r, dict) else r[0] for r in rows or []]
 
 
 def open_run(applied: bool):
@@ -609,6 +658,9 @@ def run(hubspot=None, dry_run: bool = True, limit=None,
            "created": 0, "updated": 0, "unchanged": 0, "deferred": 0,
            "unknown": 0, "failed": 0, "skipped": 0, "review": 0,
            "withheld": 0, "withheld_rows": [], "updates_only": updates_only,
+           "writes_attempted": 0, "writes_succeeded": 0,
+           "write_audit_ids": [], "run_started_at": None,
+           "duration_notes": [],
            "future_only": future_only, "include_ids": list(include_ids or ()),
            "csuite_calls": 0, "hubspot_calls": 0, "event_dates_read": 0,
            "review_rows": [], "plan": None}
@@ -625,8 +677,11 @@ def run(hubspot=None, dry_run: bool = True, limit=None,
 
     # Opened BEFORE anything happens, closed in the finally below, so a run
     # that dies still leaves a row saying it started and failed.
+    from datetime import datetime, timezone
+
     run_id = open_run(applied=not dry_run) if have_tables else None
     out["run_id"] = run_id
+    out["run_started_at"] = datetime.now(timezone.utc)
     try:
         return _run_body(out, hubspot, dry_run, limit, organizer, pace_ms,
                          updates_only, include_ids, future_only, today,
@@ -707,13 +762,20 @@ def _run_body(out, hubspot, dry_run, limit, organizer, pace_ms, updates_only,
         out.update(planned)
         return out
 
+    stats = {}
     try:
         outcomes = apply_plan(hubspot, result, limit=limit,
                               updates_only=updates_only,
                               include_ids=include_ids,
-                              future_only=future_only, today=today)
+                              future_only=future_only, today=today,
+                              stats=stats)
     except (FirstFailureStop, WriteFailed) as stop:
         outcomes, out["stopped"] = stop.outcomes, stop.reason
+    out["writes_attempted"] = stats.get("writes_attempted", 0)
+    out["writes_succeeded"] = stats.get("writes_succeeded", 0)
+    out["write_audit_ids"] = _write_audit_ids(out.get("run_started_at"))
+    out["duration_notes"] = [(o["id"], o["note"]) for o in outcomes
+                             if o.get("note")]
 
     out["outcomes"] = outcomes
     for name in ("created", "updated", "unchanged", "deferred", "unknown",
