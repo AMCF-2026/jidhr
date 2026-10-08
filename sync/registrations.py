@@ -49,6 +49,12 @@ PHASE_ONE_EVENT_IDS = ("1153", "1155", "1157", "1159", "1168", "1429",
 # The only state phase 1 would ever assert.
 REGISTERED = "REGISTERED"
 
+# Which rule set a record's interactionDateTime. Recorded per record in
+# run_log.outcomes, because "min(event start, run time)" read back from a
+# log is not the same as knowing which half of the min a given write used.
+INTERACTION_EVENT_START = "event_start"
+INTERACTION_RUN_TIME = "run_time"
+
 # Cancellation is inferred, so the inference is fenced.
 #
 # An event whose registrant list comes back EMPTY when the map holds rows for
@@ -480,28 +486,55 @@ def event_object_ids(hubspot, event_ids) -> tuple:
     return out, calls, None
 
 
-def interaction_timestamp(csuite, event_date_id, cache) -> tuple:
-    """(unix milliseconds, assumed) for one event's start.
+def event_detail(csuite, event_date_id, cache) -> dict:
+    """{"name", "start_ms"} for one event date, from ONE CSuite call.
 
-    `assumed` is always True: the doc calls interactionDateTime "the date and
-    time at which the contact subscribed to the event", and CSuite records no
-    registration timestamp. The event's own start is the nearest available
-    fact; "now" would assert that everyone registered when the sync ran.
+    The cache holds the event's own start, never the clamped value — the
+    clamp depends on when the run happened and the event does not.
     """
     from sync import event_hubspot as eh
 
     key = str(event_date_id)
     if key in cache:
-        return cache[key], True
+        return cache[key]
     response = csuite._request("event/display/eventdate",
                               {"event_date_id": int(event_date_id)})
     data = (response or {}).get("data")
     if isinstance(data, list):
         data = data[0] if data else {}
-    moment, _reason = eh.start_moment(data or {})
-    stamp = int(moment.timestamp() * 1000) if moment else None
-    cache[key] = stamp
-    return stamp, True
+    row = data or {}
+    moment, _reason = eh.start_moment(row)
+    detail = {"name": eh.event_title(row) or None,
+              "start_ms": int(moment.timestamp() * 1000) if moment else None}
+    cache[key] = detail
+    return detail
+
+
+def interaction_timestamp(csuite, event_date_id, cache, now_ms) -> tuple:
+    """(unix milliseconds, rule) for one record's interactionDateTime.
+
+    min(event start, run time). HubSpot documents the field as "the date and
+    time at which the contact subscribed to the event", and CSuite records no
+    registration timestamp, so the value is an assumption either way. But an
+    assumption can still be checked against the calendar: six of the eleven
+    phase-1 events START IN THE FUTURE (measured 2026-10-08 — 1153 is
+    2026-12-31, and 1168, 1429, 1463, 1464 and 1466 follow), so the event's
+    own start would have claimed a registration that has not happened yet.
+    The run time is the latest moment anyone could have registered by.
+
+    Past events are unchanged: their start is the nearest available fact and
+    it is already in the past, so the min is the start.
+
+    `now_ms` is a required argument, not a clock read in here. One moment for
+    the whole run keeps every record in it consistent, and it lets a test
+    pin the clock — this suite has broken twice on clock rollover.
+    """
+    stamp = event_detail(csuite, event_date_id, cache)["start_ms"]
+    if stamp is None:
+        return None, None
+    if stamp <= now_ms:
+        return stamp, INTERACTION_EVENT_START
+    return now_ms, INTERACTION_RUN_TIME
 
 
 def attendance_request(external_event_id, contact_id, when) -> tuple:
@@ -647,16 +680,25 @@ def record_registration(record, external_event_id, audit_id, status,
 
 
 def run(csuite=None, hubspot=None, dry_run: bool = True, limit=1,
-        event_ids=PHASE_ONE_EVENT_IDS) -> dict:
+        event_ids=PHASE_ONE_EVENT_IDS, now_ms=None) -> dict:
     """Preview, or write, REGISTERED states for the mapped events.
 
     A live run needs three things, and refuses on any of them:
     REGISTRATIONS_SYNC_ENABLED on, a `limit` (there is no "all of them"),
     and hubsync.registration_map in place — without the map a successful
     write could not be recorded, and the next run would send it again.
+
+    `now_ms` is the run time used to clamp interactionDateTime. Read once,
+    here, so every record in one run shares a moment, and overridable so a
+    test can pin the clock instead of racing it.
     """
+    from datetime import datetime, timezone
+
     from clients.csuite import CSuiteClient
     from clients.hubspot import HubSpotClient
+
+    if now_ms is None:
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
     if not dry_run:
         if not registrations_sync_allowed():
@@ -679,7 +721,9 @@ def run(csuite=None, hubspot=None, dry_run: bool = True, limit=1,
            "non_marketing": 0, "csuite_calls": 0, "hubspot_calls": 0,
            "registered": 0, "failed": 0, "deferred": 0, "stopped": None,
            "writes_attempted": 0, "write_audit_ids": [],
-           "interaction_assumed": False, "first_sends": []}
+           "run_time_ms": now_ms, "first_sends": [],
+           "interaction_rules": {INTERACTION_EVENT_START: 0,
+                                 INTERACTION_RUN_TIME: 0}}
 
     have_table = migration_applied()
     out["migration_applied"] = have_table
@@ -696,7 +740,7 @@ def run(csuite=None, hubspot=None, dry_run: bool = True, limit=1,
     try:
         return _run_body(out, csuite or CSuiteClient(),
                          hubspot or HubSpotClient(), event_ids, known,
-                         dry_run, limit)
+                         dry_run, limit, now_ms)
     finally:
         if run_id is not None:
             close_run(run_id,
@@ -707,7 +751,7 @@ def run(csuite=None, hubspot=None, dry_run: bool = True, limit=1,
             out["run_logged"] = True
 
 
-def _apply(out, csuite, hubspot, events, limit):
+def _apply(out, csuite, hubspot, events, limit, now_ms):
     """Write up to `limit` REGISTERED states, verifying each one.
 
     Stops on the first failure, ambiguity or unverified read-back. One
@@ -744,9 +788,19 @@ def _apply(out, csuite, hubspot, events, limit):
                     f"event {event_id} has no HubSpot objectId. Nothing "
                     f"further was written.")
 
-            when, assumed = interaction_timestamp(csuite, event_id, stamps)
-            out["csuite_calls"] += 1
-            out["interaction_assumed"] = out["interaction_assumed"] or assumed
+            # Counted only when the call is actually made. The cache is
+            # per run, so the second record on an event is free, and the
+            # old unconditional increment reported CSuite calls that never
+            # happened.
+            cached = str(event_id) in stamps
+            when, rule = interaction_timestamp(csuite, event_id, stamps,
+                                               now_ms)
+            if not cached:
+                out["csuite_calls"] += 1
+            if rule:
+                record["interaction_rule"] = rule
+                record["interaction_at"] = when
+                out["interaction_rules"][rule] += 1
             if when is None:
                 event["failed"].append(dict(
                     record, error="no usable event start, so "
@@ -827,7 +881,12 @@ def _apply(out, csuite, hubspot, events, limit):
 # on purpose — clients/audit.payload_meta draws the same line.
 _LOGGED_FIELDS = ("event_date_id", "email_sha1", "csuite_profile_id",
                   "hubspot_contact_id", "marketing", "rsvp", "attended",
-                  "why", "audit_id", "error")
+                  "why", "audit_id", "error",
+                  # Which half of min(event start, run time) this record
+                  # used, and the value it got. Neither is PII, and without
+                  # the rule the log cannot say whether a given write
+                  # claimed the event's start or the moment of the sync.
+                  "interaction_rule", "interaction_at")
 
 
 def _sort_key(value):
@@ -837,20 +896,41 @@ def _sort_key(value):
     return (0, int(text), "") if text.isdigit() else (1, 0, text)
 
 
-def first_sends(out, count=3) -> list:
+def first_sends(out, csuite=None, cache=None, now_ms=0, count=3) -> list:
     """The first `count` records a live run would send, in send order.
 
     A preview that says "92 would be registered" does not say WHICH one a
     limit of 1 buys. Printing the head of the queue makes the next write
     inspectable before it happens.
+
+    With `csuite`, each row also carries the event's name and start and the
+    interactionDateTime the write would use — the value and the rule that
+    chose it. That is one CSuite call per DISTINCT event in the head of the
+    queue (at most `count`), and it is what makes the clamp checkable
+    before a write rather than after one.
     """
     queue = []
+    cache = cache if cache is not None else {}
     for event in out.get("events") or []:
         for record in event.get("would_register") or []:
-            queue.append({"event_date_id": record["event_date_id"],
-                          "hubspot_contact_id": record.get(
-                              "hubspot_contact_id"),
-                          "marketing": record.get("marketing")})
+            event_id = record["event_date_id"]
+            row = {"event_date_id": event_id,
+                   "hubspot_contact_id": record.get("hubspot_contact_id"),
+                   "marketing": record.get("marketing"),
+                   "event_name": None, "event_start_ms": None,
+                   "interaction_at": None, "interaction_rule": None}
+            if csuite is not None:
+                cached = str(event_id) in cache
+                when, rule = interaction_timestamp(csuite, event_id, cache,
+                                                   now_ms)
+                if not cached:
+                    out["csuite_calls"] = out.get("csuite_calls", 0) + 1
+                detail = cache[str(event_id)]
+                row["event_name"] = detail["name"]
+                row["event_start_ms"] = detail["start_ms"]
+                row["interaction_at"] = when
+                row["interaction_rule"] = rule
+            queue.append(row)
             if len(queue) >= count:
                 return queue
     return queue
@@ -873,7 +953,7 @@ def _outcome_rows(out) -> list:
 
 
 def _run_body(out, csuite, hubspot, event_ids, known, dry_run=True,
-              limit=1) -> dict:
+              limit=1, now_ms=0) -> dict:
     per_event, all_emails = [], set()
 
     for event_id in event_ids:
@@ -940,11 +1020,16 @@ def _run_body(out, csuite, hubspot, event_ids, known, dry_run=True,
             1 for r in event["would_register"] if r.get("marketing") is False)
 
     if dry_run:
-        out["first_sends"] = first_sends(out)
+        # The preview reads the events in the head of the queue so the table
+        # can show the interactionDateTime the write WOULD use. Reads only.
+        out["first_sends"] = first_sends(out, csuite, {}, now_ms)
+        for row in out["first_sends"]:
+            if row.get("interaction_rule"):
+                out["interaction_rules"][row["interaction_rule"]] += 1
         return out
 
     try:
-        _apply(out, csuite, hubspot, events, limit)
+        _apply(out, csuite, hubspot, events, limit, now_ms)
     except RegistrationWriteStopped as stop:
         out["stopped"] = stop.reason
     # Tallied AFTER the writes, and after a stop, because the per-event

@@ -243,6 +243,51 @@ def _sync_registrations(query_lower: str) -> str:
 REGISTRATION_REVIEW_ROWS_SHOWN = 10
 
 
+# interactionDateTime = min(event start, run time). Two rules, so the report
+# has to say WHICH, not just that the value is an assumption. The old note
+# said "is the EVENT START" unconditionally, which stopped being true the
+# moment the clamp went in — and was already misleading for the six
+# phase-1 events that start in the future.
+_INTERACTION_RULE_LABELS = {
+    "event_start": "event start",
+    "run_time": "run time (event is in the future)",
+}
+
+
+def _registration_moment(ms) -> str:
+    """Unix milliseconds as a readable UTC moment, or an em dash."""
+    if ms in (None, ""):
+        return "—"
+    try:
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(
+            int(ms) / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "—"
+
+
+def _interaction_rule_note(results: dict, shown=None) -> str:
+    """Which rule set interactionDateTime, and how many records got each.
+
+    `shown` is the size of the previewed queue: in a dry run the rules are
+    only known for the records in the table, and reporting those counts as
+    if they covered the whole plan would overstate what was measured.
+    """
+    counts = results.get("interaction_rules") or {}
+    starts = counts.get("event_start", 0)
+    runs = counts.get("run_time", 0)
+    if not (starts or runs):
+        return ""
+    scope = f"of the {shown} shown" if shown is not None else "record(s)"
+    return (f"🕒 `interactionDateTime` is **min(event start, run time)** — "
+            f"{scope}: **{starts}** used the EVENT START (already past), "
+            f"**{runs}** used the RUN TIME (the event has not happened yet, "
+            f"so its start would claim a registration that has not "
+            f"occurred). HubSpot documents the field as when the contact "
+            f"subscribed; CSuite records no registration time, so this is "
+            f"an assumption either way — but never one in the future.")
+
+
 def _format_registration_results(results: dict) -> str:
     """Counts in the units they are measured in.
 
@@ -293,12 +338,23 @@ def _format_registration_results(results: dict) -> str:
     if dry_run and queue:
         lines += ["", f"➡️ **The next {len(queue)} to be sent**, in send "
                       "order (event, then contact id):", "",
-                  "| event | contact | marketing |", "|---|---|---|"]
+                  "| event | name | starts | contact | marketing | "
+                  "interactionDateTime | rule |",
+                  "|---|---|---|---|---|---|---|"]
         for entry in queue:
-            lines.append(f"| `{entry['event_date_id']}` | "
-                         f"`{entry['hubspot_contact_id']}` | "
-                         f"{'yes' if entry.get('marketing') else 'NO'} |")
+            name = str(entry.get("event_name") or "—")
+            lines.append(
+                f"| `{entry['event_date_id']}` | "
+                f"{name[:40]} | "
+                f"{_registration_moment(entry.get('event_start_ms'))} | "
+                f"`{entry['hubspot_contact_id']}` | "
+                f"{'yes' if entry.get('marketing') else 'NO'} | "
+                f"{_registration_moment(entry.get('interaction_at'))} | "
+                f"{_INTERACTION_RULE_LABELS.get(entry.get('interaction_rule'), '—')} |")
         lines.append("A limit of 1 sends the first row.")
+        note = _interaction_rule_note(results, len(queue))
+        if note:
+            lines.append(note)
 
     rows = results.get("review_rows") or []
     if rows:
@@ -326,11 +382,9 @@ def _format_registration_results(results: dict) -> str:
         if results.get("failed"):
             lines.append(f"• **{results['failed']}** failed — see the stop "
                          f"reason below")
-        if results.get("interaction_assumed"):
-            lines.append("   🕒 `interactionDateTime` is the EVENT START. "
-                         "HubSpot documents the field as when the contact "
-                         "subscribed; CSuite records no registration time, "
-                         "so this is an assumption, not a measurement.")
+        note = _interaction_rule_note(results)
+        if note:
+            lines.append("   " + note)
 
     lines += ["", f"📞 {results.get('csuite_calls', 0)} CSuite call(s), "
                   f"{results.get('hubspot_calls', 0)} HubSpot read call(s)"]
