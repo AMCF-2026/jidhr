@@ -13,7 +13,8 @@ Available syncs:
 from sync.donations import (DonationSync, DonationSyncDisabled,
                             PartialReadRefused,
                             donation_sync_allowed, run_donation_sync)
-from sync.registrations import (PhaseOnePreviewOnly,
+from sync.registrations import (LimitRequired,
+                                RegistrationWriteStopped,
                                 RegistrationsSyncDisabled,
                                 registrations_sync_allowed)
 from sync.newsletter import (NewsletterSync,
@@ -27,7 +28,8 @@ __all__ = [
     'PartialReadRefused',
     'donation_sync_allowed',
     'EventSync', 
-    'PhaseOnePreviewOnly',
+    'LimitRequired',
+    'RegistrationWriteStopped',
     'RegistrationsSyncDisabled',
     'registrations_sync_allowed',
     'NewsletterSync',

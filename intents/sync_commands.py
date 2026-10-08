@@ -191,23 +191,49 @@ def _event_options(query_lower: str) -> dict:
     }
 
 
+# Writing needs the word. Everything else previews — the opposite of the
+# event sync's original default, and for the same reason: a one-line chat
+# message is a thin thing to hang a write on.
+REGISTRATION_APPLY_PHRASE = "apply"
+
+# A live run always has a cap. There is no phrase for "all of them".
+REGISTRATION_DEFAULT_LIMIT = 1
+
+
+def _registration_limit(query_lower: str):
+    """The record cap for a live run. "no limit" is deliberately NOT
+    honoured: it returns None, which the sync refuses."""
+    import re
+
+    if "no limit" in query_lower or "unlimited" in query_lower:
+        return None
+    found = re.search(r"limit\s+(\d+)", query_lower)
+    if found:
+        return max(int(found.group(1)), 0)
+    return REGISTRATION_DEFAULT_LIMIT
+
+
 def _sync_registrations(query_lower: str) -> str:
-    """Preview the registrations sync. Phase 1 writes nothing, ever."""
+    """Preview, or apply, the registrations sync."""
     from sync import registrations as reg
 
-    live = "dry run" not in query_lower and "preview" not in query_lower
-    logger.info("Running registrations sync (live asked for=%s)...", live)
+    live = REGISTRATION_APPLY_PHRASE in query_lower
+    limit = _registration_limit(query_lower) if live else None
+    logger.info("Running registrations sync (apply=%s, limit=%s)...",
+                live, limit)
     try:
-        results = reg.run(dry_run=not live)
+        results = reg.run(dry_run=not live, limit=limit)
         return _format_registration_results(results)
     except reg.RegistrationsSyncDisabled as e:
         return ("⏸️ **Registrations sync is turned off.**\n\n"
                 f"{e}\n\n"
                 '• Say *"sync registrations dry run"* to preview it.')
-    except reg.PhaseOnePreviewOnly as e:
-        return ("🚧 **Registrations sync is preview-only.**\n\n"
-                f"{e}\n\n"
-                '• Say *"sync registrations dry run"* for the preview.')
+    except reg.LimitRequired as e:
+        return ("🛑 **No limit, no run.**\n\n"
+                f"{e}")
+    except reg.RegistrationWriteStopped as e:
+        return ("🛑 **Registrations run stopped before writing.**\n\n"
+                f"{e}")
     except Exception as e:
         logger.error("Registrations sync error: %s", e, exc_info=True)
         return f"❌ Registrations sync failed: {e}"
@@ -227,7 +253,10 @@ def _format_registration_results(results: dict) -> str:
     if results.get("error"):
         return f"❌ **Registrations preview stopped.**\n\n{results['error']}"
 
-    lines = ["🧪 **Registrations — PREVIEW** (nothing was written)", "",
+    dry_run = results.get("dry_run", True)
+    head = ("🧪 **Registrations — PREVIEW** (nothing was written)" if dry_run
+            else "✅ **Registrations — APPLIED**")
+    lines = [head, "",
              f"📊 **Across {results.get('events_read', 0)} event(s):**",
              f"• **{results.get('registrant_rows', 0)}** registrant rows in "
              f"CSuite",
@@ -259,9 +288,34 @@ def _format_registration_results(results: dict) -> str:
                          f"**{len(rows) - REGISTRATION_REVIEW_ROWS_SHOWN}** "
                          "more; the count above is the total")
 
+    if not dry_run:
+        lines += ["", f"• **{results.get('registered', 0)}** registered and "
+                      f"verified in HubSpot",
+                  f"• **{results.get('deferred', 0)}** deferred — the limit "
+                  f"of {results.get('limit')} was reached"]
+        if results.get("interaction_assumed"):
+            lines.append("   🕒 `interactionDateTime` is the EVENT START. "
+                         "HubSpot documents the field as when the contact "
+                         "subscribed; CSuite records no registration time, "
+                         "so this is an assumption, not a measurement.")
+
     lines += ["", f"📞 {results.get('csuite_calls', 0)} CSuite call(s), "
-                  f"{results.get('hubspot_calls', 0)} HubSpot read call(s)",
-              "✍️ **0 HubSpot writes — phase 1 has no write path.**"]
+                  f"{results.get('hubspot_calls', 0)} HubSpot read call(s)"]
+    if dry_run:
+        lines.append("✍️ **0 HubSpot writes — nothing was sent.**")
+    else:
+        ids = results.get("write_audit_ids") or []
+        trail = (" (write_audit " + ", ".join(str(i) for i in ids) + ")"
+                 if ids else " (no write_audit ids — the audit could not be "
+                             "read back)")
+        lines.append(f"✍️ **{results.get('writes_attempted', 0)} HubSpot "
+                     f"write(s) attempted, {results.get('registered', 0)} "
+                     f"verified**{trail}")
+
+    if results.get("stopped"):
+        lines += ["", f"🛑 **Stopped:** {results['stopped']}",
+                  "Nothing further was written. Every registration that did "
+                  "land is in `registration_map` and in `write_audit`."]
 
     if not results.get("migration_applied"):
         lines += ["", "⚠️ `hubsync.registration_map` does not exist, so this "

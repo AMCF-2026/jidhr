@@ -136,39 +136,111 @@ def test_a_live_run_is_refused_while_the_flag_is_off(monkeypatch):
     assert "nothing was read" in str(caught.value)
 
 
-def test_a_live_run_is_refused_AGAIN_when_the_flag_is_on(monkeypatch):
-    """Two refusals, not one. The flag exists for phase 2; phase 1 has no
-    write path, and "0 registered" must not be what a live run returns."""
+def test_a_live_run_needs_a_limit(monkeypatch):
+    """There is no "all of them". 92 registrations are planned; a run that
+    writes all 92 because nobody typed a number is one whose blast radius
+    was set by omission."""
     arm(monkeypatch, True)
 
-    with pytest.raises(reg.PhaseOnePreviewOnly) as caught:
-        reg.run(csuite=object(), hubspot=object(), dry_run=False)
+    with pytest.raises(reg.LimitRequired) as caught:
+        reg.run(csuite=object(), hubspot=object(), dry_run=False, limit=None)
 
-    assert "preview-only" in str(caught.value)
-    assert "Nothing was read" in str(caught.value)
+    assert "needs a limit" in str(caught.value)
+    assert "no phrase" in str(caught.value)
 
 
-def test_a_live_run_reads_nothing_before_refusing(monkeypatch):
+def test_a_live_run_needs_the_registration_map(monkeypatch):
+    """Without it a successful write could not be recorded, and the next run
+    would send it again."""
     arm(monkeypatch, True)
+    monkeypatch.setattr(reg, "migration_applied", lambda: False)
+
+    with pytest.raises(reg.RegistrationWriteStopped) as caught:
+        reg.run(csuite=CSuite(), hubspot=HubSpot(), dry_run=False, limit=1)
+
+    assert "005_registration_map.sql" in str(caught.value)
+    assert "Nothing was written" in str(caught.value)
+
+
+def test_a_live_run_reads_nothing_before_refusing_on_the_flag(monkeypatch):
+    arm(monkeypatch, False)
     csuite = CSuite()
 
-    with pytest.raises(reg.PhaseOnePreviewOnly):
-        reg.run(csuite=csuite, hubspot=HubSpot(), dry_run=False)
+    with pytest.raises(reg.RegistrationsSyncDisabled):
+        reg.run(csuite=csuite, hubspot=HubSpot(), dry_run=False, limit=1)
 
     assert csuite.asked == []
 
 
-def test_nothing_in_the_module_writes_to_hubspot():
-    """Phase 1's whole claim, as a source check: no write verb anywhere."""
+def test_writes_happen_only_through_the_gated_path():
+    """Item 4's replacement for "no write verbs". There is exactly one place
+    a HubSpot write can be issued, it is reached only from _apply, and
+    _apply is reached only from a non-dry run."""
     import inspect
 
-    source = inspect.getsource(reg)
-    for verb in ("_put(", "_patch(", "_delete(", '"PUT"', '"PATCH"',
-                 '"DELETE"', "_send_with_status"):
-        assert verb not in source, verb
-    # The one POST it makes is a read-shaped batch/read.
-    assert source.count("_post(") == 1
-    assert "contacts/batch/read" in source
+    module = inspect.getsource(reg)
+    assert module.count("_send_with_status") == 1, \
+        "more than one place can issue a write"
+    assert "_send_with_status" in inspect.getsource(reg.write_registration)
+
+    apply_source = inspect.getsource(reg._apply)
+    assert "write_registration(" in apply_source
+
+    body = inspect.getsource(reg._run_body)
+    assert "if dry_run:" in body and "return out" in body
+    assert "_apply(" in body
+
+
+def test_the_only_state_ever_written_is_REGISTERED():
+    """Never ATTENDED — `attended` is null on all 113 rows. Never CANCELLED
+    — CSuite has no such state."""
+    import inspect
+
+    writer = inspect.getsource(reg.write_registration)
+    assert "REGISTERED" in writer
+    assert "ATTENDED" not in writer
+    assert "CANCELLED" not in writer
+
+    applier = inspect.getsource(reg._apply)
+    for forbidden in ("ATTENDED", "CANCELLED", "NO_SHOW"):
+        assert forbidden not in applier, forbidden
+
+
+def test_the_attendance_path_is_the_shape_the_probes_confirmed():
+    assert reg._ATTENDANCE_PATH == (
+        "marketing/v3/marketing-events/attendance/"
+        "{external_event_id}/{state}/create")
+
+
+def test_the_write_body_is_the_documented_shape():
+    """HubSpot's guide: "provide the ID of the contact using the `vid` field
+    within the `inputs` array", and interactionDateTime is required."""
+    sent = {}
+
+    class Seam:
+        def _send_with_status(self, method, endpoint, data=None):
+            sent.update(method=method, endpoint=endpoint, body=data)
+            return {}, 200
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(reg, "_latest_audit_id", lambda endpoint: 99)
+        reg.write_registration(Seam(), "csuite-1462", "543954422478",
+                               1796000000000)
+
+    assert sent["method"] == "POST"
+    assert sent["endpoint"] == ("marketing/v3/marketing-events/attendance/"
+                                "csuite-1462/REGISTERED/create")
+    assert sent["body"] == {"inputs": [{"vid": 543954422478,
+                                        "interactionDateTime": 1796000000000}]}
+
+
+def test_the_attendance_post_is_an_audited_write():
+    """It must not be classified as a read-shaped POST."""
+    from clients.hubspot import is_hubspot_write
+
+    endpoint = reg._ATTENDANCE_PATH.format(external_event_id="csuite-1462",
+                                           state=reg.REGISTERED)
+    assert is_hubspot_write("POST", endpoint) is True
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +580,7 @@ def test_a_plain_request_is_refused_not_run(monkeypatch):
 
 def test_the_preview_reports_in_the_right_units():
     reply = sync_commands._format_registration_results({
+        "dry_run": True,
         "events_read": 11, "registrant_rows": 113, "unique_emails": 109,
         "duplicates_dropped": 3, "would_register": 92, "withheld": 17,
         "already": 0, "review": 0, "review_rows": [], "non_marketing": 7,
@@ -519,7 +592,7 @@ def test_the_preview_reports_in_the_right_units():
     assert "**92** would be sent as REGISTERED" in reply
     assert "**17** withheld" in reply
     assert "**7** of those contacts are deliberately NON-marketing" in reply
-    assert "0 HubSpot writes — phase 1 has no write path" in reply
+    assert "0 HubSpot writes — nothing was sent" in reply
     assert "005_registration_map.sql" in reply
     assert "hashed addresses, never addresses" in reply
 
@@ -555,3 +628,171 @@ def test_nothing_executes_the_migration():
     for line in found.strip().split("\n"):
         if line:
             assert "execute_query" not in line, line
+
+
+# ---------------------------------------------------------------------------
+# The applied report
+# ---------------------------------------------------------------------------
+
+def applied_report(**overrides):
+    base = {"dry_run": False, "limit": 1, "events_read": 11,
+            "registrant_rows": 113, "unique_emails": 109,
+            "duplicates_dropped": 3, "would_register": 92, "withheld": 17,
+            "already": 0, "review": 0, "review_rows": [], "non_marketing": 7,
+            "csuite_calls": 12, "hubspot_calls": 3, "migration_applied": True,
+            "run_logged": True, "run_id": 8, "error": None, "stopped": None,
+            "registered": 1, "failed": 0, "deferred": 91,
+            "writes_attempted": 1, "write_audit_ids": [71],
+            "interaction_assumed": True}
+    base.update(overrides)
+    return base
+
+
+def test_the_applied_report_states_writes_and_audit_ids():
+    reply = sync_commands._format_registration_results(applied_report())
+
+    assert "✅ **Registrations — APPLIED**" in reply
+    assert "**1** registered and verified in HubSpot" in reply
+    assert "**91** deferred — the limit of 1 was reached" in reply
+    assert "1 HubSpot write(s) attempted, 1 verified" in reply
+    assert "(write_audit 71)" in reply
+
+
+def test_the_applied_report_flags_the_assumed_timestamp():
+    reply = sync_commands._format_registration_results(applied_report())
+
+    assert "`interactionDateTime` is the EVENT START" in reply
+    assert "an assumption, not a measurement" in reply
+
+
+def test_a_stopped_run_says_where_it_got_to():
+    reply = sync_commands._format_registration_results(applied_report(
+        registered=0, writes_attempted=1, write_audit_ids=[71],
+        stopped="the write for event 1462 returned 2xx but could not be "
+                "verified: HubSpot reports no participation"))
+
+    assert "🛑 **Stopped:**" in reply
+    assert "could not be verified" in reply
+    assert "Nothing further was written" in reply
+    assert "1 HubSpot write(s) attempted, 0 verified" in reply
+
+
+def test_chat_defaults_a_live_run_to_a_limit_of_one():
+    assert sync_commands._registration_limit("sync registrations apply") == 1
+
+
+@pytest.mark.parametrize("phrase,expected", [
+    ("sync registrations apply", 1),
+    ("sync registrations apply limit 5", 5),
+    ("sync registrations apply limit 0", 0),
+    ("sync registrations apply no limit", None),
+    ("sync registrations apply unlimited", None),
+])
+def test_chat_reads_the_limit(phrase, expected):
+    assert sync_commands._registration_limit(phrase) == expected
+
+
+def test_no_limit_is_read_but_then_refused(monkeypatch):
+    """"no limit" parses to None, and None is what the sync refuses. The
+    phrase exists so the refusal can name it."""
+    monkeypatch.setattr(
+        "sync.registrations.run",
+        lambda **kw: (_ for _ in ()).throw(reg.LimitRequired("needs a limit")))
+
+    reply = sync_commands.handle("sync registrations apply no limit", None)
+
+    assert "🛑 **No limit, no run.**" in reply
+
+
+def test_a_plain_preview_passes_no_limit_at_all(monkeypatch):
+    seen = {}
+    monkeypatch.setattr("sync.registrations.run",
+                        lambda **kw: seen.update(kw) or {"dry_run": True,
+                                                         "error": None})
+    sync_commands.handle("sync registrations dry run", None)
+
+    assert seen["dry_run"] is True
+    assert seen["limit"] is None, "a preview is not capped"
+
+
+def test_apply_is_the_word_that_writes(monkeypatch):
+    seen = {}
+    monkeypatch.setattr("sync.registrations.run",
+                        lambda **kw: seen.update(kw) or {"dry_run": False,
+                                                         "error": None})
+    sync_commands.handle("sync registrations apply", None)
+
+    assert seen["dry_run"] is False
+    assert seen["limit"] == 1
+
+
+# ---------------------------------------------------------------------------
+# The read-back
+# ---------------------------------------------------------------------------
+
+class Breakdown:
+    def __init__(self, response):
+        self.response = response
+        self.asked = []
+
+    def _get(self, endpoint, params=None):
+        self.asked.append(endpoint)
+        return self.response
+
+
+def test_a_confirmed_registration_returns_none():
+    hub = Breakdown({"total": 1, "results": [
+        {"contactId": "701", "state": "REGISTERED"}]})
+
+    assert reg.confirm_registered(hub, "864022788822", "701") is None
+
+
+def test_an_empty_breakdown_is_a_mismatch():
+    """A 2xx says HubSpot accepted the request, not that it recorded it."""
+    why = reg.confirm_registered(Breakdown({"total": 0, "results": []}),
+                                 "864022788822", "701")
+
+    assert why and "no participation" in why
+    assert "accepted but not recorded" in why
+
+
+def test_another_contact_is_not_this_contact():
+    why = reg.confirm_registered(Breakdown({"total": 1, "results": [
+        {"contactId": "999", "state": "REGISTERED"}]}),
+        "864022788822", "701")
+
+    assert why and "none for contact 701" in why
+
+
+def test_the_wrong_state_is_a_mismatch():
+    why = reg.confirm_registered(Breakdown({"total": 1, "results": [
+        {"contactId": "701", "state": "CANCELLED"}]}),
+        "864022788822", "701")
+
+    assert why and "not as REGISTERED" in why
+
+
+def test_an_unrecognised_shape_is_unverified_not_confirmed():
+    """The populated shape has never been observed — every event had total=0
+    when this was written. An unknown shape must not read as success."""
+    why = reg.confirm_registered(Breakdown({"total": 1}),
+                                 "864022788822", "701")
+
+    assert why and "no results list" in why
+
+
+def test_a_failed_read_back_is_a_mismatch():
+    why = reg.confirm_registered(
+        Breakdown({"status": "error", "message": "403"}),
+        "864022788822", "701")
+
+    assert why and "read-back failed" in why
+
+
+def test_the_read_back_is_by_object_id():
+    hub = Breakdown({"total": 1, "results": [{"contactId": "701",
+                                              "state": "REGISTERED"}]})
+    reg.confirm_registered(hub, "864022788822", "701")
+
+    assert hub.asked == ["marketing/v3/marketing-events/participations/"
+                         "864022788822/breakdown"]
