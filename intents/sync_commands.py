@@ -254,8 +254,20 @@ def _format_registration_results(results: dict) -> str:
         return f"❌ **Registrations preview stopped.**\n\n{results['error']}"
 
     dry_run = results.get("dry_run", True)
-    head = ("🧪 **Registrations — PREVIEW** (nothing was written)" if dry_run
-            else "✅ **Registrations — APPLIED**")
+    # APPLIED only when every attempted write verified. A run that stopped,
+    # or had a failure, or attempted more than it verified, is STOPPED —
+    # "✅ APPLIED" over a 400 is the shape this whole body of work exists to
+    # remove.
+    attempted = results.get("writes_attempted", 0)
+    verified = results.get("registered", 0)
+    clean = (not results.get("stopped") and not results.get("failed")
+             and attempted == verified)
+    if dry_run:
+        head = "🧪 **Registrations — PREVIEW** (nothing was written)"
+    elif clean:
+        head = "✅ **Registrations — APPLIED**"
+    else:
+        head = "🛑 **Registrations — STOPPED**"
     lines = [head, "",
              f"📊 **Across {results.get('events_read', 0)} event(s):**",
              f"• **{results.get('registrant_rows', 0)}** registrant rows in "
@@ -277,6 +289,17 @@ def _format_registration_results(results: dict) -> str:
                       "touched — it is read-only to the API, so this sync "
                       "cannot change who may be emailed."]
 
+    queue = results.get("first_sends") or []
+    if dry_run and queue:
+        lines += ["", f"➡️ **The next {len(queue)} to be sent**, in send "
+                      "order (event, then contact id):", "",
+                  "| event | contact | marketing |", "|---|---|---|"]
+        for entry in queue:
+            lines.append(f"| `{entry['event_date_id']}` | "
+                         f"`{entry['hubspot_contact_id']}` | "
+                         f"{'yes' if entry.get('marketing') else 'NO'} |")
+        lines.append("A limit of 1 sends the first row.")
+
     rows = results.get("review_rows") or []
     if rows:
         lines += ["", "🔎 **Needs a human — nothing planned for these "
@@ -289,10 +312,20 @@ def _format_registration_results(results: dict) -> str:
                          "more; the count above is the total")
 
     if not dry_run:
-        lines += ["", f"• **{results.get('registered', 0)}** registered and "
-                      f"verified in HubSpot",
-                  f"• **{results.get('deferred', 0)}** deferred — the limit "
-                  f"of {results.get('limit')} was reached"]
+        lines += ["", f"• **{verified}** registered and verified in HubSpot"]
+        deferred = results.get("deferred", 0)
+        if deferred:
+            lines.append(f"• **{deferred}** deferred — the limit of "
+                         f"{results.get('limit')} was reached")
+        elif results.get("stopped"):
+            # "0 deferred — the limit was reached" said two contradictory
+            # things: nothing was held back, and the cap stopped it. A run
+            # that stops before the cap has deferred nothing.
+            lines.append("• **0** deferred — the run stopped before the "
+                         f"limit of {results.get('limit')} was reached")
+        if results.get("failed"):
+            lines.append(f"• **{results['failed']}** failed — see the stop "
+                         f"reason below")
         if results.get("interaction_assumed"):
             lines.append("   🕒 `interactionDateTime` is the EVENT START. "
                          "HubSpot documents the field as when the contact "
@@ -313,9 +346,12 @@ def _format_registration_results(results: dict) -> str:
                      f"verified**{trail}")
 
     if results.get("stopped"):
+        # The reason already ends with what was and was not written; adding
+        # a second sentence saying it again was how the old report said
+        # "Nothing further was written" twice.
         lines += ["", f"🛑 **Stopped:** {results['stopped']}",
-                  "Nothing further was written. Every registration that did "
-                  "land is in `registration_map` and in `write_audit`."]
+                  "Every registration that did land is in "
+                  "`registration_map`; every attempt is in `write_audit`."]
 
     if not results.get("migration_applied"):
         lines += ["", "⚠️ `hubsync.registration_map` does not exist, so this "
