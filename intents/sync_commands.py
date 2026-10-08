@@ -31,6 +31,10 @@ ALLOWED_ROLES = frozenset({"admin", "staff"})
 DONATION_SYNC_PHRASES = ['sync donations', 'sync donation', 'update donations']
 EVENT_SYNC_PHRASES = ['sync events', 'update events']  # "sync event [name]" → events.py attendee sync
 NEWSLETTER_SYNC_PHRASES = ['sync newsletter', 'sync newsletters', 'update newsletter', 'sync subscriptions']
+# Deliberately NOT in ALL_SYNC_PHRASES: "sync all" must not reach the
+# registrations sync. Phase 1 writes nothing, but the day it does, a
+# three-word message should not be what starts it.
+REGISTRATION_SYNC_PHRASES = ['sync registrations', 'sync registration']
 ALL_SYNC_PHRASES = ['sync all', 'sync everything', 'run all syncs']
 
 
@@ -49,6 +53,7 @@ def can_handle(query: str, **kwargs) -> bool:
         anchors.anchored(q, DONATION_SYNC_PHRASES) or
         anchors.anchored(q, EVENT_SYNC_PHRASES) or
         anchors.anchored(q, NEWSLETTER_SYNC_PHRASES) or
+        anchors.anchored(q, REGISTRATION_SYNC_PHRASES) or
         q in ALL_SYNC_PHRASES
     )
 
@@ -66,6 +71,11 @@ def handle(query: str, ctx) -> str:
         Formatted result string
     """
     q = query.lower().strip()
+
+    # Before the event phrases: "sync registrations" contains neither, but
+    # keeping it first makes the ordering independent of that.
+    if any(p in q for p in REGISTRATION_SYNC_PHRASES):
+        return _sync_registrations(q)
 
     if any(p in q for p in DONATION_SYNC_PHRASES):
         return _sync_donations(q)
@@ -179,6 +189,146 @@ def _event_options(query_lower: str) -> dict:
         # that was 74 of 77 creates, 73 of them archived in CSuite.
         "include_ids": re.findall(r"include\s+(\d+)", query_lower),
     }
+
+
+# Writing needs the word. Everything else previews — the opposite of the
+# event sync's original default, and for the same reason: a one-line chat
+# message is a thin thing to hang a write on.
+REGISTRATION_APPLY_PHRASE = "apply"
+
+# A live run always has a cap. There is no phrase for "all of them".
+REGISTRATION_DEFAULT_LIMIT = 1
+
+
+def _registration_limit(query_lower: str):
+    """The record cap for a live run. "no limit" is deliberately NOT
+    honoured: it returns None, which the sync refuses."""
+    import re
+
+    if "no limit" in query_lower or "unlimited" in query_lower:
+        return None
+    found = re.search(r"limit\s+(\d+)", query_lower)
+    if found:
+        return max(int(found.group(1)), 0)
+    return REGISTRATION_DEFAULT_LIMIT
+
+
+def _sync_registrations(query_lower: str) -> str:
+    """Preview, or apply, the registrations sync."""
+    from sync import registrations as reg
+
+    live = REGISTRATION_APPLY_PHRASE in query_lower
+    limit = _registration_limit(query_lower) if live else None
+    logger.info("Running registrations sync (apply=%s, limit=%s)...",
+                live, limit)
+    try:
+        results = reg.run(dry_run=not live, limit=limit)
+        return _format_registration_results(results)
+    except reg.RegistrationsSyncDisabled as e:
+        return ("⏸️ **Registrations sync is turned off.**\n\n"
+                f"{e}\n\n"
+                '• Say *"sync registrations dry run"* to preview it.')
+    except reg.LimitRequired as e:
+        return ("🛑 **No limit, no run.**\n\n"
+                f"{e}")
+    except reg.RegistrationWriteStopped as e:
+        return ("🛑 **Registrations run stopped before writing.**\n\n"
+                f"{e}")
+    except Exception as e:
+        logger.error("Registrations sync error: %s", e, exc_info=True)
+        return f"❌ Registrations sync failed: {e}"
+
+
+# How many events in review the preview names before summarising.
+REGISTRATION_REVIEW_ROWS_SHOWN = 10
+
+
+def _format_registration_results(results: dict) -> str:
+    """Counts in the units they are measured in.
+
+    A registration is a (person, event) pair, not a person: dedupe runs per
+    event, so somebody at two events is two registrations. Reporting one
+    number for both units is how 83 + 20 came to be read against 100.
+    """
+    if results.get("error"):
+        return f"❌ **Registrations preview stopped.**\n\n{results['error']}"
+
+    dry_run = results.get("dry_run", True)
+    head = ("🧪 **Registrations — PREVIEW** (nothing was written)" if dry_run
+            else "✅ **Registrations — APPLIED**")
+    lines = [head, "",
+             f"📊 **Across {results.get('events_read', 0)} event(s):**",
+             f"• **{results.get('registrant_rows', 0)}** registrant rows in "
+             f"CSuite",
+             f"• **{results.get('unique_emails', 0)}** registrations after "
+             f"dedupe by email within each event "
+             f"({results.get('duplicates_dropped', 0)} duplicate(s) dropped)",
+             f"• **{results.get('would_register', 0)}** would be sent as "
+             f"REGISTERED, by contact id",
+             f"• **{results.get('withheld', 0)}** withheld — no HubSpot "
+             f"contact for that address, and none would be created",
+             f"• **{results.get('already', 0)}** already registered by an "
+             f"earlier run"]
+
+    if results.get("non_marketing"):
+        lines += ["", f"⚠️ **{results['non_marketing']}** of those contacts "
+                      "are deliberately NON-marketing. They would be "
+                      "registered, and `hs_marketable_status` is never "
+                      "touched — it is read-only to the API, so this sync "
+                      "cannot change who may be emailed."]
+
+    rows = results.get("review_rows") or []
+    if rows:
+        lines += ["", "🔎 **Needs a human — nothing planned for these "
+                      "events:**"]
+        for event_id, why in rows[:REGISTRATION_REVIEW_ROWS_SHOWN]:
+            lines.append(f"   `{event_id}` — {str(why)[:110]}")
+        if len(rows) > REGISTRATION_REVIEW_ROWS_SHOWN:
+            lines.append(f"   … and "
+                         f"**{len(rows) - REGISTRATION_REVIEW_ROWS_SHOWN}** "
+                         "more; the count above is the total")
+
+    if not dry_run:
+        lines += ["", f"• **{results.get('registered', 0)}** registered and "
+                      f"verified in HubSpot",
+                  f"• **{results.get('deferred', 0)}** deferred — the limit "
+                  f"of {results.get('limit')} was reached"]
+        if results.get("interaction_assumed"):
+            lines.append("   🕒 `interactionDateTime` is the EVENT START. "
+                         "HubSpot documents the field as when the contact "
+                         "subscribed; CSuite records no registration time, "
+                         "so this is an assumption, not a measurement.")
+
+    lines += ["", f"📞 {results.get('csuite_calls', 0)} CSuite call(s), "
+                  f"{results.get('hubspot_calls', 0)} HubSpot read call(s)"]
+    if dry_run:
+        lines.append("✍️ **0 HubSpot writes — nothing was sent.**")
+    else:
+        ids = results.get("write_audit_ids") or []
+        trail = (" (write_audit " + ", ".join(str(i) for i in ids) + ")"
+                 if ids else " (no write_audit ids — the audit could not be "
+                             "read back)")
+        lines.append(f"✍️ **{results.get('writes_attempted', 0)} HubSpot "
+                     f"write(s) attempted, {results.get('registered', 0)} "
+                     f"verified**{trail}")
+
+    if results.get("stopped"):
+        lines += ["", f"🛑 **Stopped:** {results['stopped']}",
+                  "Nothing further was written. Every registration that did "
+                  "land is in `registration_map` and in `write_audit`."]
+
+    if not results.get("migration_applied"):
+        lines += ["", "⚠️ `hubsync.registration_map` does not exist, so this "
+                      "run has no memory of earlier ones: everything reads "
+                      "as new, and no cancellation could be inferred even if "
+                      "phase 1 tried. Apply "
+                      "`migrations/005_registration_map.sql`."]
+    if results.get("run_logged"):
+        lines += ["", f"📒 Recorded as `hubsync.run_log` id "
+                      f"{results.get('run_id')} with "
+                      f"{results.get('unique_emails', 0)} per-record input "
+                      f"row(s) — hashed addresses, never addresses."]
+    return "\n".join(lines)
 
 
 def _sync_events(query_lower: str) -> str:
