@@ -218,6 +218,49 @@ def registrations_sync_allowed() -> bool:
     return bool(getattr(config.Config, "REGISTRATIONS_SYNC_ENABLED", False))
 
 
+def held_event_ids() -> tuple:
+    """Event dates that are never sent, from config. Read at call time.
+
+    A LIST, not a branch: releasing an event is removing it from
+    Config.REGISTRATION_HELD_EVENT_IDS, and holding a new one is adding it.
+    Neither needs new logic, and neither can be done by accident in here.
+    """
+    import config
+    return tuple(str(e).strip() for e
+                 in getattr(config.Config, "REGISTRATION_HELD_EVENT_IDS", ())
+                 if str(e).strip())
+
+
+HELD_REASON = "held for CSuite setup review"
+
+
+class EventRefused(Exception):
+    """An event was asked for by id and cannot be synced."""
+
+
+def resolve_requested_event(event_id) -> str:
+    """One event id to sync, or EventRefused naming it.
+
+    Refused by NAME, not by falling back to all eleven: "sync registrations
+    apply event 9999" silently running the whole phase-1 scope is how a
+    narrow instruction becomes a broad write.
+    """
+    key = str(event_id or "").strip()
+    if key not in PHASE_ONE_EVENT_IDS:
+        raise EventRefused(
+            f"event {key} is not one of the {len(PHASE_ONE_EVENT_IDS)} "
+            f"mapped events. Phase 1 does not discover its own scope, so an "
+            f"event that is not in the list cannot be synced by asking for "
+            f"it by id. Mapped: "
+            f"{', '.join(PHASE_ONE_EVENT_IDS)}.")
+    if key in held_event_ids():
+        raise EventRefused(
+            f"event {key} is {HELD_REASON}, so nothing was read and nothing "
+            f"was sent. Remove it from REGISTRATION_HELD_EVENT_IDS to "
+            f"release it.")
+    return key
+
+
 def email_fingerprint(email) -> str:
     """A stable short hash, for a run log that must not hold addresses.
 
@@ -365,8 +408,14 @@ def resolve_contacts(hubspot, emails) -> tuple:
 # Planning
 # ---------------------------------------------------------------------------
 
-def plan_event(event_date_id, rows, contacts, known) -> dict:
-    """What this event would do. No calls; decides from what it was given."""
+def plan_event(event_date_id, rows, contacts, known, held=False) -> dict:
+    """What this event would do. No calls; decides from what it was given.
+
+    A held event still reads and still reports — the registrant rows are
+    worth seeing — but every record that would have been sent goes to
+    `held` instead of `would_register`, which is the only list _apply and
+    first_sends ever look at.
+    """
     deduped, dropped = dedupe(rows)
     known_count = sum(1 for (event, _email) in known
                       if event == str(event_date_id))
@@ -377,7 +426,7 @@ def plan_event(event_date_id, rows, contacts, known) -> dict:
            "duplicates_dropped": dropped,
            "known_rows": known_count,
            "would_register": [], "withheld": [], "already": [],
-           "review": None}
+           "held": [], "is_held": bool(held), "review": None}
 
     refusal = shrink_guard(event_date_id, rows or [], known_count)
     if refusal:
@@ -415,6 +464,9 @@ def plan_event(event_date_id, rows, contacts, known) -> dict:
         if prior.get("last_state") == REGISTERED and \
                 prior.get("status") == "synced":
             out["already"].append(record)
+        elif held:
+            record["why"] = HELD_REASON
+            out["held"].append(record)
         else:
             out["would_register"].append(record)
     return out
@@ -718,6 +770,7 @@ def run(csuite=None, hubspot=None, dry_run: bool = True, limit=1,
            "events_read": 0, "registrant_rows": 0, "unique_emails": 0,
            "duplicates_dropped": 0, "would_register": 0, "withheld": 0,
            "already": 0, "review": 0, "review_rows": [],
+           "held": 0, "held_events": [],
            "non_marketing": 0, "csuite_calls": 0, "hubspot_calls": 0,
            "registered": 0, "failed": 0, "deferred": 0, "stopped": None,
            "writes_attempted": 0, "write_audit_ids": [],
@@ -941,7 +994,7 @@ def _outcome_rows(out) -> list:
     rows = []
     for event in out.get("events") or []:
         for kind in ("would_register", "withheld", "already", "registered",
-                     "failed"):
+                     "failed", "held"):
             for record in event.get(kind) or []:
                 row = {k: record[k] for k in _LOGGED_FIELDS if k in record}
                 row["outcome"] = kind
@@ -986,13 +1039,15 @@ def _run_body(out, csuite, hubspot, event_ids, known, dry_run=True,
                         f"planned.")
         return out
 
+    held = held_event_ids()
     events = []
     for entry in per_event:
         if "_rows" not in entry:
             events.append(entry)
             continue
         events.append(plan_event(entry["event_date_id"], entry["_rows"],
-                                 contacts, known))
+                                 contacts, known,
+                                 held=entry["event_date_id"] in held))
 
     # Deterministic: by event_date_id, then by contact id. A limit of 1 has
     # to buy the SAME record every time, or "apply limit 1" is a different
@@ -1012,6 +1067,11 @@ def _run_body(out, csuite, hubspot, event_ids, known, dry_run=True,
         out["would_register"] += len(event["would_register"])
         out["withheld"] += len(event["withheld"])
         out["already"] += len(event["already"])
+        # Held records are counted on their own line and are NOT in
+        # would_register, so "to register" never includes one.
+        out["held"] += len(event.get("held") or [])
+        if event.get("is_held"):
+            out["held_events"].append(event["event_date_id"])
         if event.get("review"):
             out["review"] += 1
             out["review_rows"].append((event["event_date_id"],

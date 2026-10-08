@@ -213,16 +213,53 @@ def _registration_limit(query_lower: str):
     return REGISTRATION_DEFAULT_LIMIT
 
 
+def reg_held_reason() -> str:
+    """The one wording for a held event, from the sync module.
+
+    Imported lazily and not copied: a report that says something different
+    from what the sync recorded is a report nobody can reconcile with the
+    run log.
+    """
+    from sync.registrations import HELD_REASON
+    return HELD_REASON
+
+
+def _registration_event(query_lower: str):
+    """The one event id asked for, or None for the whole phase-1 scope.
+
+    "sync registrations apply event 1463" narrows the run to that event.
+    The limit is unaffected — a scoped run still caps, because an event
+    with 41 registrant rows is not a smaller blast radius than eleven
+    events with one each.
+    """
+    import re
+
+    found = re.search(r"\bevent\s+(\d+)", query_lower)
+    return found.group(1) if found else None
+
+
 def _sync_registrations(query_lower: str) -> str:
     """Preview, or apply, the registrations sync."""
     from sync import registrations as reg
 
     live = REGISTRATION_APPLY_PHRASE in query_lower
     limit = _registration_limit(query_lower) if live else None
-    logger.info("Running registrations sync (apply=%s, limit=%s)...",
-                live, limit)
+    asked = _registration_event(query_lower)
+    scope = {}
+    if asked:
+        try:
+            scope["event_ids"] = (reg.resolve_requested_event(asked),)
+        except reg.EventRefused as e:
+            return ("🛑 **That event cannot be synced.**\n\n"
+                    f"{e}\n\n"
+                    '• Say *"sync registrations dry run"* to preview the '
+                    "whole mapped scope.")
+    logger.info("Running registrations sync (apply=%s, limit=%s, event=%s)...",
+                live, limit, asked or "all mapped")
     try:
-        results = reg.run(dry_run=not live, limit=limit)
+        results = reg.run(dry_run=not live, limit=limit, **scope)
+        if asked:
+            results["scoped_event"] = asked
         return _format_registration_results(results)
     except reg.RegistrationsSyncDisabled as e:
         return ("⏸️ **Registrations sync is turned off.**\n\n"
@@ -326,6 +363,19 @@ def _format_registration_results(results: dict) -> str:
              f"contact for that address, and none would be created",
              f"• **{results.get('already', 0)}** already registered by an "
              f"earlier run"]
+
+    if results.get("scoped_event"):
+        lines.insert(2, f"🎯 Scoped to event `{results['scoped_event']}` "
+                        f"only, by name in the command.")
+
+    # Held events: counted on their own line, never inside "would be sent".
+    if results.get("held"):
+        held_events = results.get("held_events") or []
+        lines.append(
+            f"• **{results['held']}** {reg_held_reason()} — "
+            f"event(s) {', '.join(f'`{e}`' for e in held_events)}. "
+            f"Nothing is sent for these, and they are not in the count "
+            f"above.")
 
     if results.get("non_marketing"):
         lines += ["", f"⚠️ **{results['non_marketing']}** of those contacts "

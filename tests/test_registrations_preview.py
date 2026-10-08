@@ -1420,3 +1420,272 @@ def test_the_value_sent_to_hubspot_is_the_clamped_one(monkeypatch):
 
     assert out["registered"] == 1
     assert sent == [NOW_MS], "the future start must not reach HubSpot"
+
+
+# ---------------------------------------------------------------------------
+# The hold list, and the event filter
+# ---------------------------------------------------------------------------
+#
+# 1153 is held. Read from CSuite 2026-10-08, it is the only one of the eleven
+# mapped events with event_name 'Newsletters' and event_type_code 'marketing'
+# (the other ten are 'Event - Other' / 'event'); it has no start_time, no
+# location, no tickets and no fund, and event_date 2026-12-31. It also sorts
+# first, so it was what "apply limit 1" would have sent.
+#
+# The hold is a LIST IN CONFIG, not a branch in here: these tests set the
+# list, they never patch a code path.
+
+
+def hold(monkeypatch, *event_ids):
+    monkeypatch.setattr("config.Config.REGISTRATION_HELD_EVENT_IDS",
+                        tuple(event_ids))
+
+
+def test_the_hold_list_comes_from_config_and_holds_1153_by_default():
+    import config
+
+    assert "1153" in config.Config.REGISTRATION_HELD_EVENT_IDS
+    assert "1153" in reg.held_event_ids()
+
+
+def test_a_held_event_is_never_sent(monkeypatch):
+    hold(monkeypatch, "1")
+    csuite = CSuite({"1": [registrant("a@x.inv"), registrant("b@x.inv")]},
+                    dates={"1": "2025-01-01"})
+    hubspot = HubSpot({"a@x.inv": ("701", True, []),
+                       "b@x.inv": ("702", True, [])})
+
+    out = reg.run(csuite=csuite, hubspot=hubspot, event_ids=("1",),
+                  now_ms=NOW_MS)
+
+    assert out["would_register"] == 0, "held records are not sendable"
+    assert out["held"] == 2
+    assert out["held_events"] == ["1"]
+    assert out["first_sends"] == [], "nothing is queued for a held event"
+
+
+def test_held_records_are_not_counted_in_to_register(monkeypatch):
+    """The whole point: a held event must not inflate the number a human
+    reads as "about to be written"."""
+    hold(monkeypatch, "2")
+    csuite = CSuite({"1": [registrant("a@x.inv")],
+                     "2": [registrant("b@x.inv")]},
+                    dates={"1": "2025-01-01", "2": "2025-01-01"})
+    hubspot = HubSpot({"a@x.inv": ("701", True, []),
+                       "b@x.inv": ("702", True, [])})
+
+    out = reg.run(csuite=csuite, hubspot=hubspot, event_ids=("1", "2"),
+                  now_ms=NOW_MS)
+
+    assert out["would_register"] == 1
+    assert out["held"] == 1
+    assert [r["event_date_id"] for r in out["first_sends"]] == ["1"]
+
+
+def test_releasing_an_event_makes_it_sendable(monkeypatch):
+    """Removing it from the list is the whole release procedure — no code
+    change, which is what a config list buys."""
+    csuite = CSuite({"1": [registrant("a@x.inv")]}, dates={"1": "2025-01-01"})
+    hubspot = HubSpot({"a@x.inv": ("701", True, [])})
+
+    hold(monkeypatch, "1")
+    held_run = reg.run(csuite=csuite, hubspot=hubspot, event_ids=("1",),
+                       now_ms=NOW_MS)
+    assert held_run["would_register"] == 0 and held_run["held"] == 1
+
+    hold(monkeypatch)                 # the list is now empty
+    free_run = reg.run(csuite=csuite, hubspot=hubspot, event_ids=("1",),
+                       now_ms=NOW_MS)
+    assert free_run["would_register"] == 1
+    assert free_run["held"] == 0
+    assert free_run["held_events"] == []
+
+
+def test_a_held_event_still_reports_its_registrant_rows(monkeypatch):
+    """Held is not hidden. The rows are worth seeing — that is how anyone
+    decides whether to release it."""
+    hold(monkeypatch, "1")
+    out = reg.run(csuite=CSuite({"1": [registrant("a@x.inv")]},
+                                dates={"1": "2025-01-01"}),
+                  hubspot=HubSpot({"a@x.inv": ("701", True, [])}),
+                  event_ids=("1",), now_ms=NOW_MS)
+
+    assert out["registrant_rows"] == 1
+    assert out["events_read"] == 1
+    rows = [r for r in reg._outcome_rows(out) if r["outcome"] == "held"]
+    assert len(rows) == 1
+    assert rows[0]["why"] == reg.HELD_REASON
+    assert "contact_email" not in rows[0]
+
+
+def test_a_held_event_is_not_written_even_on_a_live_run(monkeypatch):
+    """Defence at the sync layer, not only at the command layer: a caller
+    that hands run() a held id directly still sends nothing."""
+    hold(monkeypatch, "1")
+    sent = []
+    out = live_run(monkeypatch,
+                   CSuite({"1": [registrant("a@x.inv")]},
+                          dates={"1": "2025-01-01"}),
+                   HubSpot({"a@x.inv": ("701", True, [])}),
+                   writer=lambda h, ext, cid, when:
+                       sent.append(cid) or (80, None, None),
+                   now_ms=NOW_MS)
+
+    assert sent == [], "a held event reached the write seam"
+    assert out["registered"] == 0
+    assert out["writes_attempted"] == 0
+    assert out["held"] == 1
+
+
+# --- the event filter -------------------------------------------------------
+
+def test_the_command_parses_the_event_id():
+    for text, expected in (
+            ("sync registrations dry run event 1463", "1463"),
+            ("sync registrations apply event 1463", "1463"),
+            ("sync registrations apply event 1463 limit 1", "1463"),
+            ("sync registrations dry run", None)):
+        assert sync_commands._registration_event(text) == expected
+
+
+def test_the_event_filter_runs_only_that_event(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(sync_commands, "_format_registration_results",
+                        lambda results: "ok")
+    monkeypatch.setattr(reg, "run",
+                        lambda **kwargs: seen.update(kwargs) or {})
+
+    assert sync_commands._sync_registrations(
+        "sync registrations dry run event 1463") == "ok"
+    assert seen["event_ids"] == ("1463",)
+    assert seen["dry_run"] is True
+
+
+def test_the_event_filter_reads_only_that_event():
+    """End to end at the sync layer: one CSuite registrant call, for one
+    event, not eleven."""
+    csuite = CSuite({"1463": [registrant("a@x.inv")]},
+                    dates={"1463": "2025-01-01"})
+    out = reg.run(csuite=csuite, hubspot=HubSpot({"a@x.inv": ("7", True, [])}),
+                  event_ids=("1463",), now_ms=NOW_MS)
+
+    assert out["events_read"] == 1
+    assert set(csuite.asked) == {"1463"}
+    assert [e["event_date_id"] for e in out["events"]] == ["1463"]
+
+
+def test_an_unmapped_event_id_is_refused_by_name():
+    with pytest.raises(reg.EventRefused) as refused:
+        reg.resolve_requested_event("9999")
+
+    assert "9999" in str(refused.value)
+    assert "not one of the 11 mapped events" in str(refused.value)
+
+
+def test_a_held_event_id_is_refused_by_name(monkeypatch):
+    hold(monkeypatch, "1463")
+
+    with pytest.raises(reg.EventRefused) as refused:
+        reg.resolve_requested_event("1463")
+
+    assert "1463" in str(refused.value)
+    assert reg.HELD_REASON in str(refused.value)
+    assert "REGISTRATION_HELD_EVENT_IDS" in str(refused.value)
+
+
+def test_a_mapped_released_event_resolves(monkeypatch):
+    hold(monkeypatch)
+    assert reg.resolve_requested_event("1463") == "1463"
+    assert reg.resolve_requested_event(" 1463 ") == "1463"
+
+
+def test_a_refused_event_reads_nothing_and_says_so(monkeypatch):
+    """The refusal must come BEFORE any call — "nothing was read" has to be
+    true, not reassuring."""
+    called = []
+    monkeypatch.setattr(reg, "run", lambda **k: called.append(k) or {})
+
+    reply = sync_commands._sync_registrations(
+        "sync registrations apply event 1153 limit 1")
+
+    assert called == [], "a refused event must not start a run"
+    assert "1153" in reply
+    assert reg.HELD_REASON in reply
+
+
+def test_an_unknown_event_is_refused_at_the_command_layer(monkeypatch):
+    called = []
+    monkeypatch.setattr(reg, "run", lambda **k: called.append(k) or {})
+
+    reply = sync_commands._sync_registrations(
+        "sync registrations dry run event 9999")
+
+    assert called == []
+    assert "9999" in reply
+
+
+def test_a_scoped_apply_still_needs_a_limit():
+    """Item 3: narrowing to one event does not lift the cap. 1157 alone has
+    41 registrant rows."""
+    assert sync_commands._registration_limit(
+        "sync registrations apply event 1463") == 1
+    assert sync_commands._registration_limit(
+        "sync registrations apply event 1463 no limit") is None
+    assert sync_commands._registration_limit(
+        "sync registrations apply event 1463 unlimited") is None
+
+
+def test_no_limit_is_still_refused_by_the_sync(monkeypatch):
+    arm(monkeypatch, True)
+    monkeypatch.setattr(reg, "migration_applied", lambda: True)
+
+    with pytest.raises(reg.LimitRequired):
+        reg.run(csuite=CSuite(), hubspot=HubSpot(), dry_run=False, limit=None,
+                event_ids=("1463",))
+
+
+# --- the report -------------------------------------------------------------
+
+def test_the_report_names_the_held_events():
+    reply = sync_commands._format_registration_results({
+        "dry_run": True, "events_read": 11, "registrant_rows": 115,
+        "unique_emails": 111, "duplicates_dropped": 3, "would_register": 81,
+        "withheld": 17, "already": 0, "review": 0, "review_rows": [],
+        "non_marketing": 7, "csuite_calls": 12, "hubspot_calls": 2,
+        "migration_applied": True, "run_logged": False, "error": None,
+        "held": 13, "held_events": ["1153"], "first_sends": []})
+
+    assert "**13** held for CSuite setup review" in reply
+    assert "`1153`" in reply
+    assert "not in the count above" in reply
+    assert "**81** would be sent" in reply
+
+
+def test_the_report_says_nothing_about_holds_when_there_are_none():
+    reply = sync_commands._format_registration_results({
+        "dry_run": True, "events_read": 1, "registrant_rows": 1,
+        "unique_emails": 1, "duplicates_dropped": 0, "would_register": 1,
+        "withheld": 0, "already": 0, "review": 0, "review_rows": [],
+        "non_marketing": 0, "csuite_calls": 1, "hubspot_calls": 1,
+        "migration_applied": True, "run_logged": False, "error": None,
+        "held": 0, "held_events": [], "first_sends": []})
+
+    assert "held for CSuite setup review" not in reply
+
+
+def test_the_report_names_the_scoped_event():
+    reply = sync_commands._format_registration_results({
+        "dry_run": True, "events_read": 1, "registrant_rows": 1,
+        "unique_emails": 1, "duplicates_dropped": 0, "would_register": 1,
+        "withheld": 0, "already": 0, "review": 0, "review_rows": [],
+        "non_marketing": 0, "csuite_calls": 2, "hubspot_calls": 1,
+        "migration_applied": True, "run_logged": False, "error": None,
+        "held": 0, "held_events": [], "first_sends": [],
+        "scoped_event": "1463"})
+
+    assert "Scoped to event `1463` only" in reply
+
+
+def test_the_held_wording_is_shared_not_copied():
+    """One wording, so the report and the run log can be reconciled."""
+    assert sync_commands.reg_held_reason() == reg.HELD_REASON
