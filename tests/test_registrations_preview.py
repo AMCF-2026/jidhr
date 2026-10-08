@@ -45,9 +45,15 @@ def registrant(email, profile_id=1, rsvp=None, attended=None, guests=None):
 class CSuite:
     """event/display/eventdate, and nothing else."""
 
-    def __init__(self, by_event=None, fail_on=()):
+    def __init__(self, by_event=None, fail_on=(), dates=None, names=None):
         self.by_event = by_event or {}
         self.fail_on = set(str(e) for e in fail_on)
+        # event_date is what start_moment parses; event_description is what
+        # event_title reads. Absent by default, so a test that says nothing
+        # about dates gets an event with no usable start, exactly as the 98
+        # of 179 production rows with no event_date do.
+        self.dates = {str(k): v for k, v in (dates or {}).items()}
+        self.names = {str(k): v for k, v in (names or {}).items()}
         self.asked = []
 
     def _request(self, endpoint, data=None):
@@ -56,9 +62,13 @@ class CSuite:
         self.asked.append(rid)
         if rid in self.fail_on:
             return {"success": False, "error": "CSuite returned 500"}
-        return {"success": True,
-                "data": {"event_date_id": rid,
-                         "profiles": list(self.by_event.get(rid, []))}}
+        row = {"event_date_id": rid,
+               "profiles": list(self.by_event.get(rid, []))}
+        if rid in self.dates:
+            row["event_date"] = self.dates[rid]
+        if rid in self.names:
+            row["event_description"] = self.names[rid]
+        return {"success": True, "data": row}
 
 
 class HubSpot:
@@ -777,7 +787,7 @@ def applied_report(**overrides):
             "run_logged": True, "run_id": 8, "error": None, "stopped": None,
             "registered": 1, "failed": 0, "deferred": 91,
             "writes_attempted": 1, "write_audit_ids": [71],
-            "interaction_assumed": True}
+            "interaction_rules": {"event_start": 1, "run_time": 0}}
     base.update(overrides)
     return base
 
@@ -792,11 +802,32 @@ def test_the_applied_report_states_writes_and_audit_ids():
     assert "(write_audit 71)" in reply
 
 
-def test_the_applied_report_flags_the_assumed_timestamp():
+def test_the_applied_report_says_which_timestamp_rule_was_used():
+    """Item 2: the old note said "is the EVENT START" unconditionally, which
+    stopped being true when the clamp went in."""
     reply = sync_commands._format_registration_results(applied_report())
 
-    assert "`interactionDateTime` is the EVENT START" in reply
-    assert "an assumption, not a measurement" in reply
+    assert "min(event start, run time)" in reply
+    assert "**1** used the EVENT START" in reply
+    assert "**0** used the RUN TIME" in reply
+    assert "is the EVENT START." not in reply, "the old note is gone"
+
+
+def test_the_applied_report_counts_each_rule_separately():
+    reply = sync_commands._format_registration_results(applied_report(
+        interaction_rules={"event_start": 4, "run_time": 7}))
+
+    assert "**4** used the EVENT START" in reply
+    assert "**7** used the RUN TIME" in reply
+
+
+def test_no_rule_note_when_nothing_was_stamped():
+    """A run that stopped before any timestamp was chosen has no rule to
+    report, and must not print "0 and 0"."""
+    reply = sync_commands._format_registration_results(applied_report(
+        interaction_rules={"event_start": 0, "run_time": 0}))
+
+    assert "interactionDateTime" not in reply
 
 
 def test_a_stopped_run_says_where_it_got_to():
@@ -958,7 +989,8 @@ def test_a_definite_failure_writes_no_registration_map_row(monkeypatch):
     monkeypatch.setattr(reg, "event_object_ids",
                         lambda h, ids: ({"1": "hs-ev"}, 1, None))
     monkeypatch.setattr(reg, "interaction_timestamp",
-                        lambda c, e, cache: (1796000000000, True))
+                        lambda c, e, cache, now: (
+                            1796000000000, reg.INTERACTION_EVENT_START))
     monkeypatch.setattr(reg, "write_registration",
                         lambda h, ext, cid, when: (
                             78, "HTTP 400: Unknown state", None))
@@ -988,7 +1020,8 @@ def test_an_ambiguous_write_DOES_record_unknown(monkeypatch):
     monkeypatch.setattr(reg, "event_object_ids",
                         lambda h, ids: ({"1": "hs-ev"}, 1, None))
     monkeypatch.setattr(reg, "interaction_timestamp",
-                        lambda c, e, cache: (1796000000000, True))
+                        lambda c, e, cache, now: (
+                            1796000000000, reg.INTERACTION_EVENT_START))
     monkeypatch.setattr(reg, "write_registration",
                         lambda h, ext, cid, when: (
                             78, None, "no HTTP status came back"))
@@ -1079,8 +1112,14 @@ def test_the_order_is_stable_across_runs():
                                        event_ids=("2", "1")), count=3)
 
     assert build() == build()
-    assert build()[0] == {"event_date_id": "1", "hubspot_contact_id": "3",
-                          "marketing": True}
+    first = build()[0]
+    assert first["event_date_id"] == "1"
+    assert first["hubspot_contact_id"] == "3"
+    assert first["marketing"] is True
+    # No csuite handed to first_sends, so the event detail stays blank
+    # rather than being guessed at.
+    assert first["event_name"] is None
+    assert first["interaction_at"] is None
 
 
 def test_the_dry_run_names_the_first_three_it_would_send():
@@ -1093,7 +1132,8 @@ def test_the_dry_run_names_the_first_three_it_would_send():
     assert len(out["first_sends"]) == 3
     for entry in out["first_sends"]:
         assert set(entry) == {"event_date_id", "hubspot_contact_id",
-                              "marketing"}
+                              "marketing", "event_name", "event_start_ms",
+                              "interaction_at", "interaction_rule"}
     assert out["first_sends"][0]["hubspot_contact_id"] == "10"
 
 
@@ -1104,16 +1144,28 @@ def test_the_preview_prints_the_queue():
         "withheld": 0, "already": 0, "review": 0, "review_rows": [],
         "non_marketing": 1, "csuite_calls": 1, "hubspot_calls": 1,
         "migration_applied": True, "run_logged": False, "error": None,
+        "interaction_rules": {"event_start": 1, "run_time": 1},
         "first_sends": [
             {"event_date_id": "1430", "hubspot_contact_id": "701",
-             "marketing": True},
-            {"event_date_id": "1430", "hubspot_contact_id": "702",
-             "marketing": False}]})
+             "marketing": True, "event_name": "Community Iftar",
+             "event_start_ms": 1760000000000,
+             "interaction_at": 1760000000000,
+             "interaction_rule": "event_start"},
+            {"event_date_id": "1466", "hubspot_contact_id": "702",
+             "marketing": False, "event_name": "Winter Fundraiser",
+             "event_start_ms": 1796000000000,
+             "interaction_at": 1760500000000,
+             "interaction_rule": "run_time"}]})
 
     assert "The next 2 to be sent" in reply
-    assert "| `1430` | `701` | yes |" in reply
-    assert "| `1430` | `702` | NO |" in reply
+    # Item 3: name, start and the interactionDateTime the write would use.
+    assert "| `1430` | Community Iftar | 2025-10-09 08:53 UTC | `701` | " \
+           "yes | 2025-10-09 08:53 UTC | event start |" in reply
+    assert "| `1466` | Winter Fundraiser | 2026-11-30 00:53 UTC | `702` | " \
+           "NO | 2025-10-15 03:46 UTC | run time (event is in the " \
+           "future) |" in reply
     assert "A limit of 1 sends the first row." in reply
+    assert "of the 2 shown" in reply
 
 
 def test_a_live_report_does_not_print_the_queue():
@@ -1167,3 +1219,204 @@ def test_a_clean_run_with_nothing_deferred_omits_the_line():
         deferred=0, stopped=None, registered=1, writes_attempted=1))
 
     assert "deferred" not in reply
+
+
+# ---------------------------------------------------------------------------
+# interactionDateTime = min(event start, run time)
+# ---------------------------------------------------------------------------
+#
+# Six of the eleven phase-1 events start in the FUTURE (measured 2026-10-08:
+# 1153 is 2026-12-31, and 1168, 1429, 1463, 1464 and 1466 follow). The
+# event's own start would therefore have asserted a registration that has
+# not happened yet — on 1153, the very first record a limit of 1 sends.
+#
+# The clock is pinned in every one of these. This suite has broken twice on
+# clock rollover, and a test for "never later than the run time" that reads
+# the real clock is a test that changes meaning every second.
+
+NOW_MS = 1760000000000          # 2025-10-09 08:53 UTC
+
+
+def test_a_past_event_keeps_its_own_start():
+    """Unchanged behaviour: the start is already in the past, so it IS the
+    min, and it stays the nearest available fact."""
+    csuite = CSuite(dates={"1": "2025-01-01"})
+
+    when, rule = reg.interaction_timestamp(csuite, "1", {}, NOW_MS)
+
+    assert rule == reg.INTERACTION_EVENT_START
+    assert when < NOW_MS
+    # Midnight ET, because CSuite carries no start_time for this one and
+    # start_moment will not invent a clock time.
+    assert datetime.fromtimestamp(when / 1000, timezone.utc) == \
+        datetime(2025, 1, 1, 5, 0, tzinfo=timezone.utc)
+
+
+def test_a_future_event_gets_the_run_time():
+    """Event 1153's case: 2026-12-31, read on a day in 2025."""
+    csuite = CSuite(dates={"1": "2026-12-31"})
+
+    when, rule = reg.interaction_timestamp(csuite, "1", {}, NOW_MS)
+
+    assert rule == reg.INTERACTION_RUN_TIME
+    assert when == NOW_MS
+
+
+@pytest.mark.parametrize("day", ["2020-02-29", "2024-01-01", "2025-10-09",
+                                 "2025-10-10", "2026-12-31", "2030-06-15"])
+def test_the_value_is_never_later_than_the_run_time(day):
+    csuite = CSuite(dates={"1": day})
+
+    when, rule = reg.interaction_timestamp(csuite, "1", {}, NOW_MS)
+
+    assert when <= NOW_MS, "a registration cannot have happened in the future"
+    assert rule in (reg.INTERACTION_EVENT_START, reg.INTERACTION_RUN_TIME)
+
+
+def test_an_event_starting_exactly_now_counts_as_past():
+    """The boundary belongs to the start: min(x, x) is x, and calling it the
+    run time would report a rule that changed nothing."""
+    csuite = CSuite(dates={"1": "2025-01-01"})
+    start = reg.event_detail(csuite, "1", {})["start_ms"]
+
+    when, rule = reg.interaction_timestamp(csuite, "1", {}, start)
+
+    assert when == start
+    assert rule == reg.INTERACTION_EVENT_START
+
+
+def test_an_event_with_no_date_has_no_timestamp_and_no_rule():
+    """98 of 179 production rows have no event_date. There is no min to
+    take, and _apply stops rather than guessing."""
+    csuite = CSuite(dates={})
+
+    when, rule = reg.interaction_timestamp(csuite, "1", {}, NOW_MS)
+
+    assert when is None
+    assert rule is None
+
+
+def test_the_cache_holds_the_event_start_not_the_clamped_value():
+    """The clamp depends on when the run happened; the event does not."""
+    csuite = CSuite(dates={"1": "2026-12-31"})
+    cache = {}
+
+    reg.interaction_timestamp(csuite, "1", cache, NOW_MS)
+    assert cache["1"]["start_ms"] > NOW_MS, "the start, not the run time"
+
+    # Same cache, a clock past the event: now the start is the min.
+    when, rule = reg.interaction_timestamp(csuite, "1", cache, 1830000000000)
+    assert rule == reg.INTERACTION_EVENT_START
+    assert when == cache["1"]["start_ms"]
+    assert csuite.asked == ["1"], "one CSuite call per event, not per record"
+
+
+def test_the_event_name_comes_from_the_same_call_as_the_start():
+    csuite = CSuite(dates={"1": "2026-12-31"},
+                    names={"1": "New Year Community Dinner"})
+
+    detail = reg.event_detail(csuite, "1", {})
+
+    assert detail["name"] == "New Year Community Dinner"
+    assert detail["start_ms"]
+    assert csuite.asked == ["1"]
+
+
+def test_the_preview_table_carries_the_name_start_and_timestamp():
+    """Item 3, end to end: the dry run reads the events in the head of the
+    queue so the value a write WOULD use is inspectable first."""
+    csuite = CSuite({"1": [registrant("a@x.inv")]},
+                    dates={"1": "2026-12-31"}, names={"1": "Winter Dinner"})
+    hubspot = HubSpot({"a@x.inv": ("701", True, [])})
+
+    out = reg.run(csuite=csuite, hubspot=hubspot, event_ids=("1",),
+                  now_ms=NOW_MS)
+
+    row = out["first_sends"][0]
+    assert row["event_name"] == "Winter Dinner"
+    assert row["event_start_ms"] > NOW_MS
+    assert row["interaction_at"] == NOW_MS
+    assert row["interaction_rule"] == reg.INTERACTION_RUN_TIME
+    assert out["interaction_rules"] == {"event_start": 0, "run_time": 1}
+
+
+def test_the_run_time_is_one_moment_for_the_whole_run():
+    """Read once in run(), not per record: two records stamped a second
+    apart would be two different claims about the same sync."""
+    import inspect
+
+    assert "now_ms" in inspect.signature(reg.run).parameters
+    body = inspect.getsource(reg._apply)
+    assert "datetime.now" not in body, "the clock is not read per record"
+    assert "now_ms" in body
+
+
+def live_run(monkeypatch, csuite, hubspot, writer=None, **kwargs):
+    """A successful applied run, with the write seam and the read-back
+    faked. Everything these doubles stand in for has its own test."""
+    arm(monkeypatch, True)
+    monkeypatch.setattr(reg, "migration_applied", lambda: True)
+    monkeypatch.setattr(reg, "load_map", lambda: {})
+    monkeypatch.setattr(reg, "open_run", lambda applied: None)
+    monkeypatch.setattr(reg, "close_run", lambda *a, **k: None)
+    monkeypatch.setattr(reg, "record_registration",
+                        lambda *a, **k: True)
+    monkeypatch.setattr(reg, "event_object_ids",
+                        lambda h, ids: ({"1": "hs-ev"}, 1, None))
+    monkeypatch.setattr(reg, "write_registration",
+                        writer or (lambda h, ext, cid, when: (80, None, None)))
+    monkeypatch.setattr(reg, "confirm_registered", lambda h, o, c: None)
+    return reg.run(csuite=csuite, hubspot=hubspot, dry_run=False, limit=1,
+                   event_ids=("1",), **kwargs)
+
+
+def test_the_outcome_rows_say_which_rule_each_record_used(monkeypatch):
+    """Item 1: "min(event start, run time)" read back from a log does not
+    say which half of the min a given write used."""
+    out = live_run(monkeypatch,
+                   CSuite({"1": [registrant("a@x.inv")]},
+                          dates={"1": "2026-12-31"}),
+                   HubSpot({"a@x.inv": ("701", True, [])}),
+                   now_ms=NOW_MS)
+
+    assert out["registered"] == 1
+    rows = [r for r in reg._outcome_rows(out) if r["outcome"] == "registered"]
+    assert len(rows) == 1
+    assert rows[0]["interaction_rule"] == reg.INTERACTION_RUN_TIME
+    assert rows[0]["interaction_at"] == NOW_MS
+
+
+def test_a_past_event_is_logged_as_the_event_start(monkeypatch):
+    out = live_run(monkeypatch,
+                   CSuite({"1": [registrant("a@x.inv")]},
+                          dates={"1": "2025-01-01"}),
+                   HubSpot({"a@x.inv": ("701", True, [])}),
+                   now_ms=NOW_MS)
+
+    rows = [r for r in reg._outcome_rows(out) if r["outcome"] == "registered"]
+    assert rows[0]["interaction_rule"] == reg.INTERACTION_EVENT_START
+    assert rows[0]["interaction_at"] < NOW_MS
+    assert out["interaction_rules"] == {"event_start": 1, "run_time": 0}
+
+
+def test_the_rule_is_in_the_logged_whitelist_not_leaking_the_email():
+    """The whitelist gained two fields; it must not have gained a third."""
+    assert "interaction_rule" in reg._LOGGED_FIELDS
+    assert "interaction_at" in reg._LOGGED_FIELDS
+    assert "contact_email" not in reg._LOGGED_FIELDS
+
+
+def test_the_value_sent_to_hubspot_is_the_clamped_one(monkeypatch):
+    """The clamp is worthless if _apply computes it and then sends the raw
+    start anyway."""
+    sent = []
+    out = live_run(monkeypatch,
+                   CSuite({"1": [registrant("a@x.inv")]},
+                          dates={"1": "2026-12-31"}),
+                   HubSpot({"a@x.inv": ("701", True, [])}),
+                   writer=lambda h, ext, cid, when:
+                       sent.append(when) or (80, None, None),
+                   now_ms=NOW_MS)
+
+    assert out["registered"] == 1
+    assert sent == [NOW_MS], "the future start must not reach HubSpot"
