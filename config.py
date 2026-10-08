@@ -185,6 +185,27 @@ class Config:
         os.environ.get('REGISTRATIONS_SYNC_ENABLED', 'False')
         .strip().lower() == 'true')
 
+    # Event dates whose CSuite record has to be looked at by a person before
+    # any registration is sent for them. A LIST, not a branch in the code:
+    # releasing an event is removing it from here, and holding a new one is
+    # adding it, neither of which should need a deploy of new logic.
+    #
+    # 1153 is held. Read 2026-10-08, it is the only one of the eleven mapped
+    # events with event_name 'Newsletters' and event_type_code 'marketing'
+    # (the other ten are 'Event - Other' / 'event'), and it carries no
+    # start_time, no location, no tickets and no fund. Its event_date is
+    # 2026-12-31. Its 14 'registrants' are newsletter subscribers, and it
+    # sorts first, so it is what an "apply limit 1" would send.
+    #
+    # Set REGISTRATION_HELD_EVENT_IDS to a comma-separated list to override,
+    # or to an empty string to hold nothing — no code change either way.
+    REGISTRATION_HELD_EVENT_IDS = tuple(
+        e.strip()
+        for e in (os.environ.get('REGISTRATION_HELD_EVENT_IDS', '1153')
+                  or '').split(',')
+        if e.strip()
+    )
+
     # Whether "sync donations" may WRITE to HubSpot. Off.
     #
     # It writes five properties per matched contact, one of which is
