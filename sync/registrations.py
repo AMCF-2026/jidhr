@@ -88,7 +88,28 @@ _MAP_SQL = """
 # start; nothing in CSuite is closer, and inventing "now" would assert that
 # everyone registered at the moment the sync ran.
 _ATTENDANCE_PATH = ("marketing/v3/marketing-events/attendance/"
-                    "{external_event_id}/{state}/create")
+                    "{external_event_id}/{verb}/create")
+
+# The path segment is a VERB, not the subscriber state.
+#
+# write_audit 78, production 2026-10-08: POST .../attendance/csuite-1153/
+# REGISTERED/create returned HTTP 400
+#
+#   "Unknown state for 'REGISTERED'. Correct are 'register', 'attend' or
+#    'cancel'."
+#
+# The 405 probes could not catch this: the path does not validate the
+# segment until POST, so every spelling returned 405 and looked equally
+# real — including 'BOGUS', which is recorded in the sandbox-45 notes.
+#
+# REGISTERED stays the internal state name, and the read-back still matches
+# on it, because the breakdown response may well report the state rather
+# than the verb. Only the URL segment changes.
+#
+# An allowlist of ONE, not a mapping of three: phase 1 asserts registration
+# and nothing else, and a dict with 'attend' and 'cancel' in it is an
+# invitation to pass a variable.
+_PATH_VERBS = {"REGISTERED": "register"}
 
 _UPSERT_REGISTRATION_SQL = """
     INSERT INTO hubsync.registration_map (
@@ -356,8 +377,12 @@ def plan_event(event_date_id, rows, contacts, known) -> dict:
         # Reported, never acted on. hs_marketable_status is read-only to the
         # API, so this cannot change it and must not look as though it might.
         record["marketing"] = contact["marketing"]
-        if known.get((str(event_date_id), email)) and \
-                known[(str(event_date_id), email)].get("last_state") == REGISTERED:
+        # BOTH, not either. The row left by write_audit 78 carried
+        # last_state 'REGISTERED' with status 'error', so a last_state check
+        # alone treated a failed write as a completed one.
+        prior = known.get((str(event_date_id), email)) or {}
+        if prior.get("last_state") == REGISTERED and \
+                prior.get("status") == "synced":
             out["already"].append(record)
         else:
             out["would_register"].append(record)
@@ -463,8 +488,12 @@ def write_registration(hubspot, external_event_id, contact_id, when) -> tuple:
     """
     from clients.hubspot import hubspot_error
 
+    verb = _PATH_VERBS.get(REGISTERED)
+    if verb is None:                      # unreachable by construction
+        raise RegistrationWriteStopped(
+            [], f"no path verb is allowlisted for {REGISTERED}")
     url = _ATTENDANCE_PATH.format(external_event_id=external_event_id,
-                                  state=REGISTERED)
+                                  verb=verb)
     body = {"inputs": [{"vid": int(contact_id),
                         "interactionDateTime": when}]}
     result, status = hubspot._send_with_status("POST", url, body)
@@ -591,7 +620,7 @@ def run(csuite=None, hubspot=None, dry_run: bool = True, limit=1,
            "non_marketing": 0, "csuite_calls": 0, "hubspot_calls": 0,
            "registered": 0, "failed": 0, "deferred": 0, "stopped": None,
            "writes_attempted": 0, "write_audit_ids": [],
-           "interaction_assumed": False}
+           "interaction_assumed": False, "first_sends": []}
 
     have_table = migration_applied()
     out["migration_applied"] = have_table
@@ -687,8 +716,15 @@ def _apply(out, csuite, hubspot, events, limit):
                     f"the write for event {event_id} came back ambiguous "
                     f"({ambiguous}). Recorded 'unknown' and NOT retried.")
             if write_error:
-                record_registration(record, external, audit_id, "error",
-                                    write_error)
+                # NO registration_map row. A definite failure means nothing
+                # landed, so there is nothing to record and the next run
+                # must send it again.
+                #
+                # write_audit 78 wrote one anyway, with status 'error' AND
+                # last_state 'REGISTERED' — so the record read as already
+                # registered and the next run would have skipped it. The
+                # failure is in write_audit, which is where a failed request
+                # belongs.
                 event["failed"].append(dict(record, audit_id=audit_id,
                                             error=write_error))
                 raise RegistrationWriteStopped(
@@ -733,6 +769,32 @@ def _apply(out, csuite, hubspot, events, limit):
 _LOGGED_FIELDS = ("event_date_id", "email_sha1", "csuite_profile_id",
                   "hubspot_contact_id", "marketing", "rsvp", "attended",
                   "why", "audit_id", "error")
+
+
+def _sort_key(value):
+    """(0, int) for a numeric id, (1, str) otherwise. Numbers before text,
+    and 1153 before 1462 rather than after it."""
+    text = str(value or "")
+    return (0, int(text), "") if text.isdigit() else (1, 0, text)
+
+
+def first_sends(out, count=3) -> list:
+    """The first `count` records a live run would send, in send order.
+
+    A preview that says "92 would be registered" does not say WHICH one a
+    limit of 1 buys. Printing the head of the queue makes the next write
+    inspectable before it happens.
+    """
+    queue = []
+    for event in out.get("events") or []:
+        for record in event.get("would_register") or []:
+            queue.append({"event_date_id": record["event_date_id"],
+                          "hubspot_contact_id": record.get(
+                              "hubspot_contact_id"),
+                          "marketing": record.get("marketing")})
+            if len(queue) >= count:
+                return queue
+    return queue
 
 
 def _outcome_rows(out) -> list:
@@ -793,6 +855,16 @@ def _run_body(out, csuite, hubspot, event_ids, known, dry_run=True,
         events.append(plan_event(entry["event_date_id"], entry["_rows"],
                                  contacts, known))
 
+    # Deterministic: by event_date_id, then by contact id. A limit of 1 has
+    # to buy the SAME record every time, or "apply limit 1" is a different
+    # experiment on each run and a stopped run cannot be resumed by eye.
+    # Sorted numerically where the ids are numeric, so 1153 precedes 1462
+    # rather than following it as strings would.
+    events.sort(key=lambda e: _sort_key(e["event_date_id"]))
+    for event in events:
+        event["would_register"].sort(
+            key=lambda r: _sort_key(r.get("hubspot_contact_id")))
+
     out["events"] = events
     for event in events:
         out["registrant_rows"] += event["registrant_rows"]
@@ -809,10 +881,16 @@ def _run_body(out, csuite, hubspot, event_ids, known, dry_run=True,
             1 for r in event["would_register"] if r.get("marketing") is False)
 
     if dry_run:
+        out["first_sends"] = first_sends(out)
         return out
 
     try:
-        return _apply(out, csuite, hubspot, events, limit)
+        _apply(out, csuite, hubspot, events, limit)
     except RegistrationWriteStopped as stop:
         out["stopped"] = stop.reason
-        return out
+    # Tallied AFTER the writes, and after a stop, because the per-event
+    # counts above are the PLAN and these are what happened. Without this
+    # `failed` stayed 0 over a run that had just reported a 400.
+    out["failed"] = sum(len(e.get("failed") or []) for e in events)
+    out["registered"] = sum(len(e.get("registered") or []) for e in events)
+    return out

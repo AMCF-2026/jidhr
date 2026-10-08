@@ -206,10 +206,31 @@ def test_the_only_state_ever_written_is_REGISTERED():
         assert forbidden not in applier, forbidden
 
 
-def test_the_attendance_path_is_the_shape_the_probes_confirmed():
+def test_the_path_segment_is_the_verb_not_the_state():
+    """write_audit 78, production: POST .../REGISTERED/create returned
+    HTTP 400 "Unknown state for 'REGISTERED'. Correct are 'register',
+    'attend' or 'cancel'." The 405 probes could not catch it — the path
+    does not validate the segment until POST, so every spelling looked
+    equally real, including 'BOGUS'."""
     assert reg._ATTENDANCE_PATH == (
         "marketing/v3/marketing-events/attendance/"
-        "{external_event_id}/{state}/create")
+        "{external_event_id}/{verb}/create")
+    assert reg._PATH_VERBS == {"REGISTERED": "register"}
+    assert reg.REGISTERED == "REGISTERED", "the internal name is unchanged"
+
+
+def test_only_register_can_be_reached():
+    """An allowlist of one, not a mapping of three: a dict with 'attend' and
+    'cancel' in it is an invitation to pass a variable."""
+    assert list(reg._PATH_VERBS.values()) == ["register"]
+    for forbidden in ("attend", "cancel", "no_show"):
+        assert forbidden not in reg._PATH_VERBS.values()
+
+    import inspect
+    writer = inspect.getsource(reg.write_registration)
+    assert "_PATH_VERBS" in writer
+    for forbidden in ('"attend"', "'attend'", '"cancel"', "'cancel'"):
+        assert forbidden not in writer
 
 
 def test_the_write_body_is_the_documented_shape():
@@ -229,7 +250,7 @@ def test_the_write_body_is_the_documented_shape():
 
     assert sent["method"] == "POST"
     assert sent["endpoint"] == ("marketing/v3/marketing-events/attendance/"
-                                "csuite-1462/REGISTERED/create")
+                                "csuite-1462/register/create")
     assert sent["body"] == {"inputs": [{"vid": 543954422478,
                                         "interactionDateTime": 1796000000000}]}
 
@@ -238,8 +259,9 @@ def test_the_attendance_post_is_an_audited_write():
     """It must not be classified as a read-shaped POST."""
     from clients.hubspot import is_hubspot_write
 
-    endpoint = reg._ATTENDANCE_PATH.format(external_event_id="csuite-1462",
-                                           state=reg.REGISTERED)
+    endpoint = reg._ATTENDANCE_PATH.format(
+        external_event_id="csuite-1462",
+        verb=reg._PATH_VERBS[reg.REGISTERED])
     assert is_hubspot_write("POST", endpoint) is True
 
 
@@ -452,7 +474,7 @@ def test_only_REGISTERED_is_ever_planned():
 def test_a_known_registration_is_not_sent_again(monkeypatch):
     monkeypatch.setattr(reg, "migration_applied", lambda: True)
     monkeypatch.setattr(reg, "load_map", lambda: {
-        ("1", "a@x.inv"): {"last_state": "REGISTERED"}})
+        ("1", "a@x.inv"): {"last_state": "REGISTERED", "status": "synced"}})
     csuite = CSuite({"1": [registrant("a@x.inv")]})
     hubspot = HubSpot({"a@x.inv": ("701", True, [])})
 
@@ -668,12 +690,18 @@ def test_the_applied_report_flags_the_assumed_timestamp():
 def test_a_stopped_run_says_where_it_got_to():
     reply = sync_commands._format_registration_results(applied_report(
         registered=0, writes_attempted=1, write_audit_ids=[71],
+        # The real reason _apply raises, which already ends with what was
+        # and was not written — the duplication came from the report adding
+        # a second sentence saying the same thing.
         stopped="the write for event 1462 returned 2xx but could not be "
-                "verified: HubSpot reports no participation"))
+                "verified: HubSpot reports no participation for this event "
+                "after the write. Nothing further was written."))
 
+    assert "🛑 **Registrations — STOPPED**" in reply, "not ✅ APPLIED"
     assert "🛑 **Stopped:**" in reply
     assert "could not be verified" in reply
-    assert "Nothing further was written" in reply
+    assert reply.count("Nothing further was written") == 1, \
+        "it used to be printed twice"
     assert "1 HubSpot write(s) attempted, 0 verified" in reply
 
 
@@ -796,3 +824,234 @@ def test_the_read_back_is_by_object_id():
 
     assert hub.asked == ["marketing/v3/marketing-events/participations/"
                          "864022788822/breakdown"]
+
+
+# ---------------------------------------------------------------------------
+# A definite failure records nothing, so the next run retries
+# ---------------------------------------------------------------------------
+
+def test_a_definite_failure_writes_no_registration_map_row(monkeypatch):
+    """write_audit 78 wrote one anyway — status 'error' AND last_state
+    'REGISTERED' — so the record read as already registered and the next run
+    would have skipped it. A 400 means nothing landed."""
+    arm(monkeypatch, True)
+    stored = []
+    monkeypatch.setattr(reg, "migration_applied", lambda: True)
+    monkeypatch.setattr(reg, "load_map", lambda: {})
+    monkeypatch.setattr(reg, "open_run", lambda applied: None)
+    monkeypatch.setattr(reg, "close_run", lambda *a, **k: None)
+    monkeypatch.setattr(reg, "record_registration",
+                        lambda record, ext, audit, status, error=None:
+                        stored.append(status) or True)
+    monkeypatch.setattr(reg, "event_object_ids",
+                        lambda h, ids: ({"1": "hs-ev"}, 1, None))
+    monkeypatch.setattr(reg, "interaction_timestamp",
+                        lambda c, e, cache: (1796000000000, True))
+    monkeypatch.setattr(reg, "write_registration",
+                        lambda h, ext, cid, when: (
+                            78, "HTTP 400: Unknown state", None))
+
+    out = reg.run(csuite=CSuite({"1": [registrant("a@x.inv")]}),
+                  hubspot=HubSpot({"a@x.inv": ("701", True, [])}),
+                  dry_run=False, limit=1, event_ids=("1",))
+
+    assert stored == [], "a failed write must leave no row"
+    assert out["stopped"] and "400" in out["stopped"]
+    assert out["registered"] == 0
+    assert out["failed"] == 1
+
+
+def test_an_ambiguous_write_DOES_record_unknown(monkeypatch):
+    """The opposite case: it may have landed, and HubSpot has no idempotency
+    key here, so a retry is how one registration becomes two."""
+    arm(monkeypatch, True)
+    stored = []
+    monkeypatch.setattr(reg, "migration_applied", lambda: True)
+    monkeypatch.setattr(reg, "load_map", lambda: {})
+    monkeypatch.setattr(reg, "open_run", lambda applied: None)
+    monkeypatch.setattr(reg, "close_run", lambda *a, **k: None)
+    monkeypatch.setattr(reg, "record_registration",
+                        lambda record, ext, audit, status, error=None:
+                        stored.append(status) or True)
+    monkeypatch.setattr(reg, "event_object_ids",
+                        lambda h, ids: ({"1": "hs-ev"}, 1, None))
+    monkeypatch.setattr(reg, "interaction_timestamp",
+                        lambda c, e, cache: (1796000000000, True))
+    monkeypatch.setattr(reg, "write_registration",
+                        lambda h, ext, cid, when: (
+                            78, None, "no HTTP status came back"))
+
+    out = reg.run(csuite=CSuite({"1": [registrant("a@x.inv")]}),
+                  hubspot=HubSpot({"a@x.inv": ("701", True, [])}),
+                  dry_run=False, limit=1, event_ids=("1",))
+
+    assert stored == ["unknown"]
+    assert out["stopped"] and "ambiguous" in out["stopped"]
+
+
+def test_a_failed_record_is_not_treated_as_already_registered(monkeypatch):
+    """The second half of write_audit 78: 'already' now needs status synced
+    as well as last_state REGISTERED."""
+    monkeypatch.setattr(reg, "migration_applied", lambda: True)
+    monkeypatch.setattr(reg, "load_map", lambda: {
+        ("1", "a@x.inv"): {"last_state": "REGISTERED", "status": "error"}})
+
+    out = reg.run(csuite=CSuite({"1": [registrant("a@x.inv")]}),
+                  hubspot=HubSpot({"a@x.inv": ("701", True, [])}),
+                  event_ids=("1",))
+
+    assert out["already"] == 0, "a failed write is not a completed one"
+    assert out["would_register"] == 1
+
+
+@pytest.mark.parametrize("status,already", [
+    ("synced", 1), ("error", 0), ("review", 0), ("unknown", 0),
+    ("pending", 0), (None, 0),
+])
+def test_only_a_synced_row_counts_as_already_registered(monkeypatch, status,
+                                                        already):
+    monkeypatch.setattr(reg, "migration_applied", lambda: True)
+    monkeypatch.setattr(reg, "load_map", lambda: {
+        ("1", "a@x.inv"): {"last_state": "REGISTERED", "status": status}})
+
+    out = reg.run(csuite=CSuite({"1": [registrant("a@x.inv")]}),
+                  hubspot=HubSpot({"a@x.inv": ("701", True, [])}),
+                  event_ids=("1",))
+
+    assert out["already"] == already
+
+
+# ---------------------------------------------------------------------------
+# Deterministic send order
+# ---------------------------------------------------------------------------
+
+def test_events_are_sent_in_numeric_event_order():
+    """1153 before 1462, not after it as strings would sort."""
+    csuite = CSuite({"1462": [registrant("a@x.inv")],
+                     "1153": [registrant("b@x.inv")],
+                     "999": [registrant("c@x.inv")]})
+    hubspot = HubSpot({"a@x.inv": ("1", True, []), "b@x.inv": ("2", True, []),
+                       "c@x.inv": ("3", True, [])})
+
+    out = reg.run(csuite=csuite, hubspot=hubspot,
+                  event_ids=("1462", "1153", "999"))
+
+    assert [e["event_date_id"] for e in out["events"]] == \
+        ["999", "1153", "1462"]
+
+
+def test_contacts_are_sent_in_numeric_contact_order():
+    csuite = CSuite({"1": [registrant("a@x.inv"), registrant("b@x.inv"),
+                           registrant("c@x.inv")]})
+    hubspot = HubSpot({"a@x.inv": ("900", True, []),
+                       "b@x.inv": ("80", True, []),
+                       "c@x.inv": ("1000", True, [])})
+
+    out = reg.run(csuite=csuite, hubspot=hubspot, event_ids=("1",))
+
+    sent = [r["hubspot_contact_id"]
+            for r in out["events"][0]["would_register"]]
+    assert sent == ["80", "900", "1000"]
+
+
+def test_the_order_is_stable_across_runs():
+    """A limit of 1 has to buy the SAME record every time, or "apply limit 1"
+    is a different experiment on each run."""
+    def build():
+        csuite = CSuite({"2": [registrant("x@x.inv")],
+                         "1": [registrant("a@x.inv"), registrant("b@x.inv")]})
+        hubspot = HubSpot({"a@x.inv": ("7", True, []),
+                           "b@x.inv": ("3", True, []),
+                           "x@x.inv": ("9", True, [])})
+        return reg.first_sends(reg.run(csuite=csuite, hubspot=hubspot,
+                                       event_ids=("2", "1")), count=3)
+
+    assert build() == build()
+    assert build()[0] == {"event_date_id": "1", "hubspot_contact_id": "3",
+                          "marketing": True}
+
+
+def test_the_dry_run_names_the_first_three_it_would_send():
+    csuite = CSuite({"1": [registrant(f"{i}@x.inv") for i in range(5)]})
+    hubspot = HubSpot({f"{i}@x.inv": (str(10 + i), i != 2, [])
+                       for i in range(5)})
+
+    out = reg.run(csuite=csuite, hubspot=hubspot, event_ids=("1",))
+
+    assert len(out["first_sends"]) == 3
+    for entry in out["first_sends"]:
+        assert set(entry) == {"event_date_id", "hubspot_contact_id",
+                              "marketing"}
+    assert out["first_sends"][0]["hubspot_contact_id"] == "10"
+
+
+def test_the_preview_prints_the_queue():
+    reply = sync_commands._format_registration_results({
+        "dry_run": True, "events_read": 1, "registrant_rows": 3,
+        "unique_emails": 3, "duplicates_dropped": 0, "would_register": 3,
+        "withheld": 0, "already": 0, "review": 0, "review_rows": [],
+        "non_marketing": 1, "csuite_calls": 1, "hubspot_calls": 1,
+        "migration_applied": True, "run_logged": False, "error": None,
+        "first_sends": [
+            {"event_date_id": "1430", "hubspot_contact_id": "701",
+             "marketing": True},
+            {"event_date_id": "1430", "hubspot_contact_id": "702",
+             "marketing": False}]})
+
+    assert "The next 2 to be sent" in reply
+    assert "| `1430` | `701` | yes |" in reply
+    assert "| `1430` | `702` | NO |" in reply
+    assert "A limit of 1 sends the first row." in reply
+
+
+def test_a_live_report_does_not_print_the_queue():
+    """It is a preview device. After a run, what was sent is the record."""
+    reply = sync_commands._format_registration_results(applied_report(
+        first_sends=[{"event_date_id": "1", "hubspot_contact_id": "2",
+                      "marketing": True}]))
+
+    assert "to be sent" not in reply
+
+
+# ---------------------------------------------------------------------------
+# The header tells the truth
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("overrides,expected", [
+    ({}, "✅ **Registrations — APPLIED**"),
+    ({"failed": 1, "registered": 0}, "🛑 **Registrations — STOPPED**"),
+    ({"stopped": "it stopped"}, "🛑 **Registrations — STOPPED**"),
+    ({"writes_attempted": 2, "registered": 1}, "🛑 **Registrations — STOPPED**"),
+])
+def test_applied_only_when_every_write_verified(overrides, expected):
+    reply = sync_commands._format_registration_results(
+        applied_report(**overrides))
+
+    assert expected in reply
+    if "STOPPED" in expected:
+        assert "APPLIED" not in reply
+
+
+def test_a_clean_run_says_applied():
+    reply = sync_commands._format_registration_results(applied_report(
+        writes_attempted=1, registered=1, failed=0, stopped=None))
+
+    assert "✅ **Registrations — APPLIED**" in reply
+    assert "STOPPED" not in reply
+
+
+def test_zero_deferred_never_claims_the_limit_was_reached():
+    """"0 deferred — the limit of 1 was reached" said two contradictory
+    things: nothing was held back, and the cap stopped it."""
+    reply = sync_commands._format_registration_results(applied_report(
+        deferred=0, stopped="it stopped", registered=0, failed=1))
+
+    assert "stopped before the limit" in reply
+    assert "0** deferred — the limit of 1 was reached" not in reply
+
+
+def test_a_clean_run_with_nothing_deferred_omits_the_line():
+    reply = sync_commands._format_registration_results(applied_report(
+        deferred=0, stopped=None, registered=1, writes_attempted=1))
+
+    assert "deferred" not in reply
