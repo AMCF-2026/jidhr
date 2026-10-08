@@ -90,6 +90,31 @@ _MAP_SQL = """
 _ATTENDANCE_PATH = ("marketing/v3/marketing-events/attendance/"
                     "{external_event_id}/{verb}/create")
 
+# externalAccountId is a QUERY parameter on this endpoint, not a body field.
+#
+# write_audit 79, production 2026-10-08: POST .../attendance/csuite-1153/
+# register/create returned HTTP 400 "externalAccountId is required". The
+# audit row's endpoint column carried no query string at all, and the body
+# (proven by reproducing payload_hash
+# 580bd74d...b89178) was exactly
+#
+#   {"inputs": [{"vid": 269269281527, "interactionDateTime": 1798693200000}]}
+#
+# HubSpot's OpenAPI spec for this endpoint marks the parameter
+#
+#     externalAccountId   in: query   required: false   style: form
+#
+# "required: false" is wrong about this portal: the external-id form of the
+# path resolves an event on the PAIR (externalAccountId, externalEventId),
+# which is why the GET needs it too, and omitting it is a 400. The API is
+# taken over the spec.
+#
+# It goes in the endpoint string rather than a `params=` argument because
+# _send_with_status has no params argument, and because the audit records
+# the endpoint — so the query string that was actually sent lands in
+# write_audit, which is precisely what 79 could not tell us.
+_ATTENDANCE_QUERY = "externalAccountId"
+
 # The path segment is a VERB, not the subscriber state.
 #
 # write_audit 78, production 2026-10-08: POST .../attendance/csuite-1153/
@@ -479,6 +504,47 @@ def interaction_timestamp(csuite, event_date_id, cache) -> tuple:
     return stamp, True
 
 
+def attendance_request(external_event_id, contact_id, when) -> tuple:
+    """(endpoint_with_query_string, body) for one REGISTERED write.
+
+    The COMPLETE request in one place — path, query string and body — so a
+    test can check it against HubSpot's documented shape rather than against
+    a template that only proves the code agrees with itself. Both halves of
+    write_audit 79's defect lived in the gap between a path template and the
+    request that actually went out.
+
+    Documented shape, POST /marketing/v3/marketing-events/attendance/
+    {externalEventId}/{subscriberState}/create:
+
+        externalEventId     path    required
+        subscriberState     path    required   'register' | 'attend' | 'cancel'
+        externalAccountId   query   required in practice (see above)
+        inputs              body    required   array of MarketingEventSubscriber
+          vid                       required   int64, the HubSpot contact id
+          interactionDateTime       required   int64, unix milliseconds
+          properties                required   object of string -> string
+
+    `properties` is in the spec's required list for MarketingEventSubscriber
+    and was NOT sent by 79 — the 400 never got that far, because the query
+    string is validated first. An empty map satisfies the schema and sets no
+    contact property: this sync asserts attendance, not field values.
+    """
+    from urllib.parse import urlencode
+    from sync.event_hubspot import EXTERNAL_ACCOUNT_ID
+
+    verb = _PATH_VERBS.get(REGISTERED)
+    if verb is None:                      # unreachable by construction
+        raise RegistrationWriteStopped(
+            [], f"no path verb is allowlisted for {REGISTERED}")
+    path = _ATTENDANCE_PATH.format(external_event_id=external_event_id,
+                                   verb=verb)
+    query = urlencode({_ATTENDANCE_QUERY: EXTERNAL_ACCOUNT_ID})
+    body = {"inputs": [{"vid": int(contact_id),
+                        "interactionDateTime": when,
+                        "properties": {}}]}
+    return f"{path}?{query}", body
+
+
 def write_registration(hubspot, external_event_id, contact_id, when) -> tuple:
     """POST one REGISTERED state. (audit_id, error, ambiguous).
 
@@ -488,14 +554,7 @@ def write_registration(hubspot, external_event_id, contact_id, when) -> tuple:
     """
     from clients.hubspot import hubspot_error
 
-    verb = _PATH_VERBS.get(REGISTERED)
-    if verb is None:                      # unreachable by construction
-        raise RegistrationWriteStopped(
-            [], f"no path verb is allowlisted for {REGISTERED}")
-    url = _ATTENDANCE_PATH.format(external_event_id=external_event_id,
-                                  verb=verb)
-    body = {"inputs": [{"vid": int(contact_id),
-                        "interactionDateTime": when}]}
+    url, body = attendance_request(external_event_id, contact_id, when)
     result, status = hubspot._send_with_status("POST", url, body)
 
     audit_id = _latest_audit_id(url)

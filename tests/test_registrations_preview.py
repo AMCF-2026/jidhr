@@ -179,9 +179,9 @@ def test_writes_happen_only_through_the_gated_path():
     import inspect
 
     module = inspect.getsource(reg)
-    assert module.count("_send_with_status") == 1, \
+    assert module.count("_send_with_status(") == 1, \
         "more than one place can issue a write"
-    assert "_send_with_status" in inspect.getsource(reg.write_registration)
+    assert "_send_with_status(" in inspect.getsource(reg.write_registration)
 
     apply_source = inspect.getsource(reg._apply)
     assert "write_registration(" in apply_source
@@ -227,15 +227,50 @@ def test_only_register_can_be_reached():
         assert forbidden not in reg._PATH_VERBS.values()
 
     import inspect
+    # The verb is chosen in attendance_request, which builds the whole
+    # request; write_registration only sends what it is handed.
+    builder = inspect.getsource(reg.attendance_request)
+    assert "_PATH_VERBS" in builder
     writer = inspect.getsource(reg.write_registration)
-    assert "_PATH_VERBS" in writer
-    for forbidden in ('"attend"', "'attend'", '"cancel"', "'cancel'"):
-        assert forbidden not in writer
+    assert "attendance_request(" in writer
+
+    # Docstrings excluded: the builder's docstring QUOTES the documented
+    # values of subscriberState, which is the point of having it there.
+    for func in (reg.write_registration, reg.attendance_request):
+        code = inspect.getsource(func).replace(func.__doc__ or "\0", "")
+        for forbidden in ('"attend"', "'attend'", '"cancel"', "'cancel'"):
+            assert forbidden not in code, f"{func.__name__} can reach it"
 
 
-def test_the_write_body_is_the_documented_shape():
-    """HubSpot's guide: "provide the ID of the contact using the `vid` field
-    within the `inputs` array", and interactionDateTime is required."""
+# HubSpot's documented shape for this endpoint, written out here as
+# LITERALS. The point of these tests is to check the request against the
+# documentation, not against sync.registrations' own template — a test that
+# formats _ATTENDANCE_PATH and compares it to _ATTENDANCE_PATH only proves
+# the module agrees with itself, which is exactly what passed while
+# write_audit 78 and 79 were both being rejected in production.
+#
+# POST /marketing/v3/marketing-events/attendance/{externalEventId}/
+#      {subscriberState}/create
+#
+#   externalEventId     path    required
+#   subscriberState     path    required
+#   externalAccountId   query   "in: query", "style: form"
+#   inputs              body    required, array of MarketingEventSubscriber
+#     vid                       required   int64
+#     interactionDateTime       required   int64, unix milliseconds
+#     properties                required   object of string -> string
+#
+# The spec marks externalAccountId "required: false"; production answers a
+# 400 "externalAccountId is required" without it (write_audit 79). The API
+# is taken over the spec.
+DOCUMENTED_PATH = ("marketing/v3/marketing-events/attendance/"
+                   "csuite-1462/register/create")
+DOCUMENTED_QUERY_KEYS = {"externalAccountId"}
+DOCUMENTED_SUBSCRIBER_KEYS = {"vid", "interactionDateTime", "properties"}
+
+
+def _captured_request():
+    """The complete request write_registration actually issues."""
     sent = {}
 
     class Seam:
@@ -247,21 +282,98 @@ def test_the_write_body_is_the_documented_shape():
         patch.setattr(reg, "_latest_audit_id", lambda endpoint: 99)
         reg.write_registration(Seam(), "csuite-1462", "543954422478",
                                1796000000000)
+    return sent
 
+
+def test_the_complete_request_matches_the_documented_shape():
+    """Path, query string and body keys, all three, against the docs."""
+    from urllib.parse import urlsplit, parse_qs
+
+    sent = _captured_request()
     assert sent["method"] == "POST"
-    assert sent["endpoint"] == ("marketing/v3/marketing-events/attendance/"
-                                "csuite-1462/register/create")
-    assert sent["body"] == {"inputs": [{"vid": 543954422478,
-                                        "interactionDateTime": 1796000000000}]}
+
+    parts = urlsplit(sent["endpoint"])
+    assert parts.path == DOCUMENTED_PATH
+    assert set(parse_qs(parts.query)) == DOCUMENTED_QUERY_KEYS
+    assert set(sent["body"]) == {"inputs"}
+    assert len(sent["body"]["inputs"]) == 1
+    assert set(sent["body"]["inputs"][0]) == DOCUMENTED_SUBSCRIBER_KEYS
+
+
+def test_the_query_string_carries_the_external_account_id():
+    """write_audit 79, production: HTTP 400 "externalAccountId is required".
+    The audit row's endpoint held no query string at all, because
+    _send_with_status was called with a bare path and has no params
+    argument."""
+    from urllib.parse import urlsplit, parse_qs
+    from sync.event_hubspot import EXTERNAL_ACCOUNT_ID
+
+    sent = _captured_request()
+    query = parse_qs(urlsplit(sent["endpoint"]).query)
+    assert query["externalAccountId"] == ["jidhr-amcf"]
+    assert query["externalAccountId"] == [EXTERNAL_ACCOUNT_ID], \
+        "one externalAccountId for the whole repo, not a second literal"
+    assert "externalAccountId" not in sent["body"], "query, not body"
+    assert "externalAccountId" not in sent["body"]["inputs"][0]
+
+
+def test_every_documented_required_field_is_sent():
+    """Item 4 of the brief, as a test: the required list from the spec's
+    MarketingEventSubscriber is interactionDateTime, properties and vid.
+    `properties` was NOT sent by write_audit 79 — the 400 never reached it,
+    because the query string is validated first."""
+    sent = _captured_request()
+    record = sent["body"]["inputs"][0]
+    for field in ("vid", "interactionDateTime", "properties"):
+        assert field in record, f"the docs require {field}"
+    assert record["vid"] == 543954422478, "int64, not a string"
+    assert isinstance(record["vid"], int)
+    assert record["interactionDateTime"] == 1796000000000
+    assert isinstance(record["interactionDateTime"], int)
+
+
+def test_properties_is_sent_empty_and_sets_no_field_values():
+    """The schema requires the key; this sync asserts attendance, not field
+    values, so the map is empty."""
+    sent = _captured_request()
+    assert sent["body"]["inputs"][0]["properties"] == {}
+
+
+def test_the_audit_row_records_the_query_string_that_was_sent():
+    """79 could not be diagnosed from its own audit row: the endpoint column
+    held the path only. The endpoint handed to _send_with_status is the
+    string the audit stores, so the query string has to be in it."""
+    sent = _captured_request()
+    assert "?" in sent["endpoint"]
+    assert "externalAccountId=jidhr-amcf" in sent["endpoint"]
+
+
+def test_the_audit_lookup_matches_the_endpoint_including_the_query():
+    """_latest_audit_id matches `endpoint = %s` exactly, so the string used
+    for the lookup must be the one that was sent — query string and all."""
+    looked_up = []
+    sent = {}
+
+    class Seam:
+        def _send_with_status(self, method, endpoint, data=None):
+            sent["endpoint"] = endpoint
+            return {}, 200
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(reg, "_latest_audit_id",
+                      lambda endpoint: looked_up.append(endpoint) or 99)
+        reg.write_registration(Seam(), "csuite-1462", "1", 1796000000000)
+
+    assert looked_up == [sent["endpoint"]]
 
 
 def test_the_attendance_post_is_an_audited_write():
-    """It must not be classified as a read-shaped POST."""
+    """It must not be classified as a read-shaped POST — and adding the
+    query string must not change that classification."""
     from clients.hubspot import is_hubspot_write
 
-    endpoint = reg._ATTENDANCE_PATH.format(
-        external_event_id="csuite-1462",
-        verb=reg._PATH_VERBS[reg.REGISTERED])
+    endpoint, _body = reg.attendance_request("csuite-1462", "1", 1)
+    assert "?" in endpoint
     assert is_hubspot_write("POST", endpoint) is True
 
 
