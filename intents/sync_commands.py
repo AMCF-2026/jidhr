@@ -368,8 +368,9 @@ def _format_reconcile_results(results: dict, asked=None) -> str:
     lines += [
         f"📊 Scanned **{results.get('events_scanned', 0)}** event(s) with a "
         f"2xx attendance write in `write_audit`:",
-        f"• **{results.get('confirmed', 0)}** confirmed by HubSpot as "
-        f"REGISTERED and missing a `synced` row",
+        f"• **{results.get('confirmed', 0)}** confirmed by HubSpot as a "
+        f"landed registration (REGISTERED, ATTENDED or NO_SHOW) and "
+        f"missing a `synced` row",
         f"• **{results.get('already_synced', 0)}** already recorded `synced` "
         f"— nothing to do",
         f"• **{results.get('not_in_hubspot', 0)}** not held by HubSpot, so "
@@ -380,12 +381,15 @@ def _format_reconcile_results(results: dict, asked=None) -> str:
         lines += ["", ("➡️ **Would insert/update:**" if dry_run
                        else "✍️ **Written:**"), "",
                   "| event | contact | email (hashed) | was | becomes | "
-                  "write_audit |", "|---|---|---|---|---|---|"]
+                  "last_state | write_audit |",
+                  "|---|---|---|---|---|---|---|"]
         for p in proposals:
             lines.append(f"| `{p['event_date_id']}` | "
                          f"`{p['hubspot_contact_id']}` | "
                          f"`{p['email_sha1']}` | {p['current_status']} | "
-                         f"{p['new_status']} | {p['write_audit_id']} |")
+                         f"{p['new_status']} | "
+                         f"{p.get('last_state') or '—'} | "
+                         f"{p['write_audit_id']} |")
         if dry_run:
             lines += ["", 'Say *"reconcile registrations apply"* to write '
                           "these rows. No HubSpot write is made either way "
@@ -399,6 +403,38 @@ def _format_reconcile_results(results: dict, asked=None) -> str:
                              f"be written — see the table.")
     else:
         lines += ["", "Nothing to reconcile."]
+
+    states = results.get("landed_states") or {}
+    if states:
+        lines += ["", "HubSpot holds these as: " + ", ".join(
+            f"**{n}** {state}" for state, n in sorted(states.items()))]
+    if results.get("cancelled"):
+        lines.append(f"• **{results['cancelled']}** are CANCELLED in "
+                     f"HubSpot, so they are NOT recorded as registered.")
+
+    # Every row nobody has confirmed, named whether or not this run could
+    # resolve it. A row HubSpot cannot confirm is the one most worth
+    # printing, and it used to be invisible.
+    unresolved = results.get("unresolved") or []
+    if unresolved:
+        lines += ["", f"⚠️ **{len(unresolved)}** registration_map row(s) "
+                      f"still unresolved:", "",
+                  "| event | contact | status | last_state | audit | age |",
+                  "|---|---|---|---|---|---|"]
+        for row in unresolved[:REGISTRATION_REVIEW_ROWS_SHOWN]:
+            age = int(row.get("age_seconds") or 0)
+            age_text = (f"{age // 86400}d" if age >= 86400
+                        else f"{age // 3600}h" if age >= 3600
+                        else f"{age // 60}m")
+            lines.append(
+                f"| `{row.get('csuite_eventdate_id')}` | "
+                f"`{row.get('hubspot_contact_id') or '—'}` | "
+                f"{row.get('status')} | {row.get('last_state') or '—'} | "
+                f"{row.get('write_audit_id') or '—'} | {age_text} |")
+        if len(unresolved) > REGISTRATION_REVIEW_ROWS_SHOWN:
+            lines.append(f"… and "
+                         f"**{len(unresolved) - REGISTRATION_REVIEW_ROWS_SHOWN}"
+                         f"** more")
 
     skipped = results.get("events_skipped") or []
     if skipped:
@@ -579,6 +615,22 @@ def _format_registration_results(results: dict) -> str:
         lines.insert(2, f"🎯 Scoped to event `{results['scoped_event']}` "
                         f"only, by name in the command.")
 
+    ended = results.get("ended_events") or []
+    if ended:
+        lines += ["", f"🕗 **{results.get('ended_records', 0)}** of those are "
+                      f"on events that have already ENDED — HubSpot records "
+                      f"a registration on an ended event as a **no-show**, "
+                      f"not as a registration. They are sent anyway: which "
+                      f"events and who registered matter more than "
+                      f"attendance, and no attendance data is ever sent."]
+        for event_id, count in ended[:REGISTRATION_REVIEW_ROWS_SHOWN]:
+            lines.append(f"   `{event_id}` — **{count}** record(s) will "
+                         f"appear as no-shows")
+        if len(ended) > REGISTRATION_REVIEW_ROWS_SHOWN:
+            lines.append(f"   … and "
+                         f"**{len(ended) - REGISTRATION_REVIEW_ROWS_SHOWN}** "
+                         f"more ended event(s)")
+
     if results.get("unverified_prior"):
         lines.append(
             f"• **{results['unverified_prior']}** held back from an earlier "
@@ -648,6 +700,18 @@ def _format_registration_results(results: dict) -> str:
             # that stops before the cap has deferred nothing.
             lines.append("• **0** deferred — the run stopped before the "
                          f"limit of {results.get('limit')} was reached")
+        states = results.get("landed_states") or {}
+        if states:
+            shown = ", ".join(f"**{n}** {state}"
+                              for state, n in sorted(states.items()))
+            lines.append(f"• verified in HubSpot as: {shown} — NO_SHOW is "
+                         f"what an ended event records, and is stored as "
+                         f"`last_state`")
+        if results.get("cancelled"):
+            lines.append(
+                f"• **{results['cancelled']}** came back CANCELLED in "
+                f"HubSpot — recorded `review`, not `synced`. The POST "
+                f"landed, but nobody is registered.")
         if results.get("unverified"):
             lines.append(
                 f"• **{results['unverified']}** returned 2xx but could NOT "

@@ -69,6 +69,28 @@ def accepted_writes() -> dict:
     return out
 
 
+_UNRESOLVED_SQL = """
+    SELECT csuite_eventdate_id, hubspot_contact_id, email_sha1, status,
+           last_state, write_audit_id, updated_at,
+           EXTRACT(EPOCH FROM (NOW() - updated_at)) AS age_seconds
+      FROM hubsync.registration_map
+     WHERE status = ANY(%s)
+     ORDER BY csuite_eventdate_id, hubspot_contact_id
+"""
+
+
+def unresolved_rows() -> list:
+    """registration_map rows nobody has confirmed, oldest activity first."""
+    try:
+        rows = database.execute_query(_UNRESOLVED_SQL,
+                                      (list(REPAIRABLE_STATUSES),),
+                                      fetch=True)
+    except Exception as e:
+        logger.warning("could not read unresolved rows: %s", e)
+        return []
+    return rows or []
+
+
 def _event_of(endpoint) -> str:
     """The CSuite event date id in an attendance endpoint, or ''.
 
@@ -95,13 +117,19 @@ def run(csuite=None, hubspot=None, dry_run: bool = True,
     out = {"dry_run": dry_run, "error": None, "proposals": [],
            "events_scanned": 0, "rows_written": 0, "csuite_calls": 0,
            "hubspot_calls": 0, "confirmed": 0, "not_in_hubspot": 0,
-           "already_synced": 0, "failed_writes": 0, "events_skipped": []}
+           "already_synced": 0, "failed_writes": 0, "events_skipped": [],
+           "cancelled": 0, "landed_states": {}, "unresolved": []}
 
     if not reg.migration_applied():
         out["error"] = ("hubsync.registration_map does not exist, so there "
                         "is nothing to reconcile into. Run "
                         "migrations/005_registration_map.sql first.")
         return out
+
+    # Every row nobody has confirmed, reported whether or not this run can
+    # resolve it. A row that HubSpot cannot confirm is the one most worth
+    # naming, and it was previously invisible.
+    out["unresolved"] = unresolved_rows()
 
     accepted = accepted_writes()
     if not accepted:
@@ -120,7 +148,7 @@ def run(csuite=None, hubspot=None, dry_run: bool = True,
                 (str(event_id), "no 2xx attendance write in write_audit"))
             continue
 
-        rows, error = reg.read_registrants(csuite, event_id)
+        rows, error, _event_row = reg.read_registrants(csuite, event_id)
         out["csuite_calls"] += 1
         if error:
             out["events_skipped"].append(
@@ -152,18 +180,27 @@ def run(csuite=None, hubspot=None, dry_run: bool = True,
                 out["already_synced"] += 1
                 continue
 
-            found, why = reg.registered_in_portal(
+            # THE SAME predicate the apply's read-back uses, not a second
+            # copy of it: the reconcile reported "0 confirmed" for
+            # csuite-1155 because it carried its own REGISTERED-only check
+            # while the participation was sitting there in NO_SHOW.
+            verdict, state, why = reg.participation_state(
                 hubspot, external, record["hubspot_contact_id"])
             out["hubspot_calls"] += 1
-            if found is None:
+            if verdict == reg.UNREADABLE:
                 out["events_skipped"].append(
                     (str(event_id), f"participation read failed: {why}"))
                 continue
-            if not found:
+            if verdict == reg.CANCELLED:
+                out["cancelled"] += 1
+                continue
+            if verdict != reg.LANDED:
                 out["not_in_hubspot"] += 1
                 continue
 
             out["confirmed"] += 1
+            out["landed_states"][state] = (
+                out["landed_states"].get(state, 0) + 1)
             proposal = {
                 "event_date_id": str(event_id),
                 "external_event_id": external,
@@ -174,17 +211,26 @@ def run(csuite=None, hubspot=None, dry_run: bool = True,
                 "current_status": status or "(no row)",
                 "write_audit_id": prior.get("write_audit_id") or latest_audit,
                 "new_status": "synced",
+                # The state HubSpot actually holds. csuite-1155's is
+                # NO_SHOW, and storing REGISTERED would be a record of
+                # something nobody can see in the portal.
+                "last_state": state,
+                "inserted": status is None,
             }
             out["proposals"].append(proposal)
 
             if not dry_run:
-                stored = reg.record_registration(
-                    record, external, proposal["write_audit_id"], "synced")
+                # An upsert: it INSERTS when there is no row, which is the
+                # case for every event whose unverified row failed to
+                # write at all (csuite-1155 had none).
+                stored, store_error = reg.record_registration(
+                    record, external, proposal["write_audit_id"], "synced",
+                    last_state=state)
                 if stored:
                     out["rows_written"] += 1
                 else:
                     out["failed_writes"] += 1
-                    proposal["new_status"] = "COULD NOT WRITE"
+                    proposal["new_status"] = f"COULD NOT WRITE: {store_error}"
 
     return out
 

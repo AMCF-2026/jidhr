@@ -41,20 +41,51 @@ from sync import registrations as reg
 
 logger = logging.getLogger(__name__)
 
-# A 'running' row older than this is treated as abandoned rather than as a
-# reason to refuse forever. A worker killed mid-run leaves its row 'running'
-# with no finished_at, and nothing else would ever clear it.
+# A 'running' row is abandoned when it has gone this long WITHOUT a new
+# write_audit row, not when it is simply old. A worker killed mid-run leaves
+# its row 'running' with no finished_at and nothing would ever clear it —
+# but a 29-record apply legitimately runs for 318 seconds, and judging it by
+# total age would have declared a run abandoned while it was still writing.
+#
+# Progress is measured from write_audit because every write already passes
+# through it: there is no second progress table to keep in step with the
+# first, and a run that is still writing cannot look idle.
+IDLE_ABANDONED_SECONDS = 300
+
+# Kept for the pre-write phase, which makes no writes at all: a run that has
+# not written ANYTHING yet is judged from its own start_at instead. The
+# planning phase (CSuite registrants, then one HubSpot batch read) took
+# about 30 seconds across all eleven events.
 STALE_RUNNING_MINUTES = 30
 
+# `last_activity` is the newest attendance write this run could have made,
+# falling back to the run's own start before its first write. A run still
+# writing keeps refreshing it, so only a genuinely silent run goes stale.
 _RUNNING_SQL = """
-    SELECT id, started_at,
-           EXTRACT(EPOCH FROM (NOW() - started_at)) AS age_seconds
-      FROM hubsync.run_log
-     WHERE job = 'registrations_sync'
-       AND applied IS TRUE
-       AND status = 'running'
-       AND started_at > NOW() - (%s * INTERVAL '1 minute')
-     ORDER BY id
+    SELECT r.id,
+           r.started_at,
+           EXTRACT(EPOCH FROM (NOW() - r.started_at)) AS age_seconds,
+           GREATEST(r.started_at,
+                    COALESCE(w.last_write, r.started_at)) AS last_activity,
+           EXTRACT(EPOCH FROM (NOW() - GREATEST(
+               r.started_at,
+               COALESCE(w.last_write, r.started_at)))) AS idle_seconds
+      FROM hubsync.run_log r
+      LEFT JOIN LATERAL (
+           SELECT MAX(created_at) AS last_write
+             FROM write_audit
+            WHERE target_system = 'hubspot'
+              AND http_method = 'POST'
+              AND endpoint LIKE '%%marketing-events/attendance/%%'
+              AND created_at >= r.started_at
+      ) w ON TRUE
+     WHERE r.job = 'registrations_sync'
+       AND r.applied IS TRUE
+       AND r.status = 'running'
+       AND EXTRACT(EPOCH FROM (NOW() - GREATEST(
+               r.started_at,
+               COALESCE(w.last_write, r.started_at)))) < %s
+     ORDER BY r.id
 """
 
 _RUN_SQL = """
@@ -104,10 +135,15 @@ class RunNotFound(RuntimeError):
 
 
 def running_applies() -> list:
-    """Live 'running' apply rows, oldest first. Stale rows are excluded."""
+    """Live 'running' apply rows, oldest first.
+
+    A row that has made no write for IDLE_ABANDONED_SECONDS is excluded —
+    abandoned, not running. A long run that is still writing is never
+    excluded, however long it has been going.
+    """
     try:
-        rows = database.execute_query(_RUNNING_SQL, (STALE_RUNNING_MINUTES,),
-                                      fetch=True)
+        rows = database.execute_query(_RUNNING_SQL,
+                                      (IDLE_ABANDONED_SECONDS,), fetch=True)
     except Exception as e:
         # Refusing because the guard cannot be read would make the feature
         # unusable whenever the database hiccups; reporting it and letting
@@ -150,7 +186,9 @@ def start_apply(limit, event_ids=None, runner=None) -> int:
                 f"registrations apply run_log {busy[0]['id']} is still "
                 f"running (started "
                 f"{busy[0]['started_at']:%H:%M:%S} UTC, "
-                f"{int(busy[0]['age_seconds'])}s ago). One at a time: the "
+                f"{int(busy[0]['age_seconds'])}s ago; last write "
+                f"{int(busy[0].get('idle_seconds') or 0)}s ago). One at a "
+                f"time: the "
                 f"attendance endpoint has no idempotency key, so two "
                 f"applies over the same event is how one registration "
                 f"becomes two. Say \"registrations status\" to see it.")

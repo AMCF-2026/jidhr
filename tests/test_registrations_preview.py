@@ -201,19 +201,33 @@ def test_writes_happen_only_through_the_gated_path():
     assert "_apply(" in body
 
 
-def test_the_only_state_ever_written_is_REGISTERED():
-    """Never ATTENDED — `attended` is null on all 113 rows. Never CANCELLED
-    — CSuite has no such state."""
+def test_the_only_state_ever_sent_is_a_registration():
+    """Registration only. ATTENDED, CANCELLED and NO_SHOW are now states
+    this sync READS back — HubSpot records an ended event's registration as
+    NO_SHOW by itself — but none of them is ever SENT.
+
+    So the guard is on the request builder, which is the only thing that
+    can send anything, rather than on text appearing anywhere in a
+    function. Carl's instruction stands: do not start sending attend or
+    no-show data.
+    """
     import inspect
+    from urllib.parse import urlsplit
 
-    writer = inspect.getsource(reg.write_registration)
-    assert "REGISTERED" in writer
-    assert "ATTENDED" not in writer
-    assert "CANCELLED" not in writer
+    url, body = reg.attendance_request("csuite-1155", "701", 1)
+    assert urlsplit(url).path.endswith("/register/create")
+    assert list(reg._PATH_VERBS.values()) == ["register"]
+    # Nothing in the body names a state at all.
+    assert set(body["inputs"][0]) == {"vid", "interactionDateTime",
+                                      "properties"}
 
-    applier = inspect.getsource(reg._apply)
-    for forbidden in ("ATTENDED", "CANCELLED", "NO_SHOW"):
-        assert forbidden not in applier, forbidden
+    builder = inspect.getsource(reg.attendance_request)
+    code = builder.replace(reg.attendance_request.__doc__ or "\0", "")
+    # Quoted forms: "attend" is a substring of attendance_request itself.
+    for forbidden in ("ATTENDED", "CANCELLED", "NO_SHOW", '"attend"',
+                      "'attend'", '"cancel"', "'cancel'", "/attend/",
+                      "/cancel/"):
+        assert forbidden not in code, forbidden
 
 
 def test_the_path_segment_is_the_verb_not_the_state():
@@ -570,16 +584,21 @@ def test_a_guarded_event_plans_nothing_at_all(monkeypatch):
     assert out["withheld"] == 0
 
 
-def test_phase_1_asserts_no_cancellations_at_all():
-    """The guard exists from the start, but nothing uses it to cancel: there
-    is no CANCELLED anywhere in the module."""
+def test_no_cancellation_is_ever_asserted_to_hubspot():
+    """CANCELLED is read, never written. CSuite has no cancelled state — a
+    cancellation there is a row that stops being returned — so there is
+    nothing to send, and the shrink guard exists instead."""
     import inspect
 
-    source = inspect.getsource(reg)
-    assert "CANCELLED" in source, "the state is named in the docstring"
-    assert source.count("'CANCELLED'") == 0
-    assert '"CANCELLED"' not in source.replace(
-        "('REGISTERED', 'ATTENDED', 'CANCELLED')", "")
+    # The one place a state could be sent.
+    assert reg._PATH_VERBS == {"REGISTERED": "register"}
+
+    # And the only state CANCELLED reaches is a LOCAL one: 'review'.
+    applier = inspect.getsource(reg._apply)
+    assert "CANCELLED_STATE" in applier
+    assert '"review"' in applier
+    assert "cancel/create" not in inspect.getsource(reg)
+    assert "attend/create" not in inspect.getsource(reg)
 
 
 def test_only_REGISTERED_is_ever_planned():
@@ -988,37 +1007,44 @@ def confirm(hub, contact_id="701", external=EXT):
     seconds in production; a test that actually waited ten of them would be
     a test nobody runs."""
     slept = []
-    why, calls = reg.confirm_registered(hub, external, contact_id,
-                                        sleep=slept.append)
-    return why, calls, slept
+    why, state, calls = reg.confirm_registered(hub, external, contact_id,
+                                               sleep=slept.append)
+    return why, calls, slept, state
 
 
 def test_a_confirmed_registration_returns_none():
-    why, calls, slept = confirm(Breakdown(breakdown(participation())))
+    why, calls, slept, _state = confirm(Breakdown(breakdown(participation())))
 
     assert why is None
     assert calls == 1, "a confirmed read needs no retry"
     assert slept == [], "and no waiting"
 
 
-def test_the_read_back_asks_the_documented_endpoint_with_the_filters():
+def test_the_read_back_asks_the_documented_endpoint_for_every_state():
     """Keyed on (externalAccountId, externalEventId), filtered server-side
-    by contactIdentifier and state — because `limit` defaults to 10, so the
-    eleventh registration on an event would fall off page one."""
+    to this CONTACT but NOT to a state.
+
+    Filtering to state=REGISTERED is the bug this replaces: write_audit
+    121's registration landed as NO_SHOW, the filtered read returned
+    total=0, and a landed write was reported as a failure.
+
+    limit=100 because `limit` defaults to 10 and a contact can hold more
+    than one state on one event — csuite-1157 holds REGISTERED and NO_SHOW
+    for each of its 29 contacts."""
     hub = Breakdown(breakdown(participation()))
     confirm(hub)
 
     assert hub.asked == ["marketing/v3/marketing-events/participations/"
                          "jidhr-amcf/csuite-1463/breakdown"]
-    assert hub.params == [{"contactIdentifier": "701",
-                           "state": "REGISTERED"}]
+    assert hub.params == [{"contactIdentifier": "701", "limit": 100}]
+    assert "state" not in hub.params[0]
 
 
 def test_an_empty_breakdown_is_not_confirmed():
     """A 2xx says HubSpot accepted the request, not that it recorded it."""
-    why, calls, slept = confirm(Breakdown(breakdown()))
+    why, calls, slept, _state = confirm(Breakdown(breakdown()))
 
-    assert why and "holds no REGISTERED participation" in why
+    assert why and "holds no participation" in why
     assert calls == 3, "three attempts before deciding"
     assert slept == list(reg.VERIFY_BACKOFFS)
     assert "over ~10s" in why
@@ -1029,7 +1055,7 @@ def test_an_empty_first_read_then_present_is_verified():
     a second AFTER the read-back had already given up."""
     hub = Breakdown(breakdown(), breakdown(participation()))
 
-    why, calls, slept = confirm(hub)
+    why, calls, slept, _state = confirm(hub)
 
     assert why is None, "a late participation is still a registration"
     assert calls == 2
@@ -1039,47 +1065,113 @@ def test_an_empty_first_read_then_present_is_verified():
 def test_present_only_on_the_third_read_is_verified():
     hub = Breakdown(breakdown(), breakdown(), breakdown(participation()))
 
-    why, calls, _slept = confirm(hub)
+    why, calls, _slept, _state = confirm(hub)
 
     assert why is None
     assert calls == 3
 
 
 def test_another_contact_is_not_this_contact():
-    why, _calls, _slept = confirm(
+    why, _calls, _slept, _state = confirm(
         Breakdown(breakdown(participation(contact_id="999"))))
 
     assert why and "contact 701" in why
-    assert "holds no REGISTERED participation" in why
+    assert "holds no participation" in why
 
 
 def test_a_participation_on_another_event_does_not_count():
     """The filter is server-side, but the association is checked anyway —
     an endpoint that stopped filtering must not read as success."""
-    why, _calls, _slept = confirm(
+    why, _calls, _slept, _state = confirm(
         Breakdown(breakdown(participation(external="csuite-9999"))))
 
-    assert why and "holds no REGISTERED participation" in why
+    assert why and "holds no participation" in why
 
 
-def test_the_wrong_state_is_not_confirmed():
-    why, _calls, _slept = confirm(
-        Breakdown(breakdown(participation(state="CANCELLED"))))
+def test_cancelled_is_not_confirmed_and_is_not_retried():
+    """Carl's rule: CANCELLED is NOT verified. It is also not retried —
+    absence might change in a second, a state HubSpot has definitely
+    recorded will not."""
+    hub = Breakdown(breakdown(participation(state="CANCELLED")))
 
-    assert why and "'CANCELLED'" in why
-    assert "not REGISTERED" in why
+    why, calls, slept, state = confirm(hub)
+
+    assert why and "CANCELLED" in why
+    assert "was cancelled" in why
+    assert state == reg.CANCELLED_STATE
+    assert calls == 1, "no point waiting for a decided state"
+    assert slept == []
+
+
+@pytest.mark.parametrize("state", ["REGISTERED", "ATTENDED", "NO_SHOW"])
+def test_every_landed_state_is_verified(state):
+    """write_audit 121: a register POST on csuite-1155, an event that ended
+    2026-04-10, got a 201 and HubSpot stored the participation as NO_SHOW.
+    All three landed states mean the registration exists."""
+    why, calls, _slept, seen = confirm(
+        Breakdown(breakdown(participation(state=state))))
+
+    assert why is None, f"{state} means the registration landed"
+    assert seen == state, "and the state seen is what gets stored"
+    assert calls == 1
+
+
+def test_the_most_recent_landed_state_wins():
+    """csuite-1157 holds REGISTERED and NO_SHOW for the same contact — 58
+    participations for 29 people. The portal shows the later one."""
+    early = participation(state="REGISTERED")
+    early["createdAt"] = "2026-10-09T19:20:11.000Z"
+    late = participation(state="NO_SHOW")
+    late["createdAt"] = "2026-10-09T21:00:00.000Z"
+
+    why, _calls, _slept, state = confirm(Breakdown(breakdown(early, late)))
+
+    assert why is None
+    assert state == "NO_SHOW"
+
+
+def test_a_landed_state_outweighs_a_cancellation():
+    """A stale CANCELLED alongside a live registration must not block it —
+    the registration demonstrably exists."""
+    why, _calls, _slept, state = confirm(Breakdown(breakdown(
+        participation(state="CANCELLED"), participation(state="NO_SHOW"))))
+
+    assert why is None
+    assert state == "NO_SHOW"
+
+
+def test_an_undocumented_state_is_never_treated_as_landed():
+    """The four documented values and nothing else. A state this sync has
+    not seen must not be silently accepted as a registration."""
+    why, _calls, _slept, state = confirm(
+        Breakdown(breakdown(participation(state="WAITLISTED"))))
+
+    assert why and "does not recognise" in why
+    assert "WAITLISTED" in why
+    assert state is None
+
+
+def test_the_documented_states_are_the_four_hubspot_names():
+    """HubSpot enumerates them itself when given a bad one: "State value
+    should be one of REGISTERED, CANCELLED, ATTENDED, NO_SHOW" (measured
+    2026-10-09)."""
+    assert set(reg.DOCUMENTED_STATES) == {"REGISTERED", "CANCELLED",
+                                          "ATTENDED", "NO_SHOW"}
+    assert set(reg.LANDED_STATES) == {"REGISTERED", "ATTENDED", "NO_SHOW"}
+    assert reg.CANCELLED_STATE == "CANCELLED"
+    assert reg.CANCELLED_STATE not in reg.LANDED_STATES
 
 
 def test_an_unrecognised_shape_is_unverified_not_confirmed():
     """An unknown shape must not read as success."""
-    why, calls, _slept = confirm(Breakdown({"total": 1}))
+    why, calls, _slept, _state = confirm(Breakdown({"total": 1}))
 
     assert why and "no results list" in why
     assert calls == 3, "retried, in case it was a transient shape"
 
 
 def test_a_failed_read_back_is_not_confirmed():
-    why, _calls, _slept = confirm(
+    why, _calls, _slept, _state = confirm(
         Breakdown({"status": "error", "message": "403"}))
 
     assert why and "read-back failed" in why
@@ -1090,7 +1182,7 @@ def test_a_read_error_then_a_hit_is_verified():
     hub = Breakdown({"status": "error", "category": "RATE_LIMIT"},
                     breakdown(participation()))
 
-    why, calls, _slept = confirm(hub)
+    why, calls, _slept, _state = confirm(hub)
 
     assert why is None
     assert calls == 2
@@ -1126,8 +1218,9 @@ def test_a_definite_failure_writes_no_registration_map_row(monkeypatch):
     monkeypatch.setattr(reg, "open_run", lambda applied: None)
     monkeypatch.setattr(reg, "close_run", lambda *a, **k: None)
     monkeypatch.setattr(reg, "record_registration",
-                        lambda record, ext, audit, status, error=None:
-                        stored.append(status) or True)
+                        lambda record, ext, audit, status, error=None,
+                        last_state=None:
+                        stored.append(status) or (True, None))
     monkeypatch.setattr(reg, "event_object_ids",
                         lambda h, ids: ({"1": "hs-ev"}, 1, None))
     monkeypatch.setattr(reg, "interaction_timestamp",
@@ -1157,8 +1250,9 @@ def test_an_ambiguous_write_DOES_record_unknown(monkeypatch):
     monkeypatch.setattr(reg, "open_run", lambda applied: None)
     monkeypatch.setattr(reg, "close_run", lambda *a, **k: None)
     monkeypatch.setattr(reg, "record_registration",
-                        lambda record, ext, audit, status, error=None:
-                        stored.append(status) or True)
+                        lambda record, ext, audit, status, error=None,
+                        last_state=None:
+                        stored.append(status) or (True, None))
     monkeypatch.setattr(reg, "event_object_ids",
                         lambda h, ids: ({"1": "hs-ev"}, 1, None))
     monkeypatch.setattr(reg, "interaction_timestamp",
@@ -1502,14 +1596,14 @@ def live_run(monkeypatch, csuite, hubspot, writer=None, **kwargs):
     monkeypatch.setattr(reg, "open_run", lambda applied: None)
     monkeypatch.setattr(reg, "close_run", lambda *a, **k: None)
     monkeypatch.setattr(reg, "record_registration",
-                        lambda *a, **k: True)
+                        lambda *a, **k: (True, None))
     monkeypatch.setattr(reg, "event_object_ids",
                         lambda h, ids: ({"1": "hs-ev"}, 1, None))
     monkeypatch.setattr(reg, "write_registration",
                         writer or (lambda h, ext, cid, when: (80, None, None)))
     # (reason, read calls) — None means verified.
     monkeypatch.setattr(reg, "confirm_registered",
-                        lambda h, ext, cid, sleep=None: (None, 1))
+                        lambda h, ext, cid, sleep=None: (None, "REGISTERED", 1))
     return reg.run(csuite=csuite, hubspot=hubspot, dry_run=False, limit=1,
                    event_ids=("1",), **kwargs)
 
@@ -1879,10 +1973,13 @@ def outcome_run(monkeypatch, hubspot, **kwargs):
     monkeypatch.setattr(reg, "open_run", lambda applied: None)
     monkeypatch.setattr(reg, "close_run", lambda *a, **k: None)
     monkeypatch.setattr(reg, "record_registration",
-                        lambda record, ext, audit, status, error=None:
+                        lambda record, ext, audit, status, error=None,
+                        last_state=None:
                         stored.append({"status": status, "error": error,
+                                       "last_state": last_state,
                                        "contact": record.get(
-                                           "hubspot_contact_id")}) or True)
+                                           "hubspot_contact_id")})
+                        or (True, None))
     monkeypatch.setattr(reg, "event_object_ids",
                         lambda h, ids: ({"1463": "863952588483"}, 1, None))
     monkeypatch.setattr(reg, "_latest_audit_id", lambda endpoint: 80)
@@ -2023,3 +2120,229 @@ def test_an_unverified_row_is_reported_before_any_write(monkeypatch):
     reply = sync_commands._format_registration_results(held_back)
     assert "held back from an earlier run" in reply
     assert "reconcile registrations" in reply
+
+
+# ---------------------------------------------------------------------------
+# The landed states, end to end through the real read-back
+# ---------------------------------------------------------------------------
+#
+# write_audit 121, production 2026-10-09: POST register for contact
+# 269277574890 on csuite-1155 — an event that ENDED 2026-04-10 — returned
+# 201 in 219ms, and HubSpot stored the participation as NO_SHOW. The
+# verifier asked for state=REGISTERED, got total=0, and stopped the run as
+# a failure. The write had landed.
+#
+# Past events are synced anyway (Carl's decision): which events and who
+# registered matter more than attendance, and no attendance data is sent.
+
+
+def outcome_run_with(monkeypatch, breakdowns, write=(None, 201),
+                     recorder=None, event_date="2025-01-01"):
+    """A live run on one event, with the REAL read-back and zero backoff."""
+    arm(monkeypatch, True)
+    stored = []
+
+    def record(record, ext, audit, status, error=None, last_state=None):
+        stored.append({"status": status, "last_state": last_state,
+                       "error": error})
+        return (True, None) if recorder is None else recorder()
+
+    monkeypatch.setattr(reg, "migration_applied", lambda: True)
+    monkeypatch.setattr(reg, "load_map", lambda: {})
+    monkeypatch.setattr(reg, "open_run", lambda applied: None)
+    monkeypatch.setattr(reg, "close_run", lambda *a, **k: None)
+    monkeypatch.setattr(reg, "record_registration", record)
+    monkeypatch.setattr(reg, "event_object_ids",
+                        lambda h, ids: ({"1155": "749247088350"}, 1, None))
+    monkeypatch.setattr(reg, "_latest_audit_id", lambda endpoint: 121)
+    monkeypatch.setattr(reg, "VERIFY_BACKOFFS", (0.0, 0.0))
+
+    hub = WritingHubSpot({"a@x.inv": ("269277574890", True, [])},
+                         write=write, breakdowns=breakdowns)
+    out = reg.run(csuite=CSuite({"1155": [registrant("a@x.inv")]},
+                                dates={"1155": event_date}),
+                  hubspot=hub, dry_run=False, limit=1,
+                  event_ids=("1155",), now_ms=NOW_MS)
+    return out, stored, hub
+
+
+def test_a_no_show_participation_is_VERIFIED_and_stored(monkeypatch):
+    """The regression. 2xx + NO_SHOW -> synced, last_state NO_SHOW."""
+    out, stored, _hub = outcome_run_with(
+        monkeypatch,
+        [breakdown(participation(contact_id="269277574890",
+                                 state="NO_SHOW", external="csuite-1155"))])
+
+    assert out["registered"] == 1
+    assert out["failed"] == 0
+    assert out["unverified"] == 0
+    assert out["stopped"] is None
+    assert stored == [{"status": "synced", "last_state": "NO_SHOW",
+                       "error": None}]
+    assert out["landed_states"] == {"NO_SHOW": 1}
+
+
+def test_an_attended_participation_is_VERIFIED(monkeypatch):
+    out, stored, _hub = outcome_run_with(
+        monkeypatch,
+        [breakdown(participation(contact_id="269277574890",
+                                 state="ATTENDED", external="csuite-1155"))])
+
+    assert out["registered"] == 1
+    assert stored[0]["status"] == "synced"
+    assert stored[0]["last_state"] == "ATTENDED"
+
+
+def test_a_cancelled_participation_is_review_and_stops(monkeypatch):
+    """Carl's rule: CANCELLED is NOT verified. The POST landed, but nobody
+    is registered — so it is neither a success nor a failure."""
+    out, stored, _hub = outcome_run_with(
+        monkeypatch,
+        [breakdown(participation(contact_id="269277574890",
+                                 state="CANCELLED",
+                                 external="csuite-1155"))])
+
+    assert out["registered"] == 0
+    assert out["cancelled"] == 1
+    assert out["failed"] == 0, "the POST did land"
+    assert out["stopped"] and "CANCELLED" in out["stopped"]
+    assert stored == [{"status": "review", "last_state": "CANCELLED",
+                       "error": stored[0]["error"]}]
+    assert "cancelled" in stored[0]["error"]
+
+
+def test_nothing_ever_present_is_UNVERIFIED_and_stops(monkeypatch):
+    out, stored, hub = outcome_run_with(monkeypatch, [breakdown()])
+
+    assert out["registered"] == 0
+    assert out["unverified"] == 1
+    assert out["failed"] == 0
+    assert out["stopped"] and "could not be verified" in out["stopped"]
+    assert stored[0]["status"] == "unverified"
+    assert len(hub.gets) == 3, "three attempts before deciding"
+
+
+def test_a_map_write_that_raises_stops_the_run_with_the_real_error(
+        monkeypatch):
+    """run_log 34 said only "registration_map could NOT be updated". The
+    real cause was a CheckViolation on registration_map_status_check —
+    hotfix-50 began writing status 'unverified' without widening the
+    constraint. A report that cannot name its own failure costs a day."""
+    out, stored, _hub = outcome_run_with(
+        monkeypatch,
+        [breakdown(participation(contact_id="269277574890",
+                                 state="NO_SHOW", external="csuite-1155"))],
+        recorder=lambda: (False, 'CheckViolation: new row for relation '
+                                 '"registration_map" violates check '
+                                 'constraint '
+                                 '"registration_map_status_check"'))
+
+    assert out["stopped"], "the run must still stop"
+    assert "CheckViolation" in out["stopped"]
+    assert "registration_map_status_check" in out["stopped"]
+    assert stored[0]["status"] == "synced"
+
+
+def test_the_real_exception_is_returned_not_swallowed(monkeypatch):
+    """record_registration returns the cause, not just False."""
+    class Boom:
+        @staticmethod
+        def execute_query(sql, params=None, fetch=True):
+            raise RuntimeError("relation does not exist")
+
+    monkeypatch.setattr(reg, "database", Boom)
+
+    ok, why = reg.record_registration(
+        {"event_date_id": "1155", "contact_email": "a@x.inv",
+         "email_sha1": "abc", "hubspot_contact_id": "701"},
+        "csuite-1155", 121, "unverified")
+
+    assert ok is False
+    assert "RuntimeError" in why
+    assert "relation does not exist" in why
+
+
+def test_the_state_stored_is_the_one_hubspot_holds(monkeypatch):
+    """Not the one we asked for. record_registration defaults to REGISTERED
+    only when no state is given."""
+    captured = {}
+
+    class Capture:
+        @staticmethod
+        def execute_query(sql, params=None, fetch=True):
+            captured["last_state"] = params[6]
+            return [{"id": 1}]
+
+    monkeypatch.setattr(reg, "database", Capture)
+    record = {"event_date_id": "1155", "contact_email": "a@x.inv",
+              "email_sha1": "abc", "hubspot_contact_id": "701"}
+
+    reg.record_registration(record, "csuite-1155", 121, "synced",
+                            last_state="NO_SHOW")
+    assert captured["last_state"] == "NO_SHOW"
+
+    reg.record_registration(record, "csuite-1155", 121, "synced")
+    assert captured["last_state"] == "REGISTERED", "the default is unchanged"
+
+
+# --- the ended-event flag ---------------------------------------------------
+
+def test_an_ended_event_is_flagged_in_the_preview():
+    """Step 4: say it before the run, not after somebody finds no-shows in
+    the portal."""
+    out = reg.run(csuite=CSuite({"1155": [registrant("a@x.inv")]},
+                                dates={"1155": "2025-01-01"}),
+                  hubspot=HubSpot({"a@x.inv": ("701", True, [])}),
+                  event_ids=("1155",), now_ms=NOW_MS)
+
+    assert out["ended_events"] == [("1155", 1)]
+    assert out["ended_records"] == 1
+
+    reply = sync_commands._format_registration_results(out)
+    assert "already ENDED" in reply
+    assert "no-show" in reply
+    assert "`1155` — **1** record(s) will appear as no-shows" in reply
+
+
+def test_a_future_event_is_not_flagged_as_ended():
+    out = reg.run(csuite=CSuite({"1463": [registrant("a@x.inv")]},
+                                dates={"1463": "2026-12-31"}),
+                  hubspot=HubSpot({"a@x.inv": ("701", True, [])}),
+                  event_ids=("1463",), now_ms=NOW_MS)
+
+    assert out["ended_events"] == []
+    assert out["ended_records"] == 0
+    assert "already ENDED" not in \
+        sync_commands._format_registration_results(out)
+
+
+def test_an_event_with_nothing_to_send_is_not_flagged():
+    """The flag is about records that WILL be sent, not about the calendar."""
+    out = reg.run(csuite=CSuite({"1155": [registrant("nobody@x.inv")]},
+                                dates={"1155": "2025-01-01"}),
+                  hubspot=HubSpot({}), event_ids=("1155",), now_ms=NOW_MS)
+
+    assert out["withheld"] == 1
+    assert out["ended_events"] == []
+
+
+def test_the_ended_flag_agrees_with_the_interaction_rule():
+    """Both read CSuite's event_date, so a record on an ended event is
+    exactly a record whose interactionDateTime rule is event_start."""
+    out = reg.run(csuite=CSuite({"1155": [registrant("a@x.inv")]},
+                                dates={"1155": "2025-01-01"}),
+                  hubspot=HubSpot({"a@x.inv": ("701", True, [])}),
+                  event_ids=("1155",), now_ms=NOW_MS)
+
+    assert out["ended_events"] == [("1155", 1)]
+    assert out["first_sends"][0]["interaction_rule"] == \
+        reg.INTERACTION_EVENT_START
+
+
+def test_an_event_with_no_date_is_not_called_ended():
+    """98 of 179 production rows have no event_date. "Unknown" is not
+    "past"."""
+    assert reg.event_has_ended({}, NOW_MS) is False
+    assert reg.event_has_ended({"event_date": "not a date"}, NOW_MS) is False
+    assert reg.event_has_ended({"event_date": "2025-01-01"}, NOW_MS) is True
+    assert reg.event_has_ended({"event_date": "2030-01-01"}, NOW_MS) is False

@@ -186,14 +186,38 @@ def test_the_refusal_names_the_running_run_in_chat(ledger):
     assert "registrations status" in reply
 
 
-def test_a_stale_running_row_does_not_block_forever(ledger):
-    """A killed worker leaves its row 'running' with no finished_at, and
-    nothing else would ever clear it. The SQL excludes rows older than
-    STALE_RUNNING_MINUTES — checked here on the statement itself, because
-    the fake ledger cannot evaluate an interval."""
-    assert jobs.STALE_RUNNING_MINUTES == 30
-    assert "started_at > NOW() -" in jobs._RUNNING_SQL
-    assert "INTERVAL '1 minute'" in jobs._RUNNING_SQL
+def test_abandonment_is_judged_by_write_activity_not_by_age(ledger):
+    """A 29-record apply legitimately runs for 318 seconds, so judging a run
+    by its total age would have called it abandoned while it was still
+    writing. The test is on the statement itself: the fake ledger cannot
+    evaluate an interval or a lateral join.
+
+    The idle clock is measured from the newest attendance row in
+    write_audit, falling back to the run's own start before its first
+    write — so a run that is still writing can never look idle."""
+    assert jobs.IDLE_ABANDONED_SECONDS == 300
+    sql = jobs._RUNNING_SQL
+    assert "MAX(created_at) AS last_write" in sql
+    assert "marketing-events/attendance/" in sql
+    assert "COALESCE(w.last_write, r.started_at)" in sql
+    assert "GREATEST(" in sql
+    assert "idle_seconds" in sql
+    # Not the old wall-clock rule.
+    assert "INTERVAL '1 minute'" not in sql
+
+
+def test_a_run_still_writing_is_never_treated_as_abandoned(ledger):
+    """The guard must keep refusing a second apply while the first is
+    making progress, however long it has been going."""
+    import re
+
+    sql = jobs._RUNNING_SQL
+    # The WHERE clause compares the IDLE time to the threshold, not the age.
+    where = sql.split("WHERE", 1)[1]
+    assert "idle" in where.lower() or "GREATEST(" in where
+    assert re.search(r"NOW\(\) - GREATEST", where)
+    assert "age_seconds" not in where, \
+        "age must not decide abandonment — run_log 30 ran 318s"
 
 
 def test_a_run_that_lost_the_race_stands_down_and_writes_nothing(ledger):
