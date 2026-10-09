@@ -900,73 +900,193 @@ def test_apply_is_the_word_that_writes(monkeypatch):
 # ---------------------------------------------------------------------------
 # The read-back
 # ---------------------------------------------------------------------------
+#
+# The fakes below return HubSpot's DOCUMENTED participation shape, copied
+# from a real response for csuite-1463 read on 2026-10-09:
+#
+#   {"total": 1, "results": [{"id": "869277318854",
+#     "properties": {"attendanceState": "REGISTERED",
+#                    "occurredAt": 1791571437115,
+#                    "attendanceDurationSeconds": null,
+#                    "attendancePercentage": null},
+#     "associations": {
+#       "contact": {"contactId": "543954422478", "email": "...",
+#                   "firstname": "...", "lastname": "..."},
+#       "marketingEvent": {"marketingEventId": "863952588483",
+#                          "name": "...", "externalEventId": "csuite-1463",
+#                          "externalAccountId": "jidhr-amcf"}},
+#     "createdAt": "2026-10-09T18:43:59.508Z"}]}
+#
+# The previous fakes answered {"contactId": ..., "state": ...}, which HubSpot
+# has never returned. They passed against a code path that searched a JSON
+# blob for the id, and they would have passed whatever the real shape was.
+
+EXT = "csuite-1463"
+
+
+def participation(contact_id="701", state="REGISTERED", external=EXT):
+    """One result entry, in the documented shape."""
+    return {
+        "id": "869277318854",
+        "properties": {"attendanceState": state,
+                       "occurredAt": 1791571437115,
+                       "attendanceDurationSeconds": None,
+                       "attendancePercentage": None},
+        "associations": {
+            "contact": {"contactId": contact_id, "email": "a@x.inv",
+                        "firstname": "A", "lastname": "Person"},
+            "marketingEvent": {"marketingEventId": "863952588483",
+                               "name": "An Event",
+                               "externalEventId": external,
+                               "externalAccountId": "jidhr-amcf"}},
+        "createdAt": "2026-10-09T18:43:59.508Z"}
+
+
+def breakdown(*entries):
+    return {"total": len(entries), "results": list(entries)}
+
 
 class Breakdown:
-    def __init__(self, response):
-        self.response = response
+    """Answers one response, or a different one per attempt."""
+
+    def __init__(self, *responses):
+        self.responses = list(responses)
         self.asked = []
+        self.params = []
 
     def _get(self, endpoint, params=None):
         self.asked.append(endpoint)
-        return self.response
+        self.params.append(params)
+        i = min(len(self.asked) - 1, len(self.responses) - 1)
+        return self.responses[i]
+
+
+def confirm(hub, contact_id="701", external=EXT):
+    """confirm_registered with the clock stubbed out. The backoff is real
+    seconds in production; a test that actually waited ten of them would be
+    a test nobody runs."""
+    slept = []
+    why, calls = reg.confirm_registered(hub, external, contact_id,
+                                        sleep=slept.append)
+    return why, calls, slept
 
 
 def test_a_confirmed_registration_returns_none():
-    hub = Breakdown({"total": 1, "results": [
-        {"contactId": "701", "state": "REGISTERED"}]})
+    why, calls, slept = confirm(Breakdown(breakdown(participation())))
 
-    assert reg.confirm_registered(hub, "864022788822", "701") is None
+    assert why is None
+    assert calls == 1, "a confirmed read needs no retry"
+    assert slept == [], "and no waiting"
 
 
-def test_an_empty_breakdown_is_a_mismatch():
+def test_the_read_back_asks_the_documented_endpoint_with_the_filters():
+    """Keyed on (externalAccountId, externalEventId), filtered server-side
+    by contactIdentifier and state — because `limit` defaults to 10, so the
+    eleventh registration on an event would fall off page one."""
+    hub = Breakdown(breakdown(participation()))
+    confirm(hub)
+
+    assert hub.asked == ["marketing/v3/marketing-events/participations/"
+                         "jidhr-amcf/csuite-1463/breakdown"]
+    assert hub.params == [{"contactIdentifier": "701",
+                           "state": "REGISTERED"}]
+
+
+def test_an_empty_breakdown_is_not_confirmed():
     """A 2xx says HubSpot accepted the request, not that it recorded it."""
-    why = reg.confirm_registered(Breakdown({"total": 0, "results": []}),
-                                 "864022788822", "701")
+    why, calls, slept = confirm(Breakdown(breakdown()))
 
-    assert why and "no participation" in why
-    assert "accepted but not recorded" in why
+    assert why and "holds no REGISTERED participation" in why
+    assert calls == 3, "three attempts before deciding"
+    assert slept == list(reg.VERIFY_BACKOFFS)
+    assert "over ~10s" in why
+
+
+def test_an_empty_first_read_then_present_is_verified():
+    """write_audit 80's case: the participation record's createdAt was about
+    a second AFTER the read-back had already given up."""
+    hub = Breakdown(breakdown(), breakdown(participation()))
+
+    why, calls, slept = confirm(hub)
+
+    assert why is None, "a late participation is still a registration"
+    assert calls == 2
+    assert slept == [reg.VERIFY_BACKOFFS[0]], "waited once, then found it"
+
+
+def test_present_only_on_the_third_read_is_verified():
+    hub = Breakdown(breakdown(), breakdown(), breakdown(participation()))
+
+    why, calls, _slept = confirm(hub)
+
+    assert why is None
+    assert calls == 3
 
 
 def test_another_contact_is_not_this_contact():
-    why = reg.confirm_registered(Breakdown({"total": 1, "results": [
-        {"contactId": "999", "state": "REGISTERED"}]}),
-        "864022788822", "701")
+    why, _calls, _slept = confirm(
+        Breakdown(breakdown(participation(contact_id="999"))))
 
-    assert why and "none for contact 701" in why
+    assert why and "contact 701" in why
+    assert "holds no REGISTERED participation" in why
 
 
-def test_the_wrong_state_is_a_mismatch():
-    why = reg.confirm_registered(Breakdown({"total": 1, "results": [
-        {"contactId": "701", "state": "CANCELLED"}]}),
-        "864022788822", "701")
+def test_a_participation_on_another_event_does_not_count():
+    """The filter is server-side, but the association is checked anyway —
+    an endpoint that stopped filtering must not read as success."""
+    why, _calls, _slept = confirm(
+        Breakdown(breakdown(participation(external="csuite-9999"))))
 
-    assert why and "not as REGISTERED" in why
+    assert why and "holds no REGISTERED participation" in why
+
+
+def test_the_wrong_state_is_not_confirmed():
+    why, _calls, _slept = confirm(
+        Breakdown(breakdown(participation(state="CANCELLED"))))
+
+    assert why and "'CANCELLED'" in why
+    assert "not REGISTERED" in why
 
 
 def test_an_unrecognised_shape_is_unverified_not_confirmed():
-    """The populated shape has never been observed — every event had total=0
-    when this was written. An unknown shape must not read as success."""
-    why = reg.confirm_registered(Breakdown({"total": 1}),
-                                 "864022788822", "701")
+    """An unknown shape must not read as success."""
+    why, calls, _slept = confirm(Breakdown({"total": 1}))
 
     assert why and "no results list" in why
+    assert calls == 3, "retried, in case it was a transient shape"
 
 
-def test_a_failed_read_back_is_a_mismatch():
-    why = reg.confirm_registered(
-        Breakdown({"status": "error", "message": "403"}),
-        "864022788822", "701")
+def test_a_failed_read_back_is_not_confirmed():
+    why, _calls, _slept = confirm(
+        Breakdown({"status": "error", "message": "403"}))
 
     assert why and "read-back failed" in why
 
 
-def test_the_read_back_is_by_object_id():
-    hub = Breakdown({"total": 1, "results": [{"contactId": "701",
-                                              "state": "REGISTERED"}]})
-    reg.confirm_registered(hub, "864022788822", "701")
+def test_a_read_error_then_a_hit_is_verified():
+    """A 429 on the first read is not evidence the write failed."""
+    hub = Breakdown({"status": "error", "category": "RATE_LIMIT"},
+                    breakdown(participation()))
 
-    assert hub.asked == ["marketing/v3/marketing-events/participations/"
-                         "864022788822/breakdown"]
+    why, calls, _slept = confirm(hub)
+
+    assert why is None
+    assert calls == 2
+
+
+def test_registered_in_portal_separates_absence_from_a_failed_read():
+    """None is "no evidence", False is "evidence of absence". Collapsing
+    them is how a 403 became "the write did not land"."""
+    found, _why = reg.registered_in_portal(
+        Breakdown(breakdown(participation())), EXT, "701")
+    assert found is True
+
+    found, _why = reg.registered_in_portal(Breakdown(breakdown()), EXT, "701")
+    assert found is False
+
+    found, _why = reg.registered_in_portal(
+        Breakdown({"status": "error", "message": "403"}), EXT, "701")
+    assert found is None
 
 
 # ---------------------------------------------------------------------------
@@ -1365,7 +1485,9 @@ def live_run(monkeypatch, csuite, hubspot, writer=None, **kwargs):
                         lambda h, ids: ({"1": "hs-ev"}, 1, None))
     monkeypatch.setattr(reg, "write_registration",
                         writer or (lambda h, ext, cid, when: (80, None, None)))
-    monkeypatch.setattr(reg, "confirm_registered", lambda h, o, c: None)
+    # (reason, read calls) — None means verified.
+    monkeypatch.setattr(reg, "confirm_registered",
+                        lambda h, ext, cid, sleep=None: (None, 1))
     return reg.run(csuite=csuite, hubspot=hubspot, dry_run=False, limit=1,
                    event_ids=("1",), **kwargs)
 
@@ -1689,3 +1811,193 @@ def test_the_report_names_the_scoped_event():
 def test_the_held_wording_is_shared_not_copied():
     """One wording, so the report and the run log can be reconciled."""
     assert sync_commands.reg_held_reason() == reg.HELD_REASON
+
+
+# ---------------------------------------------------------------------------
+# The three write outcomes, end to end through the real read-back
+# ---------------------------------------------------------------------------
+#
+# These drive sync.registrations._apply with the REAL confirm_registered, so
+# the retry logic is exercised rather than stubbed. The backoff is set to
+# zero seconds — the attempt COUNT is what matters, and a test that waited
+# the production ten seconds is a test nobody runs.
+
+
+class WritingHubSpot(HubSpot):
+    """batch/read for contacts, the attendance POST, and the breakdown GET.
+
+    `breakdowns` is answered one per GET, the last one repeating — so a test
+    can say "empty, then present".
+    """
+
+    def __init__(self, contacts=None, write=(None, 201), breakdowns=()):
+        super().__init__(contacts)
+        self.write = write
+        self.breakdowns = list(breakdowns) or [breakdown()]
+        self.gets = []
+        self.posted = []
+
+    def _send_with_status(self, method, endpoint, data=None):
+        self.posted.append((method, endpoint, data))
+        body, status = self.write
+        return (body if body is not None else {}), status
+
+    def _get(self, endpoint, params=None):
+        self.gets.append((endpoint, params))
+        i = min(len(self.gets) - 1, len(self.breakdowns) - 1)
+        return self.breakdowns[i]
+
+
+def outcome_run(monkeypatch, hubspot, **kwargs):
+    """A live run with the DB faked and the backoff zeroed."""
+    arm(monkeypatch, True)
+    stored = []
+    monkeypatch.setattr(reg, "migration_applied", lambda: True)
+    monkeypatch.setattr(reg, "load_map", lambda: {})
+    monkeypatch.setattr(reg, "open_run", lambda applied: None)
+    monkeypatch.setattr(reg, "close_run", lambda *a, **k: None)
+    monkeypatch.setattr(reg, "record_registration",
+                        lambda record, ext, audit, status, error=None:
+                        stored.append({"status": status, "error": error,
+                                       "contact": record.get(
+                                           "hubspot_contact_id")}) or True)
+    monkeypatch.setattr(reg, "event_object_ids",
+                        lambda h, ids: ({"1463": "863952588483"}, 1, None))
+    monkeypatch.setattr(reg, "_latest_audit_id", lambda endpoint: 80)
+    monkeypatch.setattr(reg, "VERIFY_BACKOFFS", (0.0, 0.0))
+    out = reg.run(csuite=CSuite({"1463": [registrant("a@x.inv")]},
+                                dates={"1463": "2025-01-01"}),
+                  hubspot=hubspot, dry_run=False, limit=1,
+                  event_ids=("1463",), now_ms=NOW_MS, **kwargs)
+    return out, stored
+
+
+def test_2xx_then_present_on_retry_is_VERIFIED(monkeypatch):
+    """write_audit 80's exact case. The first read is empty because the
+    participation index had not caught up; the retry finds it."""
+    hub = WritingHubSpot({"a@x.inv": ("543954422478", True, [])},
+                         write=(None, 201),
+                         breakdowns=[breakdown(),
+                                     breakdown(participation(
+                                         contact_id="543954422478"))])
+
+    out, stored = outcome_run(monkeypatch, hub)
+
+    assert out["registered"] == 1
+    assert out["unverified"] == 0
+    assert out["failed"] == 0
+    assert out["stopped"] is None
+    assert [r["status"] for r in stored] == ["synced"], \
+        "a verified write writes a synced map row"
+    assert len(hub.gets) == 2, "one empty read, then one that found it"
+
+
+def test_2xx_never_present_is_UNVERIFIED(monkeypatch):
+    """Not APPLIED and not failed. The write got a 2xx, so a resend is how
+    one registration becomes two."""
+    hub = WritingHubSpot({"a@x.inv": ("543954422478", True, [])},
+                         write=(None, 201), breakdowns=[breakdown()])
+
+    out, stored = outcome_run(monkeypatch, hub)
+
+    assert out["registered"] == 0
+    assert out["unverified"] == 1
+    assert out["failed"] == 0, "a 2xx is not a failure"
+    assert out["stopped"] and "could not be verified" in out["stopped"]
+    assert "Reconcile it" in out["stopped"]
+    assert [r["status"] for r in stored] == ["unverified"], \
+        "an unverified write DOES write a row, so it is not resent"
+    assert len(hub.gets) == 3, "three attempts before deciding"
+
+
+def test_a_non_2xx_is_FAILED_with_no_map_row(monkeypatch):
+    """Existing behaviour, unchanged: nothing landed, so nothing is
+    recorded and the next run sends it again."""
+    hub = WritingHubSpot({"a@x.inv": ("543954422478", True, [])},
+                         write=({"status": "error",
+                                 "message": "externalAccountId is required"},
+                                400))
+
+    out, stored = outcome_run(monkeypatch, hub)
+
+    assert out["registered"] == 0
+    assert out["unverified"] == 0
+    assert out["failed"] == 1
+    assert out["stopped"] and "400" in out["stopped"]
+    assert stored == [], "a definite failure must leave no row"
+    assert hub.gets == [], "and must not even read back"
+
+
+def test_the_unverified_report_is_neither_applied_nor_failed(monkeypatch):
+    hub = WritingHubSpot({"a@x.inv": ("543954422478", True, [])},
+                         write=(None, 201), breakdowns=[breakdown()])
+    out, _stored = outcome_run(monkeypatch, hub)
+
+    reply = sync_commands._format_registration_results(out)
+
+    assert "UNVERIFIED" in reply
+    assert "APPLIED" not in reply
+    assert "could NOT be verified" in reply
+    assert "reconcile registrations" in reply
+
+
+# --- a row nobody confirmed is never resent ---------------------------------
+
+@pytest.mark.parametrize("status", ["unverified", "unknown", "review"])
+def test_an_unconfirmed_row_is_not_resent(status):
+    """'review' is in the list because that is what the code wrote before
+    this hotfix — write_audit 80's row. plan_event only treated 'synced' as
+    already-registered, so the record WOULD have been sent a second time."""
+    known = {("1463", "a@x.inv"): {"last_state": "REGISTERED",
+                                   "status": status, "write_audit_id": 80}}
+
+    plan = reg.plan_event("1463", [registrant("a@x.inv")],
+                          {"a@x.inv": {"id": "543954422478",
+                                       "marketing": True}}, known)
+
+    assert plan["would_register"] == [], f"{status} must not be resent"
+    assert len(plan["unverified"]) == 1
+    assert "not resent" in plan["unverified"][0]["why"]
+    assert "80" in plan["unverified"][0]["why"]
+
+
+def test_a_synced_row_is_already_registered_and_not_resent():
+    """The acceptance condition: once reconcile records the row, the preview
+    shows it as already registered and queues nothing."""
+    known = {("1463", "a@x.inv"): {"last_state": "REGISTERED",
+                                   "status": "synced", "write_audit_id": 80}}
+
+    plan = reg.plan_event("1463", [registrant("a@x.inv")],
+                          {"a@x.inv": {"id": "543954422478",
+                                       "marketing": True}}, known)
+
+    assert plan["would_register"] == []
+    assert len(plan["already"]) == 1
+    assert plan["unverified"] == []
+
+
+def test_an_unverified_row_is_reported_before_any_write(monkeypatch):
+    out = reg.run(csuite=CSuite({"1463": [registrant("a@x.inv")]},
+                                dates={"1463": "2025-01-01"}),
+                  hubspot=HubSpot({"a@x.inv": ("543954422478", True, [])}),
+                  event_ids=("1463",), now_ms=NOW_MS)
+    assert out["would_register"] == 1
+
+    # The map is only consulted when the table exists.
+    monkeypatch.setattr(reg, "migration_applied", lambda: True)
+    monkeypatch.setattr(reg, "load_map", lambda: {
+        ("1463", "a@x.inv"): {"last_state": "REGISTERED",
+                              "status": "unverified", "write_audit_id": 80}})
+    held_back = reg.run(csuite=CSuite({"1463": [registrant("a@x.inv")]},
+                                      dates={"1463": "2025-01-01"}),
+                        hubspot=HubSpot({"a@x.inv": ("543954422478", True,
+                                                     [])}),
+                        event_ids=("1463",), now_ms=NOW_MS)
+
+    assert held_back["would_register"] == 0
+    assert held_back["unverified_prior"] == 1
+    assert held_back["first_sends"] == []
+
+    reply = sync_commands._format_registration_results(held_back)
+    assert "held back from an earlier run" in reply
+    assert "reconcile registrations" in reply
