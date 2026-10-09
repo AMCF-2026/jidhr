@@ -866,13 +866,16 @@ def test_chat_reads_the_limit(phrase, expected):
 def test_no_limit_is_read_but_then_refused(monkeypatch):
     """"no limit" parses to None, and None is what the sync refuses. The
     phrase exists so the refusal can name it."""
-    monkeypatch.setattr(
-        "sync.registrations.run",
-        lambda **kw: (_ for _ in ()).throw(reg.LimitRequired("needs a limit")))
+    arm(monkeypatch, True)
+    monkeypatch.setattr(reg, "migration_applied", lambda: True)
+    started = []
+    monkeypatch.setattr("sync.registration_jobs.reg.open_run",
+                        lambda applied: started.append(applied) or 99)
 
     reply = sync_commands.handle("sync registrations apply no limit", None)
 
     assert "🛑 **No limit, no run.**" in reply
+    assert started == [], "a refusal starts nothing"
 
 
 def test_a_plain_preview_passes_no_limit_at_all(monkeypatch):
@@ -886,15 +889,34 @@ def test_a_plain_preview_passes_no_limit_at_all(monkeypatch):
     assert seen["limit"] is None, "a preview is not capped"
 
 
-def test_apply_is_the_word_that_writes(monkeypatch):
+def test_apply_is_the_word_that_starts_a_background_run(monkeypatch):
+    """The apply no longer runs inside the HTTP request — run_log 30 took
+    318s and Railway discards a response after 300."""
     seen = {}
-    monkeypatch.setattr("sync.registrations.run",
-                        lambda **kw: seen.update(kw) or {"dry_run": False,
-                                                         "error": None})
-    sync_commands.handle("sync registrations apply", None)
+    monkeypatch.setattr("sync.registration_jobs.start_apply",
+                        lambda **kw: seen.update(kw) or 42)
+
+    reply = sync_commands.handle("sync registrations apply", None)
+
+    assert seen["limit"] == 1
+    assert "run_log 42" in reply
+    assert "background" in reply
+    assert "Do not send the apply again" in reply
+
+
+def test_the_background_thread_is_the_thing_that_writes(monkeypatch):
+    """And it runs with dry_run False, on the row chat already reported."""
+    from sync import registration_jobs as jobs
+
+    seen = {}
+    monkeypatch.setattr(jobs.reg, "run", lambda **kw: seen.update(kw) or {})
+
+    jobs._run_apply(42, 3, ("1463",))
 
     assert seen["dry_run"] is False
-    assert seen["limit"] == 1
+    assert seen["limit"] == 3
+    assert seen["run_id"] == 42
+    assert seen["event_ids"] == ("1463",)
 
 
 # ---------------------------------------------------------------------------

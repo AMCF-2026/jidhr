@@ -2,7 +2,24 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "gunicorn app:app --bind 0.0.0.0:$PORT --workers 8 --threads 4 --timeout 180"
+# --timeout 900, raised from 180 on 2026-10-09.
+#
+# 180 was below a real run: run_log 30, a 29-record registrations apply,
+# took 318 seconds. It was not what killed that request — gunicorn kills a
+# SILENT worker, and a gthread worker heartbeats from its own loop, which is
+# why run_log 30 recorded a finished_at and status 'complete' rather than
+# being cut off mid-write. The request was discarded by Railway's proxy,
+# which closes a response after 5 minutes with no data transferred.
+#
+# It is raised anyway, because a registrations apply now runs in a
+# BACKGROUND THREAD inside the worker. A worker killed mid-run is worse than
+# a lost response: the writes stop half way, with no report and a run_log row
+# stuck on 'running'. 900s matches Railway's own 15-minute ceiling, so the
+# platform gives up before gunicorn does, in every case.
+#
+# --graceful-timeout 120 so a deploy lets an in-flight apply finish its
+# current record instead of being cut at the default 30 seconds.
+startCommand = "gunicorn app:app --bind 0.0.0.0:$PORT --workers 8 --threads 4 --timeout 900 --graceful-timeout 120"
 healthcheckPath = "/health"
 healthcheckTimeout = 100
 restartPolicyType = "on_failure"
