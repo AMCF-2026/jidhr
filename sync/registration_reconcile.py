@@ -174,9 +174,11 @@ def run(csuite=None, hubspot=None, dry_run: bool = True,
 
         for record in _sendable(plan):
             email = record["contact_email"]
-            prior = known.get((str(event_id), email)) or {}
+            # The same key builder and the same predicate the sync uses, so
+            # a row this inserts is found by the next dry run.
+            prior = known.get(reg.map_key(event_id, email)) or {}
             status = prior.get("status")
-            if status == "synced":
+            if reg.already_registered(prior):
                 out["already_synced"] += 1
                 continue
 

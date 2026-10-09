@@ -1587,12 +1587,13 @@ def test_the_run_time_is_one_moment_for_the_whole_run():
     assert "now_ms" in body
 
 
-def live_run(monkeypatch, csuite, hubspot, writer=None, **kwargs):
+def live_run(monkeypatch, csuite, hubspot, writer=None, known=None,
+             **kwargs):
     """A successful applied run, with the write seam and the read-back
     faked. Everything these doubles stand in for has its own test."""
     arm(monkeypatch, True)
     monkeypatch.setattr(reg, "migration_applied", lambda: True)
-    monkeypatch.setattr(reg, "load_map", lambda: {})
+    monkeypatch.setattr(reg, "load_map", lambda: dict(known or {}))
     monkeypatch.setattr(reg, "open_run", lambda applied: None)
     monkeypatch.setattr(reg, "close_run", lambda *a, **k: None)
     monkeypatch.setattr(reg, "record_registration",
@@ -1604,8 +1605,9 @@ def live_run(monkeypatch, csuite, hubspot, writer=None, **kwargs):
     # (reason, read calls) — None means verified.
     monkeypatch.setattr(reg, "confirm_registered",
                         lambda h, ext, cid, sleep=None: (None, "REGISTERED", 1))
+    kwargs.setdefault("event_ids", ("1",))
     return reg.run(csuite=csuite, hubspot=hubspot, dry_run=False, limit=1,
-                   event_ids=("1",), **kwargs)
+                   **kwargs)
 
 
 def test_the_outcome_rows_say_which_rule_each_record_used(monkeypatch):
@@ -2346,3 +2348,167 @@ def test_an_event_with_no_date_is_not_called_ended():
     assert reg.event_has_ended({"event_date": "not a date"}, NOW_MS) is False
     assert reg.event_has_ended({"event_date": "2025-01-01"}, NOW_MS) is True
     assert reg.event_has_ended({"event_date": "2030-01-01"}, NOW_MS) is False
+
+
+# ---------------------------------------------------------------------------
+# A reconciled row is an already-registered row
+# ---------------------------------------------------------------------------
+#
+# Production 2026-10-09: "reconcile registrations apply event 1155" wrote
+# one row — event 1155, contact 269277574890, status synced, last_state
+# NO_SHOW, write_audit 121. The next dry run (run_log 36) still showed 0
+# already registered and 9 to send, with that same contact first in send
+# order.
+#
+# The key lookup was never the problem: load_map found the row by its key
+# in both cases. The predicate rejected it, because it asked for
+# last_state == 'REGISTERED' and the reconcile had stored what HubSpot
+# actually holds for an ended event — NO_SHOW.
+
+
+def map_row(status="synced", last_state="NO_SHOW", audit=121):
+    return {"status": status, "last_state": last_state,
+            "write_audit_id": audit}
+
+
+@pytest.mark.parametrize("state", ["REGISTERED", "ATTENDED", "NO_SHOW"])
+def test_a_synced_row_in_any_landed_state_is_already_registered(state):
+    known = {reg.map_key("1155", "a@x.inv"): map_row(last_state=state)}
+
+    plan = reg.plan_event("1155", [registrant("a@x.inv")],
+                          {"a@x.inv": {"id": "269277574890",
+                                       "marketing": True}}, known)
+
+    assert plan["would_register"] == [], f"synced + {state} must not resend"
+    assert len(plan["already"]) == 1
+    assert plan["already"][0]["last_state"] == state
+
+
+def test_the_reconciled_1155_row_blocks_the_resend():
+    """The exact production row, by its real values."""
+    known = {reg.map_key("1155", "r.mian@icccschool.org"):
+             {"status": "synced", "last_state": "NO_SHOW",
+              "write_audit_id": 121}}
+
+    plan = reg.plan_event(
+        "1155", [registrant("r.mian@icccschool.org", profile_id=20754,
+                            rsvp=1)],
+        {"r.mian@icccschool.org": {"id": "269277574890", "marketing": True}},
+        known)
+
+    assert plan["would_register"] == []
+    assert len(plan["already"]) == 1
+
+
+def test_a_reconciled_row_is_already_registered_end_to_end(monkeypatch):
+    """Through run(), the way the dry run reaches it: 1 already, 0 to send
+    for the one contact the reconcile recorded."""
+    monkeypatch.setattr(reg, "migration_applied", lambda: True)
+    monkeypatch.setattr(reg, "load_map", lambda: {
+        reg.map_key("1155", "a@x.inv"): map_row()})
+
+    out = reg.run(csuite=CSuite({"1155": [registrant("a@x.inv"),
+                                          registrant("b@x.inv")]},
+                                dates={"1155": "2025-01-01"}),
+                  hubspot=HubSpot({"a@x.inv": ("269277574890", True, []),
+                                   "b@x.inv": ("702", True, [])}),
+                  event_ids=("1155",), now_ms=NOW_MS)
+
+    assert out["already"] == 1
+    assert out["would_register"] == 1, "only the one with no row"
+    assert [r["hubspot_contact_id"] for r in out["first_sends"]] == ["702"]
+
+
+def test_a_reconciled_row_is_not_sent_by_a_live_run(monkeypatch):
+    """The point of all of it: no second registration."""
+    sent = []
+    out = live_run(monkeypatch,
+                   CSuite({"1155": [registrant("a@x.inv")]},
+                          dates={"1155": "2025-01-01"}),
+                   HubSpot({"a@x.inv": ("269277574890", True, [])}),
+                   writer=lambda h, ext, cid, when:
+                       sent.append(cid) or (80, None, None),
+                   known={reg.map_key("1155", "a@x.inv"): map_row()},
+                   event_ids=("1155",), now_ms=NOW_MS)
+
+    assert sent == [], "a reconciled registration must never be resent"
+    assert out["already"] == 1
+    assert out["writes_attempted"] == 0
+
+
+def test_a_cancelled_row_is_not_already_registered():
+    """CANCELLED is not a landed state. Nobody is registered, so the record
+    is not held back as already done."""
+    known = {reg.map_key("1155", "a@x.inv"):
+             map_row(status="review", last_state="CANCELLED")}
+
+    plan = reg.plan_event("1155", [registrant("a@x.inv")],
+                          {"a@x.inv": {"id": "701", "marketing": True}},
+                          known)
+
+    assert plan["already"] == []
+    # 'review' is unresendable, so it is held for the reconcile rather than
+    # sent again.
+    assert len(plan["unverified"]) == 1
+
+
+def test_status_and_state_are_both_required():
+    """write_audit 78's row carried last_state REGISTERED with status
+    'error'. A last_state check alone read a failed write as a completed
+    one."""
+    assert reg.already_registered(
+        {"status": "synced", "last_state": "REGISTERED"}) is True
+    assert reg.already_registered(
+        {"status": "error", "last_state": "REGISTERED"}) is False
+    assert reg.already_registered(
+        {"status": "synced", "last_state": None}) is False
+    assert reg.already_registered({"status": "synced"}) is False
+    assert reg.already_registered({}) is False
+    assert reg.already_registered(None) is False
+
+
+# --- one key builder --------------------------------------------------------
+
+# Captured at import, before the autouse no_db fixture replaces it.
+_REAL_LOAD_MAP = reg.load_map
+
+
+def test_the_map_key_is_built_in_one_place():
+    """It was built in three — load_map, plan_event and the reconcile."""
+    import inspect
+
+    from sync import registration_reconcile as rc
+
+    for module in (reg, rc):
+        source = inspect.getsource(module)
+        assert "(str(event_date_id), email)" not in source
+        assert "(str(event_id), email)" not in source
+    assert "map_key(" in inspect.getsource(_REAL_LOAD_MAP)
+    assert "map_key(" in inspect.getsource(reg.plan_event)
+    assert "reg.map_key(" in inspect.getsource(rc.run)
+
+
+def test_the_map_key_normalises_both_sides():
+    """A row written with a different case would otherwise be invisible to
+    the lookup while sitting in the table."""
+    assert reg.map_key("1155", "A.Person@Example.ORG") == \
+        reg.map_key(1155, "a.person@example.org")
+    assert reg.map_key(" 1155 ", "a@x.inv") == reg.map_key("1155", "a@x.inv")
+    assert reg.map_key("1155", None) == ("1155", "")
+
+
+def test_a_row_stored_with_odd_casing_is_still_found(monkeypatch):
+    """The latent half of this bug: load_map keys whatever the table holds."""
+    rows = [{"csuite_eventdate_id": "1155",
+             "contact_email": "A.Person@Example.ORG",
+             "hubspot_contact_id": "701", "last_state": "NO_SHOW",
+             "status": "synced", "last_seen_at": None,
+             "write_audit_id": 121}]
+    monkeypatch.setattr(reg.database, "execute_query",
+                        lambda *a, **k: rows)
+
+    known = _REAL_LOAD_MAP()
+
+    assert known.get(reg.map_key("1155", "a.person@example.org"))
+    assert reg.already_registered(
+        known[reg.map_key("1155", "a.person@example.org")])
