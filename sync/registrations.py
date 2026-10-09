@@ -72,7 +72,7 @@ _MAP_TABLE_SQL = """
 
 _MAP_SQL = """
     SELECT csuite_eventdate_id, contact_email, hubspot_contact_id,
-           last_state, status, last_seen_at
+           last_state, status, last_seen_at, write_audit_id
       FROM hubsync.registration_map
 """
 
@@ -232,6 +232,13 @@ def held_event_ids() -> tuple:
 
 
 HELD_REASON = "held for CSuite setup review"
+
+# registration_map statuses that must NOT be sent again. A 2xx whose
+# read-back did not confirm may still be in HubSpot, and the attendance
+# endpoint has no idempotency key, so a resend is how one registration
+# becomes two. 'review' is here because that is what the code wrote for an
+# unconfirmed read-back before this hotfix — write_audit 80's row.
+UNRESENDABLE_STATUSES = ("unverified", "unknown", "review")
 
 
 class EventRefused(Exception):
@@ -426,7 +433,8 @@ def plan_event(event_date_id, rows, contacts, known, held=False) -> dict:
            "duplicates_dropped": dropped,
            "known_rows": known_count,
            "would_register": [], "withheld": [], "already": [],
-           "held": [], "is_held": bool(held), "review": None}
+           "held": [], "is_held": bool(held), "unverified": [],
+           "review": None}
 
     refusal = shrink_guard(event_date_id, rows or [], known_count)
     if refusal:
@@ -461,7 +469,17 @@ def plan_event(event_date_id, rows, contacts, known, held=False) -> dict:
         # last_state 'REGISTERED' with status 'error', so a last_state check
         # alone treated a failed write as a completed one.
         prior = known.get((str(event_date_id), email)) or {}
-        if prior.get("last_state") == REGISTERED and \
+        if prior.get("status") in UNRESENDABLE_STATUSES:
+            # A 2xx whose read-back never confirmed. Something may be in
+            # HubSpot, there is no idempotency key on the attendance
+            # endpoint, and resending is how one registration becomes two.
+            # Not "already" either — nobody has confirmed it.
+            record["why"] = (f"an earlier run left this "
+                             f"{prior.get('status')} (write_audit "
+                             f"{prior.get('write_audit_id')}) — not resent; "
+                             f"reconcile it")
+            out["unverified"].append(record)
+        elif prior.get("last_state") == REGISTERED and \
                 prior.get("status") == "synced":
             out["already"].append(record)
         elif held:
@@ -667,45 +685,120 @@ def _latest_audit_id(endpoint):
     return row.get("id") if isinstance(row, dict) else None
 
 
-def confirm_registered(hubspot, object_id, contact_id) -> str:
-    """None when HubSpot shows this contact REGISTERED; otherwise why not.
+# Three attempts over roughly ten seconds. The participation index is
+# eventually consistent, and the first read is the one most likely to be
+# early — see the comment on confirm_registered.
+VERIFY_BACKOFFS = (3.0, 7.0)
 
-    A 2xx on the POST says HubSpot accepted the request, not that it recorded
-    the state — the same distinction that made every CSuite write read itself
-    back. So the participation is read and the contact looked for.
+# The documented filters on the breakdown endpoint, measured against this
+# portal 2026-10-09: contactIdentifier accepts a contact id OR an email and
+# really does filter (a different contact returns total=0), and state really
+# does filter (state=ATTENDED returns total=0 for a REGISTERED-only event).
+VERIFY_STATE = "REGISTERED"
 
-    The populated shape of this response has never been observed: every
-    event in the portal had total=0 when this was written, so there was
-    nothing to look at. An unrecognised shape is therefore reported as
-    UNVERIFIED rather than as a mismatch, and either way the run stops —
-    continuing blind is the thing being prevented.
+
+def participation_url(external_event_id) -> str:
+    """The documented per-event participation breakdown path.
+
+    Keyed on (externalAccountId, externalEventId), which is the form
+    HubSpot documents. `participations/{objectId}/breakdown` also answers,
+    but it is not in the docs and the objectId form of the sibling
+    `counters` route parses its single segment as an externalAccountId —
+    so the undocumented spelling is not the one to depend on.
+    """
+    from sync.event_hubspot import EXTERNAL_ACCOUNT_ID
+
+    return (f"marketing/v3/marketing-events/participations/"
+            f"{EXTERNAL_ACCOUNT_ID}/{external_event_id}/breakdown")
+
+
+def registered_in_portal(hubspot, external_event_id, contact_id) -> tuple:
+    """(True/False/None, detail). ONE read of the per-contact state.
+
+    True  — HubSpot holds a REGISTERED participation for this contact.
+    False — the read succeeded and holds no such participation.
+    None  — the read itself failed, which is not evidence either way.
+
+    Filtered server-side by contactIdentifier and state rather than by
+    scanning the event's participations, because `limit` defaults to 10:
+    the eleventh registration on an event would otherwise fall off page one
+    and read back as missing. Matched on the documented FIELDS —
+    properties.attendanceState and associations.contact.contactId — not by
+    searching a JSON blob for the id, which would also match an id that
+    happened to appear in an unrelated field.
     """
     from clients.hubspot import hubspot_error
 
-    url = (f"marketing/v3/marketing-events/participations/{object_id}"
-           f"/breakdown")
-    response = hubspot._get(url)
+    wanted = str(contact_id)
+    response = hubspot._get(participation_url(external_event_id),
+                            {"contactIdentifier": wanted,
+                             "state": VERIFY_STATE})
     error = hubspot_error(response)
     if error:
-        return f"the participation read-back failed: {error}"
+        return None, f"the participation read-back failed: {error}"
     results = (response or {}).get("results")
     if not isinstance(results, list):
-        return ("the participation read-back returned no results list "
-                f"(keys: {sorted((response or {}).keys())})")
-    if not results:
-        return ("HubSpot reports no participation for this event after the "
-                "write — the state was accepted but not recorded")
-
-    wanted = str(contact_id)
+        return None, ("the participation read-back returned no results list "
+                      f"(keys: {sorted((response or {}).keys())})")
     for entry in results:
-        blob = json.dumps(entry, default=str)
-        if wanted in blob:
-            if REGISTERED.lower() in blob.lower():
-                return None
-            return (f"HubSpot shows contact {wanted} on this event but not "
-                    f"as {REGISTERED}: {blob[:160]}")
-    return (f"HubSpot shows {len(results)} participation(s) for this event "
-            f"but none for contact {wanted}")
+        if not isinstance(entry, dict):
+            continue
+        props = entry.get("properties") or {}
+        contact = (entry.get("associations") or {}).get("contact") or {}
+        event = (entry.get("associations") or {}).get("marketingEvent") or {}
+        if str(contact.get("contactId") or "") != wanted:
+            continue
+        if str(event.get("externalEventId") or "") != str(external_event_id):
+            continue
+        if str(props.get("attendanceState") or "").upper() == VERIFY_STATE:
+            return True, None
+        return False, (f"HubSpot shows contact {wanted} on "
+                       f"{external_event_id} as "
+                       f"{props.get('attendanceState')!r}, not "
+                       f"{VERIFY_STATE}")
+    return False, (f"HubSpot holds no {VERIFY_STATE} participation for "
+                   f"contact {wanted} on {external_event_id}")
+
+
+def confirm_registered(hubspot, external_event_id, contact_id,
+                       sleep=None) -> tuple:
+    """(reason or None, read calls). None means VERIFIED.
+
+    A 2xx on the POST says HubSpot accepted the request, not that it
+    recorded the state — the same distinction that made every CSuite write
+    read itself back. So the participation is read and this contact looked
+    for.
+
+    RETRIED, because the participation index is eventually consistent and a
+    single early read is a false negative. Measured on write_audit 80
+    (2026-10-09): the POST was sent at 18:43:58.186 and returned 201 after
+    220ms; the read-back ran about 0.2s later and found nothing; the
+    participation record's own createdAt is 18:43:59.508, roughly a second
+    after we had already given up. The write had landed, the run was
+    recorded as a failure, and the UI showed the registration the whole
+    time.
+
+    So "not there yet" and "not there" are only distinguishable by waiting.
+    A read error does NOT consume the benefit of the doubt differently from
+    an absence — both are retried, and both end as a reason string.
+    """
+    import time
+
+    sleep = sleep or time.sleep
+    calls = 0
+    reason = None
+    for attempt in range(len(VERIFY_BACKOFFS) + 1):
+        if attempt:
+            sleep(VERIFY_BACKOFFS[attempt - 1])
+        found, detail = registered_in_portal(hubspot, external_event_id,
+                                             contact_id)
+        calls += 1
+        if found:
+            return None, calls
+        reason = detail
+    waited = sum(VERIFY_BACKOFFS)
+    return (f"{reason} — still not there after "
+            f"{len(VERIFY_BACKOFFS) + 1} reads over ~{waited:.0f}s"), calls
 
 
 def record_registration(record, external_event_id, audit_id, status,
@@ -771,6 +864,7 @@ def run(csuite=None, hubspot=None, dry_run: bool = True, limit=1,
            "duplicates_dropped": 0, "would_register": 0, "withheld": 0,
            "already": 0, "review": 0, "review_rows": [],
            "held": 0, "held_events": [],
+           "unverified": 0, "unverified_prior": 0,
            "non_marketing": 0, "csuite_calls": 0, "hubspot_calls": 0,
            "registered": 0, "failed": 0, "deferred": 0, "stopped": None,
            "writes_attempted": 0, "write_audit_ids": [],
@@ -824,6 +918,7 @@ def _apply(out, csuite, hubspot, events, limit, now_ms):
     stamps = {}
     for event in events:
         event["registered"], event["failed"] = [], []
+        event.setdefault("unverified", [])
         event_id = event["event_date_id"]
         external = f"csuite-{event_id}"
         object_id = object_ids.get(event_id)
@@ -899,20 +994,32 @@ def _apply(out, csuite, hubspot, events, limit, now_ms):
                     f"({write_error}). Nothing further was written.")
 
             # A 2xx says HubSpot accepted the request, not that it recorded
-            # the state.
-            mismatch = confirm_registered(hubspot, object_id,
-                                          record["hubspot_contact_id"])
-            out["hubspot_calls"] += 1
+            # the state. Retried, because the participation index is
+            # eventually consistent — see confirm_registered.
+            mismatch, reads = confirm_registered(
+                hubspot, external, record["hubspot_contact_id"])
+            out["hubspot_calls"] += reads
             if mismatch:
-                record_registration(record, external, audit_id, "review",
-                                    mismatch)
-                event["failed"].append(dict(record, audit_id=audit_id,
-                                            error=mismatch))
+                # UNVERIFIED, which is neither of the other two outcomes.
+                # The write got a 2xx, so something may well be in HubSpot;
+                # a row with status 'unverified' is what stops the next run
+                # resending it and creating a second registration. The old
+                # code wrote 'review' here, which plan_event does not treat
+                # as already-registered, so the record WOULD have been
+                # resent — that is the row write_audit 80 left behind.
+                stored = record_registration(record, external, audit_id,
+                                             "unverified", mismatch)
+                out["unverified"] += 1
+                record["why"] = mismatch
+                event["unverified"].append(dict(record, audit_id=audit_id))
                 raise RegistrationWriteStopped(
                     _outcome_rows(out),
                     f"the write for event {event_id} returned 2xx but could "
-                    f"not be verified: {mismatch}. Nothing further was "
-                    f"written.")
+                    f"not be verified: {mismatch}. Recorded 'unverified'"
+                    + ("" if stored else " (and registration_map could NOT "
+                                         "be updated)")
+                    + ", NOT retried, and nothing further was written. "
+                      "Reconcile it rather than sending it again.")
 
             stored = record_registration(record, external, audit_id, "synced")
             written += 1
@@ -994,7 +1101,7 @@ def _outcome_rows(out) -> list:
     rows = []
     for event in out.get("events") or []:
         for kind in ("would_register", "withheld", "already", "registered",
-                     "failed", "held"):
+                     "failed", "held", "unverified"):
             for record in event.get(kind) or []:
                 row = {k: record[k] for k in _LOGGED_FIELDS if k in record}
                 row["outcome"] = kind
@@ -1070,6 +1177,7 @@ def _run_body(out, csuite, hubspot, event_ids, known, dry_run=True,
         # Held records are counted on their own line and are NOT in
         # would_register, so "to register" never includes one.
         out["held"] += len(event.get("held") or [])
+        out["unverified_prior"] += len(event.get("unverified") or [])
         if event.get("is_held"):
             out["held_events"].append(event["event_date_id"])
         if event.get("review"):
@@ -1097,4 +1205,9 @@ def _run_body(out, csuite, hubspot, event_ids, known, dry_run=True,
     # `failed` stayed 0 over a run that had just reported a 400.
     out["failed"] = sum(len(e.get("failed") or []) for e in events)
     out["registered"] = sum(len(e.get("registered") or []) for e in events)
+    # This run's unverified writes, NOT the prior rows plan_event held
+    # back — those are counted separately, before any write happens.
+    out["unverified"] = sum(
+        len(e.get("unverified") or []) for e in events) - out[
+            "unverified_prior"]
     return out

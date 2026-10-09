@@ -35,6 +35,12 @@ NEWSLETTER_SYNC_PHRASES = ['sync newsletter', 'sync newsletters', 'update newsle
 # registrations sync. Phase 1 writes nothing, but the day it does, a
 # three-word message should not be what starts it.
 REGISTRATION_SYNC_PHRASES = ['sync registrations', 'sync registration']
+
+# Repairing registration_map rows for writes HubSpot already accepted. A
+# separate verb from "sync" on purpose: it sends nothing to HubSpot, and it
+# must not be reachable by anything that means "sync everything".
+REGISTRATION_RECONCILE_PHRASES = ['reconcile registrations',
+                                  'reconcile registration']
 ALL_SYNC_PHRASES = ['sync all', 'sync everything', 'run all syncs']
 
 
@@ -54,6 +60,7 @@ def can_handle(query: str, **kwargs) -> bool:
         anchors.anchored(q, EVENT_SYNC_PHRASES) or
         anchors.anchored(q, NEWSLETTER_SYNC_PHRASES) or
         anchors.anchored(q, REGISTRATION_SYNC_PHRASES) or
+        anchors.anchored(q, REGISTRATION_RECONCILE_PHRASES) or
         q in ALL_SYNC_PHRASES
     )
 
@@ -71,6 +78,11 @@ def handle(query: str, ctx) -> str:
         Formatted result string
     """
     q = query.lower().strip()
+
+    # Before the registrations sync: "reconcile registrations" contains
+    # none of the sync phrases, but the ordering should not depend on that.
+    if any(p in q for p in REGISTRATION_RECONCILE_PHRASES):
+        return _reconcile_registrations(q)
 
     # Before the event phrases: "sync registrations" contains neither, but
     # keeping it first makes the ordering independent of that.
@@ -213,6 +225,85 @@ def _registration_limit(query_lower: str):
     return REGISTRATION_DEFAULT_LIMIT
 
 
+def _reconcile_registrations(query_lower: str) -> str:
+    """Repair registration_map rows for writes HubSpot already accepted.
+
+    Dry run unless "apply" is said. This never writes to HubSpot in either
+    mode — the HubSpot write is the thing that already happened.
+    """
+    from sync import registration_reconcile as rc
+
+    live = REGISTRATION_APPLY_PHRASE in query_lower
+    asked = _registration_event(query_lower)
+    scope = {"event_ids": (asked,)} if asked else {}
+    logger.info("Reconciling registrations (apply=%s, event=%s)...",
+                live, asked or "all with a 2xx write")
+    try:
+        results = rc.run(dry_run=not live, **scope)
+        return _format_reconcile_results(results, asked)
+    except Exception as e:
+        logger.error("Registrations reconcile error: %s", e, exc_info=True)
+        return f"❌ Registrations reconcile failed: {e}"
+
+
+def _format_reconcile_results(results: dict, asked=None) -> str:
+    if results.get("error"):
+        return f"❌ **Reconcile stopped.**\n\n{results['error']}"
+
+    dry_run = results.get("dry_run", True)
+    proposals = results.get("proposals") or []
+    head = ("🧪 **Registrations reconcile — PREVIEW** (nothing written)"
+            if dry_run else "✅ **Registrations reconcile — APPLIED**")
+    lines = [head, ""]
+    if asked:
+        lines.append(f"🎯 Scoped to event `{asked}` only.")
+    lines += [
+        f"📊 Scanned **{results.get('events_scanned', 0)}** event(s) with a "
+        f"2xx attendance write in `write_audit`:",
+        f"• **{results.get('confirmed', 0)}** confirmed by HubSpot as "
+        f"REGISTERED and missing a `synced` row",
+        f"• **{results.get('already_synced', 0)}** already recorded `synced` "
+        f"— nothing to do",
+        f"• **{results.get('not_in_hubspot', 0)}** not held by HubSpot, so "
+        f"NOT recorded (these would be sent again by the next run, which is "
+        f"correct — nothing landed)"]
+
+    if proposals:
+        lines += ["", ("➡️ **Would insert/update:**" if dry_run
+                       else "✍️ **Written:**"), "",
+                  "| event | contact | email (hashed) | was | becomes | "
+                  "write_audit |", "|---|---|---|---|---|---|"]
+        for p in proposals:
+            lines.append(f"| `{p['event_date_id']}` | "
+                         f"`{p['hubspot_contact_id']}` | "
+                         f"`{p['email_sha1']}` | {p['current_status']} | "
+                         f"{p['new_status']} | {p['write_audit_id']} |")
+        if dry_run:
+            lines += ["", 'Say *"reconcile registrations apply"* to write '
+                          "these rows. No HubSpot write is made either way "
+                          "— the registration is already there."]
+        else:
+            lines.append("")
+            lines.append(f"📒 **{results.get('rows_written', 0)}** "
+                         f"registration_map row(s) written.")
+            if results.get("failed_writes"):
+                lines.append(f"⚠️ **{results['failed_writes']}** could not "
+                             f"be written — see the table.")
+    else:
+        lines += ["", "Nothing to reconcile."]
+
+    skipped = results.get("events_skipped") or []
+    if skipped:
+        lines += ["", "🔎 **Skipped:**"]
+        for event_id, why in skipped[:REGISTRATION_REVIEW_ROWS_SHOWN]:
+            lines.append(f"   `{event_id}` — {str(why)[:110]}")
+
+    lines += ["", f"📞 {results.get('csuite_calls', 0)} CSuite call(s), "
+                  f"{results.get('hubspot_calls', 0)} HubSpot read call(s)",
+              "✍️ **0 HubSpot writes — reconcile never writes to HubSpot.**"]
+    return "\n".join(lines)
+
+
 def reg_held_reason() -> str:
     """The one wording for a held event, from the sync module.
 
@@ -348,6 +439,12 @@ def _format_registration_results(results: dict) -> str:
         head = "🧪 **Registrations — PREVIEW** (nothing was written)"
     elif clean:
         head = "✅ **Registrations — APPLIED**"
+    elif results.get("unverified") and not results.get("failed"):
+        # A third outcome, and it is neither of the other two. The write got
+        # a 2xx and may well be in HubSpot — calling that "failed" is what
+        # sent write_audit 80's registration to the review pile while the
+        # UI showed it registered the whole time.
+        head = "⚠️ **Registrations — UNVERIFIED** (the write may have landed)"
     else:
         head = "🛑 **Registrations — STOPPED**"
     lines = [head, "",
@@ -367,6 +464,14 @@ def _format_registration_results(results: dict) -> str:
     if results.get("scoped_event"):
         lines.insert(2, f"🎯 Scoped to event `{results['scoped_event']}` "
                         f"only, by name in the command.")
+
+    if results.get("unverified_prior"):
+        lines.append(
+            f"• **{results['unverified_prior']}** held back from an earlier "
+            f"run that could not be verified — NOT resent, because the "
+            f"attendance endpoint has no idempotency key and a resend is "
+            f"how one registration becomes two. Say *\"reconcile "
+            f"registrations\"* to check them against HubSpot.")
 
     # Held events: counted on their own line, never inside "would be sent".
     if results.get("held"):
@@ -429,6 +534,12 @@ def _format_registration_results(results: dict) -> str:
             # that stops before the cap has deferred nothing.
             lines.append("• **0** deferred — the run stopped before the "
                          f"limit of {results.get('limit')} was reached")
+        if results.get("unverified"):
+            lines.append(
+                f"• **{results['unverified']}** returned 2xx but could NOT "
+                f"be verified — recorded `unverified`, not resent. The write "
+                f"may have landed; say *\"reconcile registrations\"* to "
+                f"check HubSpot and record it.")
         if results.get("failed"):
             lines.append(f"• **{results['failed']}** failed — see the stop "
                          f"reason below")
