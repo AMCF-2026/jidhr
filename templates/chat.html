@@ -235,7 +235,24 @@
                 }
             } catch (error) {
                 removeTyping(typingId);
-                addMessage('❌ Network error. Please try again.', 'assistant');
+                // "Please try again" is the wrong advice when the request
+                // may have been a WRITE. Railway closes a response after 5
+                // minutes with no data transferred, and run_log 30 — a
+                // 29-record registrations apply — took 318 seconds and
+                // succeeded in full while the browser showed a network
+                // error. Resending it would have written everything twice.
+                addMessage(
+                    '⚠️ **The reply did not come back** — but the server '
+                    'may still be working, and it may already have '
+                    'finished.\n\n'
+                    'If that was a sync or an apply, '
+                    '**do not send it again.** Ask for its status '
+                    'instead:\n\n'
+                    '• *"registrations status"* — the latest registrations '
+                    'apply, with its full report once it is done\n'
+                    '• *"status run N"* — a specific `run_log` id\n\n'
+                    'Only resend if the status says nothing was started.',
+                    'assistant');
             }
             
             sendBtn.disabled = false;

@@ -825,7 +825,7 @@ def record_registration(record, external_event_id, audit_id, status,
 
 
 def run(csuite=None, hubspot=None, dry_run: bool = True, limit=1,
-        event_ids=PHASE_ONE_EVENT_IDS, now_ms=None) -> dict:
+        event_ids=PHASE_ONE_EVENT_IDS, now_ms=None, run_id=None) -> dict:
     """Preview, or write, REGISTERED states for the mapped events.
 
     A live run needs three things, and refuses on any of them:
@@ -882,7 +882,11 @@ def run(csuite=None, hubspot=None, dry_run: bool = True, limit=1,
                 "Nothing was written.")
     known = load_map() if have_table else {}
 
-    run_id = open_run(applied=not dry_run)
+    # A background apply opens the row BEFORE starting its thread, so chat
+    # can answer "started, run_log N" immediately. Passing it in keeps one
+    # row per run rather than one per layer.
+    if run_id is None:
+        run_id = open_run(applied=not dry_run)
     out["run_id"] = run_id
     try:
         return _run_body(out, csuite or CSuiteClient(),
@@ -893,7 +897,9 @@ def run(csuite=None, hubspot=None, dry_run: bool = True, limit=1,
             close_run(run_id,
                       "failed" if (out.get("error") or out.get("stopped"))
                       else "complete",
-                      out, outcomes=_outcome_rows(out),
+                      out,
+                      outcomes={"summary": summary_of(out),
+                                "records": _outcome_rows(out)},
                       error_summary=out.get("error") or out.get("stopped"))
             out["run_logged"] = True
 
@@ -1094,6 +1100,19 @@ def first_sends(out, csuite=None, cache=None, now_ms=0, count=3) -> list:
             if len(queue) >= count:
                 return queue
     return queue
+
+
+def summary_of(out) -> dict:
+    """The run's report, minus anything that holds an address.
+
+    Stored in run_log.outcomes so a run whose HTTP response was lost can
+    still be reported in full — see sync/registration_jobs.py. `events` is
+    the one key dropped: its records carry contact_email, which is exactly
+    what _outcome_rows whitelists out of the log. Everything the report
+    formatter reads is a count, an id, a hash or a timestamp.
+    """
+    return {key: value for key, value in (out or {}).items()
+            if key != "events"}
 
 
 def _outcome_rows(out) -> list:

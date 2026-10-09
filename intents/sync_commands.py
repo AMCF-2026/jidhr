@@ -41,6 +41,11 @@ REGISTRATION_SYNC_PHRASES = ['sync registrations', 'sync registration']
 # must not be reachable by anything that means "sync everything".
 REGISTRATION_RECONCILE_PHRASES = ['reconcile registrations',
                                   'reconcile registration']
+
+# Reporting a background apply. "status run N" is here because that is what
+# the lost-response message tells people to say.
+REGISTRATION_STATUS_PHRASES = ['registrations status', 'registration status',
+                               'status run']
 ALL_SYNC_PHRASES = ['sync all', 'sync everything', 'run all syncs']
 
 
@@ -61,6 +66,7 @@ def can_handle(query: str, **kwargs) -> bool:
         anchors.anchored(q, NEWSLETTER_SYNC_PHRASES) or
         anchors.anchored(q, REGISTRATION_SYNC_PHRASES) or
         anchors.anchored(q, REGISTRATION_RECONCILE_PHRASES) or
+        anchors.anchored(q, REGISTRATION_STATUS_PHRASES) or
         q in ALL_SYNC_PHRASES
     )
 
@@ -78,6 +84,9 @@ def handle(query: str, ctx) -> str:
         Formatted result string
     """
     q = query.lower().strip()
+
+    if any(p in q for p in REGISTRATION_STATUS_PHRASES):
+        return _registration_status(q)
 
     # Before the registrations sync: "reconcile registrations" contains
     # none of the sync phrases, but the ordering should not depend on that.
@@ -225,6 +234,105 @@ def _registration_limit(query_lower: str):
     return REGISTRATION_DEFAULT_LIMIT
 
 
+def _start_registration_apply(limit, scope, asked) -> str:
+    """Start the apply in the background and answer with its run_log id."""
+    from sync import registration_jobs as jobs
+    from sync import registrations as reg
+
+    try:
+        run_id = jobs.start_apply(limit=limit, **scope)
+    except reg.RegistrationsSyncDisabled as e:
+        return ("⏸️ **Registrations sync is turned off.**\n\n"
+                f"{e}\n\n"
+                '• Say *"sync registrations dry run"* to preview it.')
+    except reg.LimitRequired as e:
+        return f"🛑 **No limit, no run.**\n\n{e}"
+    except jobs.ApplyAlreadyRunning as e:
+        return ("⏳ **One apply at a time.**\n\n"
+                f"{e}")
+    except reg.RegistrationWriteStopped as e:
+        return f"🛑 **Nothing was started.**\n\n{e}"
+    except Exception as e:
+        logger.error("could not start the registrations apply: %s", e,
+                     exc_info=True)
+        return f"❌ Could not start the registrations apply: {e}"
+
+    scoped = f" for event `{asked}`" if asked else ""
+    return (f"🚀 **Registrations apply started**{scoped} — "
+            f"`run_log {run_id}`, limit **{limit}**.\n\n"
+            f"It runs in the background, so this reply does not wait for it. "
+            f"A ~30-record apply took 318 seconds, and the HTTP response "
+            f"would be discarded before then.\n\n"
+            f'• Say *"status run {run_id}"* for progress, and again when it '
+            f"finishes for the full report.\n"
+            f"• **Do not send the apply again** — one at a time is enforced, "
+            f"and a resend is how one registration becomes two.")
+
+
+def _registration_run_id(query_lower: str):
+    """The run id in "status run 30", or None for the latest apply."""
+    import re
+
+    found = re.search(r"\brun\s+(\d+)", query_lower)
+    return int(found.group(1)) if found else None
+
+
+def _registration_status(query_lower: str) -> str:
+    from sync import registration_jobs as jobs
+
+    run_id = _registration_run_id(query_lower)
+    try:
+        state = jobs.status(run_id)
+    except jobs.RunNotFound as e:
+        return f"🤷 **No such run.**\n\n{e}"
+    except Exception as e:
+        logger.error("could not read the registrations run status: %s", e,
+                     exc_info=True)
+        return f"❌ Could not read the run status: {e}"
+
+    if not state.get("found"):
+        return ("🤷 **No registrations apply has been run yet.**\n\n"
+                '• Say *"sync registrations dry run"* to preview one.')
+
+    return _format_registration_status(state)
+
+
+def _format_registration_status(state: dict) -> str:
+    run_id = state["run_id"]
+    seconds = int(state.get("seconds") or 0)
+    started = state.get("started_at")
+    when = f"{started:%Y-%m-%d %H:%M:%S} UTC" if started else "unknown"
+
+    if state["status"] == "running":
+        writes = state.get("writes_so_far")
+        wrote = ("unknown — write_audit could not be read"
+                 if writes is None else f"**{writes}** so far")
+        return (f"⏳ **Registrations apply `run_log {run_id}` is still "
+                f"running.**\n\n"
+                f"• Started {when}, **{seconds}s** ago\n"
+                f"• HubSpot attendance writes attempted: {wrote}\n\n"
+                f"Each write is verified with up to three reads over ~10s, "
+                f"so a record takes a few seconds.\n\n"
+                f'• Say *"status run {run_id}"* again in a minute.\n'
+                f"• **Do not start another apply** — it would be refused, "
+                f"and resending is how one registration becomes two.")
+
+    summary = state.get("summary")
+    head = (f"📒 **Registrations apply `run_log {run_id}` finished** "
+            f"({state['status']}) — started {when}, took **{seconds}s**.")
+    if not isinstance(summary, dict):
+        # A row written before this hotfix, or a run that died before it
+        # could store its report.
+        return (f"{head}\n\n"
+                f"• **{state.get('record_count', 0)}** per-record row(s) in "
+                f"`run_log.outcomes`\n"
+                + (f"• Error: {state['error_summary']}\n"
+                   if state.get("error_summary") else "")
+                + "\nThis run stored no full report — it predates the "
+                  "background apply, so read `run_log.outcomes` directly.")
+    return f"{head}\n\n" + _format_registration_results(summary)
+
+
 def _reconcile_registrations(query_lower: str) -> str:
     """Repair registration_map rows for writes HubSpot already accepted.
 
@@ -345,10 +453,16 @@ def _sync_registrations(query_lower: str) -> str:
                     f"{e}\n\n"
                     '• Say *"sync registrations dry run"* to preview the '
                     "whole mapped scope.")
-    logger.info("Running registrations sync (apply=%s, limit=%s, event=%s)...",
-                live, limit, asked or "all mapped")
+    if live:
+        # The run does NOT belong to this HTTP request. run_log 30 took 318
+        # seconds and Railway discards a response after 300 — see
+        # sync/registration_jobs.py.
+        return _start_registration_apply(limit, scope, asked)
+
+    logger.info("Running registrations preview (limit=%s, event=%s)...",
+                limit, asked or "all mapped")
     try:
-        results = reg.run(dry_run=not live, limit=limit, **scope)
+        results = reg.run(dry_run=True, limit=limit, **scope)
         if asked:
             results["scoped_event"] = asked
         return _format_registration_results(results)
