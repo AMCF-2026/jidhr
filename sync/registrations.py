@@ -301,20 +301,49 @@ def load_map() -> dict:
 
 
 def read_registrants(csuite, event_date_id) -> tuple:
-    """(rows, error). One CSuite call; registrants for one event date."""
+    """(rows, error, event_row). One CSuite call; registrants and the row.
+
+    The event row comes back too because it is in the SAME response — its
+    event_date is what says whether the event has already happened, and
+    fetching that separately would double the CSuite calls for a fact
+    already in hand.
+    """
     try:
         response = csuite._request("event/display/eventdate",
                                    {"event_date_id": int(event_date_id)})
     except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
+        return None, f"{type(e).__name__}: {e}", {}
     if not isinstance(response, dict) or not response.get("success"):
-        return None, str((response or {}).get("error") or "read failed")[:200]
+        return (None,
+                str((response or {}).get("error") or "read failed")[:200], {})
     data = response.get("data")
     if isinstance(data, list):
         data = data[0] if data else {}
     if not isinstance(data, dict):
-        return None, f"unreadable payload: {type(data).__name__}"
-    return (data.get("profiles") or []), None
+        return None, f"unreadable payload: {type(data).__name__}", {}
+    return (data.get("profiles") or []), None, data
+
+
+def event_has_ended(event_row, now_ms) -> bool:
+    """Whether this event date is already in the past at `now_ms`.
+
+    Registrations on an ended event land as NO_SHOW rather than REGISTERED
+    (observed on csuite-1155, 2026-10-09 — see LANDED_STATES). They are
+    sent anyway: which events and who registered matter more than
+    attendance. The report says so rather than leaving it to be discovered
+    in the portal.
+
+    Decided from CSuite's own event_date, the same field start_moment
+    parses, so the warning cannot disagree with the interactionDateTime
+    rule — a record whose rule is event_start is a record on an ended
+    event.
+    """
+    from sync import event_hubspot as eh
+
+    moment, _reason = eh.start_moment(event_row or {})
+    if moment is None:
+        return False
+    return int(moment.timestamp() * 1000) <= now_ms
 
 
 def shrink_guard(event_date_id, rows, known_count) -> str:
@@ -415,7 +444,8 @@ def resolve_contacts(hubspot, emails) -> tuple:
 # Planning
 # ---------------------------------------------------------------------------
 
-def plan_event(event_date_id, rows, contacts, known, held=False) -> dict:
+def plan_event(event_date_id, rows, contacts, known, held=False,
+               ended=False) -> dict:
     """What this event would do. No calls; decides from what it was given.
 
     A held event still reads and still reports — the registrant rows are
@@ -434,7 +464,7 @@ def plan_event(event_date_id, rows, contacts, known, held=False) -> dict:
            "known_rows": known_count,
            "would_register": [], "withheld": [], "already": [],
            "held": [], "is_held": bool(held), "unverified": [],
-           "review": None}
+           "has_ended": bool(ended), "review": None}
 
     refusal = shrink_guard(event_date_id, rows or [], known_count)
     if refusal:
@@ -690,11 +720,32 @@ def _latest_audit_id(endpoint):
 # early — see the comment on confirm_registered.
 VERIFY_BACKOFFS = (3.0, 7.0)
 
-# The documented filters on the breakdown endpoint, measured against this
-# portal 2026-10-09: contactIdentifier accepts a contact id OR an email and
-# really does filter (a different contact returns total=0), and state really
-# does filter (state=ATTENDED returns total=0 for a REGISTERED-only event).
-VERIFY_STATE = "REGISTERED"
+# The four documented attendanceState values. HubSpot enumerates them itself
+# when given anything else: "State value should be one of REGISTERED,
+# CANCELLED, ATTENDED, NO_SHOW" (measured 2026-10-09).
+#
+# THREE OF THEM MEAN THE REGISTRATION EXISTS. Only CANCELLED means it does
+# not. write_audit 121 (2026-10-09) POSTed register for contact
+# 269277574890 on csuite-1155 — an event that ended 2026-04-10 — got a 201,
+# and HubSpot stored the participation as NO_SHOW. The verifier asked for
+# state=REGISTERED, got total=0, and reported a landed write as a failure.
+#
+# HubSpot's docs define NO_SHOW as "The contact registered but did not end
+# up attending the event" but do NOT document when it is assigned. What was
+# observed: csuite-1155's only participation was created as NO_SHOW at the
+# moment of our write, while csuite-1157 (also 'completed') got REGISTERED
+# at write time and a SECOND, NO_SHOW participation afterwards — 58 records
+# for 29 contacts. So a contact can hold more than one state on one event,
+# and the state can change after the write.
+LANDED_STATES = ("REGISTERED", "ATTENDED", "NO_SHOW")
+CANCELLED_STATE = "CANCELLED"
+DOCUMENTED_STATES = LANDED_STATES + (CANCELLED_STATE,)
+
+# What participation_state can conclude.
+LANDED = "landed"
+CANCELLED = "cancelled"
+ABSENT = "absent"
+UNREADABLE = "unreadable"
 
 
 def participation_url(external_event_id) -> str:
@@ -712,57 +763,104 @@ def participation_url(external_event_id) -> str:
             f"{EXTERNAL_ACCOUNT_ID}/{external_event_id}/breakdown")
 
 
-def registered_in_portal(hubspot, external_event_id, contact_id) -> tuple:
-    """(True/False/None, detail). ONE read of the per-contact state.
+def participation_state(hubspot, external_event_id, contact_id) -> tuple:
+    """(verdict, state, detail) for one contact on one event. ONE read.
 
-    True  — HubSpot holds a REGISTERED participation for this contact.
-    False — the read succeeded and holds no such participation.
-    None  — the read itself failed, which is not evidence either way.
+    THE one place that decides whether a registration exists in HubSpot.
+    The apply's read-back and the reconcile both call this, so the two
+    cannot drift — the reconcile reported "0 confirmed" for csuite-1155
+    precisely because it carried its own copy of a REGISTERED-only check.
 
-    Filtered server-side by contactIdentifier and state rather than by
-    scanning the event's participations, because `limit` defaults to 10:
-    the eleventh registration on an event would otherwise fall off page one
-    and read back as missing. Matched on the documented FIELDS —
-    properties.attendanceState and associations.contact.contactId — not by
-    searching a JSON blob for the id, which would also match an id that
-    happened to appear in an unrelated field.
+    verdict is LANDED (the registration exists, `state` says in which of
+    the three landed states), CANCELLED (it exists and was cancelled),
+    ABSENT (the read succeeded and holds nothing — evidence of absence), or
+    UNREADABLE (the read itself failed, which is not evidence either way).
+
+    No `state` filter on the request: filtering to REGISTERED is the bug
+    this replaces. `contactIdentifier` still bounds the response to this
+    contact, and limit=100 covers a contact holding several states on one
+    event — csuite-1157 holds two per person.
+
+    When several landed states are present the MOST RECENTLY CREATED one
+    wins, because that is the state the portal shows and the state a human
+    reading registration_map will be comparing against.
     """
     from clients.hubspot import hubspot_error
 
     wanted = str(contact_id)
     response = hubspot._get(participation_url(external_event_id),
-                            {"contactIdentifier": wanted,
-                             "state": VERIFY_STATE})
+                            {"contactIdentifier": wanted, "limit": 100})
     error = hubspot_error(response)
     if error:
-        return None, f"the participation read-back failed: {error}"
+        return UNREADABLE, None, f"the participation read-back failed: {error}"
     results = (response or {}).get("results")
     if not isinstance(results, list):
-        return None, ("the participation read-back returned no results list "
-                      f"(keys: {sorted((response or {}).keys())})")
+        return UNREADABLE, None, (
+            "the participation read-back returned no results list "
+            f"(keys: {sorted((response or {}).keys())})")
+
+    mine = []
     for entry in results:
         if not isinstance(entry, dict):
             continue
         props = entry.get("properties") or {}
-        contact = (entry.get("associations") or {}).get("contact") or {}
-        event = (entry.get("associations") or {}).get("marketingEvent") or {}
+        links = entry.get("associations") or {}
+        contact = links.get("contact") or {}
+        event = links.get("marketingEvent") or {}
+        # Both associations checked even though the request is filtered:
+        # an endpoint that quietly stopped filtering must not read as
+        # success for the wrong contact.
         if str(contact.get("contactId") or "") != wanted:
             continue
         if str(event.get("externalEventId") or "") != str(external_event_id):
             continue
-        if str(props.get("attendanceState") or "").upper() == VERIFY_STATE:
-            return True, None
-        return False, (f"HubSpot shows contact {wanted} on "
-                       f"{external_event_id} as "
-                       f"{props.get('attendanceState')!r}, not "
-                       f"{VERIFY_STATE}")
-    return False, (f"HubSpot holds no {VERIFY_STATE} participation for "
-                   f"contact {wanted} on {external_event_id}")
+        state = str(props.get("attendanceState") or "").upper()
+        mine.append((str(entry.get("createdAt") or ""), state))
+
+    if not mine:
+        return ABSENT, None, (
+            f"HubSpot holds no participation for contact {wanted} on "
+            f"{external_event_id}")
+
+    mine.sort()                                   # ISO timestamps sort
+    landed = [(when, state) for when, state in mine
+              if state in LANDED_STATES]
+    if landed:
+        state = landed[-1][1]
+        seen = ", ".join(sorted({s for _w, s in mine}))
+        return LANDED, state, f"HubSpot holds {seen} for contact {wanted}"
+    if any(state == CANCELLED_STATE for _w, state in mine):
+        return CANCELLED, CANCELLED_STATE, (
+            f"HubSpot shows contact {wanted} as {CANCELLED_STATE} on "
+            f"{external_event_id} — the registration was cancelled, so this "
+            f"is not a completed registration")
+    unknown = ", ".join(sorted({s or "(blank)" for _w, s in mine}))
+    return UNREADABLE, None, (
+        f"HubSpot holds participation for contact {wanted} in a state this "
+        f"sync does not recognise: {unknown}. Documented states are "
+        f"{', '.join(DOCUMENTED_STATES)}")
+
+
+def registered_in_portal(hubspot, external_event_id, contact_id) -> tuple:
+    """(True/False/None, detail). Kept as the boolean reading of the above.
+
+    True when the registration exists in ANY landed state, False when the
+    read succeeded and it does not, None when the read failed.
+    """
+    verdict, state, detail = participation_state(
+        hubspot, external_event_id, contact_id)
+    if verdict == LANDED:
+        return True, state
+    if verdict == CANCELLED:
+        return False, detail
+    if verdict == ABSENT:
+        return False, detail
+    return None, detail
 
 
 def confirm_registered(hubspot, external_event_id, contact_id,
                        sleep=None) -> tuple:
-    """(reason or None, read calls). None means VERIFIED.
+    """(reason or None, state, calls). A reason of None means VERIFIED.
 
     A 2xx on the POST says HubSpot accepted the request, not that it
     recorded the state — the same distinction that made every CSuite write
@@ -774,13 +872,11 @@ def confirm_registered(hubspot, external_event_id, contact_id,
     (2026-10-09): the POST was sent at 18:43:58.186 and returned 201 after
     220ms; the read-back ran about 0.2s later and found nothing; the
     participation record's own createdAt is 18:43:59.508, roughly a second
-    after we had already given up. The write had landed, the run was
-    recorded as a failure, and the UI showed the registration the whole
-    time.
+    after we had already given up.
 
-    So "not there yet" and "not there" are only distinguishable by waiting.
-    A read error does NOT consume the benefit of the doubt differently from
-    an absence — both are retried, and both end as a reason string.
+    CANCELLED is NOT retried. Absence and a failed read might both change
+    in a second; a state HubSpot has definitely recorded will not, and
+    waiting ten seconds to say so twice is just ten seconds.
     """
     import time
 
@@ -790,38 +886,53 @@ def confirm_registered(hubspot, external_event_id, contact_id,
     for attempt in range(len(VERIFY_BACKOFFS) + 1):
         if attempt:
             sleep(VERIFY_BACKOFFS[attempt - 1])
-        found, detail = registered_in_portal(hubspot, external_event_id,
-                                             contact_id)
+        verdict, state, detail = participation_state(
+            hubspot, external_event_id, contact_id)
         calls += 1
-        if found:
-            return None, calls
+        if verdict == LANDED:
+            return None, state, calls
+        if verdict == CANCELLED:
+            return detail, CANCELLED_STATE, calls
         reason = detail
     waited = sum(VERIFY_BACKOFFS)
     return (f"{reason} — still not there after "
-            f"{len(VERIFY_BACKOFFS) + 1} reads over ~{waited:.0f}s"), calls
+            f"{len(VERIFY_BACKOFFS) + 1} reads over ~{waited:.0f}s"), \
+        None, calls
 
 
 def record_registration(record, external_event_id, audit_id, status,
-                        error=None) -> bool:
-    """Write the registration_map row. Only ever called after a 2xx.
+                        error=None, last_state=None) -> tuple:
+    """Write the registration_map row. (ok, failure reason or None).
 
-    Returns whether it landed. A row that cannot be stored does not undo a
-    write that happened, so the caller reports it and stops rather than
+    Only ever called after a 2xx. A row that cannot be stored does not undo
+    a write that happened, so the caller reports it and stops rather than
     pretending the write did not occur.
+
+    The REAL error is returned, not just False. run_log 34 reported
+    "registration_map could NOT be updated" and nothing else; the actual
+    cause was a CheckViolation on registration_map_status_check, because
+    hotfix-50 began writing status 'unverified' without widening the
+    constraint (migrations/006). A report that cannot name its own failure
+    costs a day of looking in the wrong place.
+
+    `last_state` is the state HubSpot actually holds, which is not always
+    REGISTERED: write_audit 121's registration landed as NO_SHOW.
     """
     try:
         database.execute_query(_UPSERT_REGISTRATION_SQL, (
             record["event_date_id"], record.get("csuite_profile_id"),
             record["contact_email"], record["email_sha1"],
             external_event_id, str(record.get("hubspot_contact_id") or ""),
-            REGISTERED, record.get("rsvp"), record.get("attended"),
+            last_state or REGISTERED, record.get("rsvp"),
+            record.get("attended"),
             status, str(error)[:500] if error else None, audit_id,
         ), fetch=True)
-        return True
+        return True, None
     except Exception as e:
+        reason = f"{type(e).__name__}: {str(e).strip().splitlines()[0]}"
         logger.error("could not record registration_map row for %s/%s: %s",
-                     record["event_date_id"], record["email_sha1"], e)
-        return False
+                     record["event_date_id"], record["email_sha1"], reason)
+        return False, reason[:400]
 
 
 def run(csuite=None, hubspot=None, dry_run: bool = True, limit=1,
@@ -864,7 +975,8 @@ def run(csuite=None, hubspot=None, dry_run: bool = True, limit=1,
            "duplicates_dropped": 0, "would_register": 0, "withheld": 0,
            "already": 0, "review": 0, "review_rows": [],
            "held": 0, "held_events": [],
-           "unverified": 0, "unverified_prior": 0,
+           "unverified": 0, "unverified_prior": 0, "cancelled": 0,
+           "landed_states": {}, "ended_events": [], "ended_records": 0,
            "non_marketing": 0, "csuite_calls": 0, "hubspot_calls": 0,
            "registered": 0, "failed": 0, "deferred": 0, "stopped": None,
            "writes_attempted": 0, "write_audit_ids": [],
@@ -1002,9 +1114,27 @@ def _apply(out, csuite, hubspot, events, limit, now_ms):
             # A 2xx says HubSpot accepted the request, not that it recorded
             # the state. Retried, because the participation index is
             # eventually consistent — see confirm_registered.
-            mismatch, reads = confirm_registered(
+            mismatch, state, reads = confirm_registered(
                 hubspot, external, record["hubspot_contact_id"])
             out["hubspot_calls"] += reads
+            if state == CANCELLED_STATE:
+                # It exists in HubSpot, and it is cancelled. Not a failure
+                # (the POST landed), not a success (nobody is registered).
+                stored, store_error = record_registration(
+                    record, external, audit_id, "review", mismatch,
+                    last_state=CANCELLED_STATE)
+                out["cancelled"] += 1
+                record["why"] = mismatch
+                record["last_state"] = CANCELLED_STATE
+                event["unverified"].append(dict(record, audit_id=audit_id))
+                raise RegistrationWriteStopped(
+                    _outcome_rows(out),
+                    f"the write for event {event_id} returned 2xx but "
+                    f"HubSpot shows the participation as {CANCELLED_STATE}. "
+                    f"Recorded 'review'"
+                    + (f" (and registration_map could NOT be updated: "
+                       f"{store_error})" if not stored else "")
+                    + ", and nothing further was written.")
             if mismatch:
                 # UNVERIFIED, which is neither of the other two outcomes.
                 # The write got a 2xx, so something may well be in HubSpot;
@@ -1013,8 +1143,8 @@ def _apply(out, csuite, hubspot, events, limit, now_ms):
                 # code wrote 'review' here, which plan_event does not treat
                 # as already-registered, so the record WOULD have been
                 # resent — that is the row write_audit 80 left behind.
-                stored = record_registration(record, external, audit_id,
-                                             "unverified", mismatch)
+                stored, store_error = record_registration(
+                    record, external, audit_id, "unverified", mismatch)
                 out["unverified"] += 1
                 record["why"] = mismatch
                 event["unverified"].append(dict(record, audit_id=audit_id))
@@ -1022,22 +1152,28 @@ def _apply(out, csuite, hubspot, events, limit, now_ms):
                     _outcome_rows(out),
                     f"the write for event {event_id} returned 2xx but could "
                     f"not be verified: {mismatch}. Recorded 'unverified'"
-                    + ("" if stored else " (and registration_map could NOT "
-                                         "be updated)")
+                    + ("" if stored else
+                       f" (and registration_map could NOT be updated: "
+                       f"{store_error})")
                     + ", NOT retried, and nothing further was written. "
                       "Reconcile it rather than sending it again.")
 
-            stored = record_registration(record, external, audit_id, "synced")
+            # The state HubSpot actually holds, not the one we asked for.
+            stored, store_error = record_registration(
+                record, external, audit_id, "synced", last_state=state)
             written += 1
             out["registered"] += 1
+            record["last_state"] = state
+            out["landed_states"][state] = (
+                out["landed_states"].get(state, 0) + 1)
             event["registered"].append(dict(record, audit_id=audit_id))
             if not stored:
                 raise RegistrationWriteStopped(
                     _outcome_rows(out),
                     f"the registration for event {event_id} was written to "
-                    f"HubSpot and verified, but registration_map could not "
-                    f"be updated. The next run would send it again, so this "
-                    f"one stopped.")
+                    f"HubSpot and verified as {state}, but registration_map "
+                    f"could not be updated: {store_error}. The next run "
+                    f"would send it again, so this one stopped.")
     return out
 
 
@@ -1052,7 +1188,10 @@ _LOGGED_FIELDS = ("event_date_id", "email_sha1", "csuite_profile_id",
                   # used, and the value it got. Neither is PII, and without
                   # the rule the log cannot say whether a given write
                   # claimed the event's start or the moment of the sync.
-                  "interaction_rule", "interaction_at")
+                  "interaction_rule", "interaction_at",
+                  # The attendanceState HubSpot actually holds. Not always
+                  # REGISTERED — write_audit 121 landed as NO_SHOW.
+                  "last_state")
 
 
 def _sort_key(value):
@@ -1136,7 +1275,7 @@ def _run_body(out, csuite, hubspot, event_ids, known, dry_run=True,
     per_event, all_emails = [], set()
 
     for event_id in event_ids:
-        rows, error = read_registrants(csuite, event_id)
+        rows, error, event_row = read_registrants(csuite, event_id)
         out["csuite_calls"] += 1
         if error:
             # One unreadable event does not invalidate the others, but it is
@@ -1151,7 +1290,8 @@ def _run_body(out, csuite, hubspot, event_ids, known, dry_run=True,
         out["events_read"] += 1
         deduped, _dropped = dedupe(rows)
         all_emails |= set(deduped)
-        per_event.append({"_rows": rows, "event_date_id": str(event_id)})
+        per_event.append({"_rows": rows, "event_date_id": str(event_id),
+                          "_ended": event_has_ended(event_row, now_ms)})
 
     contacts, calls, contact_error = resolve_contacts(hubspot, all_emails)
     out["hubspot_calls"] += calls
@@ -1173,7 +1313,8 @@ def _run_body(out, csuite, hubspot, event_ids, known, dry_run=True,
             continue
         events.append(plan_event(entry["event_date_id"], entry["_rows"],
                                  contacts, known,
-                                 held=entry["event_date_id"] in held))
+                                 held=entry["event_date_id"] in held,
+                                 ended=entry.get("_ended", False)))
 
     # Deterministic: by event_date_id, then by contact id. A limit of 1 has
     # to buy the SAME record every time, or "apply limit 1" is a different
@@ -1197,6 +1338,12 @@ def _run_body(out, csuite, hubspot, event_ids, known, dry_run=True,
         # would_register, so "to register" never includes one.
         out["held"] += len(event.get("held") or [])
         out["unverified_prior"] += len(event.get("unverified") or [])
+        if event.get("has_ended") and event["would_register"]:
+            # Flagged, not withheld. Carl's call: past events are synced
+            # anyway, and NO_SHOW is acceptable.
+            out["ended_events"].append(
+                (event["event_date_id"], len(event["would_register"])))
+            out["ended_records"] += len(event["would_register"])
         if event.get("is_held"):
             out["held_events"].append(event["event_date_id"])
         if event.get("review"):

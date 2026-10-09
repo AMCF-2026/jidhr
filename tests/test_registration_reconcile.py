@@ -103,7 +103,7 @@ def test_a_confirmed_registration_is_proposed(monkeypatch):
 def test_a_dry_run_writes_nothing(monkeypatch):
     written = []
     monkeypatch.setattr(rc.reg, "record_registration",
-                        lambda *a, **k: written.append(a) or True)
+                        lambda *a, **k: written.append(a) or (True, None))
     monkeypatch.setattr(rc.reg, "load_map", lambda: {
         ("1463", EMAIL): {"status": "review", "write_audit_id": 80}})
     csuite, hubspot = doubles()
@@ -119,15 +119,15 @@ def test_apply_writes_the_row(monkeypatch):
     written = []
     monkeypatch.setattr(
         rc.reg, "record_registration",
-        lambda record, ext, audit, status, error=None:
-        written.append((ext, audit, status)) or True)
+        lambda record, ext, audit, status, error=None, last_state=None:
+        written.append((ext, audit, status, last_state)) or (True, None))
     monkeypatch.setattr(rc.reg, "load_map", lambda: {
         ("1463", EMAIL): {"status": "review", "write_audit_id": 80}})
     csuite, hubspot = doubles()
 
     out = rc.run(csuite=csuite, hubspot=hubspot, dry_run=False)
 
-    assert written == [("csuite-1463", 80, "synced")]
+    assert written == [("csuite-1463", 80, "synced", "REGISTERED")]
     assert out["rows_written"] == 1
 
 
@@ -138,7 +138,7 @@ def test_a_registration_hubspot_does_not_hold_is_not_recorded(monkeypatch):
         ("1463", EMAIL): {"status": "review", "write_audit_id": 80}})
     written = []
     monkeypatch.setattr(rc.reg, "record_registration",
-                        lambda *a, **k: written.append(a) or True)
+                        lambda *a, **k: written.append(a) or (True, None))
     csuite, hubspot = doubles(breakdowns=[breakdown()])
 
     out = rc.run(csuite=csuite, hubspot=hubspot, dry_run=False)
@@ -197,7 +197,8 @@ def test_it_reads_the_documented_participation_endpoint(monkeypatch):
                                   "participations/jidhr-amcf/csuite-1463/"
                                   "breakdown")
     assert hubspot.gets[0][1] == {"contactIdentifier": CONTACT,
-                                  "state": "REGISTERED"}
+                                  "limit": 100}, \
+        "no state filter — csuite-1155's registration is NO_SHOW"
 
 
 def test_no_registration_map_table_is_refused(monkeypatch):
@@ -309,3 +310,155 @@ def test_the_reconcile_report_never_prints_an_address():
                        "write_audit_id": 80}]})
 
     assert "@" not in reply
+
+
+# ---------------------------------------------------------------------------
+# The shared predicate, and a row that does not exist yet
+# ---------------------------------------------------------------------------
+#
+# write_audit 121: a register POST on csuite-1155 (ended 2026-04-10) got a
+# 201 and HubSpot stored the participation as NO_SHOW. "reconcile
+# registrations event 1155" reported 0 confirmed, because the reconcile
+# carried its own REGISTERED-only check while the participation sat there.
+
+
+def test_a_no_show_participation_is_confirmed(monkeypatch):
+    csuite, hubspot = doubles(
+        breakdowns=[breakdown(participation(contact_id=CONTACT,
+                                            state="NO_SHOW"))])
+
+    out = rc.run(csuite=csuite, hubspot=hubspot)
+
+    assert out["confirmed"] == 1
+    assert out["landed_states"] == {"NO_SHOW": 1}
+    assert out["proposals"][0]["last_state"] == "NO_SHOW"
+
+
+def test_a_missing_row_is_INSERTED_when_hubspot_confirms(monkeypatch):
+    """csuite-1155 had NO row at all — its unverified row failed to write.
+    The upsert inserts rather than only updating."""
+    written = []
+    monkeypatch.setattr(
+        rc.reg, "record_registration",
+        lambda record, ext, audit, status, error=None, last_state=None:
+        written.append({"event": record["event_date_id"],
+                        "status": status, "last_state": last_state,
+                        "contact": record["hubspot_contact_id"]})
+        or (True, None))
+    monkeypatch.setattr(rc.reg, "load_map", lambda: {})      # no rows at all
+    csuite, hubspot = doubles(
+        breakdowns=[breakdown(participation(contact_id=CONTACT,
+                                            state="NO_SHOW"))])
+
+    out = rc.run(csuite=csuite, hubspot=hubspot, dry_run=False)
+
+    assert out["proposals"][0]["inserted"] is True
+    assert out["proposals"][0]["current_status"] == "(no row)"
+    assert written == [{"event": "1463", "status": "synced",
+                        "last_state": "NO_SHOW", "contact": CONTACT}]
+    assert out["rows_written"] == 1
+
+
+def test_a_cancelled_participation_is_not_recorded_as_registered(monkeypatch):
+    monkeypatch.setattr(rc.reg, "load_map", lambda: {
+        ("1463", EMAIL): {"status": "unverified", "write_audit_id": 80}})
+    written = []
+    monkeypatch.setattr(rc.reg, "record_registration",
+                        lambda *a, **k: written.append(a) or (True, None))
+    csuite, hubspot = doubles(
+        breakdowns=[breakdown(participation(contact_id=CONTACT,
+                                            state="CANCELLED"))])
+
+    out = rc.run(csuite=csuite, hubspot=hubspot, dry_run=False)
+
+    assert out["cancelled"] == 1
+    assert out["confirmed"] == 0
+    assert out["proposals"] == []
+    assert written == []
+
+
+def test_the_reconcile_uses_the_shared_predicate_not_a_copy():
+    """One function, not two. The 1155 miss was two copies drifting."""
+    import inspect
+
+    source = inspect.getsource(rc)
+    assert "reg.participation_state(" in source
+    assert "state\": \"REGISTERED\"" not in source
+    assert "'state': 'REGISTERED'" not in source
+    assert "LANDED_STATES" not in source, \
+        "the predicate belongs to registrations, not here"
+
+
+def test_a_map_write_failure_names_the_cause(monkeypatch):
+    monkeypatch.setattr(
+        rc.reg, "record_registration",
+        lambda *a, **k: (False, "CheckViolation: registration_map_status_check"))
+    monkeypatch.setattr(rc.reg, "load_map", lambda: {})
+    csuite, hubspot = doubles()
+
+    out = rc.run(csuite=csuite, hubspot=hubspot, dry_run=False)
+
+    assert out["failed_writes"] == 1
+    assert "CheckViolation" in out["proposals"][0]["new_status"]
+
+
+# ---------------------------------------------------------------------------
+# Unresolved rows are named even when HubSpot cannot confirm them
+# ---------------------------------------------------------------------------
+
+def test_unresolved_rows_are_listed(monkeypatch):
+    rows = [{"csuite_eventdate_id": "1155", "hubspot_contact_id": CONTACT,
+             "email_sha1": "abc123", "status": "unverified",
+             "last_state": None, "write_audit_id": 121,
+             "age_seconds": 7200.0}]
+    monkeypatch.setattr(rc, "unresolved_rows", lambda: rows)
+    csuite, hubspot = doubles()
+
+    out = rc.run(csuite=csuite, hubspot=hubspot)
+
+    assert out["unresolved"] == rows
+
+    reply = sync_commands._format_reconcile_results(out)
+    assert "still unresolved" in reply
+    assert "`1155`" in reply
+    assert CONTACT in reply
+    assert "unverified" in reply
+    assert "121" in reply
+    assert "2h" in reply, "the age, so a stuck row is visibly stuck"
+
+
+def test_unresolved_rows_are_listed_even_when_nothing_is_confirmed(
+        monkeypatch):
+    """The row HubSpot cannot confirm is the one most worth printing."""
+    rows = [{"csuite_eventdate_id": "1155", "hubspot_contact_id": CONTACT,
+             "email_sha1": "abc", "status": "unverified", "last_state": None,
+             "write_audit_id": 121, "age_seconds": 90.0}]
+    monkeypatch.setattr(rc, "unresolved_rows", lambda: rows)
+    csuite, hubspot = doubles(breakdowns=[breakdown()])
+
+    out = rc.run(csuite=csuite, hubspot=hubspot)
+    reply = sync_commands._format_reconcile_results(out)
+
+    assert out["confirmed"] == 0
+    assert "still unresolved" in reply
+    assert "1m" in reply
+
+
+def test_the_unresolved_query_covers_every_repairable_status():
+    assert set(rc.REPAIRABLE_STATUSES) >= {"unverified", "unknown", "review",
+                                           "error"}
+    assert "status = ANY(%s)" in rc._UNRESOLVED_SQL
+
+
+def test_the_unresolved_list_never_prints_an_address(monkeypatch):
+    rows = [{"csuite_eventdate_id": "1155", "hubspot_contact_id": CONTACT,
+             "email_sha1": "abc", "status": "unverified", "last_state": None,
+             "write_audit_id": 121, "age_seconds": 1.0}]
+    monkeypatch.setattr(rc, "unresolved_rows", lambda: rows)
+    csuite, hubspot = doubles()
+
+    reply = sync_commands._format_reconcile_results(
+        rc.run(csuite=csuite, hubspot=hubspot))
+
+    assert "@" not in reply
+    assert "contact_email" not in rc._UNRESOLVED_SQL
