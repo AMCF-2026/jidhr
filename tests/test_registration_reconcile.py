@@ -151,7 +151,9 @@ def test_a_registration_hubspot_does_not_hold_is_not_recorded(monkeypatch):
 
 def test_a_row_already_synced_is_left_alone(monkeypatch):
     monkeypatch.setattr(rc.reg, "load_map", lambda: {
-        ("1463", EMAIL): {"status": "synced", "write_audit_id": 80}})
+        rc.reg.map_key("1463", EMAIL): {"status": "synced",
+                                        "last_state": "REGISTERED",
+                                        "write_audit_id": 80}})
     csuite, hubspot = doubles()
 
     out = rc.run(csuite=csuite, hubspot=hubspot)
@@ -159,6 +161,37 @@ def test_a_row_already_synced_is_left_alone(monkeypatch):
     assert out["already_synced"] == 1
     assert out["proposals"] == []
     assert hubspot.gets == [], "and HubSpot is not even asked"
+
+
+def test_a_synced_row_with_a_no_show_state_is_also_left_alone(monkeypatch):
+    """The reconcile wrote NO_SHOW itself. Running it twice must not
+    re-propose what it already recorded."""
+    monkeypatch.setattr(rc.reg, "load_map", lambda: {
+        rc.reg.map_key("1463", EMAIL): {"status": "synced",
+                                        "last_state": "NO_SHOW",
+                                        "write_audit_id": 121}})
+    csuite, hubspot = doubles()
+
+    out = rc.run(csuite=csuite, hubspot=hubspot)
+
+    assert out["already_synced"] == 1
+    assert out["proposals"] == []
+
+
+def test_a_synced_row_with_no_state_at_all_is_re_checked(monkeypatch):
+    """'synced' with nothing in last_state is not evidence of anything, so
+    HubSpot is asked rather than trusted."""
+    monkeypatch.setattr(rc.reg, "load_map", lambda: {
+        rc.reg.map_key("1463", EMAIL): {"status": "synced",
+                                        "last_state": None,
+                                        "write_audit_id": 80}})
+    csuite, hubspot = doubles()
+
+    out = rc.run(csuite=csuite, hubspot=hubspot)
+
+    assert out["already_synced"] == 0
+    assert out["confirmed"] == 1
+    assert hubspot.gets, "HubSpot was asked"
 
 
 def test_a_missing_row_is_proposed_too(monkeypatch):

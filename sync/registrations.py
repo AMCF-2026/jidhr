@@ -289,14 +289,54 @@ def migration_applied() -> bool:
     return bool(found)
 
 
+def map_key(event_date_id, email) -> tuple:
+    """The ONE key into registration_map: (event id as text, normalised email).
+
+    Built in one place because it was built in three — load_map, plan_event
+    and the reconcile each made their own tuple. They agreed only because
+    every address stored so far happened to be normalised already; a row
+    written with different case (by hand, or by an older path) would have
+    been invisible to the lookup while sitting in the table.
+
+    Normalising BOTH sides also means a row is found by the same key
+    whichever code wrote it, which is what hotfix-53 is about.
+    """
+    return (str(event_date_id).strip(), normalise_email(email) or "")
+
+
+def already_registered(prior) -> bool:
+    """Whether a registration_map row means "do not send this again".
+
+    BOTH halves, and neither alone:
+
+      status == 'synced'      somebody confirmed it on a read-back. The row
+                              write_audit 78 left carried last_state
+                              'REGISTERED' with status 'error', so a
+                              last_state check alone read a failed write as
+                              a completed one.
+
+      last_state in LANDED    the registration exists in HubSpot. Not
+                              'REGISTERED' specifically: a registration on
+                              an event that has already ended is recorded
+                              by HubSpot as NO_SHOW, and the reconcile
+                              stores exactly what HubSpot holds. Requiring
+                              'REGISTERED' is why the reconciled 1155 row
+                              was queued to send a second time while the
+                              registration sat in the portal.
+    """
+    prior = prior or {}
+    return (prior.get("status") == "synced"
+            and str(prior.get("last_state") or "") in LANDED_STATES)
+
+
 def load_map() -> dict:
-    """{(event_date_id, email): row}. Empty when the table is absent."""
+    """{map_key(): row}. Empty when the table is absent."""
     try:
         rows = database.execute_query(_MAP_SQL, (), fetch=True)
     except Exception as e:
         logger.warning("could not read registration_map: %s", e)
         return {}
-    return {(str(r["csuite_eventdate_id"]), str(r["contact_email"])): r
+    return {map_key(r["csuite_eventdate_id"], r["contact_email"]): r
             for r in rows or []}
 
 
@@ -498,7 +538,7 @@ def plan_event(event_date_id, rows, contacts, known, held=False,
         # BOTH, not either. The row left by write_audit 78 carried
         # last_state 'REGISTERED' with status 'error', so a last_state check
         # alone treated a failed write as a completed one.
-        prior = known.get((str(event_date_id), email)) or {}
+        prior = known.get(map_key(event_date_id, email)) or {}
         if prior.get("status") in UNRESENDABLE_STATUSES:
             # A 2xx whose read-back never confirmed. Something may be in
             # HubSpot, there is no idempotency key on the attendance
@@ -509,8 +549,8 @@ def plan_event(event_date_id, rows, contacts, known, held=False,
                              f"{prior.get('write_audit_id')}) — not resent; "
                              f"reconcile it")
             out["unverified"].append(record)
-        elif prior.get("last_state") == REGISTERED and \
-                prior.get("status") == "synced":
+        elif already_registered(prior):
+            record["last_state"] = prior.get("last_state")
             out["already"].append(record)
         elif held:
             record["why"] = HELD_REASON
