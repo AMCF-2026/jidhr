@@ -46,6 +46,11 @@ REGISTRATION_RECONCILE_PHRASES = ['reconcile registrations',
 # the lost-response message tells people to say.
 REGISTRATION_STATUS_PHRASES = ['registrations status', 'registration status',
                                'status run']
+
+# Creating HubSpot contacts for registrants who have none. A separate verb
+# from "sync" because it writes to a different object and registers nobody.
+CONTACT_CREATE_PHRASES = ['create contacts', 'create contact']
+CONTACT_STATUS_PHRASES = ['contacts status', 'contact status']
 ALL_SYNC_PHRASES = ['sync all', 'sync everything', 'run all syncs']
 
 
@@ -67,6 +72,8 @@ def can_handle(query: str, **kwargs) -> bool:
         anchors.anchored(q, REGISTRATION_SYNC_PHRASES) or
         anchors.anchored(q, REGISTRATION_RECONCILE_PHRASES) or
         anchors.anchored(q, REGISTRATION_STATUS_PHRASES) or
+        anchors.anchored(q, CONTACT_CREATE_PHRASES) or
+        anchors.anchored(q, CONTACT_STATUS_PHRASES) or
         q in ALL_SYNC_PHRASES
     )
 
@@ -84,6 +91,12 @@ def handle(query: str, ctx) -> str:
         Formatted result string
     """
     q = query.lower().strip()
+
+    if any(p in q for p in CONTACT_STATUS_PHRASES):
+        return _contact_status(q)
+
+    if any(p in q for p in CONTACT_CREATE_PHRASES):
+        return _create_contacts(q)
 
     if any(p in q for p in REGISTRATION_STATUS_PHRASES):
         return _registration_status(q)
@@ -232,6 +245,206 @@ def _registration_limit(query_lower: str):
     if found:
         return max(int(found.group(1)), 0)
     return REGISTRATION_DEFAULT_LIMIT
+
+
+def _create_contacts(query_lower: str) -> str:
+    """Preview, or start, contact creation for withheld registrants."""
+    from sync import contact_create as cc
+    from sync import contact_jobs as jobs
+    from sync import registrations as reg
+
+    live = REGISTRATION_APPLY_PHRASE in query_lower
+    limit = _registration_limit(query_lower) if live else None
+    asked = _registration_event(query_lower)
+    scope = {}
+    if asked:
+        try:
+            scope["event_ids"] = (reg.resolve_requested_event(asked),)
+        except reg.EventRefused as e:
+            return ("🛑 **That event cannot be synced.**\n\n"
+                    f"{e}\n\n"
+                    '• Say *"create contacts dry run"* to preview the whole '
+                    "mapped scope.")
+
+    if live:
+        try:
+            run_id = jobs.start_apply(limit=limit, **scope)
+        except reg.RegistrationsSyncDisabled as e:
+            return ("⏸️ **Registrations sync is turned off.**\n\n"
+                    f"{e}")
+        except cc.LimitRequired as e:
+            return f"🛑 **No limit, no run.**\n\n{e}"
+        except jobs.ApplyAlreadyRunning as e:
+            return f"⏳ **One run at a time.**\n\n{e}"
+        except cc.ContactCreateStopped as e:
+            return f"🛑 **Nothing was started.**\n\n{e}"
+        except Exception as e:
+            logger.error("could not start the contact create: %s", e,
+                         exc_info=True)
+            return f"❌ Could not start contact creation: {e}"
+        scoped = f" for event `{asked}`" if asked else ""
+        return (f"🚀 **Contact creation started**{scoped} — "
+                f"`run_log {run_id}`, limit **{limit}**.\n\n"
+                f"It runs in the background. Each contact is a HubSpot read "
+                f"then a write, so a long run takes minutes and the HTTP "
+                f"response would be discarded before it finished.\n\n"
+                f'• Say *"contacts status"* for progress and the full '
+                f"report.\n"
+                f"• **Do not send it again** — one at a time is enforced, "
+                f"and a resend is how one person becomes two contacts.\n"
+                f"• Nobody is registered by this. Run *\"sync registrations "
+                f"dry run\"* afterwards to see them queued.")
+
+    try:
+        results = cc.run(dry_run=True, limit=None, **scope)
+        if asked:
+            results["scoped_event"] = asked
+        return _format_contact_results(results)
+    except Exception as e:
+        logger.error("Contact create preview failed: %s", e, exc_info=True)
+        return f"❌ Contact create preview failed: {e}"
+
+
+def _contact_status(query_lower: str) -> str:
+    from sync import contact_jobs as jobs
+
+    run_id = _registration_run_id(query_lower)
+    try:
+        state = jobs.status(run_id)
+    except jobs.RunNotFound as e:
+        return f"🤷 **No such run.**\n\n{e}"
+    except Exception as e:
+        logger.error("could not read the contact-create status: %s", e,
+                     exc_info=True)
+        return f"❌ Could not read the run status: {e}"
+
+    if not state.get("found"):
+        return ("🤷 **No contact creation has been run yet.**\n\n"
+                '• Say *"create contacts dry run"* to preview one.')
+
+    run = state["run_id"]
+    seconds = int(state.get("seconds") or 0)
+    started = state.get("started_at")
+    when = f"{started:%Y-%m-%d %H:%M:%S} UTC" if started else "unknown"
+
+    if state["status"] == "running":
+        writes = state.get("writes_so_far")
+        wrote = ("unknown — write_audit could not be read"
+                 if writes is None else f"**{writes}** so far")
+        return (f"⏳ **Contact creation `run_log {run}` is still "
+                f"running.**\n\n"
+                f"• Started {when}, **{seconds}s** ago\n"
+                f"• HubSpot contact creates attempted: {wrote}\n\n"
+                f'• Say *"contacts status"* again in a minute.\n'
+                f"• **Do not start another run** — it would be refused.")
+
+    head = (f"📒 **Contact creation `run_log {run}` finished** "
+            f"({state['status']}) — started {when}, took **{seconds}s**.")
+    summary = state.get("summary")
+    if not isinstance(summary, dict):
+        return (f"{head}\n\n• **{state.get('record_count', 0)}** "
+                f"per-record row(s) in `run_log.outcomes`"
+                + (f"\n• Error: {state['error_summary']}"
+                   if state.get("error_summary") else ""))
+    return f"{head}\n\n" + _format_contact_results(summary)
+
+
+def _format_contact_results(results: dict) -> str:
+    """Counts, and masked addresses only — never a full address in chat."""
+    if results.get("error"):
+        return f"❌ **Contact creation stopped.**\n\n{results['error']}"
+
+    dry_run = results.get("dry_run", True)
+    if dry_run:
+        head = "🧪 **Create contacts — PREVIEW** (nothing was written)"
+    elif results.get("stopped") or results.get("failed"):
+        head = "🛑 **Create contacts — STOPPED**"
+    else:
+        head = "✅ **Create contacts — APPLIED**"
+
+    lines = [head, ""]
+    if results.get("scoped_event"):
+        lines.append(f"🎯 Scoped to event `{results['scoped_event']}` only.")
+    lines += [
+        f"📊 **Across {results.get('events_read', 0)} event(s):**",
+        f"• **{results.get('to_create', 0)}** registrant(s) have no HubSpot "
+        f"contact and would get one",
+        f"• **{results.get('with_name', 0)}** of those have a first or last "
+        f"name in CSuite; **{results.get('with_company', 0)}** have an "
+        f"organisation"]
+
+    if results.get("held_events"):
+        lines.append(
+            f"• held and skipped entirely: "
+            + ", ".join(f"`{e}`" for e in results['held_events'])
+            + f" — {reg_held_reason()}")
+
+    lines += ["", "🔒 **Properties sent: email, firstname, lastname"
+                  "** (plus company where CSuite has one) **and nothing "
+                  "else.** No marketing status, no subscription status, no "
+                  "list membership — newsletter consent is a separate "
+                  "decision, and `hs_marketable_status` is read-only to the "
+                  "API in any case.",
+              "🔎 Each address is re-checked in HubSpot immediately before "
+              "its create, and a 409 is read as \"already a contact\" — so "
+              "an existing person is recorded, never duplicated."]
+
+    rows = []
+    for event in results.get("events") or []:
+        for record in event.get("to_create") or []:
+            rows.append(record)
+    if dry_run and rows:
+        lines += ["", f"➡️ **The {len(rows)} to create**, in send order:", "",
+                  "| event | address (masked) | CSuite profile | name? |",
+                  "|---|---|---|---|"]
+        for record in rows[:REGISTRATION_REVIEW_ROWS_SHOWN * 2]:
+            props = record.get("properties") or {}
+            named = "yes" if (props.get("firstname")
+                              or props.get("lastname")) else "NO"
+            lines.append(f"| `{record['event_date_id']}` | "
+                         f"`{record.get('email_masked', '***')}` | "
+                         f"`{record.get('csuite_profile_id') or '—'}` | "
+                         f"{named} |")
+        if len(rows) > REGISTRATION_REVIEW_ROWS_SHOWN * 2:
+            lines.append(f"… and **{len(rows) - REGISTRATION_REVIEW_ROWS_SHOWN * 2}** more")
+
+    if not dry_run:
+        lines += ["", f"• **{results.get('created', 0)}** contact(s) created",
+                  f"• **{results.get('existing', 0)}** already existed — "
+                  f"recorded, not duplicated"]
+        if results.get("deferred"):
+            lines.append(f"• **{results['deferred']}** deferred — the limit "
+                         f"of {results.get('limit')} was reached")
+        if results.get("unknown"):
+            lines.append(f"• **{results['unknown']}** ambiguous — may have "
+                         f"landed, NOT retried")
+        if results.get("failed"):
+            lines.append(f"• **{results['failed']}** failed — see below")
+
+    review = results.get("review_rows") or []
+    if review:
+        lines += ["", "🔎 **Needs a human:**"]
+        for event_id, why in review[:REGISTRATION_REVIEW_ROWS_SHOWN]:
+            lines.append(f"   `{event_id}` — {str(why)[:110]}")
+
+    lines += ["", f"📞 {results.get('csuite_calls', 0)} CSuite call(s), "
+                  f"{results.get('hubspot_calls', 0)} HubSpot read call(s)"]
+    if dry_run:
+        lines.append("✍️ **0 HubSpot writes — nothing was created.**")
+        lines.append('Say *"create contacts apply limit N"* to create them. '
+                     "Nobody is registered by that — the next registrations "
+                     "sync does the registering.")
+    else:
+        ids = results.get("write_audit_ids") or []
+        trail = (" (write_audit " + ", ".join(str(i) for i in ids) + ")"
+                 if ids else "")
+        lines.append(f"✍️ **{results.get('writes_attempted', 0)} create(s) "
+                     f"attempted**{trail}")
+        if results.get("stopped"):
+            lines += ["", f"🛑 {results['stopped']}"]
+        lines.append('Run *"sync registrations dry run"* to see them queued '
+                     "for registration.")
+    return "\n".join(lines)
 
 
 def _start_registration_apply(limit, scope, asked) -> str:
