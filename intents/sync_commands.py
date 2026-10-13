@@ -259,7 +259,10 @@ def _create_contacts(query_lower: str) -> str:
     scope = {}
     if asked:
         try:
-            scope["event_ids"] = (reg.resolve_requested_event(asked),)
+            # The CONTACTS resolver, not the registrations one: an id in
+            # CONTACTS_ONLY_EVENT_IDS is held for registrations and allowed
+            # here, because a contact existing is the whole point of it.
+            scope["event_ids"] = (cc.resolve_requested_event(asked),)
         except reg.EventRefused as e:
             return ("🛑 **That event cannot be synced.**\n\n"
                     f"{e}\n\n"
@@ -367,11 +370,24 @@ def _format_contact_results(results: dict) -> str:
         lines.append(f"🎯 Scoped to event `{results['scoped_event']}` only.")
     lines += [
         f"📊 **Across {results.get('events_read', 0)} event(s):**",
+        f"• **{results.get('registrant_rows', 0)}** registrant row(s) in "
+        f"CSuite, **{results.get('unique_emails', 0)}** after dedupe by "
+        f"email within each event "
+        f"({results.get('duplicates_dropped', 0)} duplicate(s) dropped)",
+        f"• **{results.get('already_contacts', 0)}** already have a HubSpot "
+        f"contact",
         f"• **{results.get('to_create', 0)}** registrant(s) have no HubSpot "
         f"contact and would get one",
         f"• **{results.get('with_name', 0)}** of those have a first or last "
         f"name in CSuite; **{results.get('with_company', 0)}** have an "
         f"organisation"]
+
+    if results.get("contacts_only_events"):
+        lines.append(
+            "• contacts-only (a sign-up list, not an event — a contact is "
+            "created and NOTHING is registered): "
+            + ", ".join(f"`{e}`"
+                        for e in results["contacts_only_events"]))
 
     if results.get("held_events"):
         lines.append(
@@ -444,6 +460,13 @@ def _format_contact_results(results: dict) -> str:
             lines += ["", f"🛑 {results['stopped']}"]
         lines.append('Run *"sync registrations dry run"* to see them queued '
                      "for registration.")
+    if results.get("run_logged"):
+        # Backlog fix: the contact dry run was the only one of these that
+        # did not say where to find its own record.
+        lines += ["", f"📒 Recorded as `hubsync.run_log` id "
+                      f"{results.get('run_id')} with "
+                      f"{results.get('unique_emails', 0)} per-record input "
+                      f"row(s) — masked addresses, never addresses."]
     return "\n".join(lines)
 
 

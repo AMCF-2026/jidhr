@@ -182,6 +182,45 @@ def assert_safe_properties(props):
                     f"separate decision. Nothing was sent.")
 
 
+def contacts_only_event_ids() -> tuple:
+    """Event dates that are a sign-up LIST, not an event. Read at call time.
+
+    These are held for REGISTRATIONS and allowed for contact creation. 1153
+    is the case it exists for: HubSpot's "All Emails" segment is "Email is
+    known", so a contact existing IS the newsletter sign-up, and there is
+    nothing to register anybody to.
+    """
+    import config
+
+    return tuple(str(e).strip() for e
+                 in getattr(config.Config, "CONTACTS_ONLY_EVENT_IDS", ())
+                 if str(e).strip())
+
+
+def resolve_requested_event(event_id) -> str:
+    """One event id this path may run on, or EventRefused naming it.
+
+    Same as the registrations resolver, with ONE difference: an id in
+    CONTACTS_ONLY_EVENT_IDS is allowed through even though it is held,
+    because the hold is about registrations. An id that is held and not
+    listed there is still refused.
+    """
+    key = str(event_id or "").strip()
+    if key not in reg.PHASE_ONE_EVENT_IDS:
+        raise reg.EventRefused(
+            f"event {key} is not one of the "
+            f"{len(reg.PHASE_ONE_EVENT_IDS)} mapped events. Mapped: "
+            f"{', '.join(reg.PHASE_ONE_EVENT_IDS)}.")
+    if key in reg.held_event_ids() and key not in contacts_only_event_ids():
+        raise reg.EventRefused(
+            f"event {key} is {reg.HELD_REASON}, and it is not in "
+            f"CONTACTS_ONLY_EVENT_IDS, so contacts are not created for it "
+            f"either. Nothing was read. Add it to CONTACTS_ONLY_EVENT_IDS "
+            f"to create contacts for its registrants without registering "
+            f"them.")
+    return key
+
+
 class ContactCreateStopped(RuntimeError):
     """The run stopped before, or part way through, creating contacts."""
 
@@ -327,7 +366,11 @@ def plan(csuite, hubspot, event_ids, out) -> list:
     means there — one definition of who has no HubSpot contact, not a
     second one that can disagree with the preview Carl is reading.
     """
-    held = reg.held_event_ids()
+    # Held for REGISTRATIONS is not held for contacts. An id in
+    # CONTACTS_ONLY_EVENT_IDS is read and planned here; one that is held
+    # and not listed there is skipped entirely, as before.
+    contacts_only = contacts_only_event_ids()
+    held = tuple(e for e in reg.held_event_ids() if e not in contacts_only)
     events = []
     profiles = {}
     for event_id in event_ids:
@@ -338,6 +381,8 @@ def plan(csuite, hubspot, event_ids, out) -> list:
                            "to_create": [], "created": [], "existing": [],
                            "failed": [], "skipped": [], "review": None})
             continue
+        if key in contacts_only:
+            out["contacts_only_events"].append(key)
 
         rows, error, _event_row = reg.read_registrants(csuite, key)
         out["csuite_calls"] += 1
@@ -349,7 +394,10 @@ def plan(csuite, hubspot, event_ids, out) -> list:
             continue
         out["events_read"] += 1
 
-        deduped, _dropped = reg.dedupe(rows or [])
+        deduped, dropped = reg.dedupe(rows or [])
+        out["registrant_rows"] += len(rows or [])
+        out["unique_emails"] += len(deduped)
+        out["duplicates_dropped"] += dropped
         contacts, calls, contact_error = reg.resolve_contacts(
             hubspot, set(deduped))
         out["hubspot_calls"] += calls
@@ -364,6 +412,13 @@ def plan(csuite, hubspot, event_ids, out) -> list:
             continue
 
         planned = reg.plan_event(key, rows or [], contacts, {})
+        # Everybody who already has a contact, however the registrations
+        # planner bucketed them: a contacts-only event has no registrations,
+        # so "already registered" is not the question here — "already a
+        # contact" is.
+        out["already_contacts"] += sum(
+            len(planned.get(kind) or [])
+            for kind in ("would_register", "already", "held", "unverified"))
         entry = {"event_date_id": key, "is_held": False, "to_create": [],
                  "created": [], "existing": [], "failed": [], "skipped": [],
                  "review": planned.get("review")}
@@ -496,7 +551,9 @@ def run(csuite=None, hubspot=None, dry_run: bool = True, limit=None,
            "unknown": 0, "deferred": 0, "review": 0, "review_rows": [],
            "held_events": [], "csuite_calls": 0, "hubspot_calls": 0,
            "writes_attempted": 0, "write_audit_ids": [], "stopped": None,
-           "with_name": 0, "with_company": 0}
+           "with_name": 0, "with_company": 0, "already_contacts": 0,
+           "registrant_rows": 0, "unique_emails": 0, "duplicates_dropped": 0,
+           "contacts_only_events": []}
 
     if run_id is None:
         run_id = open_run(applied=not dry_run)
