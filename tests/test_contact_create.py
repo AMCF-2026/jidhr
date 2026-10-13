@@ -915,8 +915,9 @@ def test_the_dry_run_reports_already_to_create_and_duplicates():
 
     reply = sync_commands._format_contact_results(out)
     assert "**1** already have a HubSpot contact" in reply
-    assert "**1** registrant(s) have no HubSpot contact" in reply
-    assert "1 duplicate(s) dropped" in reply
+    assert "**1** have none and would get one" in reply
+    assert "**1** duplicate(s) dropped" in reply
+    assert "**0** excluded" in reply
     assert "contacts-only" in reply and "`1153`" in reply
 
 
@@ -946,3 +947,352 @@ def test_a_run_with_no_run_log_row_says_nothing_about_one():
 
     assert out["run_logged"] is False
     assert "run_log" not in sync_commands._format_contact_results(out)
+
+
+# ---------------------------------------------------------------------------
+# Every row accounted for
+# ---------------------------------------------------------------------------
+#
+# Production run_log 62, "create contacts dry run event 1153":
+#   "14 registrant row(s) in CSuite, 13 after dedupe (0 duplicate(s)
+#    dropped) · 13 already · 0 to create"
+#
+# 14 -> 13 with 0 duplicates does not add up. The missing row has
+# event_profile_email = None (it has a name and a profile_id), and
+# registrations.classify_rows is where it is dropped — the old dedupe
+# skipped it with a bare `continue` and counted it nowhere.
+
+
+def test_a_row_with_no_email_is_excluded_and_counted():
+    """The exact 1153 shape: 14 rows, one with no address, no duplicates."""
+    rows = [registrant(f"p{i}@example.invalid", 20000 + i)
+            for i in range(13)]
+    rows.append({"event_profile_email": None,
+                 "event_profile_name": "A Person", "profile_id": 20099,
+                 "rsvp": None, "attended": None})
+    csuite = CSuite({"1153": rows},
+                    profiles={20000 + i: profile() for i in range(13)})
+
+    out = cc.run(csuite=csuite, hubspot=HubSpot(), event_ids=("1153",))
+
+    assert out["registrant_rows"] == 14
+    assert out["excluded"] == 1
+    assert out["excluded_reasons"] == {reg.NO_EMAIL: 1}
+    assert out["duplicates_dropped"] == 0
+    assert out["unique_emails"] == 13
+    assert out["reconciles"] is True
+
+    reply = sync_commands._format_contact_results(out)
+    assert "**14** registrant row(s) in CSuite" in reply
+    assert "**1** excluded — 1 no email address in CSuite" in reply
+    assert "**13** unique address(es)" in reply
+
+
+@pytest.mark.parametrize("blank", [None, "", "   "])
+def test_every_blank_address_shape_is_excluded_not_skipped(blank):
+    rows = [registrant("real@example.invalid", 20001),
+            {"event_profile_email": blank, "event_profile_name": "X",
+             "profile_id": 20002, "rsvp": None, "attended": None}]
+    csuite = CSuite({"1153": rows}, profiles={20001: profile()})
+
+    out = cc.run(csuite=csuite, hubspot=HubSpot(), event_ids=("1153",))
+
+    assert out["excluded"] == 1
+    assert out["unique_emails"] == 1
+    assert out["reconciles"] is True
+
+
+def test_the_one_rule_lives_in_one_place():
+    """classify_rows is the rule; dedupe is it with the reasons dropped."""
+    import inspect
+
+    rows = [registrant("a@x.invalid"), registrant("a@x.invalid"),
+            {"event_profile_email": None}]
+
+    kept, dupes, excluded = reg.classify_rows(rows)
+    assert (len(kept), dupes, len(excluded)) == (1, 1, 1)
+
+    # dedupe's contract is unchanged: every existing caller reads two values.
+    assert reg.dedupe(rows) == (kept, dupes)
+    assert "classify_rows" in inspect.getsource(reg.dedupe)
+
+
+def test_both_invariants_hold_on_a_real_plan():
+    rows = [registrant("a@x.invalid", 20001),
+            registrant("a@x.invalid", 20001),
+            registrant("b@x.invalid", 20002),
+            {"event_profile_email": None, "profile_id": 20003}]
+    csuite = CSuite({"1153": rows},
+                    profiles={20001: profile(), 20002: profile()})
+
+    out = cc.run(csuite=csuite, hubspot=HubSpot({"a@x.invalid": "701"}),
+                 event_ids=("1153",))
+
+    assert out["registrant_rows"] == (out["excluded"]
+                                      + out["duplicates_dropped"]
+                                      + out["unique_emails"])
+    assert out["unique_emails"] == (out["already_contacts"]
+                                    + out["to_create"])
+    assert out["reconciles"] is True
+
+
+def test_an_invariant_violation_is_reported_in_plain_words():
+    """A report that prints numbers which do not add up is worse than one
+    that says it cannot account for them: the first looks checked."""
+    out = {"registrant_rows": 14, "excluded": 0, "duplicates_dropped": 0,
+           "unique_emails": 13, "already_contacts": 13, "to_create": 0,
+           "marketing": 13, "non_marketing": 0, "marketing_unknown": 0}
+
+    assert cc.check_reconciles(out) is False
+    assert out["reconciles"] is False
+    assert len(out["reconcile_problems"]) == 1
+    assert "do not account for" in out["reconcile_problems"][0]
+
+    reply = sync_commands._format_contact_results(
+        dict(out, dry_run=True, error=None, events=[]))
+    assert "do not add up, so do not trust them" in reply
+    assert "not a reason to apply anyway" in reply
+
+
+def test_a_bad_already_to_create_split_is_also_caught():
+    out = {"registrant_rows": 13, "excluded": 0, "duplicates_dropped": 0,
+           "unique_emails": 13, "already_contacts": 5, "to_create": 5,
+           "marketing": 5, "non_marketing": 0, "marketing_unknown": 0}
+
+    assert cc.check_reconciles(out) is False
+    assert "do not split into" in out["reconcile_problems"][0]
+
+
+def test_a_bad_marketing_split_is_also_caught():
+    out = {"registrant_rows": 13, "excluded": 0, "duplicates_dropped": 0,
+           "unique_emails": 13, "already_contacts": 13, "to_create": 0,
+           "marketing": 1, "non_marketing": 1, "marketing_unknown": 0}
+
+    assert cc.check_reconciles(out) is False
+    assert "non-marketing" in out["reconcile_problems"][0]
+
+
+# ---------------------------------------------------------------------------
+# Marketing status of the contacts that already exist
+# ---------------------------------------------------------------------------
+#
+# Being in HubSpot's "All Emails" segment is "Email is known" — it does NOT
+# mean the contact is emailed. A pre-existing contact kept whatever status
+# it had, so Carl needs the split. Measured on 1153, 2026-10-13: all 13 are
+# hs_marketable_status 'true' (12 CONTACT_IMPORT, 1 FORM_SUBMISSION).
+
+
+class StatusHubSpot(HubSpot):
+    """batch/read answering a chosen hs_marketable_status per address."""
+
+    def __init__(self, statuses):
+        super().__init__(contacts={e: f"70{i}"
+                                   for i, e in enumerate(statuses)})
+        self.statuses = dict(statuses)
+
+    def _post(self, endpoint, data=None):
+        assert endpoint == "crm/v3/objects/contacts/batch/read", endpoint
+        self.reads += 1
+        wanted = {i["id"] for i in data["inputs"]}
+        results = []
+        for email, cid in self.contacts.items():
+            if email not in wanted:
+                continue
+            props = {"email": email, "hs_additional_emails": ""}
+            status = self.statuses[email]
+            # MISSING means the key is absent, which is not the same as
+            # 'false' — batch/read omits a property with no value.
+            if status is not None:
+                props["hs_marketable_status"] = status
+            results.append({"id": cid, "properties": props})
+        return {"results": results, "numErrors": len(wanted) - len(results)}
+
+
+def test_mixed_marketable_statuses_are_counted_separately():
+    statuses = {"m1@x.invalid": "true", "m2@x.invalid": "true",
+                "n1@x.invalid": "false", "u1@x.invalid": None}
+    csuite = CSuite({"1153": [registrant(e, 20000 + i)
+                              for i, e in enumerate(statuses)]},
+                    profiles={20000 + i: profile()
+                              for i in range(len(statuses))})
+
+    out = cc.run(csuite=csuite, hubspot=StatusHubSpot(statuses),
+                 event_ids=("1153",))
+
+    assert out["already_contacts"] == 4
+    assert out["marketing"] == 2
+    assert out["non_marketing"] == 1
+    assert out["marketing_unknown"] == 1
+    assert out["to_create"] == 0
+    assert out["reconciles"] is True
+
+
+def test_a_missing_property_is_unknown_not_non_marketing():
+    """The old boolean collapsed "false" and "not returned" into one. A
+    contact whose status could not be read must not be reported as
+    deliberately non-marketing."""
+    assert cc.marketing_state({"marketable_raw": "true"}) == "marketing"
+    assert cc.marketing_state({"marketable_raw": "TRUE"}) == "marketing"
+    assert cc.marketing_state({"marketable_raw": "false"}) == "non_marketing"
+    assert cc.marketing_state({"marketable_raw": None}) == "unknown"
+    assert cc.marketing_state({}) == "unknown"
+    assert cc.marketing_state(None) == "unknown"
+    assert cc.marketing_state({"marketable_raw": "maybe"}) == "unknown"
+
+
+def test_the_non_marketing_ones_are_named_with_id_and_masked_address():
+    statuses = {"n1@donor.invalid": "false", "m1@donor.invalid": "true"}
+    csuite = CSuite({"1153": [registrant(e, 20000 + i)
+                              for i, e in enumerate(statuses)]},
+                    profiles={20000: profile(), 20001: profile()})
+
+    out = cc.run(csuite=csuite, hubspot=StatusHubSpot(statuses),
+                 event_ids=("1153",))
+
+    assert len(out["non_marketing_rows"]) == 1
+    row = out["non_marketing_rows"][0]
+    assert row["email_masked"] == "n***@donor.invalid"
+    assert row["hubspot_contact_id"]
+
+    reply = sync_commands._format_contact_results(out)
+    assert "**1** NON-marketing" in reply
+    assert "n***@donor.invalid" in reply
+    assert "n1@donor.invalid" not in reply, "never the full address"
+    assert "All Emails" in reply, "and it says why the segment is not proof"
+
+
+def test_the_non_marketing_list_is_capped_at_25_with_a_remainder():
+    rows = [{"event_date_id": "1153", "hubspot_contact_id": str(i),
+             "email_masked": f"x***@d{i}.invalid"} for i in range(30)]
+    out = {"dry_run": True, "error": None, "events": [], "events_read": 1,
+           "registrant_rows": 30, "excluded": 0, "duplicates_dropped": 0,
+           "unique_emails": 30, "already_contacts": 30, "to_create": 0,
+           "with_name": 0, "with_company": 0, "marketing": 0,
+           "non_marketing": 30, "marketing_unknown": 0,
+           "non_marketing_rows": rows, "reconciles": True,
+           "excluded_reasons": {}, "contacts_only_events": []}
+
+    reply = sync_commands._format_contact_results(out)
+
+    assert cc.NON_MARKETING_SHOWN == 25
+    assert "x***@d24.invalid" in reply
+    assert "x***@d25.invalid" not in reply
+    assert "… and **5** more" in reply
+
+
+def test_no_marketing_block_when_nobody_has_a_contact():
+    csuite, hubspot = doubles()
+    out = cc.run(csuite=csuite, hubspot=hubspot, event_ids=("1430",))
+
+    assert out["already_contacts"] == 0
+    reply = sync_commands._format_contact_results(out)
+    assert "already have a contact:" not in reply
+
+
+def test_the_new_contact_note_is_static_and_says_so():
+    """There is no API for the connected-app setting, so the code must not
+    claim to have read it."""
+    csuite, hubspot = doubles()
+    out = cc.run(csuite=csuite, hubspot=hubspot, event_ids=("1430",))
+
+    reply = sync_commands._format_contact_results(out)
+
+    assert "connected-app marketing setting" in reply
+    assert "currently ON for this app" in reply
+    assert "static note in the code, not a reading from the API" in reply
+
+
+def test_the_new_contact_note_is_absent_when_nothing_would_be_created():
+    statuses = {"m1@x.invalid": "true"}
+    csuite = CSuite({"1153": [registrant("m1@x.invalid", 20000)]},
+                    profiles={20000: profile()})
+
+    out = cc.run(csuite=csuite, hubspot=StatusHubSpot(statuses),
+                 event_ids=("1153",))
+
+    assert out["to_create"] == 0
+    assert "connected-app marketing setting" not in \
+        sync_commands._format_contact_results(out)
+
+
+# ---------------------------------------------------------------------------
+# Read-only: the write path is byte-identical to V5.72
+# ---------------------------------------------------------------------------
+
+def test_the_requested_properties_were_already_asking_for_the_status():
+    """No extra property had to be added at all — resolve_contacts has
+    requested hs_marketable_status since phase 1, to report who is
+    deliberately non-marketing. This hotfix reads the RAW value it was
+    already fetching."""
+    import inspect
+
+    source = inspect.getsource(reg.resolve_contacts)
+    assert '"hs_marketable_status"' in source
+    assert "marketable_raw" in source
+    assert source.count('"properties": [') == 1, "one properties list"
+
+
+def test_the_match_and_dedupe_results_are_unchanged_by_the_raw_value():
+    """The entry gained a key; nothing keys on it."""
+    class Index(HubSpot):
+        def _post(self, endpoint, data=None):
+            self.reads += 1
+            return {"results": [
+                {"id": "701", "properties": {
+                    "email": "a@x.invalid",
+                    "hs_additional_emails": "alias@x.invalid",
+                    "hs_marketable_status": "false"}}],
+                "numErrors": 0}
+
+    contacts, calls, error = reg.resolve_contacts(
+        Index(), {"a@x.invalid", "alias@x.invalid", "nobody@x.invalid"})
+
+    assert error is None and calls == 1
+    # Both the canonical address and the alias still resolve, and to the
+    # same contact — the behaviour the raw value must not have disturbed.
+    assert contacts["a@x.invalid"]["id"] == "701"
+    assert contacts["alias@x.invalid"]["id"] == "701"
+    assert "nobody@x.invalid" not in contacts
+    assert contacts["a@x.invalid"]["marketing"] is False
+    assert contacts["a@x.invalid"]["marketable_raw"] == "false"
+
+
+def test_the_create_body_is_unchanged_from_v572(monkeypatch):
+    """A snapshot. Nothing in this hotfix may alter what is sent."""
+    arm(monkeypatch)
+    csuite, hubspot = doubles()
+
+    cc.run(csuite=csuite, hubspot=hubspot, dry_run=False, limit=1,
+           event_ids=("1430",))
+
+    assert hubspot.posted == [(
+        "POST", "crm/v3/objects/contacts",
+        {"properties": {"email": EMAIL, "firstname": "New",
+                        "lastname": "Person"}})]
+
+
+def test_nothing_in_this_hotfix_added_a_write(monkeypatch):
+    """READ-ONLY. One create endpoint, no PATCH, nothing else."""
+    import inspect
+
+    source = inspect.getsource(cc)
+    for forbidden in ("_patch", "PATCH", "_put", '"PUT"', "DELETE"):
+        assert forbidden not in source, forbidden
+    assert source.count("_send_with_status") == 1
+
+    arm(monkeypatch)
+    csuite, hubspot = doubles()
+    cc.run(csuite=csuite, hubspot=hubspot, dry_run=False, limit=1,
+           event_ids=("1430",))
+    assert [m for m, _e, _b in hubspot.posted] == ["POST"]
+
+
+def test_a_dry_run_still_writes_nothing_at_all():
+    statuses = {"n1@x.invalid": "false"}
+    csuite = CSuite({"1153": [registrant("n1@x.invalid", 20000)]},
+                    profiles={20000: profile()})
+    hubspot = StatusHubSpot(statuses)
+
+    cc.run(csuite=csuite, hubspot=hubspot, event_ids=("1153",))
+
+    assert hubspot.posted == []

@@ -408,6 +408,36 @@ def shrink_guard(event_date_id, rows, known_count) -> str:
     return None
 
 
+# Why a registrant row counts for nothing. One reason per row, so a
+# breakdown can name it instead of leaving a gap in the arithmetic.
+NO_EMAIL = "no email address in CSuite"
+
+
+def classify_rows(rows) -> tuple:
+    """({email: row}, duplicates_dropped, [(row, reason)]).
+
+    THE one rule for which registrant rows count, and why the others do
+    not. `dedupe` is this function with the third value thrown away.
+
+    It exists because the third value used to be thrown away everywhere:
+    "14 registrant rows, 13 after dedupe, 0 duplicates dropped" was a
+    breakdown that did not add up, and the missing row — one with no
+    event_profile_email, measured on event 1153 — was silently skipped. A
+    report whose numbers do not reconcile is a report nobody can check.
+    """
+    out, dropped, excluded = {}, 0, []
+    for row in rows or []:
+        email = normalise_email((row or {}).get("event_profile_email"))
+        if not email:
+            excluded.append((row, NO_EMAIL))
+            continue
+        if email in out:
+            dropped += 1
+            continue
+        out[email] = row
+    return out, dropped, excluded
+
+
 def dedupe(rows) -> tuple:
     """({email: row}, duplicates_dropped). Guests are NOT included.
 
@@ -416,16 +446,12 @@ def dedupe(rows) -> tuple:
     (contact_email), and phase 1 does not register them: a guest has not
     given this address to AMCF, and 8 of the 23 guest emails on these events
     are already a registrant somewhere anyway.
+
+    Delegates to classify_rows so the rule lives in ONE place. The return
+    shape is unchanged, deliberately: every existing caller reads two
+    values from it.
     """
-    out, dropped = {}, 0
-    for row in rows or []:
-        email = normalise_email((row or {}).get("event_profile_email"))
-        if not email:
-            continue
-        if email in out:
-            dropped += 1
-            continue
-        out[email] = row
+    out, dropped, _excluded = classify_rows(rows)
     return out, dropped
 
 
@@ -470,7 +496,14 @@ def resolve_contacts(hubspot, emails) -> tuple:
             props = record.get("properties") or {}
             marketing = (str(props.get("hs_marketable_status")).lower()
                          == "true")
-            entry = {"id": record.get("id"), "marketing": marketing}
+            # The RAW value as well as the boolean. `marketing` collapses
+            # "false" and "the property was not returned" into the same
+            # False, which is fine for deciding nothing (this sync never
+            # acts on it) but wrong for REPORTING: a contact whose status
+            # could not be read must not be counted as non-marketing.
+            # Additive, so `marketing` keeps exactly its old meaning.
+            entry = {"id": record.get("id"), "marketing": marketing,
+                     "marketable_raw": props.get("hs_marketable_status")}
             keys = [normalise_email(props.get("email"))]
             for extra in str(props.get("hs_additional_emails") or "").split(";"):
                 keys.append(normalise_email(extra))
