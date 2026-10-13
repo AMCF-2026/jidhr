@@ -245,6 +245,39 @@ class Config:
     #
     # The explicit id lists still win: CONTACTS_ONLY_EVENT_IDS adds one
     # that this would miss, and REGISTRATION_HELD_EVENT_IDS still holds.
+    # =========================================================================
+    # THE SCHEDULED SYNC
+    # =========================================================================
+    # SEPARATE from the manual-apply flags on purpose. Arming the 06:15 cron
+    # must not be the same switch as arming a human-triggered apply, or
+    # turning one on turns the other on by accident.
+    #
+    # Ships DISARMED and stays that way until somebody sets it in Railway.
+    SCHEDULED_SYNC_ENABLED = (
+        os.environ.get('SCHEDULED_SYNC_ENABLED', 'False')
+        .strip().lower() == 'true')
+
+    # 'preview' or 'live'. ONLY the exact word 'live' means live; anything
+    # else — a typo, an empty string, 'LIVE ', 'yes', 'true' — is preview.
+    #
+    # Deliberately not a boolean. A LIVE_SYNC=true/false flag reads the same
+    # whether it was set deliberately or left over, and the failure mode of
+    # a misread boolean here is writing to production unattended.
+    SCHEDULED_SYNC_MODE = (
+        'live' if (os.environ.get('SCHEDULED_SYNC_MODE', 'preview')
+                   .strip().lower() == 'live') else 'preview')
+
+    # How far back the window reaches, in days before today. 1 means "today
+    # and anything later, plus yesterday" — the slack covers an event whose
+    # date has just passed in a timezone the sync does not model.
+    #
+    # Measured 2026-10-13: of 187 CSuite event dates, 8 fall inside
+    # today - 1, 81 are earlier and 98 carry no usable event_date. Without a
+    # window, a scheduled run would be registering people for events that
+    # finished months ago.
+    SCHEDULED_SYNC_WINDOW_DAYS = _int_or_zero(
+        os.environ.get('SCHEDULED_SYNC_WINDOW_DAYS', '1'))
+
     CONTACTS_ONLY_EVENT_CATEGORIES = tuple(
         c.strip().lower()
         for c in (os.environ.get('CONTACTS_ONLY_EVENT_CATEGORIES',

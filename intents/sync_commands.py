@@ -57,6 +57,12 @@ CONTACT_STATUS_PHRASES = ['contacts status', 'contact status']
 # thing for a donor-facing caller to be able to trigger.
 NOTIFY_TEST_PHRASES = ['test notify', 'test notification',
                        'test notifications']
+
+# Running the scheduled chain by hand, so the 06:15 behaviour can be
+# checked without waiting for 06:15. It executes the HANDLER, not a
+# reimplementation of it, so what it proves is what the cron will do.
+SCHEDULED_RUN_PHRASES = ['run scheduled sync now', 'run scheduled sync',
+                         'run the scheduled sync']
 ALL_SYNC_PHRASES = ['sync all', 'sync everything', 'run all syncs']
 
 
@@ -81,6 +87,7 @@ def can_handle(query: str, **kwargs) -> bool:
         anchors.anchored(q, CONTACT_CREATE_PHRASES) or
         anchors.anchored(q, CONTACT_STATUS_PHRASES) or
         anchors.anchored(q, NOTIFY_TEST_PHRASES) or
+        anchors.anchored(q, SCHEDULED_RUN_PHRASES) or
         q in ALL_SYNC_PHRASES
     )
 
@@ -98,6 +105,9 @@ def handle(query: str, ctx) -> str:
         Formatted result string
     """
     q = query.lower().strip()
+
+    if any(p in q for p in SCHEDULED_RUN_PHRASES):
+        return _run_scheduled_now()
 
     if any(p in q for p in NOTIFY_TEST_PHRASES):
         return _test_notify()
@@ -267,6 +277,81 @@ def _new_contact_marketing_note() -> str:
     return NEW_CONTACT_MARKETING_NOTE
 
 
+def _run_scheduled_now() -> str:
+    """Run the scheduled chain by hand, through the real handler.
+
+    Calls jobs.handlers.registrations_sync.handle, not a copy of it, so
+    what this proves is what the 06:15 cron will do — including the email.
+    Honours the current flags: with MODE=preview this is a dry run end to
+    end and writes nothing.
+    """
+    from jobs.handlers import registrations_sync as handler
+    from jobs.runner import JobFailed
+    from sync import scheduled
+
+    if not scheduled.scheduled_enabled():
+        return ("⏸️ **The scheduled sync is disarmed.**\n\n"
+                "`SCHEDULED_SYNC_ENABLED` is not `true`, so the 06:15 cron "
+                "logs \"disabled\" and exits — no CSuite call, no HubSpot "
+                "call, no email. That is the shipped default.\n\n"
+                "• Set `SCHEDULED_SYNC_ENABLED=true` to arm it.\n"
+                "• `SCHEDULED_SYNC_MODE` is currently **"
+                f"{scheduled.scheduled_mode()}** — only the exact word "
+                "`live` writes anything, and a live run ALSO needs "
+                "`REGISTRATIONS_SYNC_ENABLED=true`.")
+
+    mode = scheduled.scheduled_mode()
+    logger.info("running the scheduled sync chain by hand (mode=%s)", mode)
+    try:
+        out = handler.handle({"payload": {}})
+    except JobFailed as failed:
+        out = failed.result or {}
+        out.setdefault("stopped", str(failed))
+    except Exception as e:
+        logger.error("the scheduled chain could not be run: %s", e,
+                     exc_info=True)
+        return f"❌ Could not run the scheduled sync: {e}"
+
+    return _format_scheduled_results(out, by_hand=True)
+
+
+def _format_scheduled_results(out: dict, by_hand=False) -> str:
+    from clients import notify as notifier
+    from sync import scheduled
+
+    mode = out.get("mode") or scheduled.scheduled_mode()
+    stopped = out.get("stopped")
+    if stopped:
+        head = f"🛑 **Scheduled sync ({mode}) — STOPPED**"
+    elif mode == scheduled.MODE_LIVE:
+        head = "✅ **Scheduled sync (live) — DONE**"
+    else:
+        head = "🧪 **Scheduled sync (preview) — nothing was written**"
+
+    lines = [head, ""]
+    if by_hand:
+        lines += ["Run by hand through the real job handler, so this is "
+                  "exactly what 06:15 will do.", ""]
+    lines.append("```")
+    lines.extend(scheduled.summary_lines(out))
+    lines.append("```")
+
+    sent = ", ".join(out.get("notified") or []) or "nothing"
+    # From the constants, not a literal: a prefix spelled out here could
+    # drift from the one actually sent, and the reply would then tell Carl
+    # to filter for something that never arrives.
+    prefix = notifier.ALERT_PREFIX if stopped else notifier.OK_PREFIX
+    lines += ["", f"📣 One email sent via **{sent}** with the **{prefix}** "
+                  f"prefix. Exactly one goes out per enabled run — OK on "
+                  f"success, ALERT on a stop, never both and never "
+                  f"neither."]
+    if out.get("notify_failed"):
+        lines.append(f"⚠️ Delivery failed via "
+                     f"**{', '.join(out['notify_failed'])}** — the run is "
+                     f"unaffected, but nobody was told.")
+    return "\n".join(lines)
+
+
 def _notify_settings_table() -> str:
     """Which notifier variables are set, and what they resolve to.
 
@@ -325,8 +410,11 @@ def _test_notify() -> str:
     lines = [f"📣 **Test notification sent via: {sent}.**", "",
              f"Look for the subject **`{notifier.TEST_PREFIX} test "
              f"notification`**. Failure alerts use "
-             f"**`{notifier.ALERT_PREFIX}`** instead, so a filter on "
-             f"`subject:([Jidhr )` catches both.", ""]
+             f"**`{notifier.ALERT_PREFIX}`** and the daily heartbeat uses "
+             f"**`{notifier.OK_PREFIX}`**, so a filter on "
+             f"**`subject:Jidhr`** catches all three.", "",
+             "(Not `subject:([Jidhr )` — Gmail ignores the brackets, and "
+             "the unmatched one breaks the query.)", ""]
     if failed:
         lines += [f"⚠️ Failed: **{failed}** — see the logs for the reason. "
                   f"A failed notification can never fail a run, so this is "

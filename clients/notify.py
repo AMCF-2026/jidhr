@@ -41,11 +41,16 @@ TIMEOUT_SECONDS = 5
 # makes that certain rather than likely.
 ALERT_PREFIX = "[Jidhr ALERT]"
 TEST_PREFIX = "[Jidhr TEST]"
+# The daily heartbeat. A run that succeeded still sends one, because a
+# MISSING email is how anybody knows the schedule died — silence from a
+# cron job is indistinguishable from a cron job that never fired.
+OK_PREFIX = "[Jidhr OK]"
 
 # `kind` is reserved in notify()'s keyword arguments — it chooses the
 # prefix and is never printed as a context line.
 KIND_ALERT = "alert"
 KIND_TEST = "test"
+KIND_OK = "ok"
 
 # Submission port, STARTTLS. Gmail accepts 587 (explicit TLS) and 465
 # (implicit TLS), and they need DIFFERENT client calls: smtplib.SMTP then
@@ -135,10 +140,11 @@ def subject_line(subject, kind=KIND_ALERT) -> str:
     cannot produce "[Jidhr ALERT] [Jidhr ALERT] ...".
     """
     text = str(subject or "").strip()
-    for existing in (ALERT_PREFIX, TEST_PREFIX):
+    for existing in (ALERT_PREFIX, TEST_PREFIX, OK_PREFIX):
         while text.startswith(existing):
             text = text[len(existing):].strip()
-    prefix = TEST_PREFIX if kind == KIND_TEST else ALERT_PREFIX
+    prefix = {KIND_TEST: TEST_PREFIX, KIND_OK: OK_PREFIX}.get(
+        kind, ALERT_PREFIX)
     return f"{prefix} {text}".strip()
 
 
