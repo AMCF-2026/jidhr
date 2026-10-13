@@ -206,6 +206,28 @@ class Config:
         if e.strip()
     )
 
+    # Event dates that are a SIGN-UP LIST rather than an event: contacts
+    # are created for their registrants, and no marketing event or
+    # registration is ever written for them.
+    #
+    # 1153 is one. Read from CSuite 2026-10-12: event_name 'Newsletters',
+    # event_type_code 'marketing', 01/01-12/31/2026, no start_time, no
+    # location, no tickets, no fund. Its 14 profiles (13 after dedupe) are
+    # newsletter subscribers. HubSpot's "All Emails" segment is "Email is
+    # known", so a contact EXISTING is the newsletter sign-up — there is
+    # nothing to register them to.
+    #
+    # These ids stay in REGISTRATION_HELD_EVENT_IDS. Held means held for
+    # REGISTRATIONS: the registrations sync still refuses them, and only
+    # the contact-create path is allowed through. An id that is held and
+    # NOT listed here is refused by both.
+    CONTACTS_ONLY_EVENT_IDS = tuple(
+        e.strip()
+        for e in (os.environ.get('CONTACTS_ONLY_EVENT_IDS', '1153')
+                  or '').split(',')
+        if e.strip()
+    )
+
     # Whether "sync donations" may WRITE to HubSpot. Off.
     #
     # It writes five properties per matched contact, one of which is

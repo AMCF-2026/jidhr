@@ -464,15 +464,22 @@ def test_an_unknown_event_is_refused_by_name(monkeypatch):
     assert "9999" in reply
 
 
-def test_a_held_event_id_is_refused_by_name(monkeypatch):
+def test_a_held_event_that_is_not_contacts_only_is_refused_by_name(
+        monkeypatch):
+    """Held and not listed in CONTACTS_ONLY_EVENT_IDS is refused by BOTH
+    paths. 1430 stands in for a hold somebody adds later."""
+    monkeypatch.setattr("config.Config.REGISTRATION_HELD_EVENT_IDS",
+                        ("1430",))
+    monkeypatch.setattr("config.Config.CONTACTS_ONLY_EVENT_IDS", ("1153",))
     called = []
     monkeypatch.setattr(cc, "run", lambda **k: called.append(k) or {})
 
-    reply = sync_commands.handle("create contacts dry run event 1153", None)
+    reply = sync_commands.handle("create contacts dry run event 1430", None)
 
-    assert called == []
-    assert "1153" in reply
+    assert called == [], "nothing was read"
+    assert "1430" in reply
     assert reg.HELD_REASON in reply
+    assert "CONTACTS_ONLY_EVENT_IDS" in reply, "and it says how to allow it"
 
 
 # ---------------------------------------------------------------------------
@@ -702,3 +709,240 @@ def test_chat_recognises_both_commands():
                  "create contacts dry run event 1430", "contacts status",
                  "contacts status run 300"):
         assert sync_commands.can_handle(text), text
+
+
+# ---------------------------------------------------------------------------
+# Contacts-only events: a sign-up list, not an event
+# ---------------------------------------------------------------------------
+#
+# CSuite 1153, "Newsletter Marketing Campaign": event_name 'Newsletters',
+# event_type_code 'marketing', 01/01-12/31/2026, no start_time, no location,
+# no tickets, no fund. 14 profiles, 13 after dedupe. It is a sign-up list.
+#
+# HubSpot's "All Emails" segment is "Email is known", so a contact EXISTING
+# is the newsletter sign-up. There is nothing to register anybody to, and no
+# marketing event should be created for it.
+#
+# So 1153 stays in REGISTRATION_HELD_EVENT_IDS and is added to
+# CONTACTS_ONLY_EVENT_IDS: held means held for REGISTRATIONS.
+
+NEWSLETTER = "subscriber@example.invalid"
+
+
+def newsletter_doubles(contacts=None):
+    return (CSuite({"1153": [registrant(NEWSLETTER, 20754)]},
+                   profiles={20754: profile(first="Sub", last="Scriber")}),
+            HubSpot(contacts))
+
+
+def test_1153_is_both_held_and_contacts_only_by_default():
+    import config
+
+    assert "1153" in config.Config.REGISTRATION_HELD_EVENT_IDS
+    assert "1153" in config.Config.CONTACTS_ONLY_EVENT_IDS
+    assert "1153" in cc.contacts_only_event_ids()
+
+
+def test_a_contacts_only_event_resolves_for_creation():
+    """Allowed even though it is held — the hold is about registrations."""
+    assert cc.resolve_requested_event("1153") == "1153"
+    assert cc.resolve_requested_event(" 1153 ") == "1153"
+
+
+def test_a_contacts_only_event_is_still_refused_by_the_registrations_sync():
+    """Held means held for REGISTRATIONS. No marketing event, no
+    registration, whatever the contact path is allowed to do."""
+    with pytest.raises(reg.EventRefused) as refused:
+        reg.resolve_requested_event("1153")
+
+    assert "1153" in str(refused.value)
+    assert reg.HELD_REASON in str(refused.value)
+
+
+def test_the_registrations_sync_still_holds_1153_end_to_end(monkeypatch):
+    """Through run(), not just the resolver: its registrants are held back
+    and nothing is queued."""
+    from tests.test_registrations_preview import (CSuite as RegCSuite,
+                                                  HubSpot as RegHubSpot,
+                                                  registrant as reg_row)
+
+    monkeypatch.setattr(reg, "migration_applied", lambda: False)
+    monkeypatch.setattr(reg, "open_run", lambda applied: None)
+    monkeypatch.setattr(reg, "close_run", lambda *a, **k: None)
+
+    out = reg.run(csuite=RegCSuite({"1153": [reg_row(NEWSLETTER)]},
+                                   dates={"1153": "2026-12-31"}),
+                  hubspot=RegHubSpot({NEWSLETTER: ("701", True, [])}),
+                  event_ids=("1153",), now_ms=1760000000000)
+
+    assert out["would_register"] == 0
+    assert out["held"] == 1
+    assert out["held_events"] == ["1153"]
+    assert out["first_sends"] == [], "nothing is queued for registration"
+
+
+def test_a_contacts_only_event_is_planned_for_contact_creation():
+    csuite, hubspot = newsletter_doubles()
+
+    out = cc.run(csuite=csuite, hubspot=hubspot, event_ids=("1153",))
+
+    assert out["to_create"] == 1
+    assert out["contacts_only_events"] == ["1153"]
+    assert out["held_events"] == [], "not skipped as held"
+    assert out["events_read"] == 1
+
+
+def test_a_contacts_only_event_creates_contacts_and_registers_nobody(
+        monkeypatch):
+    arm(monkeypatch)
+    csuite, hubspot = newsletter_doubles()
+
+    out = cc.run(csuite=csuite, hubspot=hubspot, dry_run=False, limit=5,
+                 event_ids=("1153",))
+
+    assert out["created"] == 1
+    assert out["stopped"] is None
+    # The ONLY endpoint touched.
+    assert [e for _m, e, _b in hubspot.posted] == ["crm/v3/objects/contacts"]
+    for _method, endpoint, _body in hubspot.posted:
+        assert "marketing-events" not in endpoint
+        assert "attendance" not in endpoint
+
+
+def test_the_create_path_is_the_v571_one_unchanged(monkeypatch):
+    """Same pre-create read, same 409 handling, same four properties. A
+    contacts-only event is a SCOPE decision, not a second write path."""
+    arm(monkeypatch)
+    csuite, hubspot = newsletter_doubles()
+
+    cc.run(csuite=csuite, hubspot=hubspot, dry_run=False, limit=5,
+           event_ids=("1153",))
+
+    assert hubspot.reads >= 2, "planned, then re-read before creating"
+    _method, _endpoint, body = hubspot.posted[0]
+    assert set(body["properties"]) == {"email", "firstname", "lastname"}
+    assert set(body["properties"]) <= set(cc.ALLOWED_PROPERTIES)
+
+
+def test_a_409_on_a_contacts_only_event_is_still_read_as_existing(
+        monkeypatch):
+    arm(monkeypatch)
+    csuite = CSuite({"1153": [registrant(NEWSLETTER, 20754)]},
+                    profiles={20754: profile()})
+    hubspot = HubSpot(create=(
+        {"status": "error",
+         "message": "A contact with the email 'x@y.invalid' already exists. "
+                    "Existing ID: 555"}, 409))
+
+    out = cc.run(csuite=csuite, hubspot=hubspot, dry_run=False, limit=5,
+                 event_ids=("1153",))
+
+    assert out["existing"] == 1
+    assert out["failed"] == 0
+    assert out["events"][0]["existing"][0]["hubspot_contact_id"] == "555"
+
+
+@pytest.mark.parametrize("prop", [
+    "hs_marketable_status", "subscription_status", "hs_email_optout",
+    "newsletter_list", "hs_legal_basis",
+])
+def test_no_consent_property_reaches_a_contacts_only_body(prop):
+    """It is a NEWSLETTER list, which is exactly where somebody would be
+    tempted to set a subscription property. The refusal is the same one."""
+    with pytest.raises(cc.ContactCreateStopped):
+        cc.assert_safe_properties({"email": NEWSLETTER, prop: "true"})
+
+
+def test_a_contacts_only_run_sends_no_consent_property(monkeypatch):
+    """Checked on the property KEYS, not the whole body: a subscriber's own
+    address can perfectly well contain the word "subscribe"."""
+    arm(monkeypatch)
+    csuite, hubspot = newsletter_doubles()
+    cc.run(csuite=csuite, hubspot=hubspot, dry_run=False, limit=5,
+           event_ids=("1153",))
+
+    assert hubspot.posted
+    for _method, _endpoint, body in hubspot.posted:
+        keys = set(body["properties"])
+        assert keys <= set(cc.ALLOWED_PROPERTIES), keys
+        for key in keys:
+            for forbidden in cc.FORBIDDEN_PROPERTY_HINTS:
+                assert forbidden not in key.lower(), f"{key} / {forbidden}"
+
+
+def test_a_contacts_only_run_still_needs_a_limit(monkeypatch):
+    arm(monkeypatch)
+    csuite, hubspot = newsletter_doubles()
+
+    with pytest.raises(cc.LimitRequired):
+        cc.run(csuite=csuite, hubspot=hubspot, dry_run=False, limit=None,
+               event_ids=("1153",))
+
+    assert hubspot.posted == []
+
+
+def test_removing_an_id_from_contacts_only_puts_the_hold_back(monkeypatch):
+    """The release procedure in reverse, and with no code change."""
+    monkeypatch.setattr("config.Config.CONTACTS_ONLY_EVENT_IDS", ())
+    csuite, hubspot = newsletter_doubles()
+
+    out = cc.run(csuite=csuite, hubspot=hubspot, event_ids=("1153",))
+
+    assert out["to_create"] == 0
+    assert out["held_events"] == ["1153"]
+    assert csuite.asked == [], "and it is not even read"
+
+    with pytest.raises(reg.EventRefused):
+        cc.resolve_requested_event("1153")
+
+
+def test_the_dry_run_reports_already_to_create_and_duplicates():
+    """What the brief asks the dry run to say."""
+    csuite = CSuite({"1153": [registrant(NEWSLETTER, 20754),
+                              registrant("has.one@example.invalid", 20755),
+                              registrant(NEWSLETTER, 20754)]},
+                    profiles={20754: profile(), 20755: profile()})
+    hubspot = HubSpot(contacts={"has.one@example.invalid": "701"})
+
+    out = cc.run(csuite=csuite, hubspot=hubspot, event_ids=("1153",))
+
+    assert out["registrant_rows"] == 3
+    assert out["unique_emails"] == 2
+    assert out["duplicates_dropped"] == 1
+    assert out["already_contacts"] == 1
+    assert out["to_create"] == 1
+    assert out["already_contacts"] + out["to_create"] == out["unique_emails"]
+
+    reply = sync_commands._format_contact_results(out)
+    assert "**1** already have a HubSpot contact" in reply
+    assert "**1** registrant(s) have no HubSpot contact" in reply
+    assert "1 duplicate(s) dropped" in reply
+    assert "contacts-only" in reply and "`1153`" in reply
+
+
+# ---------------------------------------------------------------------------
+# Backlog: the dry run says where its own record is
+# ---------------------------------------------------------------------------
+
+def test_a_contact_dry_run_reports_its_run_log_id(monkeypatch):
+    """The registration dry run has always said this; the contact one was
+    the only report that did not."""
+    monkeypatch.setattr(cc, "open_run", lambda applied: 404)
+    csuite, hubspot = newsletter_doubles()
+
+    out = cc.run(csuite=csuite, hubspot=hubspot, event_ids=("1153",))
+
+    assert out["run_id"] == 404
+    assert out["run_logged"] is True
+
+    reply = sync_commands._format_contact_results(out)
+    assert "`hubsync.run_log` id 404" in reply
+    assert "masked addresses, never addresses" in reply
+
+
+def test_a_run_with_no_run_log_row_says_nothing_about_one():
+    csuite, hubspot = newsletter_doubles()
+    out = cc.run(csuite=csuite, hubspot=hubspot, event_ids=("1153",))
+
+    assert out["run_logged"] is False
+    assert "run_log" not in sync_commands._format_contact_results(out)
