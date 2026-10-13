@@ -1752,7 +1752,8 @@ class CSuiteClient:
     
     def create_task(self, name: str, employee_id: int, due_date: str = None,
                     description: str = None, linked_profile_id: int = None,
-                    task_type_id: int = None, **kwargs) -> dict:
+                    task_type_id: int = None, audit_meta: dict = None,
+                    **kwargs) -> dict:
         """Create a task in CSuite, optionally linked to a profile.
 
         Every field name here was VERIFIED on 2026-10-01 by creating sandbox
@@ -1821,7 +1822,21 @@ class CSuiteClient:
                     employee_id,
                     f" on profile {linked_profile_id}" if linked_profile_id
                     else " (unlinked)")
-        response = self._request("task/create", data)
+        # audit_meta goes to the AUDIT ROW only — _request merges it into the
+        # row's payload and sends `data` untouched. It is how a task records
+        # which HubSpot submission it was made for, so a returning donor's
+        # follow-up reads as handled; before this, the task row carried no
+        # submission id and that donor was offered again forever.
+        #
+        # Passed only when there is something to record — the same rule as
+        # create_individual_profile — so a narrower _request override (a
+        # proxy, a double) is not forced to know about an argument that
+        # never reaches CSuite, and every call without it is unchanged.
+        if audit_meta:
+            response = self._request("task/create", data,
+                                     audit_meta=audit_meta)
+        else:
+            response = self._request("task/create", data)
 
         # Read back, like the profile and fund creates. A task whose link went
         # missing looks exactly like a task that worked: `o` and `id` are two

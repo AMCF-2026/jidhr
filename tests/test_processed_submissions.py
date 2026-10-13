@@ -227,7 +227,15 @@ def test_the_query_asks_only_for_successful_live_creates(monkeypatch):
 
     assert "status = 'success'" in seen["sql"]
     assert "csuite_env = 'live'" in seen["sql"]
-    assert seen["params"] == (audit.PROFILE_CREATE_ENDPOINT, FORM)
+    # V5.79: a task create and a reconcile link count as handled too, so a
+    # returning donor's follow-up task is no longer invisible.
+    assert seen["params"] == (
+        FORM,
+        [audit.PROFILE_CREATE_ENDPOINT, audit.TASK_CREATE_ENDPOINT],
+        audit.LINK_TARGET_SYSTEM,
+        f"{audit.SUBMISSION_LINK_ENDPOINT}/%")
+    assert "ORDER BY id" in seen["sql"], \
+        "'first row wins' needs the rows oldest first"
 
 
 def test_a_missing_env_column_is_unavailable_not_empty(monkeypatch):

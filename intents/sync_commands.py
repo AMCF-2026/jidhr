@@ -63,6 +63,10 @@ NOTIFY_TEST_PHRASES = ['test notify', 'test notification',
 # reimplementation of it, so what it proves is what the cron will do.
 SCHEDULED_RUN_PHRASES = ['run scheduled sync now', 'run scheduled sync',
                          'run the scheduled sync']
+
+# Tying DAF submissions to follow-up work done before tasks carried a
+# submission id. Writes ONLY write_audit, never CSuite or HubSpot.
+DAF_RECONCILE_PHRASES = ['reconcile daf tasks', 'reconcile daf task']
 ALL_SYNC_PHRASES = ['sync all', 'sync everything', 'run all syncs']
 
 
@@ -88,6 +92,7 @@ def can_handle(query: str, **kwargs) -> bool:
         anchors.anchored(q, CONTACT_STATUS_PHRASES) or
         anchors.anchored(q, NOTIFY_TEST_PHRASES) or
         anchors.anchored(q, SCHEDULED_RUN_PHRASES) or
+        anchors.anchored(q, DAF_RECONCILE_PHRASES) or
         q in ALL_SYNC_PHRASES
     )
 
@@ -105,6 +110,9 @@ def handle(query: str, ctx) -> str:
         Formatted result string
     """
     q = query.lower().strip()
+
+    if any(p in q for p in DAF_RECONCILE_PHRASES):
+        return _reconcile_daf_tasks(q)
 
     if any(p in q for p in SCHEDULED_RUN_PHRASES):
         return _run_scheduled_now()
@@ -275,6 +283,110 @@ def _non_marketing_shown() -> int:
 def _new_contact_marketing_note() -> str:
     from sync.contact_create import NEW_CONTACT_MARKETING_NOTE
     return NEW_CONTACT_MARKETING_NOTE
+
+
+def _reconcile_daf_tasks(query_lower: str) -> str:
+    """Tie DAF submissions to work already done. Dry run when asked.
+
+    "reconcile daf tasks dry run" reads and proposes. "reconcile daf tasks"
+    records the links. Either way NOTHING goes to CSuite or HubSpot — the
+    live run writes write_audit rows only, and the links are what make a
+    handled returning donor stop being offered again.
+    """
+    from sync import daf_reconcile as dr
+
+    dry_run = "dry run" in query_lower
+    try:
+        out = dr.run(dry_run=dry_run)
+    except dr.ReconcileRefused as e:
+        return f"🛑 **Nothing was linked.**\n\n{e}"
+    except Exception as e:
+        logger.error("DAF reconcile failed: %s", e, exc_info=True)
+        return f"❌ DAF reconcile failed: {e}"
+
+    after = None
+    if not dry_run and out.get("written"):
+        # Read back, not added up: the acceptance is that the processed
+        # count rises by exactly the number linked, and that is a claim
+        # about what processed_submissions now SEES.
+        try:
+            from clients.audit import processed_submissions
+
+            seen = processed_submissions(out["form_id"])
+            after = sum(1 for sid in out.get("fetched_ids") or []
+                        if sid in seen)
+        except Exception as e:
+            logger.warning("could not re-read processed history: %s", e)
+    return _format_daf_reconcile(out, after)
+
+
+def _format_daf_reconcile(out: dict, after=None) -> str:
+    from sync import daf_reconcile as dr
+    from sync.contact_create import mask_email
+
+    dry_run = out.get("dry_run", True)
+    head = ("🧪 **Reconcile DAF tasks — PREVIEW** (nothing was written)"
+            if dry_run else "✅ **Reconcile DAF tasks — LINKED**")
+    links = out.get("links") or []
+    lines = [head, "",
+             f"📊 **{out.get('fetched', 0)}** newest DAF submissions read "
+             f"(page 1 only):",
+             f"• **{out.get('processed_before', 0)}** already handled",
+             f"• **{out.get('unprocessed', 0)}** not handled",
+             f"• **{len(links)}** of those tie to work already done"]
+
+    if links:
+        lines += ["", ("➡️ **Would link:**" if dry_run else "✍️ **Linked:**"),
+                  "", "| submission | submitted | reason | profile | task | "
+                      "via |", "|---|---|---|---|---|---|"]
+        for link in links:
+            lines.append(
+                f"| `{link['submission_id'][:8]}` | "
+                f"{_daf_date(link.get('submitted_at'))} | "
+                f"{link['reason']} | `{link.get('profile') or '—'}` | "
+                f"`{link.get('task') or '—'}` | "
+                f"{('`' + link['linked_from'][:8] + '`') if link.get('linked_from') else '—'} |")
+
+    unlinked = out.get("unlinked") or []
+    if unlinked:
+        from collections import Counter
+
+        lines += ["", f"📋 **{len(unlinked)} still unhandled** — NOT linked, "
+                      f"a person decides:"]
+        for why, n in Counter(u["why"].split(":")[0]
+                              for u in unlinked).most_common():
+            lines.append(f"• **{n}** — {why}")
+        lines += ["", "**The list for Munira** (newest first; masked):", "",
+                  "| submitted | address | why |", "|---|---|---|"]
+        for u in unlinked:
+            lines.append(f"| {_daf_date(u.get('submitted_at'))} | "
+                         f"`{mask_email(u.get('email'))}` | "
+                         f"{u['why'].split(':')[0]} |")
+        lines.append("")
+        lines.append("Not sent anywhere — copy it from here if it is wanted.")
+
+    lines += ["", f"📞 {out.get('csuite_reads', 0)} CSuite read(s), 1 HubSpot "
+                  f"read", "✍️ **0 CSuite writes, 0 HubSpot writes.**"]
+    if dry_run:
+        lines.append('Say *"reconcile daf tasks"* to record these links — '
+                     'write_audit only. Run '
+                     '`migrations/007_write_audit_jidhr_target.sql` first.')
+    else:
+        lines.append(f"📒 **{len(out.get('written') or [])}** link row(s) "
+                     f"written to `write_audit`, and nothing else.")
+        if after is not None:
+            before = out.get("processed_before", 0)
+            lines.append(f"Handled among the newest {out.get('fetched', 0)}: "
+                         f"**{before} → {after}** (read back from the "
+                         f"processed history, not added up).")
+    return "\n".join(lines)
+
+
+def _daf_date(value) -> str:
+    from intents.daf_workflow import _submitted_moment
+
+    moment = _submitted_moment(value)
+    return f"{moment:%Y-%m-%d}" if moment else "—"
 
 
 def _run_scheduled_now() -> str:

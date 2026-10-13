@@ -535,20 +535,57 @@ def record_write(target_system: str, http_method: str, endpoint: str,
 # this reads them back.
 
 PROFILE_CREATE_ENDPOINT = "profile/create/individual"
+TASK_CREATE_ENDPOINT = "task/create"
 
-# Only a create recorded as having gone to PRODUCTION counts as processed.
-# A sandbox create of the same submission must not hide a donor who still
+# A submission is HANDLED when any of three things carries its id:
+#
+#   profile/create/individual   a new donor's profile was made (since V5.50)
+#   task/create                 a follow-up task was made (since V5.79)
+#   submission/link/<reason>    a reconcile tied it to work done before
+#                               tasks carried the id (V5.79, local only)
+#
+# The task row is the one that matters for a RETURNING donor: that path
+# finds the existing profile, makes a task, and never creates a profile, so
+# until V5.79 nothing it wrote carried the submission id and the donor was
+# offered again forever (daf_workflow, the DuplicateProfile branch).
+HANDLED_CSUITE_ENDPOINTS = (PROFILE_CREATE_ENDPOINT, TASK_CREATE_ENDPOINT)
+
+# Link rows are local bookkeeping, not CSuite writes, so they are NOT
+# tagged target_system 'csuite'. sync/sandbox_writes reconciles a write
+# budget by counting write_audit rows per target_system, and a link row
+# counted there would read as "more writes audited than counted — the cap
+# did not hold". 'jidhr' needs migrations/007 to pass the CHECK.
+LINK_TARGET_SYSTEM = "jidhr"
+SUBMISSION_LINK_ENDPOINT = "submission/link"
+
+# Only work recorded as having gone to PRODUCTION counts as processed. A
+# sandbox create of the same submission must not hide a donor who still
 # needs a real profile.
+#
+# The profile reported is the DONOR's: linked_profile_id where the row
+# names one (a task, a link), else target_id (a profile create's own id).
+# Without that a task row would report the task's id as if it were a
+# profile.
+#
+# ORDER BY id, because "first row wins" below was written as if the rows
+# came back oldest first and nothing made them. With three kinds of row per
+# submission, which one names the profile has to be the earliest, not
+# whichever the planner returned first.
 _PROCESSED_SQL = """
     SELECT payload_meta->'ids'->>'hubspot_submission_id' AS submission_id,
-           target_id
+           COALESCE(payload_meta->'ids'->>'linked_profile_id', target_id)
+               AS target_id,
+           endpoint
       FROM write_audit
-     WHERE target_system = 'csuite'
-       AND endpoint = %s
-       AND status = 'success'
+     WHERE status = 'success'
        AND csuite_env = 'live'
        AND payload_meta->'ids'->>'hubspot_form_id' = %s
        AND payload_meta->'ids'->>'hubspot_submission_id' IS NOT NULL
+       AND (
+             (target_system = 'csuite' AND endpoint = ANY(%s))
+          OR (target_system = %s AND endpoint LIKE %s)
+       )
+     ORDER BY id
 """
 
 
@@ -563,9 +600,12 @@ class ProcessedHistoryUnavailable(RuntimeError):
     """
 
 
-def processed_submissions(form_id, endpoint: str = PROFILE_CREATE_ENDPOINT
-                          ) -> dict:
-    """{submission_id: profile_id} for successful LIVE creates on `form_id`.
+def processed_submissions(form_id,
+                          endpoints=HANDLED_CSUITE_ENDPOINTS) -> dict:
+    """{submission_id: profile_id} for every HANDLED submission on `form_id`.
+
+    Handled = a successful LIVE profile create, task create, or reconcile
+    link carrying the submission id. See HANDLED_CSUITE_ENDPOINTS.
 
     Raises ProcessedHistoryUnavailable when the question cannot be answered,
     including when write_audit has no csuite_env column — without it there is
@@ -595,8 +635,11 @@ def processed_submissions(form_id, endpoint: str = PROFILE_CREATE_ENDPOINT
             "tracking.")
 
     try:
-        rows = execute_query(_PROCESSED_SQL, (endpoint, str(form_id)),
-                             fetch=True)
+        rows = execute_query(
+            _PROCESSED_SQL,
+            (str(form_id), list(endpoints), LINK_TARGET_SYSTEM,
+             f"{SUBMISSION_LINK_ENDPOINT}/%"),
+            fetch=True)
     except Exception as e:
         raise ProcessedHistoryUnavailable(
             f"could not read the processing history for form {form_id}: "

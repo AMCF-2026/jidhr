@@ -295,6 +295,21 @@ def _processed_map(form_id):
                     f"({e}).")
 
 
+def is_newest_first(submissions) -> bool:
+    """Whether parsed submissions are ordered newest first.
+
+    The DAF flow treats index 0 as the newest and asks for a small page on
+    the assumption that new submissions are on it. This is the assumption,
+    made checkable. Equal timestamps are allowed; an unreadable one is
+    ignored rather than treated as a violation, so one bad row cannot raise
+    a false alarm about the whole page.
+    """
+    moments = [_submitted_moment((s or {}).get("submitted_at"))
+               for s in submissions or []]
+    known = [m for m in moments if m is not None]
+    return all(earlier >= later for earlier, later in zip(known, known[1:]))
+
+
 def _is_processed(parsed: dict, processed: dict) -> bool:
     """Has this submission got a successful live create on record?
 
@@ -389,6 +404,22 @@ def _initiate_workflow(query: str, state: dict, hubspot) -> str:
     # submission that had just been processed was offered again — and would
     # have been offered forever, until a newer submission displaced it.
     parsed_all = [_parse_submission(sub) for sub in submissions]
+
+    # NEWEST FIRST is assumed here and everywhere below: `parsed_all[0]` is
+    # called "the newest", and asking for limit=5 means "the five newest".
+    # HubSpot's form-integrations submissions endpoint returns newest first
+    # — measured 2026-10-14 across all 90 DAF submissions on both pages,
+    # 2026-10-08 down to 2025-10-14 with no reversal — so no paging is done
+    # and page 1 is where every NEW submission appears.
+    #
+    # If that ever flips, "the newest" becomes the oldest and this offers a
+    # months-old submission as new. It is checked rather than trusted: a
+    # violation is logged loudly. tests/test_daf_handled pins the order the
+    # code relies on against a fixture, so a test fails if it changes.
+    if not is_newest_first(parsed_all):
+        logger.error("DAF submissions did NOT come back newest first — the "
+                     "'newest' shown below may not be the newest. The code "
+                     "assumes newest-first ordering; see is_newest_first.")
     processed, history_warning = _processed_map(form_id)
 
     index = _next_unprocessed(parsed_all, processed)
@@ -1049,6 +1080,19 @@ def _create_followup_task(data, state, results, csuite, wf_type, type_label):
             description=subject,
             linked_profile_id=profile_id,
             task_type_id=Config.CSUITE_TASK_TYPE_ID,
+            # Recorded on the audit row, never sent to CSuite — the same
+            # pair create_individual_profile already carries. On the
+            # returning-donor path there IS no profile create, so before
+            # this the task was the only write and it carried no submission
+            # id: processed_submissions could not see it, and a handled
+            # donor was offered again forever. linked_profile_id is named
+            # explicitly so the processed map reports the donor's profile
+            # rather than the task's own id.
+            audit_meta={
+                "hubspot_form_id": state.get("form_id"),
+                "hubspot_submission_id": data.get("submission_id"),
+                "linked_profile_id": profile_id,
+            },
         )
     except Exception as e:
         # Never rolls back and never hides the profile. A reminder that was not
