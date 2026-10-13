@@ -1123,10 +1123,15 @@ def _notify_stop(out, reason):
     from clients.notify import safe_notify
 
     safe_notify(
-        "Jidhr: registrations sync stopped",
+        "registrations sync stopped",
         reason,
         path="sync registrations",
         run_log=out.get("run_id"),
+        events=", ".join(
+            e["event_date_id"] for e in (out.get("events") or [])
+            if e.get("registered") or e.get("failed") or e.get("unverified")
+        ) or ", ".join(e["event_date_id"]
+                       for e in (out.get("events") or [])) or "none",
         limit=out.get("limit"),
         would_register=out.get("would_register"),
         registered=out.get("registered"),

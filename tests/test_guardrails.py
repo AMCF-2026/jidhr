@@ -589,3 +589,235 @@ def test_no_scheduler_was_added():
          "-e", "add_job", "sync/", "jobs/", "clients/", "intents/"],
         capture_output=True, text=True)
     assert found.stdout.strip() == "", found.stdout
+
+
+# ---------------------------------------------------------------------------
+# The email channel: subjects that can be filtered, bodies that read plain
+# ---------------------------------------------------------------------------
+#
+# Carl's choice: email only for now, SMTP via a Workspace app password.
+# Slack stays supported and unset. The sender itself is stdlib smtplib and
+# shipped in V5.74; what this covers is the subject prefixes and the plain
+# text body.
+#
+# The prefix is applied in notify(), not at the call sites: a prefix a
+# caller has to remember is one some caller will forget, and the one it
+# forgets is the alert nobody's filter catches.
+
+
+def test_every_failure_subject_is_prefixed_as_an_alert():
+    assert notifier.subject_line("contact creation stopped") == \
+        "[Jidhr ALERT] contact creation stopped"
+    assert notifier.ALERT_PREFIX == "[Jidhr ALERT]"
+
+
+def test_the_test_command_subject_is_prefixed_as_a_test():
+    assert notifier.subject_line("test notification", notifier.KIND_TEST) == \
+        "[Jidhr TEST] test notification"
+    assert notifier.TEST_PREFIX == "[Jidhr TEST]"
+
+
+def test_both_prefixes_share_a_searchable_stem():
+    """One Gmail filter, subject:([Jidhr ), has to catch both."""
+    for prefix in (notifier.ALERT_PREFIX, notifier.TEST_PREFIX):
+        assert prefix.startswith("[Jidhr ")
+
+
+def test_prefixing_is_idempotent():
+    """A subject passed through twice must not double up."""
+    once = notifier.subject_line("stopped")
+    assert notifier.subject_line(once) == once
+    assert notifier.subject_line(once, notifier.KIND_TEST) == \
+        "[Jidhr TEST] stopped"
+
+
+def test_an_empty_subject_is_still_prefixed():
+    assert notifier.subject_line("") == "[Jidhr ALERT]"
+    assert notifier.subject_line(None) == "[Jidhr ALERT]"
+
+
+def _capture(monkeypatch):
+    """Capture the SMTP message a notification would send."""
+    monkeypatch.setenv("NOTIFY_EMAIL_TO", "carl@amuslimcf.org")
+    monkeypatch.setenv("NOTIFY_SMTP_HOST", "smtp.gmail.com")
+    monkeypatch.setenv("NOTIFY_SMTP_USER", "jidhr@amuslimcf.org")
+    monkeypatch.setenv("NOTIFY_SMTP_PASSWORD", "app-password")
+    monkeypatch.setenv("NOTIFY_EMAIL_FROM", "jidhr@amuslimcf.org")
+    sent = {}
+
+    class SMTP:
+        def __init__(self, host, port, timeout=None):
+            sent.update(host=host, port=port, timeout=timeout)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def starttls(self):
+            sent["starttls"] = True
+
+        def login(self, user, password):
+            sent["login"] = user
+
+        def send_message(self, message):
+            sent["message"] = message
+
+    monkeypatch.setattr("smtplib.SMTP", SMTP)
+    return sent
+
+
+def test_the_email_carries_the_prefixed_subject(monkeypatch):
+    sent = _capture(monkeypatch)
+
+    result = notifier.safe_notify("contact creation stopped",
+                                  "counts did not reconcile",
+                                  run_log=62, path="create contacts",
+                                  events="1430", to_create=5)
+
+    assert result["sent"] == ["email"]
+    assert sent["message"]["Subject"] == \
+        "[Jidhr ALERT] contact creation stopped"
+    assert sent["message"]["To"] == "carl@amuslimcf.org"
+    assert sent["message"]["From"] == "jidhr@amuslimcf.org"
+    assert sent["host"] == "smtp.gmail.com"
+    assert sent["port"] == 587, "STARTTLS submission, not 25"
+    assert sent["starttls"] is True
+    assert sent["timeout"] == notifier.TIMEOUT_SECONDS
+
+
+def test_the_email_body_is_plain_text_with_the_facts(monkeypatch):
+    sent = _capture(monkeypatch)
+
+    notifier.safe_notify("registrations sync stopped",
+                         "the write for event 1430 failed (HTTP 400)",
+                         run_log=77, path="sync registrations",
+                         events="1430", registered=3, failed=1,
+                         write_audit="201, 202")
+
+    message = sent["message"]
+    assert message.get_content_type() == "text/plain"
+    body = message.get_content()
+
+    # The reason, then the facts, one per line.
+    assert "the write for event 1430 failed (HTTP 400)" in body
+    for line in ("run_log: 77", "path: sync registrations", "events: 1430",
+                 "registered: 3", "failed: 1", "write_audit: 201, 202"):
+        assert line in body, line
+
+    # No markup: the Slack asterisks used to arrive as literal characters.
+    assert "*" not in body
+    assert "•" not in body
+
+
+def test_the_email_body_never_carries_an_address(monkeypatch):
+    sent = _capture(monkeypatch)
+
+    notifier.safe_notify("contact creation stopped",
+                         "donor@private.invalid could not be created",
+                         masked="d***@private.invalid", run_log=1)
+
+    body = sent["message"].get_content()
+    assert "donor@private.invalid" not in body
+    assert "<address redacted>" in body
+    assert "d***@private.invalid" in body, "the masked form survives"
+    assert sent["message"]["To"] == "carl@amuslimcf.org", \
+        "the recipient is not redacted out of the envelope"
+
+
+def test_slack_stays_supported_but_is_not_required(monkeypatch):
+    """Email only for now. Slack must not become mandatory."""
+    sent = _capture(monkeypatch)
+    monkeypatch.delenv("NOTIFY_SLACK_WEBHOOK_URL", raising=False)
+
+    result = notifier.safe_notify("stopped", "why", run_log=1)
+
+    assert result["sent"] == ["email"]
+    assert result["failed"] == []
+    assert "message" in sent
+
+
+def test_an_smtp_failure_still_cannot_fail_a_run(monkeypatch):
+    monkeypatch.setenv("NOTIFY_EMAIL_TO", "carl@amuslimcf.org")
+    monkeypatch.setenv("NOTIFY_SMTP_HOST", "smtp.gmail.com")
+
+    class SMTP:
+        def __init__(self, *a, **k):
+            raise OSError("connection refused")
+
+    monkeypatch.setattr("smtplib.SMTP", SMTP)
+
+    result = notifier.safe_notify("stopped", "why")
+
+    assert result["failed"] == ["email"]
+    assert result["sent"] == []
+
+
+def test_a_guard_sends_an_alert_subject_end_to_end(monkeypatch):
+    """The whole path: a refused batch produces a filterable email."""
+    sent = _capture(monkeypatch)
+    arm(monkeypatch)
+    monkeypatch.setattr(cc, "MAX_CREATE_BATCH", 1)
+    rows = [registrant(f"p{i}@example.invalid", 21000 + i) for i in range(3)]
+    csuite = CSuite({"1430": rows},
+                    profiles={21000 + i: profile() for i in range(3)})
+    hubspot = HubSpot()
+
+    out = cc.run(csuite=csuite, hubspot=hubspot, dry_run=False, limit=3,
+                 event_ids=("1430",))
+
+    assert hubspot.posted == []
+    assert out["stopped"]
+    subject = sent["message"]["Subject"]
+    assert subject.startswith("[Jidhr ALERT]")
+    body = sent["message"].get_content()
+    # The notification carries the guard's own reason; the chat report
+    # carries the longer "would create N" wording.
+    assert "would write 3, max 1" in body
+    assert "would create 3" in out["stopped"]
+    assert "path: create contacts" in body
+    assert "to_create: 3" in body
+
+
+def test_the_test_command_names_the_subject_to_look_for(monkeypatch):
+    monkeypatch.setattr(notifier, "configured", lambda: True)
+    monkeypatch.setattr(notifier, "safe_notify",
+                        lambda *a, **k: {"configured": True,
+                                         "sent": ["email"], "failed": []})
+
+    reply = sync_commands.handle("test notify", None)
+
+    assert "[Jidhr TEST] test notification" in reply
+    assert "[Jidhr ALERT]" in reply
+    assert "subject:([Jidhr )" in reply
+    assert "check spam" in reply
+
+
+def test_the_test_command_asks_for_the_test_kind(monkeypatch):
+    """It must not send an ALERT-prefixed test — that would train the eye
+    to ignore the prefix that matters."""
+    seen = {}
+    monkeypatch.setattr(notifier, "configured", lambda: True)
+    monkeypatch.setattr(notifier, "safe_notify",
+                        lambda subject, body, **k: seen.update(
+                            subject=subject, kind=k.get("kind"))
+                        or {"configured": True, "sent": ["email"],
+                            "failed": []})
+
+    sync_commands.handle("test notify", None)
+
+    assert seen["kind"] == notifier.KIND_TEST
+
+
+def test_no_call_site_prefixes_its_own_subject():
+    """The prefix belongs to notify(). A call site that adds its own would
+    survive the idempotency guard but duplicate the intent."""
+    import pathlib
+
+    for path in ("sync/contact_create.py", "sync/registrations.py",
+                 "sync/registration_jobs.py", "sync/contact_jobs.py",
+                 "intents/sync_commands.py"):
+        source = pathlib.Path(path).read_text()
+        for literal in ('"[Jidhr ALERT]', "'[Jidhr ALERT]"):
+            assert literal not in source, f"{path} hardcodes a prefix"

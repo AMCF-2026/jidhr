@@ -250,7 +250,7 @@ def _notify_died(run_id, detail):
     from clients.notify import safe_notify
 
     safe_notify(
-        "Jidhr: registrations apply DIED",
+        "registrations apply DIED",
         f"The background thread raised and the run was closed as failed: "
         f"{detail}",
         path="sync registrations apply",

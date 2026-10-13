@@ -287,23 +287,29 @@ def _test_notify() -> str:
                 "just cannot tell you.")
 
     result = notifier.safe_notify(
-        "Jidhr: test notification",
-        "This is a test, sent from the Jidhr chat. Nothing is wrong, and "
+        "test notification",
+        "This is a test, sent from the Jidhr chat. Nothing is wrong and "
         "nothing was written. If you can read this, a stopped sync can "
         "reach you.",
+        kind=notifier.KIND_TEST,
         path="test notify",
         run_log="n/a",
     )
     sent = ", ".join(result.get("sent") or []) or "nothing"
     failed = ", ".join(result.get("failed") or [])
-    lines = [f"📣 **Test notification sent via: {sent}.**", ""]
+    lines = [f"📣 **Test notification sent via: {sent}.**", "",
+             f"Look for the subject **`{notifier.TEST_PREFIX} test "
+             f"notification`**. Failure alerts use "
+             f"**`{notifier.ALERT_PREFIX}`** instead, so a filter on "
+             f"`subject:([Jidhr )` catches both.", ""]
     if failed:
         lines += [f"⚠️ Failed: **{failed}** — see the logs for the reason. "
                   f"A failed notification can never fail a run, so this is "
                   f"the only place it shows."]
     if result.get("sent"):
-        lines.append("If it did not arrive, the webhook or address is "
-                     "wrong — the send itself reported success.")
+        lines.append("If it did NOT arrive, check spam and then the "
+                     "address or webhook — the send itself reported "
+                     "success, which is all the code can ever know.")
     return "\n".join(lines)
 
 

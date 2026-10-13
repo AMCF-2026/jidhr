@@ -183,7 +183,7 @@ def _notify_died(run_id, detail):
     from clients.notify import safe_notify
 
     safe_notify(
-        "Jidhr: contact creation DIED",
+        "contact creation DIED",
         f"The background thread raised and the run was closed as failed: "
         f"{detail}",
         path="create contacts apply",

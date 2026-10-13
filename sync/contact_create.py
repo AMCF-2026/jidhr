@@ -672,7 +672,7 @@ def _apply(out, hubspot, events, limit):
 def _notify_stop(out, reason):
     """Tell a human a contact-create run stopped. Counts only."""
     safe_notify(
-        "Jidhr: contact creation stopped",
+        "contact creation stopped",
         reason,
         path="create contacts",
         run_log=out.get("run_id"),
