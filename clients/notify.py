@@ -31,6 +31,22 @@ logger = logging.getLogger(__name__)
 # not improved by waiting 30 seconds to say so.
 TIMEOUT_SECONDS = 5
 
+# Every subject starts with one of these, so the mail can be filtered and
+# searched. Applied HERE rather than at the call sites: a prefix a caller
+# has to remember is a prefix one caller will forget, and the one it
+# forgets is the alert nobody's filter catches.
+#
+# Suggested Gmail filter: subject:([Jidhr ) -> never send to spam, label
+# "Jidhr". Same-domain authenticated mail should inbox anyway, but a filter
+# makes that certain rather than likely.
+ALERT_PREFIX = "[Jidhr ALERT]"
+TEST_PREFIX = "[Jidhr TEST]"
+
+# `kind` is reserved in notify()'s keyword arguments — it chooses the
+# prefix and is never printed as a context line.
+KIND_ALERT = "alert"
+KIND_TEST = "test"
+
 # Belt over the callers' braces: they pass masked addresses, and anything
 # that gets through here is redacted rather than sent.
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
@@ -58,14 +74,34 @@ def configured() -> bool:
     return bool(slack or email)
 
 
-def notify(subject, body, **context) -> dict:
+def subject_line(subject, kind=KIND_ALERT) -> str:
+    """The subject, prefixed exactly once.
+
+    Idempotent: a subject that already carries a prefix is re-prefixed
+    rather than double-prefixed, so a caller passing one through twice
+    cannot produce "[Jidhr ALERT] [Jidhr ALERT] ...".
+    """
+    text = str(subject or "").strip()
+    for existing in (ALERT_PREFIX, TEST_PREFIX):
+        while text.startswith(existing):
+            text = text[len(existing):].strip()
+    prefix = TEST_PREFIX if kind == KIND_TEST else ALERT_PREFIX
+    return f"{prefix} {text}".strip()
+
+
+def notify(subject, body, kind=KIND_ALERT, **context) -> dict:
     """Tell a human. Returns what happened; never raises.
 
-    `context` is appended as `key: value` lines — run_log id, path, event,
-    counts. Keep it to ids, counts and masked addresses.
+    `body` is the reason, in plain words. `context` becomes `key: value`
+    lines — run_log id, path, event, counts. Keep it to ids, counts and
+    MASKED addresses; anything that looks like an address is redacted
+    before it is sent.
+
+    `kind` picks the subject prefix and is never printed as a line.
     """
     global _warned_unconfigured
 
+    subject = subject_line(subject, kind)
     slack, email = _targets()
     result = {"configured": bool(slack or email), "sent": [], "failed": []}
 
@@ -94,16 +130,21 @@ def notify(subject, body, **context) -> dict:
 
 
 def _format(subject, body, context) -> str:
-    lines = [f"*{subject}*", "", str(body or "").strip()]
+    """Plain text. No markup.
+
+    Read in a mail client, so there is nothing to render it: the Slack
+    `*bold*` this used to emit arrived as literal asterisks in email, and
+    Slack reads perfectly well without them.
+    """
+    lines = [subject, "", str(body or "").strip()]
     if context:
         lines.append("")
         for key in sorted(context):
             value = context[key]
             if value is None or value == [] or value == {}:
                 continue
-            lines.append(f"• {key}: {value}")
-    lines.append("")
-    lines.append("— Jidhr")
+            lines.append(f"{key}: {value}")
+    lines += ["", "— Jidhr"]
     return "\n".join(lines)
 
 
@@ -164,14 +205,14 @@ def _send_email(to_address, subject, text) -> bool:
         return False
 
 
-def safe_notify(subject, body, **context) -> dict:
+def safe_notify(subject, body, kind=KIND_ALERT, **context) -> dict:
     """notify(), with even a programming error in here caught.
 
     Guards call THIS. notify() already swallows transport failures; this
     swallows the rest, so no call site has to wrap it.
     """
     try:
-        return notify(subject, body, **context)
+        return notify(subject, body, kind=kind, **context)
     except Exception as e:
         logger.error("notify() itself failed: %s: %s", type(e).__name__, e)
         return {"configured": False, "sent": [], "failed": ["notify"]}
