@@ -267,6 +267,30 @@ def _new_contact_marketing_note() -> str:
     return NEW_CONTACT_MARKETING_NOTE
 
 
+def _notify_settings_table() -> str:
+    """Which notifier variables are set, and what they resolve to.
+
+    Printed by "test notify" so the variable NAMES never have to be read
+    out of the source, and so a test email that does not arrive can be
+    diagnosed from chat. The password is reported as set or unset and is
+    never shown.
+    """
+    from clients import notify as notifier
+
+    lines = ["**Notifier settings** (the password is never shown):", "",
+             "| variable | value |", "|---|---|"]
+    for name, _is_set, shown in notifier.settings():
+        lines.append(f"| `{name}` | {shown} |")
+    port = notifier.smtp_port()
+    mode = ("implicit TLS (`SMTP_SSL`)" if port in notifier.IMPLICIT_TLS_PORTS
+            else "STARTTLS (`SMTP` then `starttls`)")
+    lines.append("")
+    lines.append(f"Port **{port}** uses {mode}. Both 587 and 465 work; they "
+                 f"need different client calls, which is chosen by the port "
+                 f"rather than assumed.")
+    return "\n".join(lines)
+
+
 def _test_notify() -> str:
     """Send one notification, and say exactly what happened.
 
@@ -280,9 +304,10 @@ def _test_notify() -> str:
                 "Neither `NOTIFY_SLACK_WEBHOOK_URL` nor `NOTIFY_EMAIL_TO` "
                 "is set, so a stopped run would be recorded in "
                 "`hubsync.run_log` and told to nobody.\n\n"
-                "• Set `NOTIFY_SLACK_WEBHOOK_URL` for Slack.\n"
-                "• Or `NOTIFY_EMAIL_TO` **and** `NOTIFY_SMTP_HOST` for "
-                "email.\n\n"
+                "• For email: `NOTIFY_EMAIL_TO` **and** "
+                "`NOTIFY_SMTP_HOST`.\n"
+                "• For Slack: `NOTIFY_SLACK_WEBHOOK_URL`.\n\n"
+                + _notify_settings_table() + "\n\n"
                 "Guards still refuse and still stop runs without it — they "
                 "just cannot tell you.")
 
@@ -307,9 +332,11 @@ def _test_notify() -> str:
                   f"A failed notification can never fail a run, so this is "
                   f"the only place it shows."]
     if result.get("sent"):
-        lines.append("If it did NOT arrive, check spam and then the "
-                     "address or webhook — the send itself reported "
-                     "success, which is all the code can ever know.")
+        lines.append("If it did NOT arrive, check spam first, then the "
+                     "settings below — the send itself reported success, "
+                     "which is all the code can ever know.")
+    lines.append("")
+    lines.append(_notify_settings_table())
     return "\n".join(lines)
 
 

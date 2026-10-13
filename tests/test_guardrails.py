@@ -821,3 +821,174 @@ def test_no_call_site_prefixes_its_own_subject():
         source = pathlib.Path(path).read_text()
         for literal in ('"[Jidhr ALERT]', "'[Jidhr ALERT]"):
             assert literal not in source, f"{path} hardcodes a prefix"
+
+
+# ---------------------------------------------------------------------------
+# The SMTP port, and settings a human can read
+# ---------------------------------------------------------------------------
+#
+# Syntax asked whether NOTIFY_SMTP_HOST and NOTIFY_SMTP_PORT were the real
+# names. They are — clients/notify.py reads them at lines 181 and 193 — and
+# these tests pin them so the answer cannot drift.
+#
+# Reading that code turned up a trap: smtplib.SMTP + starttls() is correct
+# for 587 and WRONG for 465, which needs SMTP_SSL. The pairing failure does
+# not raise anything readable, and this module swallows its own errors by
+# design, so the symptom would have been an email that never arrived with
+# no clue why.
+
+
+def test_the_env_var_names_are_what_was_documented(monkeypatch):
+    """Pinned, because they were handed to someone to type into Railway."""
+    import pathlib
+
+    source = pathlib.Path("clients/notify.py").read_text()
+    for name in ("NOTIFY_EMAIL_TO", "NOTIFY_SMTP_HOST", "NOTIFY_SMTP_PORT",
+                 "NOTIFY_SMTP_USER", "NOTIFY_SMTP_PASSWORD",
+                 "NOTIFY_EMAIL_FROM", "NOTIFY_SLACK_WEBHOOK_URL"):
+        assert f'"{name}"' in source, name
+
+    reported = [name for name, _set, _shown in notifier.settings()]
+    assert reported == ["NOTIFY_EMAIL_TO", "NOTIFY_SMTP_HOST",
+                        "NOTIFY_SMTP_PORT", "NOTIFY_SMTP_USER",
+                        "NOTIFY_SMTP_PASSWORD", "NOTIFY_EMAIL_FROM",
+                        "NOTIFY_SLACK_WEBHOOK_URL"]
+
+
+def test_the_port_defaults_to_587(monkeypatch):
+    monkeypatch.delenv("NOTIFY_SMTP_PORT", raising=False)
+    assert notifier.smtp_port() == 587
+    assert notifier.DEFAULT_SMTP_PORT == 587
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "nope", "0", "-1"])
+def test_an_unusable_port_falls_back_rather_than_raising(monkeypatch, raw):
+    """The caller is an error path. Failing to report a failure is worse
+    than reporting it over the default port."""
+    monkeypatch.setenv("NOTIFY_SMTP_PORT", raw)
+    assert notifier.smtp_port() == 587
+
+
+def test_587_uses_starttls(monkeypatch):
+    monkeypatch.setenv("NOTIFY_EMAIL_TO", "carl@amuslimcf.org")
+    monkeypatch.setenv("NOTIFY_SMTP_HOST", "smtp.gmail.com")
+    monkeypatch.setenv("NOTIFY_SMTP_PORT", "587")
+    calls = []
+
+    class SMTP:
+        def __init__(self, host, port, timeout=None):
+            calls.append(("SMTP", host, port))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def starttls(self):
+            calls.append(("starttls",))
+
+        def login(self, u, p):
+            pass
+
+        def send_message(self, m):
+            calls.append(("sent",))
+
+    monkeypatch.setattr("smtplib.SMTP", SMTP)
+
+    assert notifier.safe_notify("s", "b")["sent"] == ["email"]
+    assert calls[0] == ("SMTP", "smtp.gmail.com", 587)
+    assert ("starttls",) in calls
+
+
+def test_465_uses_implicit_tls_and_never_calls_starttls(monkeypatch):
+    """The trap: SMTP + starttls on 465 hangs, and the swallowed error
+    would have made it undiagnosable."""
+    monkeypatch.setenv("NOTIFY_EMAIL_TO", "carl@amuslimcf.org")
+    monkeypatch.setenv("NOTIFY_SMTP_HOST", "smtp.gmail.com")
+    monkeypatch.setenv("NOTIFY_SMTP_PORT", "465")
+    calls = []
+
+    class SMTPSSL:
+        def __init__(self, host, port, timeout=None):
+            calls.append(("SMTP_SSL", host, port))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def starttls(self):
+            raise AssertionError("starttls must not be called on 465")
+
+        def login(self, u, p):
+            pass
+
+        def send_message(self, m):
+            calls.append(("sent",))
+
+    class SMTP:
+        def __init__(self, *a, **k):
+            raise AssertionError("465 must not use plain SMTP")
+
+    monkeypatch.setattr("smtplib.SMTP_SSL", SMTPSSL)
+    monkeypatch.setattr("smtplib.SMTP", SMTP)
+
+    assert notifier.safe_notify("s", "b")["sent"] == ["email"]
+    assert calls[0] == ("SMTP_SSL", "smtp.gmail.com", 465)
+    assert ("sent",) in calls
+
+
+def test_465_is_the_only_implicit_tls_port():
+    assert notifier.IMPLICIT_TLS_PORTS == (465,)
+    assert notifier.DEFAULT_SMTP_PORT not in notifier.IMPLICIT_TLS_PORTS
+
+
+def test_the_settings_report_never_shows_the_password(monkeypatch):
+    monkeypatch.setenv("NOTIFY_SMTP_PASSWORD", "abcd efgh ijkl mnop")
+    monkeypatch.setenv("NOTIFY_SLACK_WEBHOOK_URL", "https://hooks/secret")
+
+    report = dict((name, shown) for name, _set, shown
+                  in notifier.settings())
+
+    assert report["NOTIFY_SMTP_PASSWORD"] == "set (not shown)"
+    assert "abcd" not in str(report)
+    assert "secret" not in str(report)
+
+
+def test_the_settings_report_shows_non_secret_values(monkeypatch):
+    monkeypatch.setenv("NOTIFY_EMAIL_TO", "carl@amuslimcf.org")
+    monkeypatch.setenv("NOTIFY_SMTP_HOST", "smtp.gmail.com")
+
+    report = dict((name, shown) for name, _set, shown
+                  in notifier.settings())
+
+    assert report["NOTIFY_EMAIL_TO"] == "carl@amuslimcf.org"
+    assert report["NOTIFY_SMTP_HOST"] == "smtp.gmail.com"
+
+
+def test_test_notify_prints_the_settings_either_way(monkeypatch):
+    off = sync_commands.handle("test notify", None)
+    assert "NOTIFY_SMTP_HOST" in off
+    assert "defaults to 587" in off
+    assert "STARTTLS" in off
+
+    monkeypatch.setattr(notifier, "configured", lambda: True)
+    monkeypatch.setattr(notifier, "safe_notify",
+                        lambda *a, **k: {"configured": True,
+                                         "sent": ["email"], "failed": []})
+    on = sync_commands.handle("test notify", None)
+    assert "NOTIFY_SMTP_HOST" in on
+    assert "check spam first" in on
+
+
+def test_the_settings_table_names_the_tls_mode_for_the_configured_port(
+        monkeypatch):
+    monkeypatch.setenv("NOTIFY_SMTP_PORT", "465")
+    reply = sync_commands.handle("test notify", None)
+    assert "Port **465** uses implicit TLS" in reply
+
+    monkeypatch.setenv("NOTIFY_SMTP_PORT", "587")
+    reply = sync_commands.handle("test notify", None)
+    assert "Port **587** uses STARTTLS" in reply
