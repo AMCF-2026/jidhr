@@ -110,11 +110,14 @@ def get_pool():
         if not dsn:
             raise RuntimeError(_MISSING_DATABASE_URL_MESSAGE)
 
+        maxconn = _max_connections()
         try:
-            _pool = ThreadedConnectionPool(minconn=1, maxconn=2, dsn=dsn)
+            _pool = ThreadedConnectionPool(minconn=1, maxconn=maxconn,
+                                           dsn=dsn)
             logger.info(
-                "Database pool initialized (minconn=1, maxconn=2) via the %s "
-                "URL", "private" if dsn == os.environ.get('DATABASE_URL')
+                "Database pool initialized (minconn=1, maxconn=%s) via the "
+                "%s URL", maxconn,
+                "private" if dsn == os.environ.get('DATABASE_URL')
                 else "public proxy")
         except psycopg2.Error as e:
             logger.error(f"Failed to initialize database pool: {e}")
@@ -126,6 +129,48 @@ def get_pool():
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+# One more connection than the worker has request threads.
+#
+# maxconn was 2 while gunicorn ran --threads 4 (railway.toml), so a worker
+# handling three concurrent DB-touching requests raised PoolError:
+# "connection pool exhausted". That mismatch predates the background
+# applies and got worse with them, because an apply thread takes a
+# connection for each of its own queries inside the same worker — and a
+# registrations apply runs for minutes.
+#
+# RAISING THE POOL, not cutting the threads. Cutting --threads to 2 would
+# halve each worker's concurrency to fix a sizing mistake, and the threads
+# are what let one worker serve a chat request while an apply runs in it.
+# Postgres connections are the cheaper side of this trade: 8 workers x 5 is
+# 40 at worst, against Railway Postgres's default max_connections of 100,
+# and the pool opens them lazily from minconn=1.
+#
+# +1 covers the background apply thread, which is not one of the request
+# threads and needs a connection of its own.
+DEFAULT_GUNICORN_THREADS = 4
+
+
+def _max_connections() -> int:
+    """threads + 1, from DB_MAX_CONNECTIONS or GUNICORN_THREADS."""
+    for name in ("DB_MAX_CONNECTIONS",):
+        raw = (os.environ.get(name) or "").strip()
+        if raw:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return value
+    raw = (os.environ.get("GUNICORN_THREADS") or "").strip()
+    try:
+        threads = int(raw)
+    except (TypeError, ValueError):
+        threads = DEFAULT_GUNICORN_THREADS
+    if threads <= 0:
+        threads = DEFAULT_GUNICORN_THREADS
+    return threads + 1
+
 
 @contextmanager
 def get_connection():

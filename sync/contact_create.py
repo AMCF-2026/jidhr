@@ -44,11 +44,28 @@ Both paths record the id they found and move on.
 """
 
 import logging
+import os
 import re
 
+from clients.notify import safe_notify
 from sync import registrations as reg
 
 logger = logging.getLogger(__name__)
+
+
+def _int_from_env(name, default) -> int:
+    """A positive int from the environment, or the default.
+
+    Anything unparseable or <= 0 falls back rather than disabling the
+    guard: a guard switched off by a typo is worse than no guard, because
+    it looks present.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
 
 CONTACT_PATH = "crm/v3/objects/contacts"
 
@@ -180,6 +197,27 @@ def assert_safe_properties(props):
                     f"{key!r} looks like a consent or audience property "
                     f"({hint!r}). Newsletter and marketing status are a "
                     f"separate decision. Nothing was sent.")
+
+
+def contacts_only_categories() -> tuple:
+    """CSuite `event_name` values that mean "sign-up list", lowercased."""
+    import config
+
+    return tuple(
+        str(c).strip().lower() for c
+        in getattr(config.Config, "CONTACTS_ONLY_EVENT_CATEGORIES", ())
+        if str(c).strip())
+
+
+def is_contacts_only_row(event_row) -> bool:
+    """Whether this event date's CATEGORY makes it a sign-up list.
+
+    Reads CSuite's `event_name` — the parent series, which takes three
+    values across all 179 dates — not `event_description`, which is the
+    individual event's title.
+    """
+    category = str((event_row or {}).get("event_name") or "").strip().lower()
+    return bool(category) and category in contacts_only_categories()
 
 
 def contacts_only_event_ids() -> tuple:
@@ -362,6 +400,15 @@ def outcome_rows(out) -> list:
 # How many non-marketing contacts the report NAMES before summarising.
 NON_MARKETING_SHOWN = 25
 
+# The most contacts one run may create, whatever limit was typed.
+#
+# The typed limit is a human saying "this many"; this is the code saying
+# "no more than this without someone changing a setting". They guard
+# different mistakes: the limit guards a slip of the fingers, this guards a
+# CSuite read that comes back with far more registrants than an event has
+# ever had. 17 was the largest real backlog.
+MAX_CREATE_BATCH = _int_from_env("MAX_CREATE_BATCH", 25)
+
 # New contacts take whatever the portal's per-app setting says. This is a
 # STATIC note: there is no API for that setting, so the code cannot read it
 # and must not claim to have.
@@ -475,7 +522,7 @@ def plan(csuite, hubspot, event_ids, out) -> list:
         if key in contacts_only:
             out["contacts_only_events"].append(key)
 
-        rows, error, _event_row = reg.read_registrants(csuite, key)
+        rows, error, event_row = reg.read_registrants(csuite, key)
         out["csuite_calls"] += 1
         if error:
             events.append({"event_date_id": key, "is_held": False,
@@ -484,6 +531,13 @@ def plan(csuite, hubspot, event_ids, out) -> list:
                            "review": f"the registrant read failed: {error}"})
             continue
         out["events_read"] += 1
+        # By CATEGORY as well as by id, so a sign-up list created next
+        # month is handled without anyone editing a list. The id list is
+        # still consulted first, above, because it can name one this
+        # would miss.
+        if key not in contacts_only and is_contacts_only_row(event_row):
+            out["contacts_only_events"].append(key)
+            out["contacts_only_by_category"].append(key)
 
         deduped, dropped, excluded = reg.classify_rows(rows or [])
         out["registrant_rows"] += len(rows or [])
@@ -615,6 +669,28 @@ def _apply(out, hubspot, events, limit):
     return out
 
 
+def _notify_stop(out, reason):
+    """Tell a human a contact-create run stopped. Counts only."""
+    safe_notify(
+        "Jidhr: contact creation stopped",
+        reason,
+        path="create contacts",
+        run_log=out.get("run_id"),
+        events=", ".join(e["event_date_id"] for e in (out.get("events") or [])
+                         if e.get("to_create")) or "none",
+        rows=out.get("registrant_rows"),
+        unique=out.get("unique_emails"),
+        already_a_contact=out.get("already_contacts"),
+        to_create=out.get("to_create"),
+        created=out.get("created"),
+        existing=out.get("existing"),
+        failed=out.get("failed"),
+        limit=out.get("limit"),
+        write_audit=", ".join(str(i) for i in
+                              (out.get("write_audit_ids") or [])) or "none",
+    )
+
+
 def run(csuite=None, hubspot=None, dry_run: bool = True, limit=None,
         event_ids=None, run_id=None) -> dict:
     """Preview, or create, HubSpot contacts for withheld registrants.
@@ -650,7 +726,8 @@ def run(csuite=None, hubspot=None, dry_run: bool = True, limit=None,
            "writes_attempted": 0, "write_audit_ids": [], "stopped": None,
            "with_name": 0, "with_company": 0, "already_contacts": 0,
            "registrant_rows": 0, "unique_emails": 0, "duplicates_dropped": 0,
-           "contacts_only_events": [], "excluded": 0, "excluded_reasons": {},
+           "contacts_only_events": [], "contacts_only_by_category": [],
+           "excluded": 0, "excluded_reasons": {},
            "marketing": 0, "non_marketing": 0, "marketing_unknown": 0,
            "non_marketing_rows": [], "reconciles": True,
            "reconcile_problems": []}
@@ -693,10 +770,36 @@ def _run_body(out, csuite, hubspot, event_ids, dry_run, limit) -> dict:
     if dry_run:
         return out
 
+    # CHANGE 2: the reconcile check GATES the write now. It used to be
+    # computed here and then ignored — the report warned and _apply ran
+    # anyway. Numbers that do not add up mean the plan is not understood,
+    # and a plan that is not understood is not one to write from.
+    if not out["reconciles"]:
+        out["stopped"] = (
+            "the planned counts do not reconcile, so NOTHING was created: "
+            + "; ".join(out["reconcile_problems"])
+            + ". This is a bug in the count, not a reason to apply anyway.")
+        _notify_stop(out, "counts did not reconcile")
+        return out
+
+    # CHANGE 3: a cap the typed limit cannot raise.
+    cap = MAX_CREATE_BATCH
+    planned = min(out["to_create"], limit) if limit else out["to_create"]
+    if planned > cap:
+        out["stopped"] = (
+            f"this run would create {planned} contact(s), more than the "
+            f"maximum of {cap}. NOTHING was created. Raise MAX_CREATE_BATCH "
+            f"deliberately, or run it in smaller batches with a lower "
+            f"limit.")
+        _notify_stop(out, f"batch too large: would write {planned}, "
+                          f"max {cap}")
+        return out
+
     try:
         _apply(out, hubspot, events, limit)
     except ContactCreateStopped as stop:
         out["stopped"] = str(stop)
+        _notify_stop(out, str(stop))
     # Tallied after the writes: the counts above are the PLAN.
     out["failed"] = sum(len(e.get("failed") or []) for e in events)
     return out

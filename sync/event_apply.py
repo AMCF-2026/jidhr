@@ -179,6 +179,24 @@ def load_map() -> dict:
     return {str(r["csuite_eventdate_id"]): r for r in rows}
 
 
+def contacts_only_reason(row) -> str:
+    """Why this event date is a sign-up list, or ''.
+
+    Delegates to sync.contact_create so the category rule lives in ONE
+    place: a second copy here is the drift that cost hotfix-52 and -53.
+    """
+    from sync.contact_create import is_contacts_only_row
+
+    if not is_contacts_only_row(row):
+        return ""
+    return (f"CSuite event_name is "
+            f"{str((row or {}).get('event_name') or '').strip()!r}, which "
+            f"CONTACTS_ONLY_EVENT_CATEGORIES marks as a SIGN-UP LIST, not "
+            f"an event. No marketing event is created for it; its "
+            f"registrants get HubSpot contacts through \"create "
+            f"contacts\" and are never registered.")
+
+
 def plan(rows, existing_map, hubspot_events, organizer):
     """Decide what each event date needs. No writes, no HubSpot calls."""
     creates, updates, unchanged, skipped, review = [], [], [], [], []
@@ -190,6 +208,16 @@ def plan(rows, existing_map, hubspot_events, organizer):
             continue
         if not mapped.syncable:
             skipped.append((mapped, mapped.review_reason))
+            continue
+
+        # A sign-up list is not an event. Withheld by CATEGORY rather than
+        # by id, because this planner discovers its own scope from
+        # event/list/dates and would otherwise CREATE a marketing event for
+        # a Newsletters date created next month — which is how
+        # csuite-1153's event (write_audit 52) came to exist.
+        list_reason = contacts_only_reason(row)
+        if list_reason:
+            skipped.append((mapped, list_reason))
             continue
 
         known = existing_map.get(mapped.csuite_eventdate_id)

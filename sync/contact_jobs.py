@@ -172,7 +172,23 @@ def _run_apply(run_id, limit, event_ids):
     except Exception as e:
         logger.error("contact create run_log %s died: %s", run_id, e,
                      exc_info=True)
-        _close_if_open(run_id, f"{type(e).__name__}: {e}")
+        detail = f"{type(e).__name__}: {e}"
+        _close_if_open(run_id, detail)
+        _notify_died(run_id, detail)
+
+
+def _notify_died(run_id, detail):
+    """A thread that died is the case nobody can see: there is no reply to
+    read, and the run_log row is the only trace."""
+    from clients.notify import safe_notify
+
+    safe_notify(
+        "Jidhr: contact creation DIED",
+        f"The background thread raised and the run was closed as failed: "
+        f"{detail}",
+        path="create contacts apply",
+        run_log=run_id,
+    )
 
 
 def _close_if_open(run_id, error_summary):

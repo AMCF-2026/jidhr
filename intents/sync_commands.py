@@ -51,6 +51,12 @@ REGISTRATION_STATUS_PHRASES = ['registrations status', 'registration status',
 # from "sync" because it writes to a different object and registers nobody.
 CONTACT_CREATE_PHRASES = ['create contacts', 'create contact']
 CONTACT_STATUS_PHRASES = ['contacts status', 'contact status']
+
+# Proving the notifier arrives. Staff/admin like everything in this module
+# (ALLOWED_ROLES above) — it sends a message to a channel, so it is not a
+# thing for a donor-facing caller to be able to trigger.
+NOTIFY_TEST_PHRASES = ['test notify', 'test notification',
+                       'test notifications']
 ALL_SYNC_PHRASES = ['sync all', 'sync everything', 'run all syncs']
 
 
@@ -74,6 +80,7 @@ def can_handle(query: str, **kwargs) -> bool:
         anchors.anchored(q, REGISTRATION_STATUS_PHRASES) or
         anchors.anchored(q, CONTACT_CREATE_PHRASES) or
         anchors.anchored(q, CONTACT_STATUS_PHRASES) or
+        anchors.anchored(q, NOTIFY_TEST_PHRASES) or
         q in ALL_SYNC_PHRASES
     )
 
@@ -91,6 +98,9 @@ def handle(query: str, ctx) -> str:
         Formatted result string
     """
     q = query.lower().strip()
+
+    if any(p in q for p in NOTIFY_TEST_PHRASES):
+        return _test_notify()
 
     if any(p in q for p in CONTACT_STATUS_PHRASES):
         return _contact_status(q)
@@ -255,6 +265,46 @@ def _non_marketing_shown() -> int:
 def _new_contact_marketing_note() -> str:
     from sync.contact_create import NEW_CONTACT_MARKETING_NOTE
     return NEW_CONTACT_MARKETING_NOTE
+
+
+def _test_notify() -> str:
+    """Send one notification, and say exactly what happened.
+
+    A notifier nobody has seen arrive is a notifier nobody should rely on.
+    This is the only way to check it without breaking something on purpose.
+    """
+    from clients import notify as notifier
+
+    if not notifier.configured():
+        return ("⏸️ **Notifications are off.**\n\n"
+                "Neither `NOTIFY_SLACK_WEBHOOK_URL` nor `NOTIFY_EMAIL_TO` "
+                "is set, so a stopped run would be recorded in "
+                "`hubsync.run_log` and told to nobody.\n\n"
+                "• Set `NOTIFY_SLACK_WEBHOOK_URL` for Slack.\n"
+                "• Or `NOTIFY_EMAIL_TO` **and** `NOTIFY_SMTP_HOST` for "
+                "email.\n\n"
+                "Guards still refuse and still stop runs without it — they "
+                "just cannot tell you.")
+
+    result = notifier.safe_notify(
+        "Jidhr: test notification",
+        "This is a test, sent from the Jidhr chat. Nothing is wrong, and "
+        "nothing was written. If you can read this, a stopped sync can "
+        "reach you.",
+        path="test notify",
+        run_log="n/a",
+    )
+    sent = ", ".join(result.get("sent") or []) or "nothing"
+    failed = ", ".join(result.get("failed") or [])
+    lines = [f"📣 **Test notification sent via: {sent}.**", ""]
+    if failed:
+        lines += [f"⚠️ Failed: **{failed}** — see the logs for the reason. "
+                  f"A failed notification can never fail a run, so this is "
+                  f"the only place it shows."]
+    if result.get("sent"):
+        lines.append("If it did not arrive, the webhook or address is "
+                     "wrong — the send itself reported success.")
+    return "\n".join(lines)
 
 
 def _create_contacts(query_lower: str) -> str:

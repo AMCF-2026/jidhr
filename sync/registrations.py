@@ -57,6 +57,14 @@ INTERACTION_RUN_TIME = "run_time"
 
 # Cancellation is inferred, so the inference is fenced.
 #
+# The most registrations one run may send for an event NOBODY has synced
+# before. shrink_guard protects an event with history — it compares against
+# registration_map's known_count and refuses a sharp drop — but an event
+# with known_count == 0 has nothing to compare against, so a CSuite read
+# that comes back with hundreds of rows would be sent in full. The largest
+# real event so far is 1157 with 41 rows.
+MAX_FIRST_RUN_BATCH = 50
+
 # An event whose registrant list comes back EMPTY when the map holds rows for
 # it is not an event everybody cancelled; it is very likely a read that
 # failed. event/display/eventdate answers success=true with whatever it has.
@@ -386,6 +394,26 @@ def event_has_ended(event_row, now_ms) -> bool:
     return int(moment.timestamp() * 1000) <= now_ms
 
 
+def first_run_guard(event_date_id, rows, known_count,
+                    cap=None) -> str:
+    """Why an event nobody has synced before is too big to send, or ''.
+
+    The companion to shrink_guard, for the case it cannot cover: with
+    known_count == 0 there is no previous size to compare against, so the
+    only sane check is an absolute ceiling.
+    """
+    cap = MAX_FIRST_RUN_BATCH if cap is None else cap
+    if known_count:
+        return ""
+    if len(rows or []) <= cap:
+        return ""
+    return (f"event {event_date_id} has {len(rows or [])} registrant rows "
+            f"and has never been synced, so there is no previous size to "
+            f"compare against. The ceiling for a first run is {cap}. "
+            f"Nothing was planned for it — raise MAX_FIRST_RUN_BATCH "
+            f"deliberately if the event really is that big.")
+
+
 def shrink_guard(event_date_id, rows, known_count) -> str:
     """Why this event's registrant list cannot be trusted, or None.
 
@@ -539,7 +567,8 @@ def plan_event(event_date_id, rows, contacts, known, held=False,
            "held": [], "is_held": bool(held), "unverified": [],
            "has_ended": bool(ended), "review": None}
 
-    refusal = shrink_guard(event_date_id, rows or [], known_count)
+    refusal = (shrink_guard(event_date_id, rows or [], known_count)
+               or first_run_guard(event_date_id, rows or [], known_count))
     if refusal:
         out["review"] = refusal
         return out
@@ -1089,6 +1118,27 @@ def run(csuite=None, hubspot=None, dry_run: bool = True, limit=1,
             out["run_logged"] = True
 
 
+def _notify_stop(out, reason):
+    """Tell a human a registrations run stopped. Counts and ids only."""
+    from clients.notify import safe_notify
+
+    safe_notify(
+        "Jidhr: registrations sync stopped",
+        reason,
+        path="sync registrations",
+        run_log=out.get("run_id"),
+        limit=out.get("limit"),
+        would_register=out.get("would_register"),
+        registered=out.get("registered"),
+        unverified=out.get("unverified"),
+        cancelled=out.get("cancelled"),
+        failed=out.get("failed"),
+        deferred=out.get("deferred"),
+        write_audit=", ".join(str(i) for i in
+                              (out.get("write_audit_ids") or [])) or "none",
+    )
+
+
 def _apply(out, csuite, hubspot, events, limit, now_ms):
     """Write up to `limit` REGISTERED states, verifying each one.
 
@@ -1439,6 +1489,7 @@ def _run_body(out, csuite, hubspot, event_ids, known, dry_run=True,
         _apply(out, csuite, hubspot, events, limit, now_ms)
     except RegistrationWriteStopped as stop:
         out["stopped"] = stop.reason
+        _notify_stop(out, stop.reason)
     # Tallied AFTER the writes, and after a stop, because the per-event
     # counts above are the PLAN and these are what happened. Without this
     # `failed` stayed 0 over a run that had just reported a 400.
