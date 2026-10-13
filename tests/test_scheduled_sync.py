@@ -22,6 +22,14 @@ from jobs.runner import HANDLERS, JobFailed
 from sync import scheduled
 
 
+def calendar(inside, total=187, error=None, undated=None):
+    """read_calendar's return shape. The chain reads the window, the
+    undated set and the created-event names off ONE snapshot now."""
+    return {"inside": list(inside or []), "undated": list(undated or []),
+            "all": list(inside or []) + list(undated or []),
+            "total": total, "error": error}
+
+
 class Hub:
     """Records every HubSpot request so a preview can be proved silent."""
 
@@ -100,11 +108,10 @@ def chain(monkeypatch):
     monkeypatch.setattr(scheduled, "_step_events", events)
     monkeypatch.setattr(scheduled, "_step_contacts", contacts)
     monkeypatch.setattr(scheduled, "_step_registrations", registrations)
-    monkeypatch.setattr(scheduled, "events_in_window",
-                        lambda csuite, today=None: (
-                            [{"event_date_id": "1429",
+    monkeypatch.setattr(scheduled, "read_calendar",
+                        lambda csuite, today=None: calendar(*([{"event_date_id": "1429",
                               "event_name": "Event - Other",
-                              "event_date": "2026-10-20"}], 187, None))
+                              "event_date": "2026-10-20"}], 187, None)))
     monkeypatch.setattr(scheduled, "_no_manual_apply_running",
                         lambda: None)
     return seen
@@ -255,8 +262,8 @@ def test_preview_runs_every_step_as_a_dry_run(chain, sent):
 def test_preview_issues_no_write_request(monkeypatch, sent):
     """The real steps, with a HubSpot double that records every call."""
     hub = Hub()
-    monkeypatch.setattr(scheduled, "events_in_window",
-                        lambda csuite, today=None: ([], 187, None))
+    monkeypatch.setattr(scheduled, "read_calendar",
+                        lambda csuite, today=None: calendar(*([], 187, None)))
     monkeypatch.setattr(scheduled, "_no_manual_apply_running", lambda: None)
 
     class NoEvents:
@@ -372,10 +379,9 @@ def test_a_dying_chain_still_sends_one_email(monkeypatch, chain, sent):
 def test_an_incomplete_event_read_stops_before_any_step(monkeypatch, chain,
                                                         sent):
     """A slice of the calendar is not the calendar."""
-    monkeypatch.setattr(scheduled, "events_in_window",
-                        lambda csuite, today=None: (
-                            [], 40, "the CSuite event-date read came back "
-                                    "incomplete"))
+    monkeypatch.setattr(scheduled, "read_calendar",
+                        lambda csuite, today=None: calendar(*([], 40, "the CSuite event-date read came back "
+                                    "incomplete")))
 
     with pytest.raises(JobFailed):
         handler.handle({"payload": {}})
@@ -461,11 +467,6 @@ def test_the_window_excludes_a_past_event():
         complete = True
         pages = 1
 
-    import sys
-    module = type(sys)("clients.csuite_fetch")
-    inside, total, error = scheduled.events_in_window.__wrapped__(
-        None, date(2026, 10, 13)) if hasattr(
-        scheduled.events_in_window, "__wrapped__") else (None, 0, None)
     # The filter itself, exercised directly:
     floor = date(2026, 10, 12)
     kept = [r for r in rows
@@ -482,11 +483,10 @@ def test_the_window_floor_is_today_minus_one():
 
 def test_a_past_event_is_never_in_the_chain_scope(monkeypatch, chain, sent):
     """1155 finished in April. A schedule must not register anyone for it."""
-    monkeypatch.setattr(scheduled, "events_in_window",
-                        lambda csuite, today=None: (
-                            [{"event_date_id": "1429",
+    monkeypatch.setattr(scheduled, "read_calendar",
+                        lambda csuite, today=None: calendar(*([{"event_date_id": "1429",
                               "event_name": "Event - Other",
-                              "event_date": "2026-10-20"}], 187, None))
+                              "event_date": "2026-10-20"}], 187, None)))
 
     out = handler.handle({"payload": {}})
 
@@ -524,14 +524,13 @@ def test_1153_is_excluded_from_registrations_by_both_routes(monkeypatch):
 
 def test_contacts_only_events_are_named_in_the_summary(monkeypatch, chain,
                                                        sent):
-    monkeypatch.setattr(scheduled, "events_in_window",
-                        lambda csuite, today=None: (
-                            [{"event_date_id": "1153",
+    monkeypatch.setattr(scheduled, "read_calendar",
+                        lambda csuite, today=None: calendar(*([{"event_date_id": "1153",
                               "event_name": "Newsletters",
                               "event_date": "2026-12-31"},
                              {"event_date_id": "1429",
                               "event_name": "Event - Other",
-                              "event_date": "2026-10-20"}], 187, None))
+                              "event_date": "2026-10-20"}], 187, None)))
 
     out = handler.handle({"payload": {}})
 
@@ -579,11 +578,10 @@ def test_the_summary_reports_verified_not_attempted(monkeypatch, sent):
     """Live writes are verified like a manual apply; the email must report
     the verified count."""
     monkeypatch.setattr("config.Config.REGISTRATIONS_SYNC_ENABLED", True)
-    monkeypatch.setattr(scheduled, "events_in_window",
-                        lambda csuite, today=None: (
-                            [{"event_date_id": "1429",
+    monkeypatch.setattr(scheduled, "read_calendar",
+                        lambda csuite, today=None: calendar(*([{"event_date_id": "1429",
                               "event_name": "E", "event_date": "2026-10-20"}],
-                            187, None))
+                            187, None)))
     monkeypatch.setattr(scheduled, "_no_manual_apply_running", lambda: None)
     monkeypatch.setattr(scheduled, "_step_events",
                         lambda out, h, d, t: scheduled._record(

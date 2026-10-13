@@ -59,6 +59,31 @@ STEPS = (STEP_EVENTS, STEP_CONTACTS, STEP_REGISTRATIONS)
 MODE_PREVIEW = "preview"
 MODE_LIVE = "live"
 
+# The most HubSpot marketing events one unattended run may create.
+#
+# The event step creates marketing events with no human reading a plan
+# first. Measured 2026-10-13: the window holds 8 events and 3 of them need
+# creating (1529, 1530, 1531), so 3 is today's real workload and the
+# default. Anything above it stops the chain, sends one ALERT and creates
+# NOTHING — not "the first three and a deferral", which would leave a
+# partial calendar that nobody chose.
+#
+# Never off. 0, a negative, a typo or an empty value all mean the default:
+# a ceiling switched off by a typo is worse than no ceiling, because it
+# looks present.
+DEFAULT_MAX_EVENT_CREATE = 3
+
+
+def max_event_creates() -> int:
+    import os
+
+    raw = (os.environ.get("MAX_EVENT_CREATE_PER_RUN") or "").strip()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_EVENT_CREATE
+    return value if value > 0 else DEFAULT_MAX_EVENT_CREATE
+
 
 class ChainStopped(RuntimeError):
     """A step refused, so the steps after it did not run."""
@@ -96,8 +121,15 @@ def window_floor(today=None) -> date:
     return (today or date.today()) - timedelta(days=days)
 
 
-def events_in_window(csuite, today=None) -> tuple:
-    """(event_rows_inside_the_window, total_read, error).
+def read_calendar(csuite, today=None) -> dict:
+    """ONE read of event/list/dates, split three ways.
+
+    {"inside": rows in the window, "undated": rows with no usable
+     event_date, "all": every row, "total": n, "error": str | None}
+
+    One fetch rather than one per question, so the window, the undated
+    count and the created-event names are all read off the same snapshot
+    and cannot disagree with each other.
 
     Refuses on a partial read rather than syncing a slice of the calendar
     as though it were all of it — the same line sync/mirror draws.
@@ -105,31 +137,44 @@ def events_in_window(csuite, today=None) -> tuple:
     from clients.csuite_fetch import fetch_all
     from sync import event_hubspot as eh
 
+    out = {"inside": [], "undated": [], "all": [], "total": 0, "error": None}
     try:
         result = fetch_all(csuite, eh.EVENT_DATES_ENDPOINT, {})
     except Exception as e:
-        return [], 0, f"{type(e).__name__}: {e}"
+        out["error"] = f"{type(e).__name__}: {e}"
+        return out
     rows = list(result.records or [])
+    out["all"] = rows
+    out["total"] = len(rows)
     if not result.complete:
-        return [], len(rows), (
+        out["error"] = (
             f"the CSuite event-date read came back incomplete "
             f"({len(rows)} row(s), {result.pages} page(s)), so the window "
             f"cannot be trusted and nothing was planned")
+        return out
 
     floor = window_floor(today)
-    inside = []
     for row in rows:
         text = str((row or {}).get("event_date") or "")[:10]
         try:
             when = date.fromisoformat(text)
         except ValueError:
-            # 98 of 187 rows carry no usable event_date. Not an error, and
-            # not in the window either — event_apply withholds them for
-            # the same reason.
+            # Measured 2026-10-13: 98 of 187 rows have no event_date, and
+            # every one of them is event_name 'Unassigned', archived = 1,
+            # ids 1052-1149 — one legacy block that predates every real
+            # event. Not an error, and not in the window.
+            out["undated"].append(row)
             continue
         if when >= floor:
-            inside.append(row)
-    return inside, len(rows), None
+            out["inside"].append(row)
+    return out
+
+
+def events_in_window(csuite, today=None) -> tuple:
+    """(event_rows_inside_the_window, total_read, error). A thin wrapper
+    over read_calendar, kept for callers that want only the window."""
+    calendar = read_calendar(csuite, today)
+    return calendar["inside"], calendar["total"], calendar["error"]
 
 
 def event_ids_of(rows) -> list:
@@ -213,7 +258,10 @@ def run_chain(csuite=None, hubspot=None, today=None, mode=None) -> dict:
            "stopped_step": None, "steps": {}, "run_log_ids": [],
            "window_floor": str(window_floor(today)),
            "events_in_window": 0, "events_read": 0, "event_ids": [],
-           "registrable_ids": [], "contacts_only_ids": [], "error": None}
+           "registrable_ids": [], "contacts_only_ids": [], "error": None,
+           "event_creates": [], "max_event_creates": max_event_creates(),
+           "undated_count": 0, "undated_archived": 0, "undated_ids": [],
+           "new_undated": [], "undated_baseline": None}
 
     csuite = csuite or CSuiteClient()
     hubspot = hubspot or HubSpotClient()
@@ -237,10 +285,14 @@ def run_chain(csuite=None, hubspot=None, today=None, mode=None) -> dict:
                     "was written.")
             _no_manual_apply_running()
 
-        rows, total, error = events_in_window(csuite, today)
+        calendar = read_calendar(csuite, today)
+        rows, total, error = (calendar["inside"], calendar["total"],
+                              calendar["error"])
         out["events_read"] = total
         if error:
             raise ChainStopped("window", error)
+        _note_undated(out, calendar["undated"])
+        out["calendar_rows"] = calendar["all"]
         out["events_in_window"] = len(rows)
         out["event_ids"] = event_ids_of(rows)
         out["registrable_ids"] = registrable_ids(rows)
@@ -262,6 +314,7 @@ def run_chain(csuite=None, hubspot=None, today=None, mode=None) -> dict:
         out["stopped"] = f"{type(e).__name__}: {e}"
         out["stopped_step"] = out.get("stopped_step") or "chain"
     out.pop("event_rows", None)
+    out.pop("calendar_rows", None)
     return out
 
 
@@ -274,17 +327,177 @@ def _record(out, step, result, run_id=None):
 
 
 def _step_events(out, hubspot, dry_run, today):
-    """Create the marketing events the later steps need."""
+    """Create the marketing events the later steps need.
+
+    ALWAYS planned as a dry run first, in both modes, so the ceiling is
+    checked against a plan before anything is written — and so a preview
+    predicts exactly what the live run would refuse. Only if the plan is
+    within MAX_EVENT_CREATE_PER_RUN does a live run write, and then capped
+    at the number of writes that plan contained, so a calendar that grew
+    in the seconds between the two calls cannot slip extra creates past a
+    ceiling that was checked against the smaller one.
+    """
     from sync import event_apply as ea
 
-    result = ea.run(hubspot=hubspot, dry_run=dry_run,
-                    include_ids=tuple(out["event_ids"]),
-                    future_only=True, today=today)
+    scope = dict(include_ids=tuple(out["event_ids"]), future_only=True,
+                 today=today)
+    planned = ea.run(hubspot=hubspot, dry_run=True, **scope)
+    if planned.get("error"):
+        _record(out, STEP_EVENTS, planned)
+        raise ChainStopped(STEP_EVENTS, str(planned["error"]))
+
+    creates = would_create_ids(planned)
+    out["event_creates"] = describe_events(creates,
+                                           out.get("calendar_rows") or [])
+    ceiling = out.get("max_event_creates") or max_event_creates()
+    if len(creates) > ceiling:
+        _record(out, STEP_EVENTS, planned)
+        raise ChainStopped(
+            STEP_EVENTS,
+            f"this run would create {len(creates)} HubSpot marketing "
+            f"event(s), more than MAX_EVENT_CREATE_PER_RUN = {ceiling}. "
+            f"NOTHING was created, and contacts and registrations did not "
+            f"run. The events it would have created are listed above — if "
+            f"they are all real, raise the ceiling deliberately or create "
+            f"them by hand.")
+
+    if dry_run:
+        _record(out, STEP_EVENTS, planned)
+        return
+
+    approved = int(planned.get("created") or 0) + \
+        int(planned.get("updated") or 0)
+    result = ea.run(hubspot=hubspot, dry_run=False, limit=approved, **scope)
     _record(out, STEP_EVENTS, result)
+    # Live: report what was ACTUALLY created, not what was planned.
+    made = [str(o.get("id")) for o in (result.get("outcomes") or [])
+            if o.get("outcome") == "created"]
+    out["event_creates"] = describe_events(made,
+                                           out.get("calendar_rows") or [])
     if result.get("error"):
         raise ChainStopped(STEP_EVENTS, str(result["error"]))
     if result.get("stopped"):
         raise ChainStopped(STEP_EVENTS, str(result["stopped"]))
+
+
+def would_create_ids(planned) -> list:
+    """The event ids a dry run would create.
+
+    event_apply's predictor returns COUNTS, not ids, so this is the plan's
+    creates minus the ones the predictor withheld — the same subtraction
+    it does, read back by id.
+    """
+    plan = (planned or {}).get("plan") or {}
+    withheld = {str(i) for i, _why in ((planned or {}).get("withheld_rows")
+                                      or [])}
+    out = []
+    for entry in plan.get("creates") or []:
+        mapped = entry[0] if isinstance(entry, (list, tuple)) else entry
+        event_id = str(getattr(mapped, "csuite_eventdate_id", "") or "")
+        if event_id and event_id not in withheld:
+            out.append(event_id)
+    return sorted(out, key=lambda e: (len(e), e))
+
+
+def describe_events(event_ids, calendar_rows) -> list:
+    """[{id, name, date, category}] from the CSuite rows already read.
+
+    The name is event_description (the event's title); the category is
+    event_name (the parent series). An id with no row is still listed, so
+    a created event can never vanish from the email for want of a name.
+    """
+    by_id = {str((r or {}).get("event_date_id")): r
+             for r in calendar_rows or []}
+    out = []
+    for event_id in event_ids or []:
+        row = by_id.get(str(event_id)) or {}
+        out.append({
+            "id": str(event_id),
+            "name": " ".join(str(row.get("event_description")
+                                 or "(no name in CSuite)").split()),
+            "date": str(row.get("event_date") or "(no date)")[:10],
+            "category": str(row.get("event_name") or "(none)"),
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Undated events
+# ---------------------------------------------------------------------------
+#
+# Measured 2026-10-13: 98 of 187 CSuite dates have no event_date, and ALL
+# 98 are event_name 'Unassigned', event_type_code 'event', archived = 1,
+# ids 1052-1149 — one legacy block that predates every real event. So the
+# count itself is not news. A NEW undated event is: somebody created a
+# live event and left the date blank, and the window can never see it.
+
+_PREVIOUS_UNDATED_SQL = """
+    SELECT result->'undated_ids' AS undated_ids
+      FROM jobs
+     WHERE job_type = 'registrations_sync'
+       AND status IN ('complete', 'failed')
+       AND result ? 'undated_ids'
+     ORDER BY finished_at DESC NULLS LAST, id DESC
+     LIMIT 1
+"""
+
+
+def previous_undated_ids():
+    """The undated ids the last SCHEDULED run saw, or None.
+
+    Read from that run's jobs.result, which is the dict its email was built
+    from. None means no baseline yet — the first run records one rather
+    than announcing all 98 as new. A manual "run scheduled sync now"
+    compares against this too but writes no jobs row, so the baseline only
+    moves when the cron runs.
+    """
+    from clients import database
+
+    try:
+        rows = database.execute_query(_PREVIOUS_UNDATED_SQL, (), fetch=True)
+    except Exception as e:
+        logger.warning("could not read the previous undated baseline: %s", e)
+        return None
+    if not rows:
+        return None
+    found = (rows[0] or {}).get("undated_ids")
+    if isinstance(found, str):
+        import json
+        try:
+            found = json.loads(found)
+        except ValueError:
+            return None
+    return [str(i) for i in found] if isinstance(found, list) else None
+
+
+def _note_undated(out, undated_rows):
+    ids = sorted({str((r or {}).get("event_date_id"))
+                  for r in undated_rows or []
+                  if (r or {}).get("event_date_id")},
+                 key=lambda e: (len(e), e))
+    out["undated_ids"] = ids
+    out["undated_count"] = len(ids)
+    out["undated_archived"] = sum(
+        1 for r in undated_rows or []
+        if str((r or {}).get("archived")) == "1")
+
+    baseline = previous_undated_ids()
+    out["undated_baseline"] = baseline is not None
+    # Set before the early return: the function must not rely on its caller
+    # having initialised the key.
+    out["new_undated"] = []
+    if baseline is None:
+        return
+    new = [i for i in ids if i not in set(baseline)]
+    by_id = {str((r or {}).get("event_date_id")): r
+             for r in undated_rows or []}
+    out["new_undated"] = [
+        {"id": i,
+         "name": " ".join(str((by_id.get(i) or {}).get("event_description")
+                              or "(no name in CSuite)").split()),
+         "category": str((by_id.get(i) or {}).get("event_name")
+                         or "(none)")}
+        for i in new]
 
 
 def _step_contacts(out, csuite, hubspot, dry_run):
@@ -357,6 +570,36 @@ def summary_lines(out) -> list:
                      + ", ".join(out["contacts_only_ids"]))
     if out.get("run_log_ids"):
         lines.append("run_log: " + ", ".join(out["run_log_ids"]))
+
+    # Every marketing event created — or, in preview, that WOULD be — by
+    # CSuite id, name, date and category. A created event is the one thing
+    # this run does that a person did not choose, so it is named in full.
+    creates = out.get("event_creates") or []
+    verb = ("would create" if out.get("dry_run") else "created")
+    ceiling = out.get("max_event_creates")
+    lines.append("")
+    lines.append(f"marketing events {verb}: {len(creates)}"
+                 + (f" (ceiling {ceiling})" if ceiling else ""))
+    for event in creates:
+        lines.append(f"  {event['id']}  {event['date']}  "
+                     f"{event['name'][:60]}  [{event['category']}]")
+
+    # Undated events. A NOTE, not an alert: the 98 known ones are an
+    # archived legacy block, and what matters is a new one appearing.
+    lines.append("")
+    lines.append(f"undated CSuite events: {out.get('undated_count', 0)}"
+                 f" ({out.get('undated_archived', 0)} archived)")
+    if out.get("new_undated"):
+        for event in out["new_undated"]:
+            lines.append(f"  NOTE new undated event: {event['id']}, "
+                         f"{event['name'][:60]} [{event['category']}] — "
+                         f"it has no event_date, so the window can never "
+                         f"pick it up")
+    elif out.get("undated_baseline") is False:
+        lines.append("  (first scheduled run — this count is the baseline; "
+                     "a new undated event will be named from tomorrow)")
+    else:
+        lines.append("  no new undated events since the last scheduled run")
 
     for step in STEPS:
         result = out.get("steps", {}).get(step)
