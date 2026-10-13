@@ -228,12 +228,38 @@ def test_success_on_a_daily_job_queues_the_next_occurrence_once(db, handlers):
 
     assert len(db.occurrences) == 1
     sql, params = db.occurrences[0]
-    job_type, payload, priority, run_after, requested_by = params
+    job_type, payload, priority, run_after, requested_by, max_attempts = \
+        params
     assert job_type == "demo"
     assert json.loads(payload) == DAILY, "payload copied verbatim"
     assert priority == 50 and requested_by == 7
     assert run_after == datetime(2026, 9, 16, 6, 0, tzinfo=timezone.utc)
     assert summary["next_occurrence_queued"] == 501
+    # The job's own retry policy is carried, not reset to the column
+    # default. COALESCE(%s, 3) keeps the old default for a row that has
+    # none.
+    assert "max_attempts" in sql and "COALESCE(%s, 3)" in sql
+    assert max_attempts == 3, "this helper's default, carried as-is"
+
+
+def test_a_job_seeded_with_one_attempt_keeps_one_attempt(db, handlers):
+    """registrations_sync is seeded with max_attempts = 1 so a stopped
+    chain is never retried. Before this the next occurrence reverted to
+    the column default of 3, so it would have started retrying from day
+    two."""
+    runner.run(job(job_type="demo", payload=DAILY, max_attempts=1))
+
+    _sql, params = db.occurrences[0]
+    assert params[-1] == 1, "the policy survives into tomorrow's row"
+
+
+def test_the_mirror_keeps_its_own_retry_policy(db, handlers):
+    """The carry-forward must not change the mirror, which relies on
+    retries for a rate-limited night."""
+    runner.run(job(job_type="demo", payload=DAILY, max_attempts=3))
+
+    _sql, params = db.occurrences[0]
+    assert params[-1] == 3
 
 
 def test_second_finish_does_not_double_queue(db, handlers):

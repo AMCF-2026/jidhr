@@ -225,10 +225,16 @@ _RETRY_SQL = f"""
     RETURNING id
 """
 
+# max_attempts IS carried forward. It was not, so a recurring job's retry
+# policy silently reverted to the column default (3) on the occurrence
+# after the one it was seeded with. That matters for registrations_sync,
+# which is seeded with max_attempts = 1 so a stopped chain is NOT retried —
+# "never retry a write" — and would have started retrying from day two.
 _NEXT_OCCURRENCE_SQL = f"""
     INSERT INTO jobs (job_type, payload, status, priority, run_after,
-                      requested_by)
-    VALUES (%s, %s::jsonb, '{STATUS_QUEUED}', %s, %s, %s)
+                      requested_by, max_attempts)
+    VALUES (%s, %s::jsonb, '{STATUS_QUEUED}', %s, %s, %s,
+            COALESCE(%s, 3))
     RETURNING id
 """
 
@@ -345,7 +351,8 @@ def queue_next_occurrence(job: dict, now=None) -> int | None:
     inserted = _first(database.execute_query(
         _NEXT_OCCURRENCE_SQL,
         (job["job_type"], _dump(job.get("payload") or {}),
-         job.get("priority"), when, job.get("requested_by")),
+         job.get("priority"), when, job.get("requested_by"),
+         job.get("max_attempts")),
         fetch=True))
     new_id = (inserted.get("id") if isinstance(inserted, dict)
               else inserted[0]) if inserted is not None else None

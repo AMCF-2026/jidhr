@@ -46,10 +46,48 @@ MIRROR_SEED = {
     "priority": 50,
 }
 
+# The scheduled registrations chain (jobs/handlers/registrations_sync.py).
+#
+# priority 40, BEFORE the mirror's 50: claims go `ORDER BY priority,
+# run_after`, and the daily email this job sends is the dead-man's switch.
+# It should not wait behind — or be hostage to — a seven-minute mirror.
+#
+# max_attempts 1: a chain that stopped is NOT retried. Every write inside
+# it is individually guarded, but "never retry a write" is the rule, and a
+# guard that refused did so for a reason a human should read. Tomorrow's
+# 06:00 run is a fresh daily run, not a retry.
+REGISTRATIONS_JOB_TYPE = "registrations_sync"
+REGISTRATIONS_SEED = {
+    "job_type": REGISTRATIONS_JOB_TYPE,
+    "payload": {"recurring": "daily", "at": "06:00"},
+    "priority": 40,
+    "max_attempts": 1,
+}
+
 _INSERT_SQL = """
     INSERT INTO jobs (job_type, payload, status, priority, run_after)
     VALUES (%s, %s::jsonb, 'queued', %s, %s)
     RETURNING id
+"""
+
+_INSERT_WITH_ATTEMPTS_SQL = """
+    INSERT INTO jobs (job_type, payload, status, priority, run_after,
+                      max_attempts)
+    VALUES (%s, %s::jsonb, 'queued', %s, %s, %s)
+    RETURNING id
+"""
+
+# ANY live row counts, not just queued ones. The runner's own dedupe looks
+# at status = 'queued' only, so a seed that ran while the day's job was
+# claimed or running would have added a second one.
+_ACTIVE_RECURRING_SQL = """
+    SELECT id, status, run_after
+      FROM jobs
+     WHERE job_type = %s
+       AND payload->>'recurring' = 'daily'
+       AND status IN ('queued', 'claimed', 'running')
+     ORDER BY run_after
+     LIMIT 1
 """
 
 # A mirror that is already due or already running makes --now a second
@@ -111,6 +149,43 @@ def seed(now=None) -> str:
             f"for {when.isoformat()}")
 
 
+def ensure_registrations_sync(now=None) -> str:
+    """Keep exactly one live recurring registrations_sync row.
+
+    Called by --seed AND at the start of every --once, so the schedule
+    maintains itself: nobody has to remember to seed it, and nobody has to
+    type anything for the first 06:15 email after a deploy.
+
+    Idempotent. If a queued, claimed or running row exists, nothing is
+    added. Otherwise one is queued DUE NOW, so the --once that called this
+    claims it in the same invocation; the runner then queues tomorrow's
+    06:00 itself after the run, carrying max_attempts = 1 forward.
+
+    Seeded whether or not SCHEDULED_SYNC_ENABLED is set. The handler
+    decides — disabled logs and exits with no email — so arming the
+    schedule stays a single flag, with no seed step to forget.
+    """
+    existing = _first(database.execute_query(
+        _ACTIVE_RECURRING_SQL, (REGISTRATIONS_JOB_TYPE,), fetch=True))
+    if existing is not None:
+        return (f"daily {REGISTRATIONS_JOB_TYPE} already "
+                f"{_get(existing, 'status', 1)} as job "
+                f"{_get(existing, 'id', 0)} for "
+                f"{_get(existing, 'run_after', 2)} — nothing added")
+
+    when = now or datetime.now(timezone.utc)
+    inserted = _first(database.execute_query(
+        _INSERT_WITH_ATTEMPTS_SQL,
+        (REGISTRATIONS_JOB_TYPE,
+         json.dumps(REGISTRATIONS_SEED["payload"], sort_keys=True),
+         REGISTRATIONS_SEED["priority"], when,
+         REGISTRATIONS_SEED["max_attempts"]),
+        fetch=True))
+    return (f"queued daily {REGISTRATIONS_JOB_TYPE} as job "
+            f"{_get(inserted, 'id')}, due now ({when.isoformat()}); the "
+            f"runner re-queues 06:00 UTC daily from here")
+
+
 class Refused(Exception):
     """--now would start a second mirror; the message says which one."""
 
@@ -145,6 +220,14 @@ def queue_now(now=None) -> str:
 
 def run_once() -> int:
     worker = runner.worker_id()
+    # Self-maintaining schedule. A failure here is logged and the run goes
+    # on: the jobs already queued — the mirror among them — must not be
+    # held hostage to a seed that could not write.
+    try:
+        logger.info(ensure_registrations_sync())
+    except Exception as exc:
+        logger.error("could not ensure the %s job: %s: %s",
+                     REGISTRATIONS_JOB_TYPE, type(exc).__name__, exc)
     try:
         summaries = runner.run_until_empty(worker)
     except Exception as exc:
@@ -206,6 +289,7 @@ def main(argv=None) -> int:
 
     if args.seed:
         print(seed())
+        print(ensure_registrations_sync())
         return EXIT_OK
     if args.now:
         try:
