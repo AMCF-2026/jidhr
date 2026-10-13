@@ -359,6 +359,97 @@ def outcome_rows(out) -> list:
 # Planning
 # ---------------------------------------------------------------------------
 
+# How many non-marketing contacts the report NAMES before summarising.
+NON_MARKETING_SHOWN = 25
+
+# New contacts take whatever the portal's per-app setting says. This is a
+# STATIC note: there is no API for that setting, so the code cannot read it
+# and must not claim to have.
+NEW_CONTACT_MARKETING_NOTE = (
+    "New contacts take the portal's connected-app marketing setting "
+    "(currently ON for this app). That is a static note in the code, not a "
+    "reading from the API — there is no endpoint for it. Verify at Settings "
+    "> Integrations > Marketing Contacts if it matters."
+)
+
+
+def marketing_state(entry) -> str:
+    """"marketing", "non_marketing" or "unknown" for one contact.
+
+    NEVER a guess. hs_marketable_status is returned as the string 'true' or
+    'false'; a contact whose property was not returned at all is unknown,
+    not non-marketing. The boolean `marketing` on the same entry collapses
+    those two, which is why the raw value is carried alongside it.
+    """
+    raw = (entry or {}).get("marketable_raw")
+    if raw is None:
+        return "unknown"
+    text = str(raw).strip().lower()
+    if text == "true":
+        return "marketing"
+    if text == "false":
+        return "non_marketing"
+    return "unknown"
+
+
+def _tally_marketing(out, already, contacts):
+    """Count the marketing status of everyone who already has a contact."""
+    for record in already:
+        entry = (contacts or {}).get(
+            reg.normalise_email(record.get("contact_email"))) or {}
+        state = marketing_state(entry)
+        if state == "marketing":
+            out["marketing"] += 1
+        elif state == "non_marketing":
+            out["non_marketing"] += 1
+            out["non_marketing_rows"].append({
+                "event_date_id": record.get("event_date_id"),
+                "hubspot_contact_id": entry.get("id"),
+                "email_masked": mask_email(record.get("contact_email")),
+            })
+        else:
+            out["marketing_unknown"] += 1
+
+
+def check_reconciles(out):
+    """Both invariants, checked in code rather than left to the reader.
+
+    A report that prints numbers which do not add up is worse than one that
+    says it cannot account for them: the first looks checked.
+    """
+    problems = []
+    rows = out.get("registrant_rows", 0)
+    parts = (out.get("excluded", 0) + out.get("duplicates_dropped", 0)
+             + out.get("unique_emails", 0))
+    if rows != parts:
+        problems.append(
+            f"{rows} registrant row(s) do not account for "
+            f"{out.get('excluded', 0)} excluded + "
+            f"{out.get('duplicates_dropped', 0)} duplicate(s) + "
+            f"{out.get('unique_emails', 0)} unique = {parts}")
+
+    unique = out.get("unique_emails", 0)
+    split = out.get("already_contacts", 0) + out.get("to_create", 0)
+    if unique != split:
+        problems.append(
+            f"{unique} unique email(s) do not split into "
+            f"{out.get('already_contacts', 0)} already a contact + "
+            f"{out.get('to_create', 0)} to create = {split}")
+
+    marketing = (out.get("marketing", 0) + out.get("non_marketing", 0)
+                 + out.get("marketing_unknown", 0))
+    if marketing != out.get("already_contacts", 0):
+        problems.append(
+            f"{out.get('already_contacts', 0)} already a contact do not "
+            f"split into {out.get('marketing', 0)} marketing + "
+            f"{out.get('non_marketing', 0)} non-marketing + "
+            f"{out.get('marketing_unknown', 0)} unknown = {marketing}")
+
+    out["reconcile_problems"] = problems
+    out["reconciles"] = not problems
+    return out["reconciles"]
+
+
 def plan(csuite, hubspot, event_ids, out) -> list:
     """Which withheld registrants would get a contact, per event.
 
@@ -394,10 +485,14 @@ def plan(csuite, hubspot, event_ids, out) -> list:
             continue
         out["events_read"] += 1
 
-        deduped, dropped = reg.dedupe(rows or [])
+        deduped, dropped, excluded = reg.classify_rows(rows or [])
         out["registrant_rows"] += len(rows or [])
         out["unique_emails"] += len(deduped)
         out["duplicates_dropped"] += dropped
+        out["excluded"] += len(excluded)
+        for _row, reason in excluded:
+            out["excluded_reasons"][reason] = (
+                out["excluded_reasons"].get(reason, 0) + 1)
         contacts, calls, contact_error = reg.resolve_contacts(
             hubspot, set(deduped))
         out["hubspot_calls"] += calls
@@ -416,9 +511,11 @@ def plan(csuite, hubspot, event_ids, out) -> list:
         # planner bucketed them: a contacts-only event has no registrations,
         # so "already registered" is not the question here — "already a
         # contact" is.
-        out["already_contacts"] += sum(
-            len(planned.get(kind) or [])
-            for kind in ("would_register", "already", "held", "unverified"))
+        already = [record for kind in ("would_register", "already", "held",
+                                       "unverified")
+                   for record in (planned.get(kind) or [])]
+        out["already_contacts"] += len(already)
+        _tally_marketing(out, already, contacts)
         entry = {"event_date_id": key, "is_held": False, "to_create": [],
                  "created": [], "existing": [], "failed": [], "skipped": [],
                  "review": planned.get("review")}
@@ -553,7 +650,10 @@ def run(csuite=None, hubspot=None, dry_run: bool = True, limit=None,
            "writes_attempted": 0, "write_audit_ids": [], "stopped": None,
            "with_name": 0, "with_company": 0, "already_contacts": 0,
            "registrant_rows": 0, "unique_emails": 0, "duplicates_dropped": 0,
-           "contacts_only_events": []}
+           "contacts_only_events": [], "excluded": 0, "excluded_reasons": {},
+           "marketing": 0, "non_marketing": 0, "marketing_unknown": 0,
+           "non_marketing_rows": [], "reconciles": True,
+           "reconcile_problems": []}
 
     if run_id is None:
         run_id = open_run(applied=not dry_run)
@@ -587,6 +687,8 @@ def _run_body(out, csuite, hubspot, event_ids, dry_run, limit) -> dict:
                 out["with_name"] += 1
             if props.get("company"):
                 out["with_company"] += 1
+
+    check_reconciles(out)
 
     if dry_run:
         return out

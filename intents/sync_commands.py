@@ -247,6 +247,16 @@ def _registration_limit(query_lower: str):
     return REGISTRATION_DEFAULT_LIMIT
 
 
+def _non_marketing_shown() -> int:
+    from sync.contact_create import NON_MARKETING_SHOWN
+    return NON_MARKETING_SHOWN
+
+
+def _new_contact_marketing_note() -> str:
+    from sync.contact_create import NEW_CONTACT_MARKETING_NOTE
+    return NEW_CONTACT_MARKETING_NOTE
+
+
 def _create_contacts(query_lower: str) -> str:
     """Preview, or start, contact creation for withheld registrants."""
     from sync import contact_create as cc
@@ -368,18 +378,30 @@ def _format_contact_results(results: dict) -> str:
     lines = [head, ""]
     if results.get("scoped_event"):
         lines.append(f"🎯 Scoped to event `{results['scoped_event']}` only.")
+    # Every row accounted for, in one chain that adds up on its face:
+    #   rows = excluded + duplicates + unique
+    #   unique = already + to create
+    # "14 rows, 13 after dedupe, 0 duplicates dropped" was the version that
+    # did not, and the missing row was one with no email address.
+    excluded = results.get("excluded", 0)
+    reasons = results.get("excluded_reasons") or {}
+    reason_text = (" — " + ", ".join(f"{n} {why}"
+                                     for why, n in sorted(reasons.items()))
+                   if reasons else "")
     lines += [
         f"📊 **Across {results.get('events_read', 0)} event(s):**",
         f"• **{results.get('registrant_rows', 0)}** registrant row(s) in "
-        f"CSuite, **{results.get('unique_emails', 0)}** after dedupe by "
-        f"email within each event "
-        f"({results.get('duplicates_dropped', 0)} duplicate(s) dropped)",
-        f"• **{results.get('already_contacts', 0)}** already have a HubSpot "
-        f"contact",
-        f"• **{results.get('to_create', 0)}** registrant(s) have no HubSpot "
-        f"contact and would get one",
-        f"• **{results.get('with_name', 0)}** of those have a first or last "
-        f"name in CSuite; **{results.get('with_company', 0)}** have an "
+        f"CSuite",
+        f"   = **{excluded}** excluded{reason_text}",
+        f"   + **{results.get('duplicates_dropped', 0)}** duplicate(s) "
+        f"dropped (same address twice on one event)",
+        f"   + **{results.get('unique_emails', 0)}** unique address(es)",
+        f"• of those **{results.get('unique_emails', 0)}**:",
+        f"   • **{results.get('already_contacts', 0)}** already have a "
+        f"HubSpot contact",
+        f"   • **{results.get('to_create', 0)}** have none and would get "
+        f"one — **{results.get('with_name', 0)}** of those have a first or "
+        f"last name in CSuite, **{results.get('with_company', 0)}** an "
         f"organisation"]
 
     if results.get("contacts_only_events"):
@@ -389,11 +411,48 @@ def _format_contact_results(results: dict) -> str:
             + ", ".join(f"`{e}`"
                         for e in results["contacts_only_events"]))
 
+    if not results.get("reconciles", True):
+        lines += ["", "⚠️ **These numbers do not add up, so do not trust "
+                      "them.** The breakdown is meant to be checkable on "
+                      "its face; this one is not:"]
+        for problem in results.get("reconcile_problems") or []:
+            lines.append(f"   • {problem}")
+        lines.append("   Nothing was written. This is a bug in the count, "
+                     "not a reason to apply anyway.")
+
+    already = results.get("already_contacts", 0)
+    if already:
+        lines += ["", f"📧 **Of the {already} who already have a contact:** "
+                      f"**{results.get('marketing', 0)}** marketing, "
+                      f"**{results.get('non_marketing', 0)}** "
+                      f"NON-marketing, "
+                      f"**{results.get('marketing_unknown', 0)}** unknown.",
+                  "   HubSpot's \"All Emails\" segment is \"Email is "
+                  "known\", so being in it is NOT the same as being "
+                  "emailed — a non-marketing contact is in the segment and "
+                  "does not receive the newsletter."]
+        rows = results.get("non_marketing_rows") or []
+        if rows:
+            shown = rows[:_non_marketing_shown()]
+            lines += ["", "   **The non-marketing ones**, to find in "
+                          "HubSpot:", "",
+                      "| event | contact | address (masked) |",
+                      "|---|---|---|"]
+            for row in shown:
+                lines.append(f"| `{row.get('event_date_id')}` | "
+                             f"`{row.get('hubspot_contact_id') or '—'}` | "
+                             f"`{row.get('email_masked', '***')}` |")
+            if len(rows) > len(shown):
+                lines.append(f"… and **{len(rows) - len(shown)}** more")
+
     if results.get("held_events"):
         lines.append(
             f"• held and skipped entirely: "
             + ", ".join(f"`{e}`" for e in results['held_events'])
             + f" — {reg_held_reason()}")
+
+    if results.get("to_create"):
+        lines += ["", f"ℹ️ {_new_contact_marketing_note()}"]
 
     lines += ["", "🔒 **Properties sent: email, firstname, lastname"
                   "** (plus company where CSuite has one) **and nothing "
