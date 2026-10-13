@@ -228,6 +228,30 @@ class Config:
         if e.strip()
     )
 
+    # The same decision made by CATEGORY instead of by id, so a sign-up
+    # list created next month is excluded WITHOUT anyone editing a list.
+    #
+    # Matched case-insensitively against CSuite's `event_name`, which is the
+    # parent series and takes three values across all 179 dates:
+    # "Unassigned", "Event - Other" and "Newsletters". It is NOT the event's
+    # title — that is event_description.
+    #
+    # This inverts the default. Today sync/event_apply plans every date
+    # event/list/dates returns, with no category filter at all, so a new
+    # Newsletters list would be CREATED as a HubSpot marketing event, which
+    # is how csuite-1153's event (write_audit 52) came to exist. With this,
+    # a matching date is withheld from the event sync and treated as
+    # contacts-only instead.
+    #
+    # The explicit id lists still win: CONTACTS_ONLY_EVENT_IDS adds one
+    # that this would miss, and REGISTRATION_HELD_EVENT_IDS still holds.
+    CONTACTS_ONLY_EVENT_CATEGORIES = tuple(
+        c.strip().lower()
+        for c in (os.environ.get('CONTACTS_ONLY_EVENT_CATEGORIES',
+                                 'Newsletters') or '').split(',')
+        if c.strip()
+    )
+
     # Whether "sync donations" may WRITE to HubSpot. Off.
     #
     # It writes five properties per matched contact, one of which is
@@ -351,9 +375,16 @@ class Config:
     # a type. So a task without one is normal, and `task_type_id` is omitted
     # entirely when this is unset rather than guessed at.
     #
-    # 1065 is "DIY Form-Contact" in the SANDBOX (VERIFIED 2026-10-01, task
-    # 1033). It is NOT confirmed in production — there is no task-type list
-    # endpoint this key may read, and no production task uses any type.
+    # 1065 is "DIY Form-Contact", and it IS confirmed in production:
+    # production task 1038 (write_audit 76, 2026-10-08, csuite_env 'live')
+    # reads back task_type = {"task_type_name": "DIY Form-Contact",
+    # "task_type_id": 1065}. Verified in the sandbox first (2026-10-01, task
+    # 1033).
+    #
+    # The earlier note here said it was NOT confirmed in production and that
+    # no production task used any type. Both were true when written and are
+    # not any more. There is still no task-type list endpoint, so a created
+    # task read back is the only way to confirm it.
     CSUITE_TASK_TYPE_ID = _int_or_zero(
         os.environ.get('CSUITE_TASK_TYPE_ID', '0')) or None
 
