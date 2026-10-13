@@ -47,6 +47,16 @@ TEST_PREFIX = "[Jidhr TEST]"
 KIND_ALERT = "alert"
 KIND_TEST = "test"
 
+# Submission port, STARTTLS. Gmail accepts 587 (explicit TLS) and 465
+# (implicit TLS), and they need DIFFERENT client calls: smtplib.SMTP then
+# starttls() for 587, smtplib.SMTP_SSL for 465. Getting that pairing wrong
+# does not raise anything readable — it hangs until the timeout — and this
+# module swallows its own errors by design, so the symptom would be an
+# email that never arrives and no clue why. Both are supported, chosen by
+# port, rather than one being a trap.
+DEFAULT_SMTP_PORT = 587
+IMPLICIT_TLS_PORTS = (465,)
+
 # Belt over the callers' braces: they pass masked addresses, and anything
 # that gets through here is redacted rather than sent.
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
@@ -72,6 +82,49 @@ def _targets():
 def configured() -> bool:
     slack, email = _targets()
     return bool(slack or email)
+
+
+def smtp_port() -> int:
+    """The submission port, defaulting to 587.
+
+    A value that will not parse falls back rather than raising: the caller
+    is an error path, and failing to report a failure is worse than
+    reporting it over the default port.
+    """
+    import os
+
+    raw = (os.environ.get("NOTIFY_SMTP_PORT") or "").strip()
+    try:
+        port = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_SMTP_PORT
+    return port if port > 0 else DEFAULT_SMTP_PORT
+
+
+def settings() -> list:
+    """[(env var name, set?, shown value)] — for "test notify".
+
+    So the names never have to be read out of the source again, and so a
+    test email that does not arrive can be diagnosed from chat. The
+    password is reported as set or unset and NEVER shown.
+    """
+    import os
+
+    out = []
+    for name in ("NOTIFY_EMAIL_TO", "NOTIFY_SMTP_HOST", "NOTIFY_SMTP_PORT",
+                 "NOTIFY_SMTP_USER", "NOTIFY_SMTP_PASSWORD",
+                 "NOTIFY_EMAIL_FROM", "NOTIFY_SLACK_WEBHOOK_URL"):
+        raw = (os.environ.get(name) or "").strip()
+        if name == "NOTIFY_SMTP_PASSWORD":
+            shown = "set (not shown)" if raw else "—"
+        elif name == "NOTIFY_SLACK_WEBHOOK_URL":
+            shown = "set (not shown)" if raw else "— (Slack off)"
+        elif name == "NOTIFY_SMTP_PORT":
+            shown = raw or f"— (defaults to {DEFAULT_SMTP_PORT})"
+        else:
+            shown = raw or "—"
+        out.append((name, bool(raw), shown))
+    return out
 
 
 def subject_line(subject, kind=KIND_ALERT) -> str:
@@ -190,11 +243,16 @@ def _send_email(to_address, subject, text) -> bool:
                            or to_address)
         message["To"] = to_address
         message.set_content(text)
-        port = int(os.environ.get("NOTIFY_SMTP_PORT") or 587)
+        port = smtp_port()
         user = os.environ.get("NOTIFY_SMTP_USER") or ""
         password = os.environ.get("NOTIFY_SMTP_PASSWORD") or ""
-        with smtplib.SMTP(host, port, timeout=TIMEOUT_SECONDS) as smtp:
-            smtp.starttls()
+        if port in IMPLICIT_TLS_PORTS:
+            opener, upgrade = smtplib.SMTP_SSL, False
+        else:
+            opener, upgrade = smtplib.SMTP, True
+        with opener(host, port, timeout=TIMEOUT_SECONDS) as smtp:
+            if upgrade:
+                smtp.starttls()
             if user and password:
                 smtp.login(user, password)
             smtp.send_message(message)
