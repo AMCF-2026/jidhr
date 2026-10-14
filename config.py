@@ -424,7 +424,24 @@ class Config:
     CSUITE_DAF_CREATE_ENABLED = (
         os.environ.get('CSUITE_DAF_CREATE_ENABLED', 'False')
         .strip().lower() == 'true')
-    
+
+    # Whether "new endowment" may do anything at all. Off.
+    #
+    # Until V5.81 the endowment path ran behind the DAF switches above, so
+    # turning DAF on turned endowment on too — and the endowment path built
+    # the wrong record: an INDIVIDUAL profile for the contact person, with
+    # the ORGANISATION's address on it, no org name and no EIN (Step 0
+    # discovery, 2026-10-14). Now it has its own switch, and the DAF ones
+    # no longer reach it.
+    #
+    # Same fail-closed parsing as the DAF flags: only the exact string
+    # "true" enables it. The raw value is kept so a reply can say "the
+    # value was not understood, so it is off" rather than going quiet.
+    CSUITE_ENDOWMENT_CREATE_RAW = os.environ.get(
+        'CSUITE_ENDOWMENT_CREATE_ENABLED', '')
+    CSUITE_ENDOWMENT_CREATE_ENABLED = (
+        CSUITE_ENDOWMENT_CREATE_RAW.strip().lower() == 'true')
+
     # CSuite UI base URL (for deep-linking to profiles, funds, etc.)
     CSUITE_UI_BASE_URL = "https://amuslimcf.fcsuite.com/erp"
     CSUITE_PROFILE_URL = f"{CSUITE_UI_BASE_URL}/profile/display?profile_id={{profile_id}}"

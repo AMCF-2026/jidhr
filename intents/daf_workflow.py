@@ -366,6 +366,37 @@ def _render_submission(parsed: dict, wf_type: str, note: str = None) -> str:
 # Initiation: pull latest submission and present for review
 # ---------------------------------------------------------------------------
 
+def endowment_switch():
+    """(enabled, note). `note` is set when the flag's value was not understood.
+
+    Only the exact word "true" turns endowment on, as with the DAF flags. A
+    value that is neither "true" nor "false" is OFF, and the reply says so:
+    someone who typed "yes" believes it is on.
+    """
+    raw = str(getattr(Config, "CSUITE_ENDOWMENT_CREATE_RAW", "") or "")
+    enabled = bool(getattr(Config, "CSUITE_ENDOWMENT_CREATE_ENABLED", False))
+    note = None
+    if raw.strip() and raw.strip().lower() not in ("true", "false"):
+        note = ("⚠️ CSUITE_ENDOWMENT_CREATE_ENABLED is set to a value that is "
+                "not understood, so endowment is OFF. Only `true` turns it "
+                "on.")
+    return enabled, note
+
+
+def endowment_refusal():
+    """The reply when endowment is switched off, or None when it is on."""
+    enabled, note = endowment_switch()
+    if enabled:
+        return None
+    lines = ["⏸️ **Endowment inquiries are turned off.**", ""]
+    if note:
+        lines += [note, ""]
+    lines += ["Nothing was read from HubSpot and nothing was written. "
+              "CSUITE_ENDOWMENT_CREATE_ENABLED controls this; the DAF "
+              "switches do not."]
+    return "\n".join(lines)
+
+
 def _initiate_workflow(query: str, state: dict, hubspot) -> str:
     """Fetch the latest form submission and ask for confirmation."""
     q = query.lower()
@@ -375,6 +406,14 @@ def _initiate_workflow(query: str, state: dict, hubspot) -> str:
         wf_type = "endowment"
     else:
         wf_type = "daf"
+
+    # Endowment has its own switch, checked before anything is fetched. The
+    # DAF switches used to be the only gate, so turning DAF on turned on an
+    # endowment path that builds the wrong record.
+    if wf_type == "endowment":
+        refusal = endowment_refusal()
+        if refusal:
+            return refusal
 
     logger.info(f"Initiating {wf_type} inquiry workflow...")
 
@@ -1258,6 +1297,23 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
             "❓ I need a clear confirmation. Say *\"Yes\"* to create the profile and fund, "
             "or *\"Cancel\"* to abort."
         )
+
+    # Checked again here, not only at initiation: a workflow opened before the
+    # switch went off must not create after it.
+    if state.get("type") == "endowment":
+        refusal = endowment_refusal()
+        if refusal:
+            _reset_state(state)
+            return refusal
+        # Switched on, but the only create path here is the INDIVIDUAL one,
+        # and an endowment inquiry is an organisation: the contact person
+        # would get the org's address and the org's name and EIN would be
+        # lost. Refused until the organisation path exists.
+        _reset_state(state)
+        return ("🛑 **Endowment create is not available in this version.** "
+                "The only create path here makes an individual profile, and "
+                "an endowment inquiry is an organisation. Nothing was "
+                "written.")
 
     state["step"] = "processing"
     # The API base URL of the client doing the work, so every UI link in the
