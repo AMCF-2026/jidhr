@@ -148,15 +148,17 @@ def test_daf_is_unchanged_with_endowment_off(monkeypatch):
     assert "turned off" not in reply.split("Profile Created")[0]
 
 
-def test_switched_on_still_refuses_the_individual_create(monkeypatch):
-    """Part 1 alone has no organisation path. On must not fall through to
-    create_individual_profile."""
+def test_switched_on_never_reaches_the_individual_create(monkeypatch):
+    """On goes to the ORGANISATION path (Part 3), which refuses while the
+    assignee is unconfirmed. It must never fall through to
+    create_individual_profile — CSuiteNeverCalled fails on any call."""
     _all_daf_switches_on(monkeypatch)
     _endowment(monkeypatch, "true")
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_ASSIGNEE", None)
     state = _confirming("endowment")
 
     reply = daf_workflow._step_create("yes", state, HubSpot(),
                                       CSuiteNeverCalled())
 
-    assert "not available in this version" in reply
+    assert "assignee not confirmed" in reply
     assert state["active"] is False

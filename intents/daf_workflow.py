@@ -178,6 +178,11 @@ def can_handle(query: str, workflow_state: dict = None, **kwargs) -> bool:
     if anchors.yields_to_content(query):
         return False
 
+    # Checked before the exclusions: a note may say "report" or "summary".
+    from intents.mark_handled import MARK_HANDLED_PHRASES
+    if anchors.anchored(q, MARK_HANDLED_PHRASES) and not _is_prose(q):
+        return True
+
     # Don't match summary/report queries that happen to contain "daf inquiry"
     if any(ex in q for ex in _EXCLUDE_PHRASES):
         return False
@@ -205,6 +210,12 @@ def handle(query: str, ctx) -> str:
     # --- Active workflow: handle conversation ---
     if state.get("active"):
         return _handle_active_workflow(query, state, hubspot, csuite)
+
+    from intents import mark_handled
+    if anchors.anchored(query.lower().strip(),
+                        mark_handled.MARK_HANDLED_PHRASES):
+        actor = getattr(getattr(ctx, "actor", None), "user_id", None)
+        return mark_handled.start(query, state, hubspot, actor)
 
     # --- New workflow initiation ---
     return _initiate_workflow(query, state, hubspot)
@@ -560,7 +571,8 @@ def _initiate_workflow(query: str, state: dict, hubspot) -> str:
 
     index = _next_unprocessed(parsed_all, processed)
     if index is None:
-        return _all_processed_message(parsed_all, processed, type_label)
+        return _all_processed_message(parsed_all, _shown(processed),
+                                      type_label)
 
     parsed = parsed_all[index]
     if not parsed.get("email"):
@@ -591,9 +603,24 @@ def _initiate_workflow(query: str, state: dict, hubspot) -> str:
 
     note = history_warning
     if index > 0:
-        skipped = _skipped_note(parsed_all, processed, index, type_label)
+        skipped = _skipped_note(parsed_all, _shown(processed), index,
+                                type_label)
         note = f"{note}\n{skipped}" if note else skipped
+    if row["profile_kind"] == "org":
+        from intents import endowment_inquiry
+        # The cookie holds the contact and the organisation, never the EIN,
+        # the goal or the essays; the create step re-reads those.
+        state["submission_data"] = endowment_inquiry.session_copy(parsed)
+        return endowment_inquiry.render_review(parsed, hubspot, note=note)
     return _render_submission(parsed, wf_type, note=note)
+
+
+def _shown(processed: dict) -> dict:
+    """The processed map for a message. A submission marked handled with no
+    task has no profile, and "profile None" would read as a fault."""
+    return {sid: (profile if profile not in (None, "")
+                  else "none (marked handled, no task)")
+            for sid, profile in (processed or {}).items()}
 
 
 def _skipped_note(parsed_all, processed, index: int, type_label: str) -> str:
@@ -687,6 +714,11 @@ def _skip_to_next(state: dict, hubspot=None) -> str:
                   "step": "confirm", "profile_id": None, "funit_id": None,
                   "ticket_id": None})
     position = f"⏭️ Skipped. Submission {index + 1} of {len(submissions)}."
+    if (inquiry_form(wf_type) or {}).get("profile_kind") == "org":
+        from intents import endowment_inquiry
+        state["submission_data"] = endowment_inquiry.session_copy(parsed)
+        return endowment_inquiry.render_review(parsed, hubspot,
+                                               note=position)
     return _render_submission(parsed, wf_type, note=position)
 
 
@@ -701,6 +733,11 @@ def _handle_active_workflow(query: str, state: dict, hubspot, csuite) -> str:
     if says_no(q) or "forget it" in q:
         _reset_state(state)
         return "👍 Workflow cancelled."
+
+    # Before "skip": this step has no list to skip through.
+    if step == "confirm_mark":
+        from intents import mark_handled
+        return mark_handled.confirm(q, state)
 
     # Skip: move to the NEXT unprocessed submission in the page already
     # fetched. It used to reset the workflow, which meant "skip" and "cancel"
@@ -1204,14 +1241,17 @@ def task_assignee_for_form(form_id):
 
     None means no task, and the caller names the form.
     """
-    return {
-        Config.DAF_INQUIRY_FORM_ID:
-            Config.CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY,
-        Config.ENDOWMENT_INQUIRY_FORM_ID:
-            Config.CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY,
-        # Asset Transfer and Investment Request are deliberately absent: this
-        # workflow does not handle them, so no task is created for them.
-    }.get(form_id)
+    # Each Config.INQUIRY_FORMS row names its own assignee variable. Asset
+    # Transfer and Investment Request have no row: this workflow does not
+    # handle them, so no task is created for them.
+    #
+    # Endowment reads CSUITE_ENDOWMENT_ASSIGNEE since V5.81, NOT
+    # CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY: that one served the retired
+    # individual path, and the new one stays unset until Carl confirms 1002.
+    row = inquiry_form_for_id(form_id)
+    if row is None:
+        return None
+    return getattr(Config, row["assignee_env"], None) or None
 
 
 def _create_followup_task(data, state, results, csuite, wf_type, type_label):
@@ -1442,15 +1482,10 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         if refusal:
             _reset_state(state)
             return refusal
-        # Switched on, but the only create path here is the INDIVIDUAL one,
-        # and an endowment inquiry is an organisation: the contact person
-        # would get the org's address and the org's name and EIN would be
-        # lost. Refused until the organisation path exists.
-        _reset_state(state)
-        return ("🛑 **Endowment create is not available in this version.** "
-                "The only create path here makes an individual profile, and "
-                "an endowment inquiry is an organisation. Nothing was "
-                "written.")
+        # An endowment inquiry is an ORGANISATION. It never reaches the
+        # individual create below.
+        from intents import endowment_inquiry
+        return endowment_inquiry.step_create(state, hubspot, csuite)
 
     state["step"] = "processing"
     # The API base URL of the client doing the work, so every UI link in the

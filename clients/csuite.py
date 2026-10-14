@@ -1292,12 +1292,31 @@ class CSuiteClient:
         return response
 
     def create_org_profile(self, organization: str, email: str = None,
-                           phone: str = None, **kwargs) -> dict:
+                           phone: str = None, address_line: str = None,
+                           city: str = None, state: str = None,
+                           zipcode: str = None, audit_meta: dict = None,
+                           **kwargs) -> dict:
         """Create an organization profile in CSuite. **UNVERIFIED.**
 
-        Used by: nothing. This method has no caller in any commit, and
-        `profile/create/org` has never been called from this repository —
-        not in production, not in the sandbox.
+        Used by: the endowment inquiry workflow (V5.81), behind
+        CSUITE_ENDOWMENT_CREATE_ENABLED, default off. Until V5.81 this method
+        had no caller, and `profile/create/org` has still never been called
+        from this repository — not in production, not in the sandbox. The
+        first real call is therefore also the first test of the names below;
+        verify_writes reads the profile back and reports any it dropped.
+
+        V5.81 added, each by the rule its individual counterpart follows:
+        the email is normalised and the phone is normalised (or left out with
+        `phone_warning`), the address goes as the nested object build_address
+        makes (all four parts or none, `address_warning` otherwise), and
+        `audit_meta` is recorded on the audit row only, passed to _request
+        only when there is something to record.
+
+        NOT sendable, because no input name is confirmed and none is invented:
+        the contact person's name (`org_contact_name` is a display field on
+        org profile 9648, never an input), the EIN (no field on an org profile
+        at all), the starting goal and the essays. The caller puts those in
+        the follow-up task instead.
 
         **UNVERIFIED:** `email` and `phone_number` are carried over from
         `profile/create/individual`, where both were confirmed by a
@@ -1322,14 +1341,39 @@ class CSuiteClient:
         """
         data = {"organization": organization}
         if email:
-            data["email"] = email
+            from sync.readback import normalise_email
+            data["email"] = normalise_email(email) or email
+
+        phone_warning = None
         if phone:
-            data["phone_number"] = phone
+            number, phone_warning = normalize_phone(phone)
+            if number:
+                data["phone_number"] = number
+            else:
+                logger.warning("CSuite org profile create: %s", phone_warning)
+
+        address, address_warning = build_address(address_line, city, state,
+                                                zipcode)
+        if address:
+            data["address"] = address
+        elif address_warning:
+            logger.warning("CSuite org profile create: %s", address_warning)
+
         check_input_fields(kwargs, "profile/create/org")
         data.update(kwargs)
 
         logger.info(f"Creating org profile: {organization}")
-        return self._request("profile/create/org", data)
+        if audit_meta:
+            response = self._request("profile/create/org", data,
+                                     audit_meta=audit_meta)
+        else:
+            response = self._request("profile/create/org", data)
+        if isinstance(response, dict):
+            if phone_warning:
+                response["phone_warning"] = phone_warning
+            if address_warning:
+                response["address_warning"] = address_warning
+        return response
     
     def create_household_profile(self, household: str, **kwargs) -> dict:
         """Create a household profile in CSuite.

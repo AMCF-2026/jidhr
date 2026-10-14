@@ -655,3 +655,53 @@ def processed_submissions(form_id,
         # duplicate exists is a separate problem this must not paper over.
         processed.setdefault(str(submission_id), row.get("target_id"))
     return processed
+
+
+# Which follow-up TASK handled a submission, for the cross-form note in the
+# inquiry review ("also a DAF inquiry, task 1036"). A task row names its own
+# id in target_id; a reconcile link row names the task it tied the submission
+# to in linked_task_id. Separate from _PROCESSED_SQL on purpose: that query's
+# parameters are pinned for DAF and this one answers a different question.
+_HANDLED_TASKS_SQL = """
+    SELECT payload_meta->'ids'->>'hubspot_submission_id' AS submission_id,
+           CASE WHEN target_system = 'csuite' THEN target_id
+                ELSE payload_meta->'ids'->>'linked_task_id' END AS task_id
+      FROM write_audit
+     WHERE status = 'success'
+       AND csuite_env = 'live'
+       AND payload_meta->'ids'->>'hubspot_form_id' = %s
+       AND payload_meta->'ids'->>'hubspot_submission_id' IS NOT NULL
+       AND (
+             (target_system = 'csuite' AND endpoint = %s)
+          OR (target_system = %s AND endpoint LIKE %s)
+       )
+     ORDER BY id
+"""
+
+
+def handled_tasks(form_id) -> dict:
+    """{submission_id: task_id or None} for a form. Raises
+    ProcessedHistoryUnavailable when it cannot be read. First row wins."""
+    if not form_id:
+        return {}
+    try:
+        from clients.database import execute_query
+        rows = execute_query(
+            _HANDLED_TASKS_SQL,
+            (str(form_id), TASK_CREATE_ENDPOINT, LINK_TARGET_SYSTEM,
+             f"{SUBMISSION_LINK_ENDPOINT}/%"),
+            fetch=True)
+    except Exception as e:
+        raise ProcessedHistoryUnavailable(
+            f"could not read the task history for form {form_id}: {e}") from e
+    found = {}
+    for row in rows or []:
+        sid = (row or {}).get("submission_id")
+        if sid in (None, ""):
+            continue
+        task = row.get("task_id")
+        if task and not found.get(str(sid)):
+            found[str(sid)] = str(task)
+        else:
+            found.setdefault(str(sid), None)
+    return found

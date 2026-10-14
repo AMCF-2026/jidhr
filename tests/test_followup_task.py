@@ -143,10 +143,21 @@ def test_an_unparseable_assignee_is_none_not_zero(monkeypatch, raw):
 
 def test_each_form_has_its_own_assignee(monkeypatch):
     monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY", 1004)
-    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY", 1009)
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_ASSIGNEE", 1009)
 
     assert task_assignee_for_form(Config.DAF_INQUIRY_FORM_ID) == 1004
     assert task_assignee_for_form(Config.ENDOWMENT_INQUIRY_FORM_ID) == 1009
+
+
+def test_the_retired_endowment_variable_assigns_nobody(monkeypatch):
+    """V5.81: CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY served the retired
+    individual path. A deployment that still sets it must not get an
+    endowment task assigned through it."""
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY",
+                        1002)
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_ASSIGNEE", None)
+
+    assert task_assignee_for_form(Config.ENDOWMENT_INQUIRY_FORM_ID) is None
 
 
 def test_there_is_NO_fallback_to_a_default_person(monkeypatch):
@@ -568,7 +579,7 @@ def test_a_configured_form_still_gets_its_own_person(monkeypatch):
     monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
     monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", True)
     monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY", 1004)
-    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY", 1009)
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_ASSIGNEE", 1009)
     monkeypatch.setattr(Config, "CSUITE_TASK_TYPE_ID", None)
 
     for form_id, expected in ((Config.DAF_INQUIRY_FORM_ID, 1004),
