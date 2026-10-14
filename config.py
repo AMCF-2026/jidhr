@@ -463,7 +463,83 @@ class Config:
     FUND_GROUP_GIVING_CIRCLE = 1007
     FUND_GROUP_ENDOWMENT = 1008
     FUND_GROUP_GRANT = 1009
-    
+
+    # =========================================================================
+    # INQUIRY FORMS (V5.81)
+    # =========================================================================
+    # One row per HubSpot inquiry form the "new <key>" workflow handles. A new
+    # form is a new row, not new code.
+    #
+    #   key               what the chat command and TICKET_PIPELINES call it
+    #   form_id           the HubSpot form GUID
+    #   label             what a person reads: "New DAF Inquiry"
+    #   profile_kind      "individual" or "org" — which CSuite create is used
+    #   field_map         {(objectTypeId, hubspot field name): parsed key}.
+    #                     objectTypeId is "0-1" (contact) or "0-2" (company);
+    #                     "*" matches any object, which is what DAF has always
+    #                     done. A submission value carries its objectTypeId, so
+    #                     a row that names the object will not read a company
+    #                     address as a person's.
+    #   fund_group        CSuite fund group, for the (deferred) fund create
+    #   task_type_id      a fixed task type, or None to read task_type_env
+    #   task_type_env     the Config attribute holding the task type, or None
+    #   assignee_env      the Config attribute holding the task assignee
+    #   create_flag       the Config switch for the profile create
+    #   task_flag         the Config switch for the follow-up task
+    #   profile_endpoint  the CSuite create endpoint; it is also what the
+    #                     processed history counts as handled, with task/create
+    #
+    # DAF is row 1 and is byte-identical to V5.80: same names, same flags, the
+    # same task type variable, and a field map copied key for key.
+    _DAF_FIELD_MAP = {
+        ("*", "firstname"): "first_name",
+        ("*", "first_name"): "first_name",
+        ("*", "first name"): "first_name",
+        ("*", "lastname"): "last_name",
+        ("*", "last_name"): "last_name",
+        ("*", "last name"): "last_name",
+        ("*", "email"): "email",
+        ("*", "phone"): "phone",
+        ("*", "mobilephone"): "phone",
+        # TODO(hotfix-63): these never match. The live DAF form calls them
+        # "what_would_you_like_to_name_your_fund_" and
+        # "estimated_initial_contribution_amount" (Step 0, 2026-10-14), so
+        # every DAF review prints "Not specified" for both. Left as-is here:
+        # V5.81 moves DAF without changing what it does.
+        ("*", "fund_name"): "fund_name",
+        ("*", "fund name"): "fund_name",
+        ("*", "requested_fund_name"): "fund_name",
+        ("*", "initial_contribution"): "initial_contribution",
+        ("*", "contribution_amount"): "initial_contribution",
+        ("*", "amount"): "initial_contribution",
+        ("*", "address"): "address_street",
+        ("*", "street address"): "address_street",
+        ("*", "address2"): "address_street2",
+        ("*", "city"): "address_city",
+        ("*", "state"): "address_state",
+        ("*", "state/region"): "address_state",
+        ("*", "zip"): "address_zip",
+        ("*", "zipcode"): "address_zip",
+        ("*", "postal code"): "address_zip",
+    }
+
+    INQUIRY_FORMS = [
+        {
+            "key": "daf",
+            "form_id": DAF_INQUIRY_FORM_ID,
+            "label": "DAF",
+            "profile_kind": "individual",
+            "field_map": _DAF_FIELD_MAP,
+            "fund_group": FUND_GROUP_DAF,
+            "task_type_id": None,
+            "task_type_env": "CSUITE_TASK_TYPE_ID",
+            "assignee_env": "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY",
+            "create_flag": "CSUITE_DAF_CREATE_ENABLED",
+            "task_flag": "CSUITE_DAF_TASK_CREATE_ENABLED",
+            "profile_endpoint": "profile/create/individual",
+        },
+    ]
+
     # Default account for fund creation (Bank of America Restricted)
     DEFAULT_CASH_ACCOUNT_ID = 1069
     

@@ -270,7 +270,92 @@ def format_submitted_at(value) -> str:
             f"{hour}:{local:%M} {local:%p} ET")
 
 
-def _processed_map(form_id):
+# ---------------------------------------------------------------------------
+# Inquiry forms (Config.INQUIRY_FORMS)
+# ---------------------------------------------------------------------------
+
+def inquiry_form(key):
+    """The Config.INQUIRY_FORMS row for `key`, or None."""
+    for row in getattr(Config, "INQUIRY_FORMS", None) or []:
+        if row.get("key") == key:
+            return row
+    return None
+
+
+def inquiry_form_for_id(form_id):
+    """The Config.INQUIRY_FORMS row for a HubSpot form id, or None."""
+    for row in getattr(Config, "INQUIRY_FORMS", None) or []:
+        if row.get("form_id") == form_id:
+            return row
+    return None
+
+
+def form_switch(row, name) -> bool:
+    """A row's switch (`create_flag` or `task_flag`), read at call time."""
+    attribute = (row or {}).get(name)
+    return bool(attribute and getattr(Config, attribute, False))
+
+
+def form_task_type(row):
+    """The row's task type: fixed, or read from the Config attribute it names."""
+    row = row or {}
+    if row.get("task_type_id") is not None:
+        return row["task_type_id"]
+    if row.get("task_type_env"):
+        return getattr(Config, row["task_type_env"], None)
+    return None
+
+
+def handled_endpoints(row):
+    """The CSuite endpoints that make one of this row's submissions handled.
+
+    None for a row whose answer is the default, so the processed-history
+    call for DAF stays exactly `processed_submissions(form_id)`.
+    """
+    from clients.audit import HANDLED_CSUITE_ENDPOINTS, TASK_CREATE_ENDPOINT
+
+    endpoints = ((row or {}).get("profile_endpoint"), TASK_CREATE_ENDPOINT)
+    return None if endpoints == tuple(HANDLED_CSUITE_ENDPOINTS) else endpoints
+
+
+# Full paging, newest first. 50 is HubSpot's page size for this endpoint; the
+# page cap stops a cursor that never ends from looping forever, and is far
+# above the 90 DAF and 13 endowment submissions there are (2026-10-14).
+SUBMISSION_PAGE_SIZE = 50
+MAX_SUBMISSION_PAGES = 40
+
+
+def fetch_all_submissions(hubspot, form_id):
+    """(raw submissions, error, complete). Follows HubSpot's `after` cursor.
+
+    Until V5.81 the chat flow asked for limit=5, so only the five newest were
+    ever offered: 8 of the 13 endowment submissions and 85 of the 90 DAF ones
+    were unreachable. `complete` is False when the page cap stopped the read.
+    `error` is HubSpot's error text when a page failed; nothing is returned
+    from a read that failed part way, because a partial list would look whole.
+    """
+    found, after, seen = [], None, set()
+    for _page in range(MAX_SUBMISSION_PAGES):
+        response = hubspot.get_form_submissions(
+            form_id, limit=SUBMISSION_PAGE_SIZE, after=after)
+        if not isinstance(response, dict):
+            return [], "HubSpot returned no response", False
+        if "error" in response:
+            return [], response["error"], False
+        found.extend(response.get("results") or [])
+        after = ((response.get("paging") or {}).get("next") or {}).get("after")
+        if not after:
+            return found, None, True
+        if after in seen:
+            logger.error("HubSpot repeated a submissions cursor; stopping")
+            return found, None, False
+        seen.add(after)
+    logger.error("stopped reading submissions for form %s at %d pages",
+                 form_id, MAX_SUBMISSION_PAGES)
+    return found, None, False
+
+
+def _processed_map(form_id, endpoints=None):
     """({submission_id: profile_id}, warning or None). Never raises.
 
     A failure here is NOT an empty history: an empty history offers every
@@ -281,7 +366,9 @@ def _processed_map(form_id):
     from clients.audit import ProcessedHistoryUnavailable, processed_submissions
 
     try:
-        return processed_submissions(form_id), None
+        if endpoints is None:
+            return processed_submissions(form_id), None
+        return processed_submissions(form_id, endpoints=endpoints), None
     except ProcessedHistoryUnavailable as e:
         logger.error("processed history unavailable for form %s: %s",
                      form_id, e)
@@ -339,6 +426,9 @@ def _donor_label(parsed: dict) -> str:
 def _render_submission(parsed: dict, wf_type: str, note: str = None) -> str:
     """The review block for one submission. Shared by initiation and skip."""
     type_label = "DAF" if wf_type == "daf" else "Endowment"
+    # TODO(hotfix-63): always "Not specified" on the live DAF form, whose
+    # fields are what_would_you_like_to_name_your_fund_ and
+    # estimated_initial_contribution_amount. See Config._DAF_FIELD_MAP.
     fund_name = parsed.get("fund_name") or "Not specified"
     contribution = parsed.get("initial_contribution") or "Not specified"
     lines = [f"📋 **New {type_label} Inquiry**", ""]
@@ -415,41 +505,42 @@ def _initiate_workflow(query: str, state: dict, hubspot) -> str:
         if refusal:
             return refusal
 
+    row = inquiry_form(wf_type)
+    if row is None:
+        return (f"⚠️ No inquiry form is configured for {wf_type!r}. Nothing "
+                "was read and nothing was written.")
+
     logger.info(f"Initiating {wf_type} inquiry workflow...")
 
-    # Fetch submissions
+    # Fetch submissions — every page, not the newest five.
     try:
-        if wf_type == "daf":
-            response = hubspot.get_daf_inquiry_submissions(limit=5)
-        else:
-            response = hubspot.get_endowment_inquiry_submissions(limit=5)
+        submissions, error, complete = fetch_all_submissions(
+            hubspot, row["form_id"])
     except Exception as e:
         logger.error(f"Error fetching {wf_type} submissions: {e}")
         return f"❌ Failed to fetch {wf_type} inquiry submissions: {e}"
 
-    if "error" in response:
-        return f"❌ Failed to fetch {wf_type} inquiry submissions: {response['error']}"
+    if error:
+        return f"❌ Failed to fetch {wf_type} inquiry submissions: {error}"
 
-    submissions = response.get("results", [])
     if not submissions:
         return f"📭 No pending {wf_type.upper()} inquiry submissions found."
 
-    form_id = (Config.DAF_INQUIRY_FORM_ID if wf_type == "daf"
-               else Config.ENDOWMENT_INQUIRY_FORM_ID)
-    type_label = "DAF" if wf_type == "daf" else "Endowment"
+    form_id = row["form_id"]
+    type_label = row["label"]
 
-    # The whole page is parsed, not just [0]. Until 2026-10-05 this took
+    # Every submission is parsed, not just [0]. Until 2026-10-05 this took
     # submissions[0] unconditionally and nothing recorded a success, so a
     # submission that had just been processed was offered again — and would
     # have been offered forever, until a newer submission displaced it.
-    parsed_all = [_parse_submission(sub) for sub in submissions]
+    parsed_all = [_parse_submission(sub, row["field_map"])
+                  for sub in submissions]
 
     # NEWEST FIRST is assumed here and everywhere below: `parsed_all[0]` is
-    # called "the newest", and asking for limit=5 means "the five newest".
-    # HubSpot's form-integrations submissions endpoint returns newest first
-    # — measured 2026-10-14 across all 90 DAF submissions on both pages,
-    # 2026-10-08 down to 2025-10-14 with no reversal — so no paging is done
-    # and page 1 is where every NEW submission appears.
+    # called "the newest". HubSpot's form-integrations submissions endpoint
+    # returns newest first, and keeps that order across pages — measured
+    # 2026-10-14 across all 90 DAF submissions on both pages, 2026-10-08 down
+    # to 2025-10-14 with no reversal, and across all 13 endowment ones.
     #
     # If that ever flips, "the newest" becomes the oldest and this offers a
     # months-old submission as new. It is checked rather than trusted: a
@@ -459,7 +550,13 @@ def _initiate_workflow(query: str, state: dict, hubspot) -> str:
         logger.error("DAF submissions did NOT come back newest first — the "
                      "'newest' shown below may not be the newest. The code "
                      "assumes newest-first ordering; see is_newest_first.")
-    processed, history_warning = _processed_map(form_id)
+    processed, history_warning = _processed_map(form_id,
+                                                handled_endpoints(row))
+    if not complete:
+        cut = (f"⚠️ Only the newest {len(submissions)} {type_label} "
+               "submissions could be read; older ones were not checked.")
+        history_warning = (f"{history_warning}\n{cut}" if history_warning
+                           else cut)
 
     index = _next_unprocessed(parsed_all, processed)
     if index is None:
@@ -479,9 +576,14 @@ def _initiate_workflow(query: str, state: dict, hubspot) -> str:
         "step": "confirm",
         "form_id": form_id,
         "submission_data": parsed,
-        "submissions": parsed_all,
+        # NOT the list. This dict lives in the Flask session COOKIE, and a
+        # browser drops a cookie over 4,096 bytes without a word. Measured
+        # 2026-10-14 with realistic values: 5 parsed submissions sign to
+        # 1,335 bytes, 20 to 3,300 and 90 to 12,419. "skip" re-reads the
+        # list instead — see _reload_submissions.
+        "submissions": [],
         "submission_index": index,
-        "processed": processed,
+        "processed": {},
         "profile_id": None,
         "funit_id": None,
         "ticket_id": None,
@@ -527,14 +629,48 @@ def _all_processed_message(parsed_all, processed, type_label: str) -> str:
 # Active workflow conversation handler
 # ---------------------------------------------------------------------------
 
-def _skip_to_next(state: dict) -> str:
+def _reload_submissions(state: dict, hubspot):
+    """(parsed submissions newest first, processed map, error). For "skip".
+
+    The list is read again rather than kept in the session, which is a
+    cookie (see the note in _initiate_workflow). The processed history is
+    read again too, so a submission handled since the list was first shown
+    is skipped over rather than offered.
+    """
+    row = inquiry_form(state.get("type") or "daf")
+    if row is None:
+        return [], {}, "no inquiry form is configured for this workflow"
+    try:
+        raw, error, _complete = fetch_all_submissions(hubspot, row["form_id"])
+    except Exception as e:
+        return [], {}, str(e)
+    if error:
+        return [], {}, error
+    parsed_all = [_parse_submission(sub, row["field_map"]) for sub in raw]
+    processed, _warning = _processed_map(row["form_id"],
+                                         handled_endpoints(row))
+    return parsed_all, processed, None
+
+
+def _skip_to_next(state: dict, hubspot=None) -> str:
     """Show the next unprocessed submission, or end when there are none."""
-    submissions = state.get("submissions") or []
-    processed = state.get("processed") or {}
     wf_type = state.get("type") or "daf"
     type_label = "DAF" if wf_type == "daf" else "Endowment"
+    submissions, processed, error = _reload_submissions(state, hubspot)
+    if error:
+        # The workflow stays where it was: nothing was skipped.
+        return (f"❌ Could not re-read the {type_label} submissions to skip "
+                f"to the next one: {error}. Nothing was skipped.")
     current = state.get("submission_index")
     current = current if isinstance(current, int) else 0
+    # Found by id, not trusted by position: a submission that arrived since
+    # the list was shown moves everything down one.
+    shown = str((state.get("submission_data") or {}).get("submission_id")
+                or "")
+    for position, sub in enumerate(submissions):
+        if shown and sub.get("submission_id") == shown:
+            current = position
+            break
 
     index = _next_unprocessed(submissions, processed, start=current + 1)
     if index is None:
@@ -571,7 +707,7 @@ def _handle_active_workflow(query: str, state: dict, hubspot, csuite) -> str:
     # did the same thing and the next submission was unreachable — saying
     # "process daf inquiry" again just re-offered the one that was skipped.
     if any(w in q for w in ['skip', 'next']):
-        return _skip_to_next(state)
+        return _skip_to_next(state, hubspot)
 
     if step == "confirm":
         return _step_create(q, state, hubspot, csuite)
@@ -1087,8 +1223,9 @@ def _create_followup_task(data, state, results, csuite, wf_type, type_label):
     """
     profile_id = state.get("profile_id")
     label = "DAF" if wf_type == "daf" else "Endowment"
+    row = inquiry_form(wf_type)
 
-    if not Config.CSUITE_DAF_TASK_CREATE_ENABLED:
+    if not form_switch(row, "task_flag"):
         results["task_skipped"] = "follow-up tasks are turned off"
         return
     if not profile_id:
@@ -1118,7 +1255,7 @@ def _create_followup_task(data, state, results, csuite, wf_type, type_label):
             due_date=due,
             description=subject,
             linked_profile_id=profile_id,
-            task_type_id=Config.CSUITE_TASK_TYPE_ID,
+            task_type_id=form_task_type(row),
             # Recorded on the audit row, never sent to CSuite — the same
             # pair create_individual_profile already carries. On the
             # returning-donor path there IS no profile create, so before
@@ -1399,8 +1536,10 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         "errors": [],
     }
 
+    row = inquiry_form(wf_type)
+
     # --- 1. Create CSuite profile ---
-    if not Config.CSUITE_DAF_CREATE_ENABLED:
+    if not form_switch(row, "create_flag"):
         # Off by default. create_individual_profile has sent primary_email
         # since 2026-03-17 and CSuite does not recognise that input name —
         # it returns 200 with a profile_id and drops the value. A profile
@@ -1533,7 +1672,7 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
     # to report as failed.
     if results["profile_created"] and Config.CSUITE_DAF_FUND_CREATE_ENABLED:
         fund_name = data.get("fund_name") or f"{data.get('last_name', 'New')} Family Fund"
-        fgroup_id = Config.FUND_GROUP_DAF if wf_type == "daf" else Config.FUND_GROUP_ENDOWMENT
+        fgroup_id = row["fund_group"]
 
         logger.info(f"Creating CSuite fund: {fund_name}...")
         try:
@@ -1717,43 +1856,21 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
 # Submission parser
 # ---------------------------------------------------------------------------
 
-# Common HubSpot form field names (may vary — we try multiple variants)
-_FIELD_MAP = {
-    "firstname": "first_name",
-    "first_name": "first_name",
-    "first name": "first_name",
-    "lastname": "last_name",
-    "last_name": "last_name",
-    "last name": "last_name",
-    "email": "email",
-    "phone": "phone",
-    "mobilephone": "phone",
-    "fund_name": "fund_name",
-    "fund name": "fund_name",
-    "requested_fund_name": "fund_name",
-    "initial_contribution": "initial_contribution",
-    "contribution_amount": "initial_contribution",
-    "amount": "initial_contribution",
-    # The DAF Inquiry Form and the Endowment Inquiry Form both carry these
-    # four as REQUIRED fields, so every submission has a full address —
-    # verified against reports/hubspot_form_fields_2026-09-30.csv. They were
-    # not mapped here before, so the address was discarded at the parse step
-    # and nobody downstream could tell it had ever been submitted.
-    #
-    # They are mapped now so the address can be REPORTED. It is still not
-    # sent to CSuite: no input name for it has been found, and nine
-    # candidates have been eliminated by sandbox writes. See
-    # clients/csuite.py::create_individual_profile.
-    "address": "address_street",
-    "street address": "address_street",
-    "address2": "address_street2",
-    "city": "address_city",
-    "state": "address_state",
-    "state/region": "address_state",
-    "zip": "address_zip",
-    "zipcode": "address_zip",
-    "postal code": "address_zip",
-}
+# The field maps live in Config.INQUIRY_FORMS, one per form, keyed by
+# (objectTypeId, field name). DAF's is copied key for key from the map that
+# lived here until V5.81, every key matching any object ("*"), so DAF parses
+# exactly as before.
+#
+# Why the address fields are mapped at all: the DAF Inquiry Form carries all
+# four as REQUIRED fields, so every submission has a full address — verified
+# against reports/hubspot_form_fields_2026-09-30.csv. They were not mapped
+# before 2026-10-01, so the address was discarded at the parse step and nobody
+# downstream could tell it had ever been submitted.
+#
+# The Endowment Inquiry Form ALSO has address/city/state/zip, but on the
+# COMPANY object (0-2): that is the organisation's address. A name-only map
+# read it as the person's. Its row names the object.
+_DEFAULT_FORM_KEY = "daf"
 
 # The parsed keys that together make up an address, in the order a person
 # would write them.
@@ -1777,8 +1894,15 @@ def submitted_address(data: dict) -> str:
     return ", ".join(p for p in (street, city, tail) if p)
 
 
-def _parse_submission(submission: dict) -> dict:
-    """Parse a HubSpot form submission into a normalised dict."""
+def _parse_submission(submission: dict, field_map: dict = None) -> dict:
+    """Parse a HubSpot form submission into a normalised dict.
+
+    `field_map` is a Config.INQUIRY_FORMS row's map; DAF's by default. A
+    value matches on its own (objectTypeId, name) first, then on ("*", name).
+    """
+    if field_map is None:
+        field_map = (inquiry_form(_DEFAULT_FORM_KEY) or {}).get(
+            "field_map") or {}
     parsed = {
         # Identifiers, not donor data. They are what makes a submission
         # replayable from HubSpot after a run that could not complete —
@@ -1799,11 +1923,17 @@ def _parse_submission(submission: dict) -> dict:
         "submitted_at": submission.get("submittedAt", "Unknown"),
     }
 
+    # A row's own keys start empty, as the shared ones above do, so a reader
+    # can tell "not submitted" from "not parsed".
+    for target in field_map.values():
+        parsed.setdefault(target, "")
+
     values = submission.get("values", [])
     for v in values:
         field = v.get("name", "").lower().strip()
         value = v.get("value", "").strip()
-        mapped = _FIELD_MAP.get(field)
+        mapped = (field_map.get((v.get("objectTypeId"), field))
+                  or field_map.get(("*", field)))
         if mapped and value:
             parsed[mapped] = value
 

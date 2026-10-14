@@ -242,6 +242,10 @@ class SubmissionsHub:
     def get_daf_inquiry_submissions(self, limit=50):
         return {"results": self._subs[:limit]}
 
+    def get_form_submissions(self, form_id, limit=50, after=None):
+        # One page: every fixture here is shorter than a page.
+        return {"results": self._subs[:limit]}
+
 
 def sub(conv, first, submitted):
     return {"conversionId": conv, "submittedAt": submitted,
@@ -340,9 +344,9 @@ def test_a_flipped_page_is_logged_loudly(monkeypatch, caplog):
                for r in caplog.records)
 
 
-def test_no_paging_is_done():
-    """Page 1 only, by decision. The chat flow asks for 5, the reconcile
-    for 50, and neither follows a cursor."""
+def test_the_reconcile_does_no_paging():
+    """The RECONCILE reads page 1 only, by decision: 50, no cursor. (The chat
+    flow pages fully since V5.81 — tests/test_daf_unchanged.)"""
     import inspect
 
     assert "after" not in inspect.getsource(dr.page_one)
@@ -414,8 +418,8 @@ def reconcile(monkeypatch):
     state = {"links": [], "processed": {"6a31606e": "21699"},
              "csuite": ReconcileCSuite()}
 
-    monkeypatch.setattr(dr, "legacy_tasks", lambda: ["1033", "1036"])
-    monkeypatch.setattr(dr, "tasked_submissions", lambda: set())
+    monkeypatch.setattr(dr, "legacy_tasks", lambda form_id: ["1033", "1036"])
+    monkeypatch.setattr(dr, "tasked_submissions", lambda form_id: set())
     monkeypatch.setattr(dr, "_pace", lambda: None)
     monkeypatch.setattr(dr, "link_rows_allowed", lambda: True)
     monkeypatch.setattr(audit, "processed_submissions",
@@ -590,7 +594,7 @@ def test_no_earlier_link_when_the_handled_donor_has_no_task(reconcile,
                                                            monkeypatch):
     """Processed but never followed up: not "handled" in the sense the rule
     needs."""
-    monkeypatch.setattr(dr, "legacy_tasks", lambda: ["1033"])
+    monkeypatch.setattr(dr, "legacy_tasks", lambda form_id: ["1033"])
 
     out, _hub = run_reconcile(reconcile, dry_run=True)
 

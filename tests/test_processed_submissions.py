@@ -51,6 +51,10 @@ class HubSpot:
     def get_daf_inquiry_submissions(self, limit=50):
         return {"results": self._submissions[:limit]}
 
+    def get_form_submissions(self, form_id, limit=50, after=None):
+        # One page: every fixture here is shorter than a page.
+        return {"results": self._submissions[:limit]}
+
     def search_contact_by_email(self, email, properties=None):
         return contact("70123")
 

@@ -904,7 +904,8 @@ class HubSpotClient:
         """Get forms list"""
         return self._get("marketing/v3/forms", {"limit": limit})
     
-    def get_form_submissions(self, form_id: str, limit: int = 50) -> dict:
+    def get_form_submissions(self, form_id: str, limit: int = 50,
+                             after: str = None) -> dict:
         """Get form submissions for a specific form.
         
         Used by: DAF/Endowment inquiry processing (Kods),
@@ -913,14 +914,21 @@ class HubSpotClient:
         Args:
             form_id: HubSpot form GUID (use Config.DAF_INQUIRY_FORM_ID, etc.)
             limit: Number of submissions to return
-            
+            after: the cursor from a previous page's paging.next.after.
+                Omitted from the request when None, so a first-page call is
+                unchanged.
+
         Returns:
             dict with 'results' containing submission objects.
             Each submission has 'values' dict with field name → value mappings.
+            'paging.next.after' is present when there is another page.
         """
+        params = {"limit": limit}
+        if after:
+            params["after"] = after
         return self._get(
             f"form-integrations/v1/submissions/forms/{form_id}",
-            {"limit": limit}
+            params
         )
     
     def get_daf_inquiry_submissions(self, limit: int = 50) -> dict:
