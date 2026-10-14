@@ -1,0 +1,615 @@
+"""V5.81 Part 3: the endowment row makes an ORGANISATION profile.
+
+Every value here is invented. The EIN, goal and essays are obviously fake
+markers, so a test can search logs and audit rows for them. The CSuite client
+is the REAL CSuiteClient._request with its transport faked; HubSpot, the
+mirror and the audit store are test doubles. No network, no database.
+"""
+
+import json
+import logging
+from datetime import datetime, timezone
+
+import pytest
+
+from clients import audit
+from clients.csuite import CSuiteClient
+from config import Config
+from intents import daf_workflow, endowment_inquiry, mark_handled
+from sync import org_match
+from sync.sandbox_writes import WriteBudget
+
+FORM = Config.ENDOWMENT_INQUIRY_FORM_ID
+DAF = Config.DAF_INQUIRY_FORM_ID
+EIN = "00-FAKE-EIN-0042"
+GOAL = "FAKEGOAL-250000"
+ESSAYS = {"what_is_your_organization_s_mission_and_core_services_programs_":
+          "FAKEMISSION " * 20,
+          "what_prompted_your_organization_s_interest_in_starting_an_"
+          "endowment_": "FAKEINTEREST " * 20,
+          "what_are_your_organization_s_main_endowment_goals_":
+          "FAKEGOALS " * 20}
+SECRETS = (EIN, GOAL, "FAKEMISSION", "FAKEINTEREST", "FAKEGOALS")
+FIXED_EPOCH = 1800000000
+
+
+def endowment_submission(conv="endw0001-aaaa-bbbb", org="Test Peace Academy",
+                         email="director@example.invalid",
+                         ms=1900000000000, **overrides):
+    contact = {"firstname": "Dana", "lastname": "Director", "email": email,
+               "phone": "(703) 555-0123",
+               "how_did_you_hear_about_us_": "FAKEHEARD"}
+    company = {"name": org, "organization_ein": EIN,
+               "address": "9 Org Plaza", "city": "Herndon", "state": "VA",
+               "zip": "20170", "website": "https://org.example.invalid",
+               "what_is_your_endowment_starting_goal_": GOAL, **ESSAYS}
+    company.update(overrides)
+    values = ([{"name": k, "value": v, "objectTypeId": "0-1"}
+               for k, v in contact.items()]
+              + [{"name": k, "value": v, "objectTypeId": "0-2"}
+                 for k, v in company.items()])
+    return {"conversionId": conv, "submittedAt": ms, "values": values}
+
+
+class Hub:
+    """HubSpot double: per-form submission lists, one page each."""
+
+    def __init__(self, by_form=None, contact_profile=None):
+        self.by_form = by_form if by_form is not None else {
+            FORM: [endowment_submission()], DAF: []}
+        self.contact_profile = contact_profile
+        self.calls = []
+
+    def get_form_submissions(self, form_id, limit=50, after=None):
+        self.calls.append(form_id)
+        return {"results": list(self.by_form.get(form_id, []))}
+
+    def search_contact_by_email(self, email, properties=None):
+        props = ({"csuite_profile_id": self.contact_profile}
+                 if self.contact_profile else {})
+        return {"results": [{"id": "70999", "properties": props}]}
+
+    def __getattr__(self, name):
+        raise AssertionError(f"unexpected HubSpot call: {name}()")
+
+
+class Client(CSuiteClient):
+    """The real _request. `existing` maps an email to [(profile_id, ptype)]."""
+
+    def __init__(self, existing=None):
+        self.api_key, self.api_secret = "k", "s"
+        self.base_url = "https://amuslimcf.fcsuite.com/api/v2"
+        self.env = "live"
+        self.verify_writes = False
+        self.write_budget = WriteBudget(5)
+        self.sent = []
+        outer, existing = self, existing or {}
+        ptypes = {str(pid): pt for rows in existing.values()
+                  for pid, pt in rows}
+
+        class Session:
+            def post(_self, url, data=None, **kwargs):
+                endpoint = url.split("/api/v2/", 1)[-1]
+                body = json.loads(data)
+                outer.sent.append({"endpoint": endpoint, "body": body,
+                                   "raw": data})
+                if endpoint == "profile/list":
+                    email = body.get("primary_email")
+                    if email is None:
+                        reply = {"count": 18797, "results": []}
+                    elif str(email).startswith("filter-probe-"):
+                        reply = {"count": 0, "results": []}
+                    else:
+                        rows = existing.get(email, [])
+                        reply = {"count": len(rows), "results": [
+                            {"profile_id": pid} for pid, _pt in rows]}
+                    payload = {"success": 1, "data": reply}
+                elif endpoint == "profile/display":
+                    pid = str(body.get("profile_id"))
+                    payload = {"success": 1, "data": {
+                        "profile_id": int(pid),
+                        "ptype": ptypes.get(pid, "org")}}
+                elif endpoint == "profile/create/org":
+                    payload = {"success": 1, "data": {"profile_id": 40001}}
+                elif endpoint == "task/create":
+                    payload = {"success": 1, "data": {"task_id": 2001}}
+                else:
+                    raise AssertionError(f"unexpected CSuite {endpoint}")
+
+                class R:
+                    status_code = 200
+                    text = json.dumps(payload)
+
+                    def json(self):
+                        return payload
+                return R()
+
+        self.session = Session()
+
+    def endpoints(self):
+        return [s["endpoint"] for s in self.sent]
+
+    def body(self, endpoint):
+        return next(s["body"] for s in self.sent if s["endpoint"] == endpoint)
+
+
+MIRROR_SYNCED = datetime(2026, 9, 23, 19, 52, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+def world(monkeypatch):
+    """Switch on, assignee confirmed, empty history, a mirror with orgs."""
+    import clients.csuite as mod
+
+    state = {"audit": [], "records": [], "processed": {FORM: {}, DAF: {}},
+             "tasks": {FORM: {}, DAF: {}},
+             "mirror": [{"profile_id": "9648", "organization":
+                         "Unrelated Charity Trust", "ptype": "org"}]}
+    monkeypatch.setattr(Config, "CSUITE_ENV", "live")
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_CREATE_RAW", "true")
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_CREATE_ENABLED", True)
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_ASSIGNEE", 1002)
+    monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
+    monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", True)
+
+    def reserve(system, method, endpoint, target_id=None, payload=None,
+                sync_run_id=None):
+        state["audit"].append({"endpoint": endpoint,
+                               "meta": audit.payload_meta(payload)})
+        return {"id": len(state["audit"])}
+
+    monkeypatch.setattr(mod, "reserve_write", reserve)
+    monkeypatch.setattr(mod, "complete_write", lambda *a, **kw: None)
+    monkeypatch.setattr(mod.time, "time", lambda: FIXED_EPOCH)
+    monkeypatch.setattr(audit, "processed_submissions",
+                        lambda form_id, **k: dict(state["processed"][form_id]))
+    monkeypatch.setattr(audit, "handled_tasks",
+                        lambda form_id: dict(state["tasks"][form_id]))
+    monkeypatch.setattr(org_match, "mirror_org_rows",
+                        lambda: (list(state["mirror"]), MIRROR_SYNCED))
+
+    def record(system, method, endpoint, target_id=None, payload=None,
+               status="success", **kwargs):
+        state["records"].append({"system": system, "endpoint": endpoint,
+                                 "meta": audit.payload_meta(payload)})
+        ids = (payload or {})
+        state["processed"][ids["hubspot_form_id"]][
+            ids["hubspot_submission_id"]] = None
+        return True
+
+    monkeypatch.setattr(audit, "record_write", record)
+    monkeypatch.setattr("sync.daf_reconcile.link_rows_allowed", lambda: True)
+    return state
+
+
+def offer_and_create(hub=None, client=None):
+    hub = hub or Hub()
+    client = client or Client()
+    state = daf_workflow.default_workflow_state()
+    review = daf_workflow._initiate_workflow("new endowment", state, hub)
+    reply = daf_workflow._handle_active_workflow("yes", state, hub, client)
+    return review, reply, state, client
+
+
+# --- the profile is an ORGANISATION, with the organisation's address --------
+
+def test_the_org_profile_body(world):
+    _review, reply, state, client = offer_and_create()
+
+    assert client.endpoints() == ["profile/list", "profile/list",
+                                  "profile/list", "profile/create/org",
+                                  "task/create"]
+    body = client.body("profile/create/org")
+    assert body == {
+        "env": "live", "epoch": FIXED_EPOCH,
+        "organization": "Test Peace Academy",
+        "email": "director@example.invalid",
+        "phone_number": "7035550123",
+        "address": {"address": "9 Org Plaza", "city": "Herndon",
+                    "state": "VA", "zipcode": "20170"},
+        "website": "https://org.example.invalid"}
+    assert state["profile_id"] == 40001
+    assert "Organisation Profile Created" in reply
+
+
+def test_no_individual_profile_call_ever(world):
+    for existing in ({}, {"director@example.invalid": [(555, "indiv")]},
+                     {"director@example.invalid": [(556, "org")]}):
+        _r, _reply, _s, client = offer_and_create(client=Client(existing))
+        assert "profile/create/individual" not in client.endpoints()
+
+
+def test_the_address_is_the_organisations_and_never_the_persons(world):
+    parsed = daf_workflow._parse_submission(
+        endowment_submission(),
+        daf_workflow.inquiry_form("endowment")["field_map"])
+    assert parsed["org_address_street"] == "9 Org Plaza"
+    assert parsed["org_address_zip"] == "20170"
+    for person_key in ("address_street", "address_city", "address_state",
+                       "address_zip"):
+        assert parsed[person_key] == ""
+
+
+def test_a_contact_field_with_a_company_name_is_not_read_as_the_company():
+    """The map names the object. A contact-object "address" is not the
+    organisation's address."""
+    sub = endowment_submission()
+    sub["values"] = [v for v in sub["values"] if v["name"] != "address"]
+    sub["values"].append({"name": "address", "value": "1 Person Rd",
+                          "objectTypeId": "0-1"})
+    parsed = daf_workflow._parse_submission(
+        sub, daf_workflow.inquiry_form("endowment")["field_map"])
+    assert parsed["org_address_street"] == ""
+
+
+def test_the_task(world):
+    _review, reply, _state, client = offer_and_create()
+    body = client.body("task/create")
+
+    assert body["employee_id"] == 1002
+    assert body["task_type_id"] == 1065
+    assert body["o"] == "profile" and body["id"] == 40001
+    assert body["name"] == ("Endowment inquiry follow-up: Test Peace Academy"
+                            " — director@example.invalid")
+    assert "📝 Follow-up task 2001 for 1002" in reply
+
+
+def test_the_task_description_order(world):
+    _review, _reply, _state, client = offer_and_create()
+    text = client.body("task/create")["task_description"]
+    order = ["Organization: Test Peace Academy", f"EIN: {EIN}",
+             "Website: https://org.example.invalid", "Contact: Dana Director",
+             "Email: director@example.invalid", "Phone: (703) 555-0123",
+             f"Starting goal: {GOAL}", "Mission and core services",
+             "What prompted the interest", "Main endowment goals",
+             "How they heard: FAKEHEARD", "Submitted:", "HubSpot: https://"]
+    positions = [text.index(item) for item in order]
+    assert positions == sorted(positions)
+    assert "(submission endw0001-aaaa-bbbb)" in text
+
+
+def test_a_long_description_cuts_the_essays_and_nothing_else():
+    data = daf_workflow._parse_submission(
+        endowment_submission(**{k: "LONGESSAY " * 2000 for k in ESSAYS}),
+        daf_workflow.inquiry_form("endowment")["field_map"])
+
+    text = endowment_inquiry.task_description(data, limit=1500)
+
+    assert len(text) <= 1500
+    assert text.count(endowment_inquiry.TRUNCATED) == 3
+    for kept in (f"EIN: {EIN}", "Contact: Dana Director",
+                 "Email: director@example.invalid", "Phone: (703) 555-0123",
+                 "Organization: Test Peace Academy", "How they heard:",
+                 "HubSpot: "):
+        assert kept in text
+
+
+def test_a_short_description_is_not_cut():
+    data = daf_workflow._parse_submission(
+        endowment_submission(),
+        daf_workflow.inquiry_form("endowment")["field_map"])
+    assert endowment_inquiry.TRUNCATED not in \
+        endowment_inquiry.task_description(data)
+
+
+# --- EIN, goal and essays: never logged, never audited, never in the cookie ----
+
+def test_ein_goal_and_essays_are_absent_from_logs_and_audit(world, caplog):
+    with caplog.at_level(logging.DEBUG):
+        offer_and_create()
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    audited = json.dumps(world["audit"])
+    assert world["audit"], "the audit rows were captured"
+    for secret in SECRETS:
+        assert secret not in logged, f"{secret} reached a log line"
+        assert secret not in audited, f"{secret} reached write_audit"
+
+
+def test_the_session_never_holds_the_ein_goal_or_essays(world):
+    hub = Hub()
+    state = daf_workflow.default_workflow_state()
+    daf_workflow._initiate_workflow("new endowment", state, hub)
+
+    cookie = json.dumps(state)
+    for secret in SECRETS:
+        assert secret not in cookie
+    assert state["submission_data"]["organization"] == "Test Peace Academy"
+
+
+def test_the_audit_rows_carry_the_submission(world):
+    offer_and_create()
+    by_endpoint = {row["endpoint"]: row["meta"]["ids"]
+                   for row in world["audit"]}
+    assert by_endpoint["profile/create/org"]["hubspot_submission_id"] == \
+        "endw0001-aaaa-bbbb"
+    assert by_endpoint["task/create"]["linked_profile_id"] == 40001
+    assert by_endpoint["task/create"]["hubspot_form_id"] == FORM
+
+
+# --- the duplicate check -------------------------------------------------------
+
+def test_an_exact_name_match_is_existing_and_gets_only_a_task(world):
+    world["mirror"].append({"profile_id": "18075",
+                            "organization": "The Test Peace Academy, Inc.",
+                            "ptype": "org"})
+    _review, reply, state, client = offer_and_create()
+
+    assert "profile/create/org" not in client.endpoints()
+    assert client.body("task/create")["id"] == 18075
+    assert "Already in CSuite" in reply
+
+
+def test_a_close_name_match_is_ambiguous_and_writes_nothing(world):
+    world["mirror"].append({"profile_id": "18076",
+                            "organization": "Test Peace Academy of Virginia",
+                            "ptype": "org"})
+    review, reply, state, client = offer_and_create()
+
+    assert "AMBIGUOUS" in review
+    assert "Test Peace Academy of Virginia (profile 18076)" in review
+    assert not [e for e in client.endpoints() if "create" in e]
+    assert "No profile and no task created" in reply
+    assert "never linked automatically" in reply
+
+
+def test_two_exact_name_matches_are_ambiguous(world):
+    world["mirror"] += [{"profile_id": "1", "organization":
+                         "Test Peace Academy", "ptype": "org"},
+                        {"profile_id": "2", "organization":
+                         "Test Peace Academy Foundation", "ptype": "org"}]
+    _review, reply, _state, client = offer_and_create()
+    assert not [e for e in client.endpoints() if "create" in e]
+
+
+def test_an_individual_with_the_same_employer_name_is_not_compared():
+    rows = [{"profile_id": "7", "organization": "Test Peace Academy",
+             "ptype": "indiv"}]
+    # mirror_org_rows asks for ptype 'org' only; the matcher is given what
+    # it is given, so the SQL is what keeps individuals out.
+    import inspect
+    assert "'ptype' = %s" in inspect.getsource(org_match.mirror_org_rows)
+    assert org_match.match_org_name("Test Peace Academy", rows)["exact"]
+
+
+def test_an_email_on_an_individual_profile_is_ambiguous(world):
+    client = Client({"director@example.invalid": [(555, "indiv")]})
+    _review, reply, _state, client = offer_and_create(client=client)
+
+    assert not [e for e in client.endpoints() if "create" in e]
+    assert "INDIVIDUAL" in reply
+
+
+def test_an_email_on_an_org_profile_is_existing(world):
+    client = Client({"director@example.invalid": [(556, "org")]})
+    _review, reply, _state, client = offer_and_create(client=client)
+
+    assert "profile/create/org" not in client.endpoints()
+    assert client.body("task/create")["id"] == 556
+
+
+def test_an_unreadable_mirror_stops_the_create(world, monkeypatch):
+    def down():
+        raise org_match.MirrorUnavailable("the CSuite mirror could not be "
+                                          "read: boom")
+    monkeypatch.setattr(org_match, "mirror_org_rows", down)
+    _review, reply, _state, client = offer_and_create()
+
+    assert not [e for e in client.endpoints() if "create" in e]
+    assert "could not be ruled out" in reply
+
+
+def test_the_reply_says_how_old_the_mirror_is(world):
+    review, reply, _state, _client = offer_and_create()
+    for text in (review, reply):
+        assert "Mirror data from Sep 23, 2026" in text
+        assert "days old" in text
+
+
+@pytest.mark.parametrize("a,b,same", [
+    ("The Peace Foundation, Inc.", "peace", True),
+    ("Peace & Light", "peace and light", True),
+    ("Peace Academy", "Peace Academy Inc", True),
+    ("Peace Academy", "Grace Academy", False),
+])
+def test_name_normalisation(a, b, same):
+    assert (org_match.normalise_org_name(a)
+            == org_match.normalise_org_name(b)) is same
+
+
+# --- cross-form ----------------------------------------------------------------
+
+def test_a_daf_inquiry_from_the_same_email_is_noted_not_blocking(world):
+    daf_sub = {"conversionId": "daf00001", "submittedAt": 1890000000000,
+               "values": [{"name": "email",
+                           "value": "Director@example.invalid"}]}
+    world["processed"][DAF] = {"daf00001": "21699"}
+    world["tasks"][DAF] = {"daf00001": "1036"}
+    hub = Hub({FORM: [endowment_submission()], DAF: [daf_sub]})
+
+    review, reply, _state, client = offer_and_create(hub=hub)
+
+    assert "Also a DAF inquiry" in review and "task 1036" in review
+    assert "Also a DAF inquiry" in reply
+    assert "profile/create/org" in client.endpoints(), "noted, not blocking"
+
+
+# --- refusals ------------------------------------------------------------------
+
+def test_refuses_when_the_assignee_is_unset(world, monkeypatch):
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_ASSIGNEE", None)
+    review, reply, state, client = offer_and_create()
+
+    assert "Assignee not confirmed" in review
+    assert "assignee not confirmed" in reply
+    assert client.sent == []
+    assert state["active"] is False
+
+
+def test_refuses_when_the_flag_is_off(world, monkeypatch):
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_CREATE_RAW", "")
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_CREATE_ENABLED", False)
+    hub = Hub()
+    state = daf_workflow.default_workflow_state()
+
+    reply = daf_workflow._initiate_workflow("new endowment", state, hub)
+
+    assert "turned off" in reply and hub.calls == []
+
+
+def test_the_retired_assignee_variable_does_not_unlock_create(world,
+                                                              monkeypatch):
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_ASSIGNEE", None)
+    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY",
+                        1002)
+    _review, reply, _state, client = offer_and_create()
+    assert "assignee not confirmed" in reply and client.sent == []
+
+
+# --- skip ------------------------------------------------------------------------
+
+def test_skip_renders_the_next_organisation(world):
+    hub = Hub({FORM: [endowment_submission(),
+                      endowment_submission("endw0002-cccc", "Second Org",
+                                           "two@example.invalid",
+                                           1899000000000)], DAF: []})
+    state = daf_workflow.default_workflow_state()
+    daf_workflow._initiate_workflow("new endowment", state, hub)
+
+    reply = daf_workflow._handle_active_workflow("skip", state, hub, None)
+
+    assert "🏛️ **Organization:** Second Org" in reply
+    assert "Submission 2 of 2." in reply
+    assert EIN not in json.dumps(state)
+
+
+# --- mark inquiry handled ----------------------------------------------------------
+
+def _mark(state, hub, text):
+    return daf_workflow.handle(text, _Ctx(state, hub))
+
+
+class _Ctx:
+    def __init__(self, state, hub):
+        from intents.context import Actor, Services
+        self.workflow_state = state
+        self.services = Services(hubspot=hub, csuite=None, claude=None)
+        self.actor = Actor(user_id=7, email="staff@example.invalid",
+                           role="staff")
+
+
+def test_mark_handled_writes_one_row_with_ids_only(world):
+    hub = Hub()
+    state = daf_workflow.default_workflow_state()
+    ask = _mark(state, hub, "mark inquiry handled endowment endw0001 "
+                            "Ola replied by email")
+    assert "Mark this Endowment submission handled" in ask
+    assert "NOT stored" in ask and "Ola replied by email" in ask
+    assert world["records"] == [], "nothing before the yes"
+
+    done = _mark(state, hub, "yes")
+
+    assert "recorded as handled" in done
+    assert len(world["records"]) == 1
+    row = world["records"][0]
+    assert row["system"] == "jidhr"
+    assert row["endpoint"] == "submission/link/marked_handled"
+    assert row["meta"]["ids"] == {"hubspot_form_id": FORM,
+                                  "hubspot_submission_id": "endw0001-aaaa-bbbb",
+                                  "actor_user_id": 7}
+    assert row["meta"]["keys"] == ["actor_user_id", "hubspot_form_id",
+                                   "hubspot_submission_id"]
+
+
+def test_mark_handled_is_idempotent(world):
+    hub = Hub()
+    state = daf_workflow.default_workflow_state()
+    _mark(state, hub, "mark inquiry handled endowment endw0001-aaaa-bbbb")
+    _mark(state, hub, "yes")
+
+    again = _mark(state, hub, "mark inquiry handled endowment "
+                              "endw0001-aaaa-bbbb")
+
+    assert "already handled" in again
+    assert len(world["records"]) == 1
+
+
+def test_a_second_yes_does_not_write_twice(world):
+    hub = Hub()
+    state = daf_workflow.default_workflow_state()
+    _mark(state, hub, "mark inquiry handled endowment endw0001-aaaa-bbbb")
+    # Someone else marks it between the question and the answer.
+    world["processed"][FORM]["endw0001-aaaa-bbbb"] = None
+
+    reply = _mark(state, hub, "yes")
+
+    assert "already handled" in reply
+    assert world["records"] == []
+
+
+def test_a_marked_submission_is_not_offered_again(world):
+    hub = Hub({FORM: [endowment_submission(),
+                      endowment_submission("endw0002-cccc", "Second Org",
+                                           "two@example.invalid",
+                                           1899000000000)], DAF: []})
+    state = daf_workflow.default_workflow_state()
+    _mark(state, hub, "mark inquiry handled endowment endw0001-aaaa-bbbb")
+    _mark(state, hub, "yes")
+
+    review = daf_workflow._initiate_workflow("new endowment", state, hub)
+
+    assert "Second Org" in review
+    assert "none (marked handled, no task)" in review
+    assert "profile None" not in review
+
+
+def test_mark_handled_refuses_when_endowment_is_off(world, monkeypatch):
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_CREATE_RAW", "")
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_CREATE_ENABLED", False)
+    hub = Hub()
+    reply = _mark(daf_workflow.default_workflow_state(), hub,
+                  "mark inquiry handled endowment endw0001-aaaa-bbbb")
+    assert "turned off" in reply and hub.calls == []
+
+
+@pytest.mark.parametrize("text,needle", [
+    ("mark inquiry handled", "where <form> is one of"),
+    ("mark inquiry handled nonsense abc12345", "where <form> is one of"),
+    ("mark inquiry handled endowment", "Which submission?"),
+    ("mark inquiry handled endowment endw", "at least its first 8"),
+    ("mark inquiry handled endowment zzzzzzzz", "no submission on this form"),
+])
+def test_mark_handled_needs_a_form_and_a_real_submission(world, text,
+                                                         needle):
+    reply = _mark(daf_workflow.default_workflow_state(), Hub(), text)
+    assert needle in reply
+    assert world["records"] == []
+
+
+def test_mark_handled_is_routed_to_this_workflow():
+    from intents import route_intent
+    from tests.test_context import make_ctx
+
+    for text in ("mark inquiry handled endowment endw0001",
+                 "mark inquiry handled daf 6fff2fa0 replied, see report"):
+        name, _handle = route_intent(text, make_ctx())
+        assert name == "daf_workflow", text
+
+
+# --- the 06:15 run is untouched ------------------------------------------------------
+
+def test_nothing_the_scheduled_run_executes_has_changed():
+    """V5.81 must not change the runner or what it runs. Everything under
+    jobs/, the runner script, both Railway configs and the scheduled chain's
+    modules are byte-identical to V5.80 (de92baa)."""
+    import subprocess
+
+    found = subprocess.run(
+        ["git", "diff", "--stat", "de92baa", "--", "jobs/",
+         "scripts/jobs_run.py", "railway.toml", "railway.jobs.toml",
+         "sync/scheduled.py", "sync/registrations.py",
+         "sync/contact_create.py", "sync/mirror.py", "clients/notify.py",
+         "clients/database.py", "clients/mirror_read.py"],
+        capture_output=True, text=True)
+    assert found.returncode == 0, found.stderr
+    assert found.stdout.strip() == "", found.stdout

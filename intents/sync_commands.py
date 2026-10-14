@@ -67,6 +67,9 @@ SCHEDULED_RUN_PHRASES = ['run scheduled sync now', 'run scheduled sync',
 # Tying DAF submissions to follow-up work done before tasks carried a
 # submission id. Writes ONLY write_audit, never CSuite or HubSpot.
 DAF_RECONCILE_PHRASES = ['reconcile daf tasks', 'reconcile daf task']
+# The same reconcile for any Config.INQUIRY_FORMS row: "reconcile inquiries
+# <key> [dry run]". "reconcile daf tasks" is an exact alias for the daf row.
+INQUIRY_RECONCILE_PHRASES = ['reconcile inquiries', 'reconcile inquiry']
 ALL_SYNC_PHRASES = ['sync all', 'sync everything', 'run all syncs']
 
 
@@ -93,6 +96,7 @@ def can_handle(query: str, **kwargs) -> bool:
         anchors.anchored(q, NOTIFY_TEST_PHRASES) or
         anchors.anchored(q, SCHEDULED_RUN_PHRASES) or
         anchors.anchored(q, DAF_RECONCILE_PHRASES) or
+        anchors.anchored(q, INQUIRY_RECONCILE_PHRASES) or
         q in ALL_SYNC_PHRASES
     )
 
@@ -113,6 +117,9 @@ def handle(query: str, ctx) -> str:
 
     if any(p in q for p in DAF_RECONCILE_PHRASES):
         return _reconcile_daf_tasks(q)
+
+    if any(p in q for p in INQUIRY_RECONCILE_PHRASES):
+        return _reconcile_inquiries(q)
 
     if any(p in q for p in SCHEDULED_RUN_PHRASES):
         return _run_scheduled_now()
@@ -292,17 +299,46 @@ def _reconcile_daf_tasks(query_lower: str) -> str:
     records the links. Either way NOTHING goes to CSuite or HubSpot — the
     live run writes write_audit rows only, and the links are what make a
     handled returning donor stop being offered again.
+
+    An exact alias for "reconcile inquiries daf": same run, same reply.
     """
+    return _run_inquiry_reconcile("daf", "dry run" in query_lower,
+                                  "reconcile daf tasks")
+
+
+def _reconcile_inquiries(query_lower: str) -> str:
+    """"reconcile inquiries <key> [dry run]" for any Config.INQUIRY_FORMS row."""
+    from config import Config
+
+    rest = query_lower
+    for phrase in INQUIRY_RECONCILE_PHRASES:
+        if phrase in rest:
+            rest = rest.split(phrase, 1)[1]
+            break
+    words = rest.replace("dry run", " ").split()
+    keys = [row["key"] for row in Config.INQUIRY_FORMS]
+    if not words or words[0] not in keys:
+        return ("❓ Which form? Say *\"reconcile inquiries <form> dry "
+                "run\"*, where <form> is one of: "
+                + ", ".join(f"`{k}`" for k in keys) + ". Nothing was read.")
+    key = words[0]
+    return _run_inquiry_reconcile(key, "dry run" in query_lower,
+                                  f"reconcile inquiries {key}")
+
+
+def _run_inquiry_reconcile(key: str, dry_run: bool, command: str) -> str:
+    from intents.daf_workflow import handled_endpoints, inquiry_form
     from sync import daf_reconcile as dr
 
-    dry_run = "dry run" in query_lower
+    row = inquiry_form(key)
+    label = row["label"]
     try:
-        out = dr.run(dry_run=dry_run)
+        out = dr.run(dry_run=dry_run, form_id=row["form_id"])
     except dr.ReconcileRefused as e:
         return f"🛑 **Nothing was linked.**\n\n{e}"
     except Exception as e:
-        logger.error("DAF reconcile failed: %s", e, exc_info=True)
-        return f"❌ DAF reconcile failed: {e}"
+        logger.error("%s reconcile failed: %s", label, e, exc_info=True)
+        return f"❌ {label} reconcile failed: {e}"
 
     after = None
     if not dry_run and out.get("written"):
@@ -312,24 +348,30 @@ def _reconcile_daf_tasks(query_lower: str) -> str:
         try:
             from clients.audit import processed_submissions
 
-            seen = processed_submissions(out["form_id"])
+            endpoints = handled_endpoints(row)
+            seen = (processed_submissions(out["form_id"]) if endpoints is None
+                    else processed_submissions(out["form_id"],
+                                               endpoints=endpoints))
             after = sum(1 for sid in out.get("fetched_ids") or []
                         if sid in seen)
         except Exception as e:
             logger.warning("could not re-read processed history: %s", e)
-    return _format_daf_reconcile(out, after)
+    return _format_daf_reconcile(out, after, label=label, command=command)
 
 
-def _format_daf_reconcile(out: dict, after=None) -> str:
+def _format_daf_reconcile(out: dict, after=None, label: str = "DAF",
+                          command: str = "reconcile daf tasks") -> str:
     from sync import daf_reconcile as dr
     from sync.contact_create import mask_email
 
     dry_run = out.get("dry_run", True)
-    head = ("🧪 **Reconcile DAF tasks — PREVIEW** (nothing was written)"
-            if dry_run else "✅ **Reconcile DAF tasks — LINKED**")
+    title = ("Reconcile DAF tasks" if command == "reconcile daf tasks"
+             else f"Reconcile {label} inquiries")
+    head = (f"🧪 **{title} — PREVIEW** (nothing was written)"
+            if dry_run else f"✅ **{title} — LINKED**")
     links = out.get("links") or []
     lines = [head, "",
-             f"📊 **{out.get('fetched', 0)}** newest DAF submissions read "
+             f"📊 **{out.get('fetched', 0)}** newest {label} submissions read "
              f"(page 1 only):",
              f"• **{out.get('processed_before', 0)}** already handled",
              f"• **{out.get('unprocessed', 0)}** not handled",
@@ -356,7 +398,10 @@ def _format_daf_reconcile(out: dict, after=None) -> str:
         for why, n in Counter(u["why"].split(":")[0]
                               for u in unlinked).most_common():
             lines.append(f"• **{n}** — {why}")
-        lines += ["", "**The list for Munira** (newest first; masked):", "",
+        # Munira works the DAF list. Another form's list is not hers.
+        heading = ("**The list for Munira**" if label == "DAF"
+                   else f"**The {label} list**")
+        lines += ["", f"{heading} (newest first; masked):", "",
                   "| submitted | address | why |", "|---|---|---|"]
         for u in unlinked:
             lines.append(f"| {_daf_date(u.get('submitted_at'))} | "
@@ -368,7 +413,7 @@ def _format_daf_reconcile(out: dict, after=None) -> str:
     lines += ["", f"📞 {out.get('csuite_reads', 0)} CSuite read(s), 1 HubSpot "
                   f"read", "✍️ **0 CSuite writes, 0 HubSpot writes.**"]
     if dry_run:
-        lines.append('Say *"reconcile daf tasks"* to record these links — '
+        lines.append(f'Say *"{command}"* to record these links — '
                      'write_audit only. Run '
                      '`migrations/007_write_audit_jidhr_target.sql` first.')
     else:

@@ -424,7 +424,36 @@ class Config:
     CSUITE_DAF_CREATE_ENABLED = (
         os.environ.get('CSUITE_DAF_CREATE_ENABLED', 'False')
         .strip().lower() == 'true')
-    
+
+    # Whether "new endowment" may do anything at all. Off.
+    #
+    # Until V5.81 the endowment path ran behind the DAF switches above, so
+    # turning DAF on turned endowment on too — and the endowment path built
+    # the wrong record: an INDIVIDUAL profile for the contact person, with
+    # the ORGANISATION's address on it, no org name and no EIN (Step 0
+    # discovery, 2026-10-14). Now it has its own switch, and the DAF ones
+    # no longer reach it.
+    #
+    # Same fail-closed parsing as the DAF flags: only the exact string
+    # "true" enables it. The raw value is kept so a reply can say "the
+    # value was not understood, so it is off" rather than going quiet.
+    CSUITE_ENDOWMENT_CREATE_RAW = os.environ.get(
+        'CSUITE_ENDOWMENT_CREATE_ENABLED', '')
+    CSUITE_ENDOWMENT_CREATE_ENABLED = (
+        CSUITE_ENDOWMENT_CREATE_RAW.strip().lower() == 'true')
+
+    # Who an endowment follow-up task is assigned to: Ola, employee 1002, once
+    # Carl has confirmed that id in the CSuite UI. **Unset until then, and
+    # unset means endowment create REFUSES** with "assignee not confirmed" —
+    # it does not create a profile with no task, and it never guesses an id.
+    #
+    # A new variable rather than CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY on
+    # purpose: that one may already be set in a deployment, and it was set for
+    # the individual endowment path V5.81 retired. Setting this one is the
+    # deliberate act that says "the id is confirmed".
+    CSUITE_ENDOWMENT_ASSIGNEE = _int_or_zero(
+        os.environ.get('CSUITE_ENDOWMENT_ASSIGNEE', '0')) or None
+
     # CSuite UI base URL (for deep-linking to profiles, funds, etc.)
     CSUITE_UI_BASE_URL = "https://amuslimcf.fcsuite.com/erp"
     CSUITE_PROFILE_URL = f"{CSUITE_UI_BASE_URL}/profile/display?profile_id={{profile_id}}"
@@ -446,7 +475,130 @@ class Config:
     FUND_GROUP_GIVING_CIRCLE = 1007
     FUND_GROUP_ENDOWMENT = 1008
     FUND_GROUP_GRANT = 1009
-    
+
+    # =========================================================================
+    # INQUIRY FORMS (V5.81)
+    # =========================================================================
+    # One row per HubSpot inquiry form the "new <key>" workflow handles. A new
+    # form is a new row, not new code.
+    #
+    #   key               what the chat command and TICKET_PIPELINES call it
+    #   form_id           the HubSpot form GUID
+    #   label             what a person reads: "New DAF Inquiry"
+    #   profile_kind      "individual" or "org" — which CSuite create is used
+    #   field_map         {(objectTypeId, hubspot field name): parsed key}.
+    #                     objectTypeId is "0-1" (contact) or "0-2" (company);
+    #                     "*" matches any object, which is what DAF has always
+    #                     done. A submission value carries its objectTypeId, so
+    #                     a row that names the object will not read a company
+    #                     address as a person's.
+    #   fund_group        CSuite fund group, for the (deferred) fund create
+    #   task_type_id      a fixed task type, or None to read task_type_env
+    #   task_type_env     the Config attribute holding the task type, or None
+    #   assignee_env      the Config attribute holding the task assignee
+    #   create_flag       the Config switch for the profile create
+    #   task_flag         the Config switch for the follow-up task
+    #   profile_endpoint  the CSuite create endpoint; it is also what the
+    #                     processed history counts as handled, with task/create
+    #
+    # DAF is row 1 and is byte-identical to V5.80: same names, same flags, the
+    # same task type variable, and a field map copied key for key.
+    _DAF_FIELD_MAP = {
+        ("*", "firstname"): "first_name",
+        ("*", "first_name"): "first_name",
+        ("*", "first name"): "first_name",
+        ("*", "lastname"): "last_name",
+        ("*", "last_name"): "last_name",
+        ("*", "last name"): "last_name",
+        ("*", "email"): "email",
+        ("*", "phone"): "phone",
+        ("*", "mobilephone"): "phone",
+        # TODO(hotfix-63): these never match. The live DAF form calls them
+        # "what_would_you_like_to_name_your_fund_" and
+        # "estimated_initial_contribution_amount" (Step 0, 2026-10-14), so
+        # every DAF review prints "Not specified" for both. Left as-is here:
+        # V5.81 moves DAF without changing what it does.
+        ("*", "fund_name"): "fund_name",
+        ("*", "fund name"): "fund_name",
+        ("*", "requested_fund_name"): "fund_name",
+        ("*", "initial_contribution"): "initial_contribution",
+        ("*", "contribution_amount"): "initial_contribution",
+        ("*", "amount"): "initial_contribution",
+        ("*", "address"): "address_street",
+        ("*", "street address"): "address_street",
+        ("*", "address2"): "address_street2",
+        ("*", "city"): "address_city",
+        ("*", "state"): "address_state",
+        ("*", "state/region"): "address_state",
+        ("*", "zip"): "address_zip",
+        ("*", "zipcode"): "address_zip",
+        ("*", "postal code"): "address_zip",
+    }
+
+    # The Endowment Inquiry Form is an ORGANISATION form (Step 0, 2026-10-14):
+    # five fields on the contact (0-1), eleven on the company (0-2). Every key
+    # names its object, so the company's address/city/state/zip land in org_*
+    # keys and can never be read as the contact person's address.
+    #
+    # The EIN, the starting goal and the three essays are parsed for the
+    # reviewer and the CSuite TASK DESCRIPTION only. They are never logged and
+    # never go to write_audit (whose payload_meta keeps key names and ids).
+    _ENDOWMENT_FIELD_MAP = {
+        ("0-1", "firstname"): "first_name",
+        ("0-1", "lastname"): "last_name",
+        ("0-1", "email"): "email",
+        ("0-1", "phone"): "phone",
+        ("0-1", "how_did_you_hear_about_us_"): "heard_about",
+        ("0-2", "name"): "organization",
+        ("0-2", "organization_ein"): "ein",
+        ("0-2", "website"): "website",
+        ("0-2", "address"): "org_address_street",
+        ("0-2", "city"): "org_address_city",
+        ("0-2", "state"): "org_address_state",
+        ("0-2", "zip"): "org_address_zip",
+        ("0-2", "what_is_your_endowment_starting_goal_"): "starting_goal",
+        ("0-2", "what_is_your_organization_s_mission_and_core_services_"
+                "programs_"): "essay_mission",
+        ("0-2", "what_prompted_your_organization_s_interest_in_starting_an_"
+                "endowment_"): "essay_interest",
+        ("0-2", "what_are_your_organization_s_main_endowment_goals_"):
+            "essay_goals",
+    }
+
+    INQUIRY_FORMS = [
+        {
+            "key": "daf",
+            "form_id": DAF_INQUIRY_FORM_ID,
+            "label": "DAF",
+            "profile_kind": "individual",
+            "field_map": _DAF_FIELD_MAP,
+            "fund_group": FUND_GROUP_DAF,
+            "task_type_id": None,
+            "task_type_env": "CSUITE_TASK_TYPE_ID",
+            "assignee_env": "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY",
+            "create_flag": "CSUITE_DAF_CREATE_ENABLED",
+            "task_flag": "CSUITE_DAF_TASK_CREATE_ENABLED",
+            "profile_endpoint": "profile/create/individual",
+        },
+        {
+            # Row 2, V5.81. Off behind its own switch; refuses until the
+            # assignee is confirmed. Task type 1065 "DIY Form-Contact", the
+            # type every DAF follow-up already uses (decided for both forms).
+            "key": "endowment",
+            "form_id": ENDOWMENT_INQUIRY_FORM_ID,
+            "label": "Endowment",
+            "profile_kind": "org",
+            "field_map": _ENDOWMENT_FIELD_MAP,
+            "fund_group": FUND_GROUP_ENDOWMENT,
+            "task_type_id": 1065,
+            "task_type_env": None,
+            "assignee_env": "CSUITE_ENDOWMENT_ASSIGNEE",
+            "create_flag": "CSUITE_ENDOWMENT_CREATE_ENABLED",
+            "task_flag": "CSUITE_ENDOWMENT_CREATE_ENABLED",
+            "profile_endpoint": "profile/create/org",
+        },
+    ]
+
     # Default account for fund creation (Bank of America Restricted)
     DEFAULT_CASH_ACCOUNT_ID = 1069
     

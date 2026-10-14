@@ -63,7 +63,16 @@ NOT_ORDERABLE = ("the donor's handled submission is not on page 1, so which "
 AMBIGUOUS_TASK = "the task matches more than one submission"
 NO_ADDRESS = "the submission carries no email address"
 
-# Live DAF follow-up tasks made before tasks carried a submission id.
+# Live follow-up tasks made before tasks carried a submission id, for ONE
+# form.
+#
+# Until V5.81 this was not filtered by form at all, which was harmless while
+# DAF was the only form with tasks and wrong the moment a second one had any.
+# A row that names its form counts only for that form. A row that names NO
+# form is a pre-V5.79 task, and those are attributed to DAF: all six (1033-
+# 1038, write_audit 54-76) are DAF follow-ups assigned to 1012, read
+# 2026-10-14, and no other form had a task path then. See
+# LEGACY_UNTAGGED_FORM_ID.
 _LEGACY_TASKS_SQL = """
     SELECT id AS audit_id, target_id AS task_id
       FROM write_audit
@@ -72,11 +81,12 @@ _LEGACY_TASKS_SQL = """
        AND status = 'success'
        AND csuite_env = 'live'
        AND payload_meta->'ids'->>'hubspot_submission_id' IS NULL
+       AND COALESCE(payload_meta->'ids'->>'hubspot_form_id', %s) = %s
        AND target_id IS NOT NULL
      ORDER BY id
 """
 
-# Tasks made SINCE V5.79, which carry their submission.
+# Tasks made SINCE V5.79, which carry their submission — and their form.
 _TASKED_SUBMISSIONS_SQL = """
     SELECT DISTINCT payload_meta->'ids'->>'hubspot_submission_id' AS sid
       FROM write_audit
@@ -85,7 +95,15 @@ _TASKED_SUBMISSIONS_SQL = """
        AND status = 'success'
        AND csuite_env = 'live'
        AND payload_meta->'ids'->>'hubspot_submission_id' IS NOT NULL
+       AND payload_meta->'ids'->>'hubspot_form_id' = %s
 """
+
+
+def legacy_untagged_form_id():
+    """The form a task row with no form id belongs to: DAF. See above."""
+    from config import Config
+
+    return Config.DAF_INQUIRY_FORM_ID
 
 # Is migrations/007 in? Checked BEFORE writing anything, rather than
 # discovered as a CheckViolation part way through a run.
@@ -115,17 +133,20 @@ def link_rows_allowed() -> bool:
     return "'jidhr'" in definition
 
 
-def legacy_tasks() -> list:
+def legacy_tasks(form_id) -> list:
     from clients import database
 
-    rows = database.execute_query(_LEGACY_TASKS_SQL, (), fetch=True)
+    rows = database.execute_query(
+        _LEGACY_TASKS_SQL, (legacy_untagged_form_id(), str(form_id)),
+        fetch=True)
     return [str(r["task_id"]) for r in rows or [] if r.get("task_id")]
 
 
-def tasked_submissions() -> set:
+def tasked_submissions(form_id) -> set:
     from clients import database
 
-    rows = database.execute_query(_TASKED_SUBMISSIONS_SQL, (), fetch=True)
+    rows = database.execute_query(_TASKED_SUBMISSIONS_SQL, (str(form_id),),
+                                  fetch=True)
     return {str(r["sid"]) for r in rows or [] if r.get("sid")}
 
 
@@ -161,11 +182,16 @@ def profiles_for(csuite, email) -> tuple:
 
 
 def page_one(hubspot, form_id) -> list:
-    """The newest 50 submissions, parsed. No paging, by decision."""
-    from intents.daf_workflow import _parse_submission
+    """The newest 50 submissions, parsed. No paging, by decision.
 
+    Parsed with the form's own field map, so an organisation form's company
+    address is not read as a person's.
+    """
+    from intents.daf_workflow import _parse_submission, inquiry_form_for_id
+
+    field_map = (inquiry_form_for_id(form_id) or {}).get("field_map")
     raw = hubspot.get_form_submissions(form_id, limit=50) or {}
-    return [_parse_submission(s) for s in raw.get("results") or []]
+    return [_parse_submission(s, field_map) for s in raw.get("results") or []]
 
 
 def _moment(value):
@@ -183,19 +209,23 @@ def plan(hubspot, csuite, form_id) -> dict:
            "unprocessed": 0, "links": [], "unlinked": [], "tasks": {},
            "csuite_reads": 0}
 
+    from intents.daf_workflow import handled_endpoints, inquiry_form_for_id
+
     submissions = page_one(hubspot, form_id)
     out["fetched"] = len(submissions)
     # Kept so "processed after" is the SAME measurement as "processed
     # before" — page 1, handled — and the two can be compared directly.
     out["fetched_ids"] = [s["submission_id"] for s in submissions]
     by_id = {s["submission_id"]: s for s in submissions}
-    processed = processed_submissions(form_id)
+    endpoints = handled_endpoints(inquiry_form_for_id(form_id))
+    processed = (processed_submissions(form_id) if endpoints is None
+                 else processed_submissions(form_id, endpoints=endpoints))
     out["processed_before"] = sum(1 for s in submissions
                                   if s["submission_id"] in processed)
 
     # Each legacy task's profile, read back from CSuite.
     tasks_by_profile = defaultdict(list)
-    for task_id in legacy_tasks():
+    for task_id in legacy_tasks(form_id):
         profile = task_profile(csuite, task_id)
         out["csuite_reads"] += 1
         _pace()
@@ -204,7 +234,7 @@ def plan(hubspot, csuite, form_id) -> dict:
             tasks_by_profile[profile].append(task_id)
 
     # A processed submission's donor, and whether that donor has a task.
-    tasked = tasked_submissions()
+    tasked = tasked_submissions(form_id)
     handled_by_profile = defaultdict(list)
     for sid, profile in processed.items():
         if profile:

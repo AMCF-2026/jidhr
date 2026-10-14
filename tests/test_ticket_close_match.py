@@ -151,14 +151,20 @@ def test_a_closed_ticket_is_ignored(monkeypatch):
 
 def test_an_endowment_inquiry_uses_its_own_pipeline(monkeypatch):
     """Endowment tickets were unreachable before: their pipeline is not the
-    DAF one and their New stage is not "1"."""
-    reply, hs, _ = run(monkeypatch, [
+    DAF one and their New stage is not "1".
+
+    Asked of the selector directly since V5.81: the old endowment create path
+    that reached it through _step_create is refused (it built an individual
+    profile for an organisation)."""
+    hs = HubSpot([
         ticket("T-ENDOW", subject="Endowment inquiry",
                pipeline=ENDOW["pipeline"], stage=ENDOW["new_stage"]),
-        ticket("T-DAF", subject="DAF Form Submission")],
-        wf_type="endowment")
+        ticket("T-DAF", subject="DAF Form Submission")])
 
-    assert hs.closed == ["T-ENDOW"], "and not the DAF ticket"
+    matches, _note = daf_workflow.open_inquiry_tickets(hs, "70123",
+                                                       "endowment")
+
+    assert [m["id"] for m in matches] == ["T-ENDOW"], "and not the DAF ticket"
 
 
 # ---------------------------------------------------------------------------

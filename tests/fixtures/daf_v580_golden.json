@@ -1,0 +1,294 @@
+{
+ "create_off": {
+  "audit": [],
+  "replies": [
+   "📋 **New DAF Inquiry**\n\n⏭️ The newest DAF submission has already been processed — Handled Already is profile 21000. Showing the next one.\n\n👤 **Name:** Fresh Donor\n📧 **Email:** fresh.donor@example.invalid\n📱 **Phone:** (703) 555-0177\n💰 **Requested Fund Name:** Not specified\n💵 **Initial Contribution:** Not specified\n📅 **Submitted:** Sun Mar 17, 2030 11:00 AM ET\n\n---\n**Shall I create the CSuite profile and fund?**\n• Say *\"Yes\"* or *\"Create it\"* to proceed\n• Say *\"Skip\"* to move to the next submission\n• Say *\"Cancel\"* to stop",
+   "⏸️ **DAF Not Created**\n\n⏸️ Profile: **not created — CSuite profile creation is turned off.** CSuite silently discards the email, phone and address this path sends, so a profile made now would be missing them. Create it in CSuite by hand, or set CSUITE_DAF_CREATE_ENABLED once the field names are fixed.\n📝 No task: no CSuite profile to attach it to\n🎫 Ticket close: off\n\nSay anything to continue, or start a new workflow."
+  ],
+  "sent": []
+ },
+ "new_donor": {
+  "audit": [
+   {
+    "endpoint": "profile/create/individual",
+    "meta": {
+     "ids": {
+      "hubspot_form_id": "8dba272f-1986-4bcc-80b4-0b49bc1a4400",
+      "hubspot_submission_id": "fresh001-bbbb"
+     },
+     "keys": [
+      "address",
+      "email",
+      "first_name",
+      "hubspot_form_id",
+      "hubspot_submission_id",
+      "last_name",
+      "phone_number"
+     ]
+    },
+    "system": "csuite"
+   },
+   {
+    "endpoint": "task/create",
+    "meta": {
+     "ids": {
+      "employee_id": 1012,
+      "hubspot_form_id": "8dba272f-1986-4bcc-80b4-0b49bc1a4400",
+      "hubspot_submission_id": "fresh001-bbbb",
+      "id": 31337,
+      "linked_profile_id": 31337,
+      "task_type_id": 1065
+     },
+     "keys": [
+      "due_ts",
+      "employee_id",
+      "hubspot_form_id",
+      "hubspot_submission_id",
+      "id",
+      "linked_profile_id",
+      "name",
+      "o",
+      "task_description",
+      "task_type_id"
+     ]
+    },
+    "system": "csuite"
+   }
+  ],
+  "replies": [
+   "📋 **New DAF Inquiry**\n\n⏭️ The newest DAF submission has already been processed — Handled Already is profile 21000. Showing the next one.\n\n👤 **Name:** Fresh Donor\n📧 **Email:** fresh.donor@example.invalid\n📱 **Phone:** (703) 555-0177\n💰 **Requested Fund Name:** Not specified\n💵 **Initial Contribution:** Not specified\n📅 **Submitted:** Sun Mar 17, 2030 11:00 AM ET\n\n---\n**Shall I create the CSuite profile and fund?**\n• Say *\"Yes\"* or *\"Create it\"* to proceed\n• Say *\"Skip\"* to move to the next submission\n• Say *\"Cancel\"* to stop",
+   "✅ **DAF Inquiry — Profile Created**\n\n👤 Profile: Fresh Donor — [CSuite](https://amuslimcf.fcsuite.com/erp/profile/display?profile_id=31337)\n💰 Fund: not opened yet — a fund is created when the donor commits, not at inquiry.\n🎯 HubSpot contact updated — [View](https://app-na2.hubspot.com/contacts/243832852/contact/70123)\n📝 Follow-up task 1099 for 1012 — re: Fresh Donor — due 2030-03-19 — [View](https://amuslimcf.fcsuite.com/erp/task/display?task_id=1099)\n🎫 Ticket close: off\n\nSay anything to continue, or start a new workflow."
+  ],
+  "sent": [
+   {
+    "body": {
+     "env": "live",
+     "epoch": 1800000000,
+     "view_limit": 1
+    },
+    "endpoint": "profile/list",
+    "raw": "{\"env\": \"live\", \"epoch\": 1800000000, \"view_limit\": 1}"
+   },
+   {
+    "body": {
+     "env": "live",
+     "epoch": 1800000000,
+     "primary_email": "filter-probe-00000000000000000000000000005eed@example.invalid",
+     "view_limit": 1
+    },
+    "endpoint": "profile/list",
+    "raw": "{\"env\": \"live\", \"epoch\": 1800000000, \"primary_email\": \"filter-probe-00000000000000000000000000005eed@example.invalid\", \"view_limit\": 1}"
+   },
+   {
+    "body": {
+     "env": "live",
+     "epoch": 1800000000,
+     "primary_email": "fresh.donor@example.invalid",
+     "view_limit": 5
+    },
+    "endpoint": "profile/list",
+    "raw": "{\"env\": \"live\", \"epoch\": 1800000000, \"primary_email\": \"fresh.donor@example.invalid\", \"view_limit\": 5}"
+   },
+   {
+    "body": {
+     "address": {
+      "address": "1 Test Way",
+      "city": "Reston",
+      "state": "VA",
+      "zipcode": "20190"
+     },
+     "email": "fresh.donor@example.invalid",
+     "env": "live",
+     "epoch": 1800000000,
+     "first_name": "Fresh",
+     "last_name": "Donor",
+     "phone_number": "7035550177"
+    },
+    "endpoint": "profile/create/individual",
+    "raw": "{\"env\": \"live\", \"epoch\": 1800000000, \"first_name\": \"Fresh\", \"last_name\": \"Donor\", \"email\": \"fresh.donor@example.invalid\", \"phone_number\": \"7035550177\", \"address\": {\"address\": \"1 Test Way\", \"city\": \"Reston\", \"state\": \"VA\", \"zipcode\": \"20190\"}}"
+   },
+   {
+    "body": {
+     "due_ts": "2030-03-19",
+     "employee_id": 1012,
+     "env": "live",
+     "epoch": 1800000000,
+     "id": 31337,
+     "name": "DAF inquiry follow-up: Fresh Donor — fresh.donor@example.invalid",
+     "o": "profile",
+     "task_description": "DAF inquiry follow-up: Fresh Donor — fresh.donor@example.invalid",
+     "task_type_id": 1065
+    },
+    "endpoint": "task/create",
+    "raw": "{\"env\": \"live\", \"epoch\": 1800000000, \"name\": \"DAF inquiry follow-up: Fresh Donor \\u2014 fresh.donor@example.invalid\", \"employee_id\": 1012, \"due_ts\": \"2030-03-19\", \"task_description\": \"DAF inquiry follow-up: Fresh Donor \\u2014 fresh.donor@example.invalid\", \"task_type_id\": 1065, \"o\": \"profile\", \"id\": 31337}"
+   }
+  ]
+ },
+ "reconcile_dry_run": {
+  "hub_calls": [
+   [
+    "GET",
+    "8dba272f-1986-4bcc-80b4-0b49bc1a4400",
+    50
+   ]
+  ],
+  "reply": "🧪 **Reconcile DAF tasks — PREVIEW** (nothing was written)\n\n📊 **5** newest DAF submissions read (page 1 only):\n• **1** already handled\n• **4** not handled\n• **2** of those tie to work already done\n\n➡️ **Would link:**\n\n| submission | submitted | reason | profile | task | via |\n|---|---|---|---|---|---|\n| `62ed3c5d` | 2026-09-29 | task_for_profile | `21696` | `1033` | — |\n| `6fff2fa0` | 2026-09-04 | earlier_submission_same_donor | `21699` | `1036` | `6a31606e` |\n\n📋 **2 still unhandled** — NOT linked, a person decides:\n• **1** — a profile, but no follow-up task and no handled submission\n• **1** — no CSuite profile for this address\n\n**The list for Munira** (newest first; masked):\n\n| submitted | address | why |\n|---|---|---|\n| 2026-08-29 | `l***@example.invalid` | a profile, but no follow-up task and no handled submission |\n| 2026-08-17 | `n***@example.invalid` | no CSuite profile for this address |\n\nNot sent anywhere — copy it from here if it is wanted.\n\n📞 6 CSuite read(s), 1 HubSpot read\n✍️ **0 CSuite writes, 0 HubSpot writes.**\nSay *\"reconcile daf tasks\"* to record these links — write_audit only. Run `migrations/007_write_audit_jidhr_target.sql` first."
+ },
+ "returning_donor": {
+  "audit": [
+   {
+    "endpoint": "task/create",
+    "meta": {
+     "ids": {
+      "employee_id": 1012,
+      "hubspot_form_id": "8dba272f-1986-4bcc-80b4-0b49bc1a4400",
+      "hubspot_submission_id": "back0001-cccc",
+      "id": 21999,
+      "linked_profile_id": 21999,
+      "task_type_id": 1065
+     },
+     "keys": [
+      "due_ts",
+      "employee_id",
+      "hubspot_form_id",
+      "hubspot_submission_id",
+      "id",
+      "linked_profile_id",
+      "name",
+      "o",
+      "task_description",
+      "task_type_id"
+     ]
+    },
+    "system": "csuite"
+   }
+  ],
+  "replies": [
+   "📋 **New DAF Inquiry**\n\n⏭️ The newest DAF submission has already been processed — Handled Already is profile 21000. Showing the next one.\n\n👤 **Name:** Fresh Donor\n📧 **Email:** fresh.donor@example.invalid\n📱 **Phone:** (703) 555-0177\n💰 **Requested Fund Name:** Not specified\n💵 **Initial Contribution:** Not specified\n📅 **Submitted:** Sun Mar 17, 2030 11:00 AM ET\n\n---\n**Shall I create the CSuite profile and fund?**\n• Say *\"Yes\"* or *\"Create it\"* to proceed\n• Say *\"Skip\"* to move to the next submission\n• Say *\"Cancel\"* to stop",
+   "📋 **New DAF Inquiry**\n\n⏭️ Skipped. Submission 3 of 3.\n\n👤 **Name:** Returning Donor\n📧 **Email:** returning.donor@example.invalid\n📱 **Phone:** (703) 555-0177\n💰 **Requested Fund Name:** Not specified\n💵 **Initial Contribution:** Not specified\n📅 **Submitted:** Sun Mar 17, 2030 8:13 AM ET\n\n---\n**Shall I create the CSuite profile and fund?**\n• Say *\"Yes\"* or *\"Create it\"* to proceed\n• Say *\"Skip\"* to move to the next submission\n• Say *\"Cancel\"* to stop",
+   "♻️ **Already in CSuite — no new profile created**\n\n👤 Profile 21999 — [CSuite](https://amuslimcf.fcsuite.com/erp/profile/display?profile_id=21999)\n   Found via: CSuite primary_email search\n🔗 skipped: HubSpot backfill is turned off\n📝 Follow-up task 1099 for 1012 — re: Returning Donor — due 2030-03-19 — [View](https://amuslimcf.fcsuite.com/erp/task/display?task_id=1099)\n\nSay anything to continue, or start a new workflow."
+  ],
+  "sent": [
+   {
+    "body": {
+     "env": "live",
+     "epoch": 1800000000,
+     "view_limit": 1
+    },
+    "endpoint": "profile/list",
+    "raw": "{\"env\": \"live\", \"epoch\": 1800000000, \"view_limit\": 1}"
+   },
+   {
+    "body": {
+     "env": "live",
+     "epoch": 1800000000,
+     "primary_email": "filter-probe-00000000000000000000000000005eed@example.invalid",
+     "view_limit": 1
+    },
+    "endpoint": "profile/list",
+    "raw": "{\"env\": \"live\", \"epoch\": 1800000000, \"primary_email\": \"filter-probe-00000000000000000000000000005eed@example.invalid\", \"view_limit\": 1}"
+   },
+   {
+    "body": {
+     "env": "live",
+     "epoch": 1800000000,
+     "primary_email": "returning.donor@example.invalid",
+     "view_limit": 5
+    },
+    "endpoint": "profile/list",
+    "raw": "{\"env\": \"live\", \"epoch\": 1800000000, \"primary_email\": \"returning.donor@example.invalid\", \"view_limit\": 5}"
+   },
+   {
+    "body": {
+     "due_ts": "2030-03-19",
+     "employee_id": 1012,
+     "env": "live",
+     "epoch": 1800000000,
+     "id": 21999,
+     "name": "DAF inquiry follow-up: Returning Donor — returning.donor@example.invalid",
+     "o": "profile",
+     "task_description": "DAF inquiry follow-up: Returning Donor — returning.donor@example.invalid",
+     "task_type_id": 1065
+    },
+    "endpoint": "task/create",
+    "raw": "{\"env\": \"live\", \"epoch\": 1800000000, \"name\": \"DAF inquiry follow-up: Returning Donor \\u2014 returning.donor@example.invalid\", \"employee_id\": 1012, \"due_ts\": \"2030-03-19\", \"task_description\": \"DAF inquiry follow-up: Returning Donor \\u2014 returning.donor@example.invalid\", \"task_type_id\": 1065, \"o\": \"profile\", \"id\": 21999}"
+   }
+  ]
+ },
+ "task_off": {
+  "audit": [
+   {
+    "endpoint": "profile/create/individual",
+    "meta": {
+     "ids": {
+      "hubspot_form_id": "8dba272f-1986-4bcc-80b4-0b49bc1a4400",
+      "hubspot_submission_id": "fresh001-bbbb"
+     },
+     "keys": [
+      "address",
+      "email",
+      "first_name",
+      "hubspot_form_id",
+      "hubspot_submission_id",
+      "last_name",
+      "phone_number"
+     ]
+    },
+    "system": "csuite"
+   }
+  ],
+  "replies": [
+   "📋 **New DAF Inquiry**\n\n⏭️ The newest DAF submission has already been processed — Handled Already is profile 21000. Showing the next one.\n\n👤 **Name:** Fresh Donor\n📧 **Email:** fresh.donor@example.invalid\n📱 **Phone:** (703) 555-0177\n💰 **Requested Fund Name:** Not specified\n💵 **Initial Contribution:** Not specified\n📅 **Submitted:** Sun Mar 17, 2030 11:00 AM ET\n\n---\n**Shall I create the CSuite profile and fund?**\n• Say *\"Yes\"* or *\"Create it\"* to proceed\n• Say *\"Skip\"* to move to the next submission\n• Say *\"Cancel\"* to stop",
+   "✅ **DAF Inquiry — Profile Created**\n\n👤 Profile: Fresh Donor — [CSuite](https://amuslimcf.fcsuite.com/erp/profile/display?profile_id=31337)\n💰 Fund: not opened yet — a fund is created when the donor commits, not at inquiry.\n🎯 HubSpot contact updated — [View](https://app-na2.hubspot.com/contacts/243832852/contact/70123)\n📝 No task: follow-up tasks are turned off\n🎫 Ticket close: off\n\nSay anything to continue, or start a new workflow."
+  ],
+  "sent": [
+   {
+    "body": {
+     "env": "live",
+     "epoch": 1800000000,
+     "view_limit": 1
+    },
+    "endpoint": "profile/list",
+    "raw": "{\"env\": \"live\", \"epoch\": 1800000000, \"view_limit\": 1}"
+   },
+   {
+    "body": {
+     "env": "live",
+     "epoch": 1800000000,
+     "primary_email": "filter-probe-00000000000000000000000000005eed@example.invalid",
+     "view_limit": 1
+    },
+    "endpoint": "profile/list",
+    "raw": "{\"env\": \"live\", \"epoch\": 1800000000, \"primary_email\": \"filter-probe-00000000000000000000000000005eed@example.invalid\", \"view_limit\": 1}"
+   },
+   {
+    "body": {
+     "env": "live",
+     "epoch": 1800000000,
+     "primary_email": "fresh.donor@example.invalid",
+     "view_limit": 5
+    },
+    "endpoint": "profile/list",
+    "raw": "{\"env\": \"live\", \"epoch\": 1800000000, \"primary_email\": \"fresh.donor@example.invalid\", \"view_limit\": 5}"
+   },
+   {
+    "body": {
+     "address": {
+      "address": "1 Test Way",
+      "city": "Reston",
+      "state": "VA",
+      "zipcode": "20190"
+     },
+     "email": "fresh.donor@example.invalid",
+     "env": "live",
+     "epoch": 1800000000,
+     "first_name": "Fresh",
+     "last_name": "Donor",
+     "phone_number": "7035550177"
+    },
+    "endpoint": "profile/create/individual",
+    "raw": "{\"env\": \"live\", \"epoch\": 1800000000, \"first_name\": \"Fresh\", \"last_name\": \"Donor\", \"email\": \"fresh.donor@example.invalid\", \"phone_number\": \"7035550177\", \"address\": {\"address\": \"1 Test Way\", \"city\": \"Reston\", \"state\": \"VA\", \"zipcode\": \"20190\"}}"
+   }
+  ]
+ }
+}
