@@ -95,9 +95,6 @@ def run(monkeypatch, csuite=None, hubspot=None, enabled=True, assignee=1007,
     monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", enabled)
     monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY",
                         assignee)
-    monkeypatch.setattr(Config,
-                        "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY",
-                        assignee)
     monkeypatch.setattr(Config, "CSUITE_TASK_TYPE_ID", task_type)
     state = {"active": True, "workflow_type": "daf", "type": wf_type,
              "step": "confirm", "form_id": Config.DAF_INQUIRY_FORM_ID,
@@ -149,22 +146,32 @@ def test_each_form_has_its_own_assignee(monkeypatch):
     assert task_assignee_for_form(Config.ENDOWMENT_INQUIRY_FORM_ID) == 1009
 
 
-def test_the_retired_endowment_variable_assigns_nobody(monkeypatch):
-    """V5.81: CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY served the retired
-    individual path. A deployment that still sets it must not get an
-    endowment task assigned through it."""
-    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY",
-                        1002)
-    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_ASSIGNEE", None)
+def test_the_retired_endowment_variable_is_not_read(monkeypatch):
+    """CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY served the individual path
+    V5.81 retired, and V5.82 stops reading it. Production still sets it
+    until Carl removes it; that must assign nobody."""
+    import importlib
 
-    assert task_assignee_for_form(Config.ENDOWMENT_INQUIRY_FORM_ID) is None
+    import config
+    monkeypatch.setenv("CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY", "1002")
+    monkeypatch.delenv("CSUITE_ENDOWMENT_ASSIGNEE", raising=False)
+    importlib.reload(config)
+    try:
+        assert not hasattr(config.Config,
+                           "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY")
+        assert config.Config.CSUITE_ENDOWMENT_ASSIGNEE is None
+        monkeypatch.setattr(daf_workflow, "Config", config.Config)
+        assert task_assignee_for_form(
+            config.Config.ENDOWMENT_INQUIRY_FORM_ID) is None
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
 
 
 def test_there_is_NO_fallback_to_a_default_person(monkeypatch):
     """A task in the wrong queue looks exactly like a task in the right one."""
     monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID", 1007)
     monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY", None)
-    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY", None)
 
     assert task_assignee_for_form(Config.DAF_INQUIRY_FORM_ID) is None
     assert task_assignee_for_form(Config.ENDOWMENT_INQUIRY_FORM_ID) is None
@@ -560,7 +567,6 @@ def test_an_unmapped_form_names_the_form_and_makes_no_task(monkeypatch):
     monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
     monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", True)
     monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY", 1004)
-    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY", 1009)
     monkeypatch.setattr(Config, "CSUITE_TASK_TYPE_ID", None)
 
     csuite = CSuite()
@@ -601,7 +607,6 @@ def test_the_shared_variable_is_ignored_entirely(monkeypatch):
     monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", True)
     monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID", 1007)
     monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY", None)
-    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY", None)
 
     csuite = CSuite()
     state = {"active": True, "workflow_type": "daf", "type": "daf",
@@ -621,7 +626,7 @@ def test_the_old_endowment_assignee_no_longer_makes_a_task(monkeypatch):
     monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
     monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False)
     monkeypatch.setattr(Config, "CSUITE_DAF_TASK_CREATE_ENABLED", True)
-    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY", 1002)
+    monkeypatch.setenv("CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY", "1002")
     monkeypatch.setattr(Config, "CSUITE_TASK_TYPE_ID", None)
 
     csuite = CSuite()

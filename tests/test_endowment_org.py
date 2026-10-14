@@ -460,8 +460,7 @@ def test_refuses_when_the_flag_is_off(world, monkeypatch):
 def test_the_retired_assignee_variable_does_not_unlock_create(world,
                                                               monkeypatch):
     monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_ASSIGNEE", None)
-    monkeypatch.setattr(Config, "CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY",
-                        1002)
+    monkeypatch.setenv("CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY", "1002")
     _review, reply, _state, client = offer_and_create()
     assert "assignee not confirmed" in reply and client.sent == []
 
@@ -600,13 +599,14 @@ def test_mark_handled_is_routed_to_this_workflow():
 
 def test_nothing_the_scheduled_run_executes_has_changed():
     """V5.81 must not change the runner or what it runs. Everything under
-    jobs/, the runner script, both Railway configs and the scheduled chain's
-    modules are byte-identical to V5.80 (de92baa)."""
+    jobs/, the runner script, railway.toml and the scheduled chain's modules
+    are byte-identical to V5.80 (de92baa). (railway.jobs.toml was deleted in
+    V5.82: new Railway services cannot use a config file.)"""
     import subprocess
 
     found = subprocess.run(
         ["git", "diff", "--stat", "de92baa", "--", "jobs/",
-         "scripts/jobs_run.py", "railway.toml", "railway.jobs.toml",
+         "scripts/jobs_run.py", "railway.toml",
          "sync/scheduled.py", "sync/registrations.py",
          "sync/contact_create.py", "sync/mirror.py", "clients/notify.py",
          "clients/database.py", "clients/mirror_read.py"],

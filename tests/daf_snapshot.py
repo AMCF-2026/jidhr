@@ -208,6 +208,9 @@ def record_reconcile(monkeypatch) -> dict:
 
     processed = {"6a31606e": "21699"}
     csuite = h.ReconcileCSuite()
+    # On, as in production. Since V5.82 the reconcile honours the form's
+    # own create switch.
+    monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
     monkeypatch.setattr(dr, "legacy_tasks", lambda *a, **k: ["1033", "1036"])
     monkeypatch.setattr(dr, "tasked_submissions", lambda *a, **k: set())
     monkeypatch.setattr(dr, "_pace", lambda: None)

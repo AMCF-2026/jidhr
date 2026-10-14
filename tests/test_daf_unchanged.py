@@ -158,6 +158,7 @@ def test_reconcile_inquiries_daf_is_the_same_run(monkeypatch):
     """The alias and the general command run the same thing; only the
     heading and the "say ..." line name the command that was typed."""
     seen = []
+    monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
     monkeypatch.setattr(dr, "run", lambda **k: seen.append(k) or {
         "dry_run": k["dry_run"], "form_id": k["form_id"], "links": [],
         "unlinked": [], "fetched": 0, "processed_before": 0,
@@ -468,3 +469,43 @@ def test_a_failed_re_read_skips_nothing(monkeypatch):
     assert "Nothing was skipped" in reply
     assert state["active"] is True
     assert state["submission_data"]["submission_id"] == "s0000"
+
+
+# --- V5.82: the reconcile honours each form's own switch ----------------------
+
+@pytest.mark.parametrize("command", ["reconcile daf tasks dry run",
+                                     "reconcile daf tasks",
+                                     "reconcile inquiries daf dry run",
+                                     "reconcile inquiries daf"])
+def test_the_daf_reconcile_refuses_when_daf_is_off(monkeypatch, command):
+    monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", False)
+    monkeypatch.setattr(dr, "run", lambda **k: pytest.fail("it ran"))
+    reply = sync_commands.handle(command, None)
+    assert "DAF inquiries are turned off" in reply
+    assert "CSUITE_DAF_CREATE_ENABLED" in reply
+
+
+@pytest.mark.parametrize("command", ["reconcile inquiries endowment dry run",
+                                     "reconcile inquiries endowment"])
+def test_the_endowment_reconcile_obeys_the_kill_switch(monkeypatch, command):
+    """V5.81 gap: the kill switch could be walked round through this
+    command. Off refuses before anything is read — even with DAF on."""
+    monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_CREATE_RAW", "")
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_CREATE_ENABLED", False)
+    monkeypatch.setattr(dr, "run", lambda **k: pytest.fail("it ran"))
+    reply = sync_commands.handle(command, None)
+    assert "Endowment inquiries are turned off" in reply
+
+
+def test_the_endowment_reconcile_runs_when_switched_on(monkeypatch):
+    seen = []
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_CREATE_RAW", "true")
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_CREATE_ENABLED", True)
+    monkeypatch.setattr(dr, "run", lambda **k: seen.append(k) or {
+        "dry_run": k["dry_run"], "form_id": k["form_id"], "links": [],
+        "unlinked": [], "fetched": 0, "processed_before": 0,
+        "unprocessed": 0, "written": []})
+    sync_commands.handle("reconcile inquiries endowment dry run", None)
+    assert seen == [{"dry_run": True,
+                     "form_id": Config.ENDOWMENT_INQUIRY_FORM_ID}]

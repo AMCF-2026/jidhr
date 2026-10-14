@@ -1245,9 +1245,9 @@ def task_assignee_for_form(form_id):
     # Transfer and Investment Request have no row: this workflow does not
     # handle them, so no task is created for them.
     #
-    # Endowment reads CSUITE_ENDOWMENT_ASSIGNEE since V5.81, NOT
-    # CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY: that one served the retired
-    # individual path, and the new one stays unset until Carl confirms 1002.
+    # Endowment reads CSUITE_ENDOWMENT_ASSIGNEE since V5.81, which stays
+    # unset until Carl confirms 1002. The variable the retired individual
+    # path used is not read at all since V5.82.
     row = inquiry_form_for_id(form_id)
     if row is None:
         return None
@@ -2005,9 +2005,8 @@ def _task_lines(data: dict, results: dict) -> list:
                 "add it by hand in CSuite."]
     if results.get("task_skipped"):
         # The endowment-specific "assignee not set" warning was removed on
-        # 2026-10-02: CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY is now set, so
-        # that gap is closed and the line would only ever appear if someone
-        # unset it — which the generic line already covers.
+        # 2026-10-02; the generic line covers any form with no assignee.
+        # (Endowment's assignee is CSUITE_ENDOWMENT_ASSIGNEE since V5.81.)
         return [f"📝 No task: {results['task_skipped']}"]
     return []
 
