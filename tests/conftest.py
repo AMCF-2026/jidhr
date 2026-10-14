@@ -36,6 +36,59 @@ def _unset_database_url(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+PLACEHOLDER_CREDENTIALS = {
+    "CSUITE_API_KEY": "placeholder-csuite-key-not-real",
+    "CSUITE_API_SECRET": "placeholder-csuite-secret-not-real",
+    "CSUITE_SANDBOX_KEY": "placeholder-csuite-sandbox-key-not-real",
+    "CSUITE_SANDBOX_SECRET": "placeholder-csuite-sandbox-secret-not-real",
+    "HUBSPOT_ACCESS_TOKEN": "placeholder-hubspot-token-not-real",
+}
+
+
+@pytest.fixture(autouse=True)
+def _placeholder_credentials(monkeypatch):
+    """Every test sees placeholder API credentials, never real ones.
+
+    Until V5.83 the suite took whatever .env held. In a clean checkout with
+    no .env, 44 tests failed because CSuiteClient refuses to construct
+    without a key and secret (CSuiteEnvMismatch), and the CSuite
+    network-guard test failed with them. In a developer checkout the same
+    tests ran holding PRODUCTION credentials. Now both see the same values,
+    and a value here is useless off this machine anyway: the network block
+    below refuses every connection.
+
+    Set in TWO places, because of `importlib.reload(config)`, which several
+    tests do. A reload builds a NEW `config.Config` from the environment:
+    clients/hubspot.py keeps reading the class it imported, but
+    clients.csuite.resolve_csuite_env imports Config inside the function
+    and so reads the NEW one. A class-only patch therefore leaked the real
+    .env key into a CSuiteClient built after a reload (found 2026-10-14).
+
+    * as ENVIRONMENT variables, so any reload rebuilds Config with the
+      placeholders — load_dotenv never overrides a variable already set;
+    * on every distinct Config class already loaded (config's own and the
+      ones the client modules imported), for code that reads those.
+
+    A test that needs a credential to be missing patches it to "" itself;
+    the test body runs after this fixture.
+    """
+    import config
+    import clients.csuite
+    import clients.hubspot
+
+    for name, value in PLACEHOLDER_CREDENTIALS.items():
+        monkeypatch.setenv(name, value)
+
+    seen = []
+    for holder in (config.Config, clients.csuite.Config,
+                   clients.hubspot.Config):
+        if any(holder is other for other in seen):
+            continue
+        seen.append(holder)
+        for name, value in PLACEHOLDER_CREDENTIALS.items():
+            monkeypatch.setattr(holder, name, value, raising=False)
+
+
 class AuditStore:
     """An in-memory stand-in for the `write_audit` table.
 
