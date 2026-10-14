@@ -78,6 +78,22 @@ def log_user_action(action, details=""):
 # FLASK APP
 # =============================================================================
 
+# The cron service (jidhr-jobs) runs scripts/jobs_run.py --once and sets
+# JIDHR_ROLE=jobs. If a misconfiguration ever starts THIS app there instead,
+# it refuses with one clear line rather than serving web — and a booted web
+# app on a cron service never exits, so Railway would skip every later run.
+#
+# 2026-10-14: the first cron service took the root railway.toml's gunicorn
+# command despite Railway saying new services cannot opt into config-as-code.
+# It died on the missing SECRET_KEY, which was luck, not a guard.
+if os.environ.get("JIDHR_ROLE", "").strip().lower() == "jobs":
+    logger.critical("JIDHR_ROLE=jobs: this service runs scripts/jobs_run.py "
+                    "--once, not the web app. Refusing to start the web app.")
+    raise RuntimeError(
+        "JIDHR_ROLE=jobs: this service runs scripts/jobs_run.py --once, not "
+        "the web app. Fix the service's start command; do not unset the "
+        "variable.")
+
 # Refuse to start rather than fall back to a guessable key. Without this the
 # app would boot happily and sign session cookies with a value an attacker can
 # read out of the repo, which is worse than being down.

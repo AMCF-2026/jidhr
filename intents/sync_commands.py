@@ -326,12 +326,34 @@ def _reconcile_inquiries(query_lower: str) -> str:
                                   f"reconcile inquiries {key}")
 
 
+def _inquiry_switch_refusal(row):
+    """The reply when this form's own create switch is off, else None.
+
+    The reconcile writes nothing to CSuite or HubSpot, but its dry run reads
+    both and its live run writes write_audit link rows. A form that is
+    switched off is off for this too: endowment's kill switch must not be
+    walked round through a different command.
+    """
+    from intents.daf_workflow import endowment_refusal, form_switch
+
+    if row["key"] == "endowment":
+        return endowment_refusal()
+    if not form_switch(row, "create_flag"):
+        return (f"⏸️ {row['label']} inquiries are turned off "
+                f"({row['create_flag']}), so nothing was read and nothing "
+                "was linked.")
+    return None
+
+
 def _run_inquiry_reconcile(key: str, dry_run: bool, command: str) -> str:
     from intents.daf_workflow import handled_endpoints, inquiry_form
     from sync import daf_reconcile as dr
 
     row = inquiry_form(key)
     label = row["label"]
+    refusal = _inquiry_switch_refusal(row)
+    if refusal:
+        return refusal
     try:
         out = dr.run(dry_run=dry_run, form_id=row["form_id"])
     except dr.ReconcileRefused as e:

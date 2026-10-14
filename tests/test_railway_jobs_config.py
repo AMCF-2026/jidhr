@@ -1,63 +1,40 @@
-"""The jidhr-jobs service's own config file.
+"""The cron service (jidhr-jobs) is configured in the Railway dashboard.
 
-Without /railway.jobs.toml set as its config path, jidhr-jobs would read the
-web service's /railway.toml — and Railway's config-as-code OVERRIDES the
-dashboard, so the web's gunicorn startCommand would win over any start
-command typed in. A second web app never exits, a cron service whose run
-stays Active has every later run SKIPPED, and nothing would notice. These
-tests pin the file that prevents that, and pin the web's file as untouched.
+V5.80 gave it its own config file, /railway.jobs.toml. That cannot work: on
+2026-10-14 the new service refused the config path ("services that have never
+used Config as Code cannot opt in") and still applied the ROOT railway.toml —
+8 gunicorn workers on a Nixpacks image — so it booted the web app and died on
+the missing SECRET_KEY. V5.82 deletes the file. The cron service's settings
+live in its dashboard, and app.py refuses to start the web app on a service
+marked JIDHR_ROLE=jobs.
+
+The guard is tested by importing app.py in a SUBPROCESS with SECRET_KEY and
+DATABASE_URL set empty: every case stops at import, before anything connects.
 """
 
+import os
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
-JOBS = ROOT / "railway.jobs.toml"
 WEB = ROOT / "railway.toml"
-
-
-def jobs_config():
-    return tomllib.loads(JOBS.read_text())
 
 
 def web_config():
     return tomllib.loads(WEB.read_text())
 
 
-def test_the_jobs_service_runs_the_runner_not_the_web_app():
-    start = jobs_config()["deploy"]["startCommand"]
-
-    assert start == "python scripts/jobs_run.py --once"
-    assert "gunicorn" not in start, "that is the web app"
-    assert "--once" in start, "a cron run must claim, run and EXIT"
+def test_there_is_no_jobs_config_file():
+    """New services cannot use one; a file that is silently ignored only
+    misleads the next reader."""
+    assert not (ROOT / "railway.jobs.toml").exists()
 
 
-def test_it_runs_at_0615_utc_daily():
-    cron = jobs_config()["deploy"]["cronSchedule"]
-
-    assert cron == "15 6 * * *"
-    assert len(cron.split()) == 5, "a standard 5-field cron expression"
-
-
-def test_it_never_restarts():
-    """A restart would only rerun --once; a failure is the ALERT email's
-    job, not a retry's."""
-    assert jobs_config()["deploy"]["restartPolicyType"] == "NEVER"
-
-
-def test_it_has_no_healthcheck():
-    """The runner serves no HTTP, so any healthcheck would fail the deploy."""
-    deploy = jobs_config()["deploy"]
-    assert "healthcheckPath" not in deploy
-    assert "healthcheckTimeout" not in deploy
-
-
-def test_it_builds_the_same_image_as_the_web_service():
-    assert jobs_config()["build"] == web_config()["build"]
-
-
-def test_the_runner_it_starts_exists_and_takes_once():
+def test_the_runner_the_cron_service_starts_exists_and_takes_once():
     script = ROOT / "scripts" / "jobs_run.py"
     source = script.read_text()
 
@@ -67,15 +44,14 @@ def test_the_runner_it_starts_exists_and_takes_once():
 
 
 def test_the_web_config_is_byte_identical_to_v579():
-    """The web service's file must not change: the fix is a SECOND file, not
-    an edit to the one serving production."""
+    """V5.82 leaves railway.toml alone. Moving web's settings into its
+    dashboard and deleting the file is a separate, later commit."""
     diff = subprocess.run(["git", "diff", "--quiet", "e5fb901", "--",
                            "railway.toml"], cwd=ROOT)
     assert diff.returncode == 0, "railway.toml changed"
 
 
 def test_the_web_config_still_serves_the_web_app():
-    """Belt and braces: the web's own settings are what they were."""
     deploy = web_config()["deploy"]
 
     assert deploy["startCommand"].startswith("gunicorn app:app")
@@ -84,10 +60,38 @@ def test_the_web_config_still_serves_the_web_app():
         "a cron schedule on the WEB service would stop it serving"
 
 
-def test_the_jobs_file_says_where_to_point_the_service():
-    """The path is set in the dashboard and nowhere else, so the file has to
-    say what it is."""
-    text = JOBS.read_text()
+# --- JIDHR_ROLE=jobs: the web app refuses to start ----------------------------
 
-    assert "/railway.jobs.toml" in text
-    assert "Config-as-code" in text
+def import_app(role):
+    env = dict(os.environ, SECRET_KEY="", DATABASE_URL="",
+               DATABASE_PUBLIC_URL="")
+    env.pop("JIDHR_ROLE", None)
+    if role is not None:
+        env["JIDHR_ROLE"] = role
+    return subprocess.run([sys.executable, "-c", "import app"], cwd=ROOT,
+                          env=env, capture_output=True, text=True,
+                          timeout=120)
+
+
+@pytest.mark.parametrize("role", ["jobs", "JOBS", " jobs "])
+def test_the_web_app_refuses_to_start_on_the_jobs_service(role):
+    found = import_app(role)
+
+    assert found.returncode != 0
+    assert "RuntimeError: JIDHR_ROLE=jobs" in found.stderr
+    assert "SECRET_KEY is not set" not in found.stderr, \
+        "the guard comes first, so the reason is the right one"
+    refusals = [line for line in found.stdout.splitlines()
+                if "Refusing to start the web app" in line]
+    assert len(refusals) == 1, "exactly one clear log line"
+    assert "CRITICAL" in refusals[0]
+
+
+@pytest.mark.parametrize("role", [None, "", "web"])
+def test_the_guard_does_not_fire_without_jobs(role):
+    """Web does not set it. Unset, empty or anything else passes the guard —
+    here, to the SECRET_KEY check, which stops the import in this test."""
+    found = import_app(role)
+
+    assert "JIDHR_ROLE=jobs" not in found.stderr + found.stdout
+    assert "SECRET_KEY is not set" in found.stderr

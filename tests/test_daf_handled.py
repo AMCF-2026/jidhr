@@ -662,6 +662,7 @@ def test_the_constraint_check_reads_the_real_definition(monkeypatch):
 
 def test_the_command_is_recognised_and_dry_run_is_explicit(monkeypatch):
     seen = {}
+    monkeypatch.setattr(Config, "CSUITE_DAF_CREATE_ENABLED", True)
     monkeypatch.setattr(dr, "run", lambda **k: seen.update(k) or {
         "dry_run": k["dry_run"], "links": [], "unlinked": [], "fetched": 0,
         "processed_before": 0, "unprocessed": 0, "written": []})

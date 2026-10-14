@@ -368,8 +368,9 @@ class Config:
     # default, because there is no way to guess who owns a form.
     CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY = _int_or_zero(
         os.environ.get('CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY', '0')) or None
-    CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY = _int_or_zero(
-        os.environ.get('CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY', '0')) or None
+    # CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY is no longer read (V5.82). It
+    # served the individual endowment path V5.81 retired; endowment's assignee
+    # is CSUITE_ENDOWMENT_ASSIGNEE, below.
 
     # Human names for the forms, for the "no assignee set for X" line. A form
     # id in a message tells a reader nothing.
@@ -448,9 +449,9 @@ class Config:
     # it does not create a profile with no task, and it never guesses an id.
     #
     # A new variable rather than CSUITE_TASK_EMPLOYEE_ID_ENDOWMENT_INQUIRY on
-    # purpose: that one may already be set in a deployment, and it was set for
-    # the individual endowment path V5.81 retired. Setting this one is the
-    # deliberate act that says "the id is confirmed".
+    # purpose: that one was set in production for the individual endowment
+    # path V5.81 retired, and is not read at all since V5.82. Setting this
+    # one is the deliberate act that says "the id is confirmed".
     CSUITE_ENDOWMENT_ASSIGNEE = _int_or_zero(
         os.environ.get('CSUITE_ENDOWMENT_ASSIGNEE', '0')) or None
 

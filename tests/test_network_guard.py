@@ -19,11 +19,21 @@ import pytest
 from tests.conftest import OutboundNetworkBlocked
 
 
-def test_a_real_hubspot_client_cannot_reach_hubspot():
-    """The seam clients/hubspot.py uses: module-level requests helpers."""
-    from clients.hubspot import HubSpotClient
+def test_a_real_hubspot_client_cannot_reach_hubspot(monkeypatch):
+    """The seam clients/hubspot.py uses: module-level requests helpers.
 
-    client = HubSpotClient()
+    A placeholder token, because a client with NO token returns "not
+    configured" before it touches the network — so in a checkout without
+    .env this test used to fail with DID NOT RAISE, proving nothing.
+    """
+    import clients.hubspot as hubspot
+
+    # On the Config the CLIENT module holds. Other tests reload `config`,
+    # after which `from config import Config` is a different class from the
+    # one clients/hubspot.py imported, and a patch on it changes nothing.
+    monkeypatch.setattr(hubspot.Config, "HUBSPOT_ACCESS_TOKEN",
+                        "placeholder-not-a-real-token")
+    client = hubspot.HubSpotClient()
     with pytest.raises(OutboundNetworkBlocked) as caught:
         client._get("crm/v3/objects/contacts", {"limit": 1})
 
