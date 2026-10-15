@@ -346,7 +346,10 @@ PINNED = {
         # (the session is a cookie). Its replies are pinned by the golden
         # returning_donor scenario, which skips once.
     ],
-    "clients/csuite.py": ["create_individual_profile", "create_task",
+    # create_task is NOT pinned since V5.86: its log line records the
+    # title's length instead of its text (an endowment title carries the EIN
+    # and goal). What it SENDS is pinned byte for byte by the golden replay.
+    "clients/csuite.py": ["create_individual_profile",
                           "build_address", "check_input_fields"],
     "clients/audit.py": ["processed_submissions", "payload_meta",
                          "record_write"],

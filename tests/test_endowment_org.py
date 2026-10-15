@@ -76,7 +76,7 @@ class Hub:
 class Client(CSuiteClient):
     """The real _request. `existing` maps an email to [(profile_id, ptype)]."""
 
-    def __init__(self, existing=None):
+    def __init__(self, existing=None, fedids=None, unreadable=()):
         self.api_key, self.api_secret = "k", "s"
         self.base_url = "https://amuslimcf.fcsuite.com/api/v2"
         self.env = "live"
@@ -86,6 +86,10 @@ class Client(CSuiteClient):
         outer, existing = self, existing or {}
         ptypes = {str(pid): pt for rows in existing.values()
                   for pid, pt in rows}
+        # What profile/display says each profile's fedid is. Updated by a
+        # successful profile/edit, as CSuite would.
+        self.fedids = {str(k): v for k, v in (fedids or {}).items()}
+        unreadable = {str(u) for u in unreadable}
 
         class Session:
             def post(_self, url, data=None, **kwargs):
@@ -106,9 +110,18 @@ class Client(CSuiteClient):
                     payload = {"success": 1, "data": reply}
                 elif endpoint == "profile/display":
                     pid = str(body.get("profile_id"))
-                    payload = {"success": 1, "data": {
-                        "profile_id": int(pid),
-                        "ptype": ptypes.get(pid, "org")}}
+                    if pid in unreadable:
+                        payload = {"success": 0,
+                                   "errors": ["Internal server error"]}
+                    else:
+                        payload = {"success": 1, "data": {
+                            "profile_id": int(pid),
+                            "ptype": ptypes.get(pid, "org"),
+                            "fedid": outer.fedids.get(pid)}}
+                elif endpoint == "profile/edit":
+                    outer.fedids[str(body["profile_id"])] = body.get("fedid")
+                    payload = {"success": 1,
+                               "data": {"profile_id": body["profile_id"]}}
                 elif endpoint == "profile/create/org":
                     payload = {"success": 1, "data": {"profile_id": 40001}}
                 elif endpoint == "task/create":
@@ -223,7 +236,8 @@ def test_the_org_profile_body(world):
         "phone_number": "7035550123",
         "address": {"address": "9 Org Plaza", "city": "Herndon",
                     "state": "VA", "zipcode": "20170"},
-        "website": "https://org.example.invalid"}
+        "website": "https://org.example.invalid",
+        "fedid": EIN}
     assert state["profile_id"] == 40001
     assert "Organisation Profile Created" in reply
 
@@ -258,6 +272,10 @@ def test_a_contact_field_with_a_company_name_is_not_read_as_the_company():
     assert parsed["org_address_street"] == ""
 
 
+TITLE = ("Endowment inquiry: Test Peace Academy — EIN 00-FAKE-EIN-0042 — "
+         "goal FAKEGOAL-250000 — Dana Director <director@example.invalid>")
+
+
 def test_the_task(world):
     _review, reply, _state, client = offer_and_create()
     body = client.body("task/create")
@@ -265,47 +283,72 @@ def test_the_task(world):
     assert body["employee_id"] == 1002
     assert body["task_type_id"] == 1065
     assert body["o"] == "profile" and body["id"] == 40001
-    assert body["name"] == ("Endowment inquiry follow-up: Test Peace Academy"
-                            " — director@example.invalid")
     assert "📝 Follow-up task 2001 for 1002" in reply
 
 
-def test_the_task_description_order(world):
+def test_the_task_text_is_the_title_in_both_fields(world):
+    """A CSuite task keeps ONE text: task_description is ignored when name
+    is sent (sandbox, 2026-10-15). The same text goes in both, as DAF."""
     _review, _reply, _state, client = offer_and_create()
-    text = client.body("task/create")["task_description"]
-    order = ["Organization: Test Peace Academy", f"EIN: {EIN}",
-             "Website: https://org.example.invalid", "Contact: Dana Director",
-             "Email: director@example.invalid", "Phone: (703) 555-0123",
-             f"Starting goal: {GOAL}", "Mission and core services",
-             "What prompted the interest", "Main endowment goals",
-             "How they heard: FAKEHEARD", "Submitted:", "HubSpot: https://"]
-    positions = [text.index(item) for item in order]
-    assert positions == sorted(positions)
-    assert "(submission endw0001-aaaa-bbbb)" in text
+    body = client.body("task/create")
+
+    assert body["name"] == TITLE
+    assert body["task_description"] == TITLE
+    for essay in ("FAKEMISSION", "FAKEINTEREST", "FAKEGOALS", "FAKEHEARD"):
+        assert essay not in body["name"], "the essays stay in HubSpot"
 
 
-def test_a_long_description_cuts_the_essays_and_nothing_else():
-    data = daf_workflow._parse_submission(
-        endowment_submission(**{k: "LONGESSAY " * 2000 for k in ESSAYS}),
+def _data(**overrides):
+    return daf_workflow._parse_submission(
+        endowment_submission(**overrides),
         daf_workflow.inquiry_form("endowment")["field_map"])
 
-    text = endowment_inquiry.task_description(data, limit=1500)
 
-    assert len(text) <= 1500
-    assert text.count(endowment_inquiry.TRUNCATED) == 3
-    for kept in (f"EIN: {EIN}", "Contact: Dana Director",
-                 "Email: director@example.invalid", "Phone: (703) 555-0123",
-                 "Organization: Test Peace Academy", "How they heard:",
-                 "HubSpot: "):
-        assert kept in text
+def test_a_short_title_is_not_cut():
+    assert endowment_inquiry.task_title(_data()) == TITLE
 
 
-def test_a_short_description_is_not_cut():
-    data = daf_workflow._parse_submission(
-        endowment_submission(),
-        daf_workflow.inquiry_form("endowment")["field_map"])
-    assert endowment_inquiry.TRUNCATED not in \
-        endowment_inquiry.task_description(data)
+def test_a_long_goal_is_cut_to_40_first():
+    goal = "We hope to raise " + "a great deal " * 30
+    title = endowment_inquiry.task_title(_data(
+        what_is_your_endowment_starting_goal_=goal))
+
+    assert len(title) <= 255
+    cut = title.split(" — goal ")[1].split(" — ")[0]
+    assert len(cut) == 40 and cut.endswith("…")
+    assert "Test Peace Academy" in title, "the org is not cut while goal can be"
+    assert "EIN 00-FAKE-EIN-0042" in title
+    assert "<director@example.invalid>" in title
+
+
+def test_then_the_organisation_name_is_cut(world):
+    org = "The Very Long Named Organisation " * 10
+    title = endowment_inquiry.task_title(_data(
+        name=org, what_is_your_endowment_starting_goal_="g" * 100))
+
+    assert len(title) == 255
+    assert title.split(" — goal ")[1].startswith("g" * 39 + "…")
+    assert title.split(" — EIN ")[0].endswith("…")
+    assert "EIN 00-FAKE-EIN-0042" in title
+    assert title.endswith("Dana Director <director@example.invalid>")
+
+
+@pytest.mark.parametrize("org_len,goal_len", [(400, 400), (1000, 5),
+                                              (230, 0), (5, 1000)])
+def test_the_ein_and_email_are_never_cut(org_len, goal_len):
+    title = endowment_inquiry.task_title(_data(
+        name="O" * org_len,
+        what_is_your_endowment_starting_goal_="G" * goal_len))
+
+    assert len(title) <= 255
+    assert "— EIN 00-FAKE-EIN-0042 —" in title
+    assert title.endswith("<director@example.invalid>")
+
+
+def test_missing_values_are_said_not_dropped():
+    title = endowment_inquiry.task_title(_data(
+        organization_ein="", what_is_your_endowment_starting_goal_=""))
+    assert "— EIN not given — goal not given —" in title
 
 
 # --- EIN, goal and essays: never logged, never audited, never in the cookie ----
@@ -645,9 +688,17 @@ def test_the_first_yes_reads_only_and_shows_a_new_organisation(world):
     assert "1. `profile/create/org`" in plan
     assert "2. `task/create`" in plan
     assert "Assigned to employee 1002, task type 1065" in plan
-    assert "linked to the new organisation profile" in plan
+    assert "2. `task/create` — the new organisation profile:" in plan
+    assert f"*{TITLE}*" in plan
+    assert f"({len(TITLE)} of 255 characters" in plan
+    assert "The rest of the submission stays in HubSpot" in plan
+    assert "essay" not in plan.lower(), "the plan no longer mentions essays"
+    # The EIN and the goal ARE shown: both are written now (the EIN to the
+    # profile, both in the task title), and the reviewer approves them.
+    assert f"EIN {EIN} (as fedid)" in plan
     for secret in SECRETS:
-        assert secret not in plan, "the plan lists what is sent, not values"
+        if secret not in (EIN, GOAL):
+            assert secret not in plan, "the essays are never shown"
 
 
 def test_the_first_yes_shows_an_existing_organisation(world):
@@ -657,9 +708,11 @@ def test_the_first_yes_shows_an_existing_organisation(world):
     _review, plan, _state, client = offer_and_create(second=None)
 
     assert "**Outcome: EXISTING organisation — profile 18075.**" in plan
-    assert "will make 1 CSuite write:" in plan
+    # 18075 has no EIN in the double, so the plan includes setting it.
+    assert "will make 2 CSuite writes:" in plan
+    assert "`profile/edit` on profile 18075 — sets ONLY fedid" in plan
     assert "profile/create/org" not in plan
-    assert "linked to profile 18075" in plan
+    assert "`task/create` — profile 18075:" in plan
     assert not [e for e in client.endpoints() if e in WRITES]
 
 
@@ -762,6 +815,131 @@ def test_the_plan_in_the_cookie_holds_ids_only(world):
     _review, _plan, state, _client = offer_and_create(second=None)
     plan = state["endowment_plan"]
     assert plan == {"submission_id": "endw0001-aaaa-bbbb", "outcome": "new",
-                    "profile_id": None}
+                    "profile_id": None, "ein_action": None}
     for secret in SECRETS:
         assert secret not in json.dumps(state)
+
+
+# --- V5.86: the EIN goes into CSuite's fedid --------------------------------------
+
+def _existing(world, pid="18075"):
+    world["mirror"].append({"profile_id": pid,
+                            "organization": "Test Peace Academy",
+                            "ptype": "org"})
+
+
+def test_a_new_organisation_without_an_ein_sends_no_fedid(world):
+    hub = Hub({FORM: [endowment_submission(organization_ein="")], DAF: []})
+    _review, _reply, _state, client = offer_and_create(hub=hub)
+    assert "fedid" not in client.body("profile/create/org")
+
+
+def test_existing_with_no_ein_gets_one_guarded_edit_setting_only_fedid(world):
+    _existing(world)
+    _review, reply, _state, client = offer_and_create(client=Client())
+
+    writes = [e for e in client.endpoints()
+              if e in WRITES or e == "profile/edit"]
+    assert writes == ["profile/edit", "task/create"]
+    body = client.body("profile/edit")
+    assert {k: v for k, v in body.items() if k not in ("env", "epoch")} \
+        == {"profile_id": 18075, "fedid": EIN}
+    assert f"EIN {EIN} set on profile 18075 (it had none)" in reply
+
+
+@pytest.mark.parametrize("stored", [EIN, "00FAKEEIN0042", " 00-FAKE-EIN-0042 "])
+def test_existing_with_the_same_ein_is_not_written(world, stored):
+    """The same digits in any formatting count as the same EIN."""
+    _existing(world)
+    client = Client(fedids={18075: stored})
+    _review, reply, _state, client = offer_and_create(client=client)
+
+    assert "profile/edit" not in client.endpoints()
+    assert "already holds" in client.plan_reply
+    assert "will make 1 CSuite write:" in client.plan_reply
+    assert client.body("task/create")["id"] == 18075
+
+
+def test_existing_with_a_different_ein_is_never_overwritten(world):
+    _existing(world)
+    client = Client(fedids={18075: "99-9999999"})
+    _review, reply, _state, client = offer_and_create(client=client)
+
+    assert "profile/edit" not in client.endpoints()
+    assert client.fedids["18075"] == "99-9999999"
+    for text in (client.plan_reply, reply):
+        assert "EIN MISMATCH" in text and "99-9999999" in text
+    assert "will make 1 CSuite write:" in client.plan_reply
+    assert client.body("task/create")["id"] == 18075, "the task still goes"
+
+
+def test_an_unreadable_existing_profile_gets_no_ein_write(world):
+    _existing(world)
+    client = Client(unreadable=(18075,))
+    _review, _reply, _state, client = offer_and_create(client=client)
+
+    assert "profile/edit" not in client.endpoints()
+    assert "could not be read" in client.plan_reply
+
+
+def test_existing_and_no_ein_on_the_form_gets_no_edit(world):
+    _existing(world)
+    hub = Hub({FORM: [endowment_submission(organization_ein="")], DAF: []})
+    _review, _reply, _state, client = offer_and_create(hub=hub)
+
+    assert "profile/edit" not in client.endpoints()
+    assert "the form has none" in client.plan_reply
+
+
+def test_an_ein_appearing_between_the_two_yeses_stops_the_write(world):
+    """Approved to SET an empty EIN; by the second yes the profile has one.
+    Never overwrite: nothing at all is written."""
+    _existing(world)
+    hub, client = Hub(), Client()
+    state = daf_workflow.default_workflow_state()
+    daf_workflow._initiate_workflow("new endowment", state, hub)
+    plan = daf_workflow._handle_active_workflow("yes", state, hub, client)
+    assert "sets ONLY fedid" in plan
+
+    client.fedids["18075"] = "11-1111111"          # someone set it meanwhile
+    reply = daf_workflow._handle_active_workflow("yes", state, hub, client)
+
+    assert "changed since you approved it" in reply
+    assert "EIN step approved: set; now: mismatch" in reply
+    assert [e for e in client.endpoints()
+            if e in WRITES or e == "profile/edit"] == []
+
+
+def test_the_ein_never_reaches_logs_or_audit_on_the_edit_path(world, caplog):
+    _existing(world)
+    with caplog.at_level(logging.DEBUG):
+        offer_and_create(client=Client())
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    audited = json.dumps(world["audit"])
+    assert any(row["endpoint"] == "profile/edit" for row in world["audit"])
+    for secret in SECRETS:
+        assert secret not in logged
+        assert secret not in audited
+
+
+def test_the_field_gate_allows_fedid_only_where_it_was_verified():
+    from clients.csuite import UnconfirmedField, check_input_fields
+
+    check_input_fields(["fedid"], "profile/create/org")
+    check_input_fields(["fedid"], "profile/edit")
+    with pytest.raises(UnconfirmedField):
+        check_input_fields(["fedid"], "profile/create/individual")
+
+
+@pytest.mark.parametrize("name", ["org_contact_name", "is_nonprofit"])
+def test_the_display_only_names_are_refused_by_the_gate(name):
+    """Probed 2026-10-15: CSuite drops them. The gate refuses them before a
+    request is built, so nothing pretends to set them."""
+    from clients.csuite import ORG_DISPLAY_ONLY, UnconfirmedField, \
+        check_input_fields
+
+    assert name in ORG_DISPLAY_ONLY
+    for endpoint in ("profile/create/org", "profile/edit"):
+        with pytest.raises(UnconfirmedField):
+            check_input_fields([name], endpoint)

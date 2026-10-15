@@ -16,20 +16,30 @@ What it writes, and what it never writes
 ----------------------------------------
 * One `profile/create/org`, only when neither duplicate check finds the
   organisation. Organisation name, contact email, contact phone, the
-  organisation's address, website.
+  organisation's address, website, and the EIN as `fedid` (V5.86).
+* For an EXISTING organisation, at most one `profile/edit` that sets ONLY
+  `fedid`, and only when the profile has none and the form has one. A
+  different EIN already on the profile is never overwritten: nothing is
+  written to the profile and the mismatch is shown. (V5.86)
 * One `task/create`, assigned to CSUITE_ENDOWMENT_ASSIGNEE, task type 1065,
-  linked to the new or existing org profile. Its description carries the
-  EIN, the starting goal and the three essays, because no profile field
-  can: an org profile has no EIN field, and none of the others has a
-  confirmed input name.
+  linked to the new or existing org profile. A CSuite task holds ONE text,
+  at most 255 characters (sandbox, 2026-10-15: `task_description` is ignored
+  when `name` is sent, and a 256-character name is refused), so the task is
+  a title — "Endowment inquiry: {org} — EIN {ein} — goal {goal} — {contact}
+  <{email}>" — sent as both name and task_description, as DAF does. The
+  essays stay in HubSpot. The contact's name and the nonprofit flag cannot
+  be set on the profile through the API at all (see
+  clients.csuite.ORG_DISPLAY_ONLY).
 * Never a fund (deferred, as for DAF). Never the HubSpot contact: its
   csuite_profile_id is the PERSON's link, and an org id there would be
   wrong. Never a ticket: the HubSpot workflow creates none (Carl,
   2026-10-14).
 
 The EIN, the goal and the essays are never logged, never put in write_audit
-(payload_meta keeps key names and ids only) and never kept in the session
-cookie: the create step re-reads the submission from HubSpot.
+(payload_meta keeps key names and ids only, and `fedid` is not an id name)
+and never kept in the session cookie: the create step re-reads the
+submission from HubSpot. (create_task logs the title's length, not its
+text, since the title now carries the EIN and the goal.)
 
 Two confirmations (V5.85)
 -------------------------
@@ -72,18 +82,24 @@ ESSAYS = (("essay_mission", "Mission and core services/programs"),
           ("essay_interest", "What prompted the interest in an endowment"),
           ("essay_goals", "Main endowment goals"))
 
-# CSuite's task_description limit is NOT KNOWN. No endpoint describes task
-# fields, no write has ever tested one, and the 14 tasks in production carry
-# one-line descriptions. 4,000 characters is a conservative guess: the
-# read-back compares task_description, so a cut CSuite makes is reported as
-# "did not store: task_description" rather than missed.
-TASK_DESCRIPTION_MAX = 4000
-TRUNCATED = "[truncated, see HubSpot]"
+# A CSuite task's only text. MEASURED in the sandbox 2026-10-15: 255
+# characters stored identically (263 bytes, em dashes included); 256 refused
+# with "name: must not be longer than 255". Characters, not bytes.
+TASK_TITLE_MAX = 255
+GOAL_TRIMMED_TO = 40
+ELLIPSIS = "…"
 REVIEW_ESSAY_PREVIEW = 200
 
 # How the four outcomes of the duplicate check are named.
 NEW, EXISTING, AMBIGUOUS, UNVERIFIABLE = ("new", "existing", "ambiguous",
                                           "unverifiable")
+
+# What happens to an EXISTING organisation's EIN (fedid). Never overwrite.
+EIN_SET = "set"                # profile has none, form has one: one edit
+EIN_SAME = "same"              # profile already holds the form's EIN
+EIN_MISMATCH = "mismatch"      # profile holds a DIFFERENT EIN: no write
+EIN_NO_FORM_VALUE = "no_form_value"   # form has no EIN: nothing to do
+EIN_UNREADABLE = "unreadable"  # the profile could not be read: no write
 
 
 def _row():
@@ -284,63 +300,49 @@ def render_review(parsed: dict, hubspot, note: str = None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# The task description
+# The task title — the task's only text
 # ---------------------------------------------------------------------------
 
-def task_description(data: dict, limit: int = TASK_DESCRIPTION_MAX) -> str:
-    """Everything a reviewer acts on, in the order the brief sets.
+def _one_line(text) -> str:
+    return " ".join(str(text or "").split())
 
-    Too long: the essays are cut first, evenly, each ending in TRUNCATED.
-    The organisation, EIN and contact lines are never cut.
+
+def _shorten(text: str, length: int) -> str:
+    """`text` cut to `length` characters, ending in an ellipsis if cut."""
+    if len(text) <= length:
+        return text
+    return text[:max(length - 1, 0)].rstrip() + ELLIPSIS
+
+
+def task_title(data: dict, limit: int = TASK_TITLE_MAX) -> str:
+    """Endowment inquiry: {org} — EIN {ein} — goal {goal} — {name} <{email}>
+
+    Over `limit`: the goal is cut to GOAL_TRIMMED_TO, then the organisation
+    name, then the contact's name — each only as far as needed. The EIN and
+    the email are never cut. (If those two alone exceed the limit, CSuite
+    refuses the task and the reply says so; nothing is invented to fit.)
     """
-    from intents.daf_workflow import format_submitted_at
+    org = _one_line(data.get("organization")) or "unnamed organisation"
+    ein = _one_line(data.get("ein")) or "not given"
+    goal = _one_line(data.get("starting_goal")) or "not given"
+    who = _one_line(contact_name(data)) or "no name given"
+    email = _one_line(data.get("email")) or "no email"
 
-    head = [f"Organization: {data.get('organization') or 'Not given'}",
-            f"EIN: {data.get('ein') or 'Not given'}",
-            f"Website: {data.get('website') or 'N/A'}",
-            f"Contact: {contact_name(data) or 'Not given'}",
-            f"Email: {data.get('email') or 'N/A'}",
-            f"Phone: {data.get('phone') or 'N/A'}",
-            f"Starting goal: {data.get('starting_goal') or 'Not given'}"]
-    tail = [f"How they heard: {data.get('heard_about') or 'Not given'}",
-            f"Submitted: {format_submitted_at(data.get('submitted_at'))}",
-            f"HubSpot: {submission_link(data.get('submission_id'))}"]
-    essays = [(label, " ".join(str(data.get(key) or "").split()) or "—")
-              for key, label in ESSAYS]
+    def build():
+        return (f"Endowment inquiry: {org} — EIN {ein} — goal {goal} — "
+                f"{who} <{email}>")
 
-    def build(texts):
-        body = [f"{label}: {text}" for (label, _), text in zip(essays, texts)]
-        return "\n".join(head + body + tail)
-
-    texts = [text for _label, text in essays]
-    if len(build(texts)) <= limit:
-        return build(texts)
-
-    # Share what is left between the essays, the longest cut first.
-    fixed = len(build(["" for _ in texts]))
-    budget = max(limit - fixed, 0)
-    allowances = [0] * len(texts)
-    remaining, open_ = budget, list(range(len(texts)))
-    while open_:
-        share = remaining // len(open_)
-        short = [i for i in open_ if len(texts[i]) <= share]
-        if not short:
-            for i in open_:
-                allowances[i] = share
-            break
-        for i in short:
-            allowances[i] = len(texts[i])
-            remaining -= len(texts[i])
-            open_.remove(i)
-
-    cut = []
-    for text, allowance in zip(texts, allowances):
-        if len(text) <= allowance:
-            cut.append(text)
-            continue
-        keep = max(allowance - len(TRUNCATED) - 1, 0)
-        cut.append((text[:keep].rstrip() + " " + TRUNCATED).strip())
-    return build(cut)
+    title = build()
+    if len(title) > limit:
+        goal = _shorten(goal, GOAL_TRIMMED_TO)
+        title = build()
+    if len(title) > limit:
+        org = _shorten(org, max(len(org) - (len(title) - limit), 1))
+        title = build()
+    if len(title) > limit:
+        who = _shorten(who, max(len(who) - (len(title) - limit), 1))
+        title = build()
+    return title
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +458,62 @@ def _refuse_unassigned(state):
             "guessed. Nothing was written.")
 
 
+def _ein_digits(value) -> str:
+    """Digits only, so 12-3456789 and 123456789 compare equal."""
+    import re
+
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def ein_plan(data: dict, duplicate: dict, csuite) -> dict:
+    """{"action", "stored"} for an EXISTING organisation's EIN. One read.
+
+    `stored` is what the profile holds now, for the reviewer. The guard is
+    here, at plan time, and is evaluated again at the second "yes": a value
+    on the profile — any value — is never overwritten.
+    """
+    from sync.profile_state import PROFILE_EXISTS, csuite_profile_state
+
+    form = (data.get("ein") or "").strip()
+    if duplicate.get("outcome") != EXISTING:
+        return {"action": None, "stored": None}
+    if not _ein_digits(form):
+        return {"action": EIN_NO_FORM_VALUE, "stored": None}
+    state, record = csuite_profile_state(csuite,
+                                         _existing_id(duplicate))
+    if state != PROFILE_EXISTS:
+        return {"action": EIN_UNREADABLE, "stored": None}
+    stored = str((record or {}).get("fedid") or "").strip()
+    if not stored:
+        return {"action": EIN_SET, "stored": None}
+    if _ein_digits(stored) == _ein_digits(form):
+        return {"action": EIN_SAME, "stored": stored}
+    return {"action": EIN_MISMATCH, "stored": stored}
+
+
+def ein_lines(data: dict, ein: dict, profile_id) -> list:
+    """The EIN line(s) for the plan and the confirmation."""
+    action = (ein or {}).get("action")
+    form = (data.get("ein") or "").strip()
+    if action == EIN_SET:
+        return [f"• EIN: profile {mark_id(profile_id)} has none — the form's "
+                f"EIN {form} will be set."]
+    if action == EIN_SAME:
+        return [f"• EIN: profile {mark_id(profile_id)} already holds {form}. "
+                "No change."]
+    if action == EIN_MISMATCH:
+        return [f"• ⚠️ EIN MISMATCH: profile {mark_id(profile_id)} holds "
+                f"{ein.get('stored')}, the form says {form}. Nothing is "
+                "written to the profile — check which is right by hand."]
+    if action == EIN_UNREADABLE:
+        return [f"• ⚠️ EIN: profile {mark_id(profile_id)} could not be read, "
+                "so its EIN is unknown. Nothing is written to the profile."]
+    if action == EIN_NO_FORM_VALUE:
+        return ["• EIN: the form has none. Nothing is written to the "
+                "profile."]
+    return []
+
+
 def _check(state, hubspot, csuite):
     """(data, results, duplicate) or (None, reply, None). Reads only."""
     from intents.daf_workflow import _reset_state
@@ -476,6 +534,7 @@ def _check(state, hubspot, csuite):
     duplicate = duplicate_check(data, hubspot, csuite)
     results["checks"] = duplicate["lines"]
     results["outcome"] = duplicate["outcome"]
+    results["ein"] = ein_plan(data, duplicate, csuite)
     found, warnings = other_handled(data.get("email"),
                                     data.get("submission_id"), hubspot)
     results["cross_form"] = other_handled_lines(found, warnings)
@@ -513,7 +572,8 @@ def step_create(state: dict, hubspot, csuite) -> str:
     state[PLAN_KEY] = {"submission_id": data.get("submission_id"),
                        "outcome": duplicate["outcome"],
                        "profile_id": _existing_id(duplicate)
-                       if duplicate["outcome"] == EXISTING else None}
+                       if duplicate["outcome"] == EXISTING else None,
+                       "ein_action": results["ein"]["action"]}
     state["step"] = "confirm_write"
     return render_plan(data, results, duplicate)
 
@@ -526,8 +586,10 @@ def render_plan(data: dict, results: dict, duplicate: dict) -> str:
     existing = duplicate["outcome"] == EXISTING
     profile_id = _existing_id(duplicate) if existing else None
     email = (data.get("email") or "").strip()
-    description = task_description(data)
-    writes = 1 if existing else 2
+    title = task_title(data)
+    ein_action = (results.get("ein") or {}).get("action")
+    sets_ein = existing and ein_action == EIN_SET
+    writes = (1 + (1 if sets_ein else 0)) if existing else 2
 
     lines = ["🔎 **Duplicate check done — nothing has been written yet.**",
              "", f"🏛️ {org}"]
@@ -546,24 +608,32 @@ def render_plan(data: dict, results: dict, duplicate: dict) -> str:
                 "the organisation's address (street, city, state, zip)"]
         if data.get("website"):
             sent.append("website")
+        if _ein_digits(data.get("ein")):
+            sent.append(f"EIN {data['ein'].strip()} (as fedid)")
         lines += [f"{step}. `profile/create/org` — " + ", ".join(sent) + ".",
-                  "   Not sent (no CSuite field takes them): the contact's "
-                  "name, the EIN, the starting goal, the essays — they go in "
-                  "the task."]
+                  "   Not sent (the API cannot set them): the contact's "
+                  "name and the nonprofit flag."]
+        if not _ein_digits(data.get("ein")):
+            lines.append("   The form has no EIN, so none is sent.")
         step += 1
+    else:
+        lines += ein_lines(data, results.get("ein"), profile_id)
+        if sets_ein:
+            lines.append(f"{step}. `profile/edit` on profile "
+                         f"{mark_id(profile_id)} — sets ONLY fedid (the EIN). "
+                         "Nothing else on the profile changes.")
+            step += 1
     target = (f"profile {mark_id(profile_id)}" if existing
               else "the new organisation profile")
-    truncated = (", essays shortened to fit" if TRUNCATED in description
-                 else "")
-    lines += [f"{step}. `task/create` — *Endowment inquiry follow-up: "
-              f"{org}" + (f" — {email}" if email else "") + "*",
-              f"   Assigned to employee {assignee()}, task type "
-              f"{form_task_type(_row())}, due "
-              f"{task_due_date(data.get('submitted_at'))}, linked to "
-              f"{target}.",
-              "   Description: organisation, EIN, website, contact, starting "
-              "goal, the three essays, how they heard, submitted date, "
-              f"HubSpot link ({len(description)} characters{truncated}).",
+    lines += [f"{step}. `task/create` — {target}:",
+              f"   *{title}*",
+              f"   ({len(title)} of {TASK_TITLE_MAX} characters — a CSuite "
+              f"task holds this one line and nothing else.) Assigned to "
+              f"employee {assignee()}, task type {form_task_type(_row())}, "
+              f"due {task_due_date(data.get('submitted_at'))}.",
+              "",
+              "The rest of the submission stays in HubSpot: "
+              f"{submission_link(data.get('submission_id'))}",
               "",
               "No fund, no HubSpot change, no ticket.",
               "",
@@ -608,8 +678,10 @@ def step_write(query: str, state: dict, hubspot, csuite) -> str:
         return results
     now_existing = (_existing_id(duplicate)
                     if duplicate["outcome"] == EXISTING else None)
+    now_ein = (results.get("ein") or {}).get("action")
     if duplicate["outcome"] != plan.get("outcome") or \
-            str(now_existing) != str(plan.get("profile_id")):
+            str(now_existing) != str(plan.get("profile_id")) or \
+            now_ein != plan.get("ein_action"):
         logger.warning("endowment write STOPPED for submission %s: the check "
                        "changed from %s to %s", data.get("submission_id"),
                        plan.get("outcome"), duplicate["outcome"])
@@ -623,6 +695,9 @@ def step_write(query: str, state: dict, hubspot, csuite) -> str:
                  f"Now: {duplicate['outcome']}"
                  + (f" (profile {now_existing})" if now_existing else ""),
                  ""]
+        if now_ein != plan.get("ein_action"):
+            lines += [f"EIN step approved: {plan.get('ein_action')}; now: "
+                      f"{now_ein}.", ""]
         lines += results.get("checks") or []
         lines += ["", 'Say *"new endowment"* to look at it again.']
         return "\n".join(lines)
@@ -639,6 +714,8 @@ def _write(data, state, results, duplicate, csuite, employee) -> str:
 
     if duplicate["outcome"] == EXISTING:
         state["profile_id"] = _existing_id(duplicate)
+        if (results.get("ein") or {}).get("action") == EIN_SET:
+            _set_ein(data, state, results, csuite)
     else:
         try:
             response = csuite.create_org_profile(
@@ -651,7 +728,9 @@ def _write(data, state, results, duplicate, csuite, employee) -> str:
                 zipcode=data.get("org_address_zip"),
                 audit_meta=meta,
                 **({"website": data["website"]}
-                   if data.get("website") else {}))
+                   if data.get("website") else {}),
+                **({"fedid": data["ein"].strip()}
+                   if _ein_digits(data.get("ein")) else {}))
         except Exception as e:
             response = {"success": False, "error": str(e)}
         if response.get("success") and isinstance(response.get("data"), dict):
@@ -686,19 +765,49 @@ def _write(data, state, results, duplicate, csuite, employee) -> str:
     return format_confirmation(data, state, results)
 
 
+def _set_ein(data, state, results, csuite):
+    """The one guarded profile write on an existing organisation: fedid only.
+
+    Reached only when the plan said EIN_SET and the check at the second "yes"
+    still says so — the profile had NO EIN a moment ago. A failure is
+    reported and does not stop the task.
+    """
+    profile_id = state["profile_id"]
+    try:
+        response = csuite.edit_profile(profile_id,
+                                       fedid=data["ein"].strip())
+    except Exception as e:
+        response = {"success": False, "error": str(e)}
+    if response.get("success") and not response.get("fields_dropped") \
+            and not response.get("nothing_stored"):
+        results["ein_written"] = True
+        if response.get("verify_warning"):
+            results["warnings"].append(response["verify_warning"])
+        logger.info("EIN set on existing org profile %s", profile_id)
+    else:
+        reason = (response.get("error")
+                  or ("CSuite stored nothing" if response.get("nothing_stored")
+                      else "CSuite did not store fedid"
+                      if response.get("fields_dropped") else "unknown"))
+        results["errors"].append(
+            f"EIN NOT set on profile {profile_id} ({reason}). Set it by hand.")
+        logger.error("EIN NOT set on existing org profile %s", profile_id)
+
+
 def _create_task(data, state, results, csuite, employee, meta):
     from intents.daf_workflow import form_task_type, task_due_date
 
     row = _row()
     org = data.get("organization") or "unnamed organisation"
-    email = (data.get("email") or "").strip()
-    subject = (f"Endowment inquiry follow-up: {org}"
-               + (f" — {email}" if email else ""))
+    # The task's only text, sent as both name and task_description, as DAF
+    # does: CSuite keeps one of them and ignores task_description when name
+    # is present (sandbox, 2026-10-15).
+    title = task_title(data)
     due = task_due_date(data.get("submitted_at"))
     try:
         response = csuite.create_task(
-            name=subject, employee_id=employee, due_date=due,
-            description=task_description(data),
+            name=title, employee_id=employee, due_date=due,
+            description=title,
             linked_profile_id=state["profile_id"],
             task_type_id=form_task_type(row),
             audit_meta=dict(meta, linked_profile_id=state["profile_id"]))
@@ -723,10 +832,9 @@ def _create_task(data, state, results, csuite, employee, meta):
                      state["profile_id"])
 
 
-NOT_ON_THE_PROFILE = ("Not on the CSuite profile, because no confirmed input "
-                      "takes them: the contact's name, the EIN, the starting "
-                      "goal and the essays. They are in the task "
-                      "description.")
+NOT_ON_THE_PROFILE = ("Not on the CSuite profile, because the API cannot set "
+                      "them: the contact's name and the nonprofit flag. The "
+                      "essays stay in HubSpot.")
 
 
 def format_confirmation(data: dict, state: dict, results: dict) -> str:
@@ -767,7 +875,17 @@ def format_confirmation(data: dict, state: dict, results: dict) -> str:
     for warning in results.get("warnings") or []:
         lines.append(warning)
     if results.get("profile_created"):
+        if _ein_digits(data.get("ein")):
+            lines.append(f"🧾 EIN {data['ein'].strip()} set on the new "
+                         "profile (fedid).")
         lines.append(f"ℹ️ {NOT_ON_THE_PROFILE}")
+    if outcome == EXISTING:
+        if results.get("ein_written"):
+            lines.append(f"🧾 EIN {data['ein'].strip()} set on profile "
+                         f"{mark_id(profile_id)} (it had none). Nothing else "
+                         "on the profile changed.")
+        elif (results.get("ein") or {}).get("action") != EIN_SET:
+            lines += ein_lines(data, results.get("ein"), profile_id)
     lines += results.get("checks") or []
     lines += results.get("cross_form") or []
     lines.append("💰 Fund: not opened — a fund is created when the "

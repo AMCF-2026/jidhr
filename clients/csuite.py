@@ -199,6 +199,10 @@ CONFIRMED_INPUT_FIELDS = frozenset({
 ENDPOINT_CONFIRMED_FIELDS = {
     "address": ("profile/create/individual", "profile/create/org",
                 "profile/create/household"),
+    # The EIN / Federal ID. VERIFIED 2026-10-15 in the sandbox: sent to
+    # profile/create/org on new profile 21725 and read back as fedid; sent to
+    # profile/edit on 21724 (fedid empty) and read back, modified_ts moved.
+    "fedid": ("profile/create/org", "profile/edit"),
     # VERIFIED 2026-10-01 by task/create -> task/display on sandbox task 1034.
     # Every one of these was sent and read back. They are endpoint-scoped
     # because `id` in particular must never become a global input name: a task
@@ -276,6 +280,25 @@ OBSERVED_OUTPUT = {
                             "field on any read endpoint",
     },
 }
+
+
+# Org-profile names that are DISPLAY-ONLY as far as the API goes. Probed
+# 2026-10-15 in the sandbox on profiles 21724/21725; each was answered with
+# success and stored nothing (modified_ts unchanged on edit):
+#
+#   org_contact_name, contact_name, org_contact, contact,
+#   org_contact_profile_id, contact_profile_id, org_contact_id
+#       on profile/create/org and/or profile/edit — the org contact cannot be
+#       set from here. It is probably a link CSuite makes in its UI.
+#   is_nonprofit (1 and "x"), nonprofit, is_charity
+#       is_nonprofit reads 0 on every new org whatever is sent.
+#
+# tax_class_id IS recognised: an unknown id makes profile/edit fail with HTTP
+# 500 instead of being ignored. Its list endpoint, profile/taxclass/list,
+# exists but answers "access to this function has not been defined yet ...
+# define access to taxclass for profile" for this API user, so the valid
+# ids — and whether one of them is what makes is_nonprofit 1 — are unknown.
+ORG_DISPLAY_ONLY = ("org_contact_name", "org_contact_label", "is_nonprofit")
 
 
 ENDPOINT_ALLOWED_UNVERIFIED = {
@@ -1327,11 +1350,16 @@ class CSuiteClient:
         `audit_meta` is recorded on the audit row only, passed to _request
         only when there is something to record.
 
+        The EIN goes as `fedid` through **kwargs: VERIFIED 2026-10-15 on
+        sandbox profile 21725 (create) and 21724 (profile/edit), read back as
+        `fedid` both times.
+
         NOT sendable, because no input name is confirmed and none is invented:
-        the contact person's name (`org_contact_name` and `org_contact_label`
-        are display fields, and stayed empty on 21724), the EIN (no field on
-        an org profile at all), the starting goal and the essays. The caller
-        puts those in the follow-up task instead.
+        the contact person's name (`org_contact_name` and seven other
+        candidates were probed on create and edit and all were dropped — see
+        ORG_DISPLAY_ONLY), the nonprofit flag (`is_nonprofit` is dropped; it
+        reads 0 on every new org), the starting goal and the essays. The
+        caller puts those in the follow-up task instead.
 
         Args:
             organization: Organization name (required) -> organization
@@ -1341,7 +1369,8 @@ class CSuiteClient:
                 sent as the nested `address` object -> primary_*
             audit_meta: recorded on the audit row, never sent
             **kwargs: checked against CONFIRMED_INPUT_FIELDS first
-                (`website` -> website, verified on this endpoint)
+                (`website` -> website and `fedid` -> fedid, both verified on
+                this endpoint)
 
         Returns:
             dict with 'data': {'profile_id': int} on success
@@ -1869,8 +1898,10 @@ class CSuiteClient:
         check_input_fields(kwargs, "task/create")
         data.update(kwargs)
 
-        logger.info("Creating CSuite task %r for employee %s%s", name,
-                    employee_id,
+        # The title's LENGTH, not its text: an endowment title carries the
+        # EIN and the starting goal, which never go to a log (V5.86).
+        logger.info("Creating CSuite task (%d-character title) for employee "
+                    "%s%s", len(name or ""), employee_id,
                     f" on profile {linked_profile_id}" if linked_profile_id
                     else " (unlinked)")
         # audit_meta goes to the AUDIT ROW only — _request merges it into the
