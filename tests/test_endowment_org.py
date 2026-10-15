@@ -182,13 +182,27 @@ def world(monkeypatch):
     return state
 
 
-def offer_and_create(hub=None, client=None):
+def offer_and_create(hub=None, client=None, second="yes"):
+    """Review, first "yes" (the check), and — when it asks — `second`.
+
+    Returns the LAST reply. The plan shown between the two is on
+    client.plan_reply, and the CSuite requests made before the second
+    answer on client.before_second.
+    """
     hub = hub or Hub()
     client = client or Client()
     state = daf_workflow.default_workflow_state()
     review = daf_workflow._initiate_workflow("new endowment", state, hub)
     reply = daf_workflow._handle_active_workflow("yes", state, hub, client)
+    client.plan_reply, client.before_second = None, list(client.endpoints())
+    if state.get("step") == "confirm_write" and second is not None:
+        client.plan_reply = reply
+        reply = daf_workflow._handle_active_workflow(second, state, hub,
+                                                     client)
     return review, reply, state, client
+
+
+WRITES = ("profile/create/org", "profile/create/individual", "task/create")
 
 
 # --- the profile is an ORGANISATION, with the organisation's address --------
@@ -196,9 +210,11 @@ def offer_and_create(hub=None, client=None):
 def test_the_org_profile_body(world):
     _review, reply, state, client = offer_and_create()
 
-    assert client.endpoints() == ["profile/list", "profile/list",
-                                  "profile/list", "profile/create/org",
-                                  "task/create"]
+    # The check (3 reads) at the first yes, again at the second, then the
+    # two writes.
+    check = ["profile/list", "profile/list", "profile/list"]
+    assert client.endpoints() == check + check + ["profile/create/org",
+                                                  "task/create"]
     body = client.body("profile/create/org")
     assert body == {
         "env": "live", "epoch": FIXED_EPOCH,
@@ -614,3 +630,138 @@ def test_nothing_the_scheduled_run_executes_has_changed():
         capture_output=True, text=True)
     assert found.returncode == 0, found.stderr
     assert found.stdout.strip() == "", found.stdout
+
+
+# --- V5.85: a second confirmation before any CSuite write ------------------------
+
+def test_the_first_yes_reads_only_and_shows_a_new_organisation(world):
+    _review, plan, state, client = offer_and_create(second=None)
+
+    assert not [e for e in client.endpoints() if e in WRITES]
+    assert state["step"] == "confirm_write"
+    assert "nothing has been written yet" in plan
+    assert "**Outcome: NEW organisation.**" in plan
+    assert "will make 2 CSuite writes" in plan
+    assert "1. `profile/create/org`" in plan
+    assert "2. `task/create`" in plan
+    assert "Assigned to employee 1002, task type 1065" in plan
+    assert "linked to the new organisation profile" in plan
+    for secret in SECRETS:
+        assert secret not in plan, "the plan lists what is sent, not values"
+
+
+def test_the_first_yes_shows_an_existing_organisation(world):
+    world["mirror"].append({"profile_id": "18075",
+                            "organization": "Test Peace Academy",
+                            "ptype": "org"})
+    _review, plan, _state, client = offer_and_create(second=None)
+
+    assert "**Outcome: EXISTING organisation — profile 18075.**" in plan
+    assert "will make 1 CSuite write:" in plan
+    assert "profile/create/org" not in plan
+    assert "linked to profile 18075" in plan
+    assert not [e for e in client.endpoints() if e in WRITES]
+
+
+def test_the_second_yes_writes_what_was_shown(world):
+    _review, reply, _state, client = offer_and_create()
+
+    assert not [e for e in client.before_second if e in WRITES]
+    assert [e for e in client.endpoints() if e in WRITES] == [
+        "profile/create/org", "task/create"]
+    assert "Organisation Profile Created" in reply
+
+
+def test_a_stopped_outcome_never_asks_a_second_time(world):
+    world["mirror"].append({"profile_id": "18076", "organization":
+                            "Test Peace Academy of Virginia",
+                            "ptype": "org"})
+    _review, reply, state, client = offer_and_create(second=None)
+
+    assert client.plan_reply is None
+    assert state["step"] == "done"
+    assert "No profile and no task created" in reply
+    assert not [e for e in client.endpoints() if e in WRITES]
+
+
+@pytest.mark.parametrize("answer", ["cancel", "no", "not yet"])
+def test_saying_no_at_the_second_step_writes_nothing(world, answer):
+    _review, reply, state, client = offer_and_create(second=answer)
+
+    assert "cancelled" in reply.lower()
+    assert state["active"] is False
+    assert not [e for e in client.endpoints() if e in WRITES]
+
+
+@pytest.mark.parametrize("answer", ["hmm", "what will it write?", "maybe"])
+def test_anything_else_at_the_second_step_writes_nothing_and_waits(world,
+                                                                   answer):
+    _review, reply, state, client = offer_and_create(second=answer)
+
+    assert "Nothing has been written" in reply
+    assert state["step"] == "confirm_write"
+    assert not [e for e in client.endpoints() if e in WRITES]
+
+
+def test_a_changed_check_at_the_second_yes_writes_nothing(world):
+    """Approved as NEW; by the second yes the organisation exists."""
+    hub, client = Hub(), Client()
+    state = daf_workflow.default_workflow_state()
+    daf_workflow._initiate_workflow("new endowment", state, hub)
+    plan = daf_workflow._handle_active_workflow("yes", state, hub, client)
+    assert "NEW organisation" in plan
+
+    world["mirror"].append({"profile_id": "19999",
+                            "organization": "Test Peace Academy",
+                            "ptype": "org"})
+    reply = daf_workflow._handle_active_workflow("yes", state, hub, client)
+
+    assert "changed since you approved it" in reply
+    assert "Approved: new" in reply and "Now: existing (profile 19999)" in reply
+    assert not [e for e in client.endpoints() if e in WRITES]
+
+
+def test_the_switch_going_off_between_the_two_yeses_writes_nothing(
+        world, monkeypatch):
+    hub, client = Hub(), Client()
+    state = daf_workflow.default_workflow_state()
+    daf_workflow._initiate_workflow("new endowment", state, hub)
+    daf_workflow._handle_active_workflow("yes", state, hub, client)
+
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_CREATE_RAW", "")
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_CREATE_ENABLED", False)
+    reply = daf_workflow._handle_active_workflow("yes", state, hub, client)
+
+    assert "turned off" in reply
+    assert not [e for e in client.endpoints() if e in WRITES]
+
+
+def test_a_plan_for_another_submission_is_not_used(world):
+    """Skipping after the plan was shown must not let a second yes write
+    the skipped submission's plan onto the next one."""
+    hub = Hub({FORM: [endowment_submission(),
+                      endowment_submission("endw0002-cccc", "Second Org",
+                                           "two@example.invalid",
+                                           1899000000000)], DAF: []})
+    client = Client()
+    state = daf_workflow.default_workflow_state()
+    daf_workflow._initiate_workflow("new endowment", state, hub)
+    daf_workflow._handle_active_workflow("yes", state, hub, client)
+    state["submission_data"]["submission_id"] = "endw0002-cccc"
+    state["step"] = "confirm_write"
+
+    reply = daf_workflow._handle_active_workflow("yes", state, hub, client)
+
+    assert "no approved plan" in reply
+    assert not [e for e in client.endpoints() if e in WRITES]
+
+
+def test_the_plan_in_the_cookie_holds_ids_only(world):
+    import json
+
+    _review, _plan, state, _client = offer_and_create(second=None)
+    plan = state["endowment_plan"]
+    assert plan == {"submission_id": "endw0001-aaaa-bbbb", "outcome": "new",
+                    "profile_id": None}
+    for secret in SECRETS:
+        assert secret not in json.dumps(state)

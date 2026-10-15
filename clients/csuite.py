@@ -1296,45 +1296,52 @@ class CSuiteClient:
                            city: str = None, state: str = None,
                            zipcode: str = None, audit_meta: dict = None,
                            **kwargs) -> dict:
-        """Create an organization profile in CSuite. **UNVERIFIED.**
+        """Create an organization profile in CSuite. VERIFIED in the sandbox.
 
         Used by: the endowment inquiry workflow (V5.81), behind
-        CSUITE_ENDOWMENT_CREATE_ENABLED, default off. Until V5.81 this method
-        had no caller, and `profile/create/org` has still never been called
-        from this repository — not in production, not in the sandbox. The
-        first real call is therefore also the first test of the names below;
-        verify_writes reads the profile back and reports any it dropped.
+        CSUITE_ENDOWMENT_CREATE_ENABLED, default off.
 
-        V5.81 added, each by the rule its individual counterpart follows:
-        the email is normalised and the phone is normalised (or left out with
+        VERIFIED 2026-10-15 by one sandbox create and an independent
+        `profile/display`, exactly as `profile/create/individual` was
+        confirmed. Sandbox profile 21724, ptype "org". Every name sent was
+        stored, and the client's own read-back agreed (verified = True,
+        nothing dropped):
+
+        | sent | stored as |
+        |---|---|
+        | `organization` | `organization` (and CSuite derives `name`, `label`) |
+        | `email` | `primary_email` |
+        | `phone_number` `7035550199` | `primary_phone_number` `703-555-0199` |
+        | `address` {address, city, state, zipcode} | `primary_address`, `primary_city`, `primary_state`, `primary_zipcode` |
+        | `website` | `website` |
+
+        CSuite then derived `primary_address_string`, `primary_citystatezip`
+        and `primary_country` ("US") itself, as it does for individuals.
+        NOT yet run in PRODUCTION: the first endowment create will be the
+        first production call, and verify_writes still reads it back.
+
+        Each input follows its individual counterpart's rule: the email is
+        normalised, the phone is normalised (or left out with
         `phone_warning`), the address goes as the nested object build_address
         makes (all four parts or none, `address_warning` otherwise), and
         `audit_meta` is recorded on the audit row only, passed to _request
         only when there is something to record.
 
         NOT sendable, because no input name is confirmed and none is invented:
-        the contact person's name (`org_contact_name` is a display field on
-        org profile 9648, never an input), the EIN (no field on an org profile
-        at all), the starting goal and the essays. The caller puts those in
-        the follow-up task instead.
-
-        **UNVERIFIED:** `email` and `phone_number` are carried over from
-        `profile/create/individual`, where both were confirmed by a
-        read-back. Nothing has shown that the org endpoint takes the same
-        input names, and `organization` itself has never been confirmed
-        either. CSuite's input and output vocabularies differ per field, so
-        they may well differ per endpoint.
-
-        Before this is called for real: one sandbox create and one
-        `profile/display`, exactly as `profile/create/individual` was
-        confirmed. Until then treat a 200 from here as meaning nothing
-        about what was stored.
+        the contact person's name (`org_contact_name` and `org_contact_label`
+        are display fields, and stayed empty on 21724), the EIN (no field on
+        an org profile at all), the starting goal and the essays. The caller
+        puts those in the follow-up task instead.
 
         Args:
-            organization: Organization name (required) — UNVERIFIED name
-            email: email address -> primary_email (UNVERIFIED on this endpoint)
-            phone: phone number -> phone_number (UNVERIFIED on this endpoint)
+            organization: Organization name (required) -> organization
+            email: email address -> primary_email
+            phone: any format; normalised to ten digits -> primary_phone_number
+            address_line, city, state, zipcode: the organisation's address,
+                sent as the nested `address` object -> primary_*
+            audit_meta: recorded on the audit row, never sent
             **kwargs: checked against CONFIRMED_INPUT_FIELDS first
+                (`website` -> website, verified on this endpoint)
 
         Returns:
             dict with 'data': {'profile_id': int} on success
