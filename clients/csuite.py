@@ -120,6 +120,31 @@ OUTCOME_REJECTED = "rejected"                # HTTP 2xx, success != 1
 MAX_BODY_CHARS = 600
 
 
+# note/create, VERIFIED 2026-10-15 in the sandbox. Shape found from its own
+# validation errors ("missing ref", then "ref_id", then "note_text"):
+#     {"ref": "profile", "ref_id": <profile id>, "note_text": <text>}
+# It answers {"note_id": 303140, "success": 0} for a note it DID create:
+# Carl found notes 303139 (3,287 characters, multi-line) and 303140 on
+# sandbox profile 21728 in the UI, exactly two, complete, author "Dodge,
+# Carl" (1006, the API user). So a returned note_id with no errors is a
+# create, whatever `success` says. Notes cannot be read back by this API
+# user: note/display and note/list are "not available", and
+# profile/note/list is not permitted ("define access to note for profile").
+NOTE_CREATE_ENDPOINT = "note/create"
+NOTE_NOT_READ_BACK = ("Not read back through the API: this API user cannot "
+                      "list or display notes (profile/note/list is not "
+                      "permitted), so what CSuite stored has not been "
+                      "checked.")
+
+
+def note_created(endpoint, body) -> bool:
+    """True when a note/create reply says a note exists, success flag or not."""
+    return (str(endpoint or "").strip("/") == NOTE_CREATE_ENDPOINT
+            and isinstance(body, dict)
+            and body.get("note_id") not in (None, "", 0)
+            and not body.get("errors"))
+
+
 def _safe_body(response) -> str:
     """The response body, length-capped, for a diagnosable error."""
     try:
@@ -203,6 +228,11 @@ ENDPOINT_CONFIRMED_FIELDS = {
     # profile/create/org on new profile 21725 and read back as fedid; sent to
     # profile/edit on 21724 (fedid empty) and read back, modified_ts moved.
     "fedid": ("profile/create/org", "profile/edit"),
+    # note/create's three inputs, VERIFIED 2026-10-15 (notes 303139/303140,
+    # checked in the sandbox UI — the API cannot read notes back).
+    "ref": ("note/create",),
+    "ref_id": ("note/create",),
+    "note_text": ("note/create",),
     # VERIFIED 2026-10-01 by task/create -> task/display on sandbox task 1034.
     # Every one of these was sent and read back. They are endpoint-scoped
     # because `id` in particular must never become a global input name: a task
@@ -1067,6 +1097,14 @@ class CSuiteClient:
             try:
                 json_response = response.json()
 
+                # note/create's own success shape — see note_created. Only
+                # that endpoint, and only with a note_id and no errors.
+                if json_response.get("success") != 1 and \
+                        note_created(endpoint, json_response):
+                    json_response = dict(
+                        json_response, success=1,
+                        data={"note_id": json_response["note_id"]})
+
                 if json_response.get("success") == 1:
                     audit("success", status_code, body=json_response)
                     result = {
@@ -1428,6 +1466,31 @@ class CSuiteClient:
         logger.info(f"Creating household profile: {household}")
         return self._request("profile/create/household", data)
     
+    def create_note(self, profile_id, note_text: str,
+                    audit_meta: dict = None) -> dict:
+        """Attach a note to a profile. ONE request, never retried.
+
+        A returned note_id is a created note even when CSuite says
+        success: 0 (see note_created). There is no read-back — this API user
+        cannot read notes — so a successful response carries `verified =
+        None` and `note_warning` saying so. The text is never logged; its
+        length is.
+        """
+        data = {"ref": "profile", "ref_id": profile_id,
+                "note_text": note_text}
+        check_input_fields(data, NOTE_CREATE_ENDPOINT)
+        logger.info("Creating CSuite note (%d characters) on profile %s",
+                    len(note_text or ""), profile_id)
+        if audit_meta:
+            response = self._request(NOTE_CREATE_ENDPOINT, data,
+                                     audit_meta=audit_meta)
+        else:
+            response = self._request(NOTE_CREATE_ENDPOINT, data)
+        if isinstance(response, dict) and response.get("success"):
+            response["verified"] = None
+            response["note_warning"] = NOTE_NOT_READ_BACK
+        return response
+
     def edit_profile(self, profile_id: int, **kwargs) -> dict:
         """Edit an existing profile.
         
