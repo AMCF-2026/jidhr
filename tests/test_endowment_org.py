@@ -599,14 +599,15 @@ def test_mark_handled_is_routed_to_this_workflow():
 
 def test_nothing_the_scheduled_run_executes_has_changed():
     """V5.81 must not change the runner or what it runs. Everything under
-    jobs/, the runner script, railway.toml and the scheduled chain's modules
-    are byte-identical to V5.80 (de92baa). (railway.jobs.toml was deleted in
-    V5.82: new Railway services cannot use a config file.)"""
+    jobs/, the runner script and the scheduled chain's modules are
+    byte-identical to V5.80 (de92baa). railway.toml changed deliberately in
+    V5.84 (role switch, no healthcheck) and is pinned by
+    tests/test_railway_jobs_config.py instead."""
     import subprocess
 
     found = subprocess.run(
         ["git", "diff", "--stat", "de92baa", "--", "jobs/",
-         "scripts/jobs_run.py", "railway.toml",
+         "scripts/jobs_run.py",
          "sync/scheduled.py", "sync/registrations.py",
          "sync/contact_create.py", "sync/mirror.py", "clients/notify.py",
          "clients/database.py", "clients/mirror_read.py"],

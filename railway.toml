@@ -19,41 +19,47 @@ builder = "nixpacks"
 #
 # --graceful-timeout 120 so a deploy lets an in-flight apply finish its
 # current record instead of being cut at the default 30 seconds.
-startCommand = "gunicorn app:app --bind 0.0.0.0:$PORT --workers 8 --threads 4 --timeout 900 --graceful-timeout 120"
-healthcheckPath = "/health"
-healthcheckTimeout = 100
+#
+# ONE FILE, TWO SERVICES (V5.84). Every service built from this repo applies
+# this file — on 2026-10-14 the new cron service did, despite Railway saying
+# new services cannot opt into config-as-code — so the start command picks
+# the role from JIDHR_ROLE:
+#
+#   JIDHR_ROLE=jobs   python scripts/jobs_run.py --once   (the cron service)
+#   anything else     the gunicorn command, byte for byte as before (web)
+#
+# Wrapped in /bin/sh -c explicitly: Railway documents shell execution for
+# Railpack but not for Nixpacks, and exec form does not expand variables. The
+# wrapper works either way. `exec` hands the process over, so gunicorn or the
+# runner receives Railway's signals directly, as gunicorn did before.
+startCommand = "/bin/sh -c 'if [ \"$JIDHR_ROLE\" = \"jobs\" ]; then exec python scripts/jobs_run.py --once; else exec gunicorn app:app --bind 0.0.0.0:$PORT --workers 8 --threads 4 --timeout 900 --graceful-timeout 120; fi'"
+
+# NO healthcheck in this file (V5.84). It applies to every service, and a
+# deploy that does not answer 2xx on the path within the timeout is marked
+# FAILED (docs.railway.com/reference/healthchecks). The runner serves no HTTP,
+# so /health here would fail every cron deploy after 100 seconds. Web's
+# healthcheck — /health, timeout 100, as before — is set in WEB's dashboard,
+# which applies once this file stops setting it.
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
 # =============================================================================
-# SECOND SERVICE: nightly jobs runner (cron)
+# SECOND SERVICE: the nightly jobs runner (cron)
 # =============================================================================
-# This file configures the web service above and is left as-is. The jobs
-# runner is a SEPARATE Railway service on the SAME repo, created in the
-# Railway dashboard rather than here, because Railway reads one railway.toml
-# per service and the two need different start commands:
+# Same repo, same file, same image. Set on the cron service in its dashboard:
 #
-#   Service name    jidhr-jobs
-#   Source          this repository, branch main (same as the web service)
-#   Start command   /opt/venv/bin/python scripts/jobs_run.py --once
-#                   (if that interpreter path is wrong on the image,
-#                    `python scripts/jobs_run.py --once` — find the right
-#                    one with `which gunicorn` in the web service's shell)
-#   Cron schedule   15 6 * * *      (06:15 UTC = 2:15 AM ET; the queued
-#                                    mirror_refresh is dated 06:00 UTC, so
-#                                    it is already claimable when this fires)
-#   Variables       share the web service's DATABASE_URL, CSUITE_API_KEY,
-#                   CSUITE_API_SECRET, CSUITE_BASE_URL and SECRET_KEY
-#                   (Railway: "Shared Variables" or reference ${{jidhr.X}})
-#   Replicas        1 — two runners are safe (FOR UPDATE SKIP LOCKED), but
-#                   one is enough and halves the CSuite call rate
-#   Restart policy  never — `--once` exits 0 when the queue is empty, 1 if
-#                   a job failed, 2 if the database is unreachable; a
-#                   restart would just run an empty queue again
+#   Variables       JIDHR_ROLE=jobs, plus the runner's own (see the V5.80 A4
+#                   list: DATABASE_URL, CSuite, HubSpot, NOTIFY_*,
+#                   SCHEDULED_SYNC_ENABLED)
+#   Cron schedule   15 6 * * *   (06:15 UTC; not in this file, so the
+#                                 dashboard value applies)
+#   Healthcheck     none
+#   Public domain   none
 #
-# After the service exists, seed the recurring job once from either
-# service's shell:
+# app.py also refuses to start the web app when JIDHR_ROLE=jobs (V5.82), so a
+# misconfigured cron service cannot serve web.
 #
-#   /opt/venv/bin/python scripts/jobs_run.py --seed
-#
-# The runner re-queues the next 06:00 UTC occurrence itself after every
-# run, so --seed is a one-time step (and is idempotent if run again).
+# Restart policy: this file's on_failure / 3 applies to the cron service too.
+# A failed run (exit 1 or 2) is restarted up to 3 times; each restart runs
+# --once again, which only claims jobs that are due — a failed job is either
+# not retried (max_attempts 1) or retried later by the runner itself — so a
+# restart costs a few seconds and changes nothing.

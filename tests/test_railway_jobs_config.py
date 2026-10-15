@@ -8,6 +8,10 @@ the missing SECRET_KEY. V5.82 deletes the file. The cron service's settings
 live in its dashboard, and app.py refuses to start the web app on a service
 marked JIDHR_ROLE=jobs.
 
+V5.84: railway.toml's start command picks the role itself — JIDHR_ROLE=jobs
+runs the runner, anything else runs the unchanged gunicorn line — and the file
+no longer carries a healthcheck, which would fail every cron deploy.
+
 The guard is tested by importing app.py in a SUBPROCESS with SECRET_KEY and
 DATABASE_URL set empty: every case stops at import, before anything connects.
 """
@@ -43,21 +47,99 @@ def test_the_runner_the_cron_service_starts_exists_and_takes_once():
     assert "sys.exit(main())" in source, "the exit code reaches Railway"
 
 
-def test_the_web_config_is_byte_identical_to_v579():
-    """V5.82 leaves railway.toml alone. Moving web's settings into its
-    dashboard and deleting the file is a separate, later commit."""
-    diff = subprocess.run(["git", "diff", "--quiet", "e5fb901", "--",
-                           "railway.toml"], cwd=ROOT)
-    assert diff.returncode == 0, "railway.toml changed"
+V579_GUNICORN = ("gunicorn app:app --bind 0.0.0.0:$PORT --workers 8 "
+                 "--threads 4 --timeout 900 --graceful-timeout 120")
+
+
+def v579_config():
+    text = subprocess.run(["git", "show", "e5fb901:railway.toml"], cwd=ROOT,
+                          capture_output=True, text=True, check=True).stdout
+    return tomllib.loads(text)
+
+
+def test_the_web_command_inside_the_switch_is_the_v579_command_exactly():
+    """The web branch runs the same gunicorn line, byte for byte."""
+    assert v579_config()["deploy"]["startCommand"] == V579_GUNICORN
+    start = web_config()["deploy"]["startCommand"]
+    assert f"else exec {V579_GUNICORN}; fi" in start
+    assert start.count("gunicorn") == 1
+
+
+def test_only_the_start_command_and_the_healthcheck_changed():
+    then, now = v579_config(), web_config()
+    assert then["build"] == now["build"]
+    for key in ("restartPolicyType", "restartPolicyMaxRetries"):
+        assert then["deploy"][key] == now["deploy"][key]
+    assert set(then["deploy"]) - set(now["deploy"]) == {
+        "healthcheckPath", "healthcheckTimeout"}
+    assert set(now["deploy"]) - set(then["deploy"]) == set()
+    assert "cronSchedule" not in now["deploy"], \
+        "a cron schedule here would apply to WEB too and stop it serving"
+
+
+def test_there_is_no_healthcheck_in_the_file():
+    """It applies to every service, and the runner serves no HTTP: Railway
+    marks a deploy failed when the path never answers 2xx. Web's
+    healthcheck lives in web's dashboard."""
+    deploy = web_config()["deploy"]
+    assert "healthcheckPath" not in deploy
+    assert "healthcheckTimeout" not in deploy
+
+
+# --- the start command, executed ------------------------------------------------
+#
+# `python` and `gunicorn` are stub scripts on PATH that record their argv, so
+# the REAL command string runs and nothing real starts. Run both ways Railway
+# might: split into argv (exec form) and handed to a shell (shell form).
+
+STUB = """#!/bin/sh
+printf '%s' "$(basename "$0")" > "$STUB_OUT"
+for arg in "$@"; do printf ' %s' "$arg" >> "$STUB_OUT"; done
+"""
+
+
+def run_start(tmp_path, role, form):
+    import shlex
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    for name in ("python", "gunicorn"):
+        stub = bin_dir / name
+        stub.write_text(STUB)
+        stub.chmod(0o755)
+    out = tmp_path / "ran.txt"
+    env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "PORT": "8080",
+           "STUB_OUT": str(out)}
+    if role is not None:
+        env["JIDHR_ROLE"] = role
+    start = web_config()["deploy"]["startCommand"]
+    argv = (shlex.split(start) if form == "exec"
+            else ["/bin/sh", "-c", start])
+    subprocess.run(argv, env=env, check=True, timeout=30)
+    return out.read_text()
+
+
+@pytest.mark.parametrize("form", ["exec", "shell"])
+def test_jobs_runs_the_runner_once(tmp_path, form):
+    assert run_start(tmp_path, "jobs", form) == \
+        "python scripts/jobs_run.py --once"
+
+
+@pytest.mark.parametrize("form", ["exec", "shell"])
+@pytest.mark.parametrize("role", [None, "", "web", "JOBS", "jobs2"])
+def test_anything_else_runs_the_v579_gunicorn(tmp_path, role, form):
+    """Only the exact value "jobs" picks the runner. A near miss starts
+    gunicorn — and app.py's own JIDHR_ROLE guard (V5.82) then refuses a
+    case-variant of "jobs", so it still cannot serve web there."""
+    assert run_start(tmp_path, role, form) == \
+        V579_GUNICORN.replace("$PORT", "8080")
 
 
 def test_the_web_config_still_serves_the_web_app():
     deploy = web_config()["deploy"]
 
-    assert deploy["startCommand"].startswith("gunicorn app:app")
-    assert deploy["healthcheckPath"] == "/health"
-    assert "cronSchedule" not in deploy, \
-        "a cron schedule on the WEB service would stop it serving"
+    assert "exec gunicorn app:app" in deploy["startCommand"]
+    assert "cronSchedule" not in deploy
 
 
 # --- JIDHR_ROLE=jobs: the web app refuses to start ----------------------------
