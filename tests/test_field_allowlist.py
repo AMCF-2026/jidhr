@@ -148,9 +148,9 @@ def test_the_gate_does_not_block_a_methods_own_fields():
     """create_org_profile sends `organization`, which is not on the list.
 
     The gate covers **kwargs, which is where a caller can introduce a name
-    nobody checked. A method's own declared fields are its contract; two of
-    them are known-wrong and fixing them is a separate change, so
-    verify_writes is what catches those.
+    nobody checked. A method's own declared fields are its contract, and
+    for this method every one of them was read back in the sandbox on
+    2026-10-15 (profile 21724); verify_writes still checks each write.
     """
     client = Client()
     client.create_org_profile("Some Org", email="a@b.invalid")

@@ -31,6 +31,16 @@ The EIN, the goal and the essays are never logged, never put in write_audit
 (payload_meta keeps key names and ids only) and never kept in the session
 cookie: the create step re-reads the submission from HubSpot.
 
+Two confirmations (V5.85)
+-------------------------
+The review needs no CSuite call, so it cannot say whether the organisation is
+already in CSuite. The first "yes" therefore runs the duplicate check — reads
+only — and shows the outcome and exactly what would be written. Nothing is
+written until a SECOND "yes". At that second "yes" the check runs again, and
+if its answer is no longer the one that was approved (someone created the
+organisation in between, say), nothing is written and the new answer is
+shown instead.
+
 Refusals, each before anything is written
 -----------------------------------------
 * CSUITE_ENDOWMENT_ASSIGNEE unset: "assignee not confirmed". Employee 1002
@@ -260,9 +270,11 @@ def render_review(parsed: dict, hubspot, note: str = None) -> str:
     lines += [
         "",
         "---",
-        "**Shall I create the CSuite organisation profile and follow-up "
-        "task?** (No fund — that waits for a commitment.)",
-        '• Say *"Yes"* or *"Create it"* to proceed',
+        "**Shall I check CSuite for this organisation?** \"Yes\" runs the "
+        "duplicate check and shows exactly what would be written — nothing "
+        "is written until you say yes a second time. (No fund — that waits "
+        "for a commitment.)",
+        '• Say *"Yes"* to run the check',
         '• Say *"Skip"* to move to the next submission',
         '• Say *"Cancel"* to stop',
         f'• Handled by email already? *"mark inquiry handled endowment '
@@ -430,54 +442,203 @@ def _reread(state, hubspot):
     return None, f"submission {wanted} is no longer in HubSpot"
 
 
-def step_create(state: dict, hubspot, csuite) -> str:
-    """The confirmed create. Refuses before writing anything it cannot do."""
+PLAN_KEY = "endowment_plan"
+
+
+def _refuse_unassigned(state):
     from intents.daf_workflow import _reset_state
 
-    employee = assignee()
-    if not employee:
-        _reset_state(state)
-        return ("🛑 **Endowment create refused: assignee not confirmed.**\n\n"
-                "CSUITE_ENDOWMENT_ASSIGNEE is not set. It waits on Carl "
-                "confirming in the CSuite UI who employee 1002 is; no id is "
-                "guessed. Nothing was written.")
+    state.pop(PLAN_KEY, None)
+    _reset_state(state)
+    return ("🛑 **Endowment create refused: assignee not confirmed.**\n\n"
+            "CSUITE_ENDOWMENT_ASSIGNEE is not set. It waits on Carl "
+            "confirming in the CSuite UI who employee 1002 is; no id is "
+            "guessed. Nothing was written.")
+
+
+def _check(state, hubspot, csuite):
+    """(data, results, duplicate) or (None, reply, None). Reads only."""
+    from intents.daf_workflow import _reset_state
 
     data, error = _reread(state, hubspot)
     if data is None:
+        state.pop(PLAN_KEY, None)
         _reset_state(state)
-        return (f"❌ The submission could not be re-read from HubSpot "
-                f"({error}). Nothing was written.")
+        return None, (f"❌ The submission could not be re-read from HubSpot "
+                      f"({error}). Nothing was written."), None
 
-    state["step"] = "processing"
     state["csuite_api_base"] = getattr(csuite, "base_url", None)
     results = {"profile_created": False, "profile_id": None, "errors": [],
                "warnings": [], "task_id": None, "task_due": None,
                "task_failed": None, "task_skipped": None,
                "task_warning": None, "task_assignee": None,
                "task_donor": None, "csuite_api_base": state["csuite_api_base"]}
-
     duplicate = duplicate_check(data, hubspot, csuite)
     results["checks"] = duplicate["lines"]
     results["outcome"] = duplicate["outcome"]
     found, warnings = other_handled(data.get("email"),
                                     data.get("submission_id"), hubspot)
     results["cross_form"] = other_handled_lines(found, warnings)
+    return data, results, duplicate
+
+
+def _existing_id(duplicate):
+    """The existing profile id as CSuite sends ids: a number."""
+    found = str(duplicate.get("profile_id") or "").strip()
+    return int(found) if found.isdigit() else (found or None)
+
+
+def step_create(state: dict, hubspot, csuite) -> str:
+    """The FIRST "yes": run the duplicate check and show the plan.
+
+    Reads only. A stopped outcome ends here with nothing written. A new or
+    existing organisation is shown with exactly what would be written, and
+    the workflow waits for a second "yes" (step_write).
+    """
+    if not assignee():
+        return _refuse_unassigned(state)
+
+    data, results, duplicate = _check(state, hubspot, csuite)
+    if data is None:
+        return results
 
     if duplicate["outcome"] in (AMBIGUOUS, UNVERIFIABLE):
         logger.warning("endowment create STOPPED for submission %s: %s",
                        data.get("submission_id"), duplicate["outcome"])
+        state.pop(PLAN_KEY, None)
         state["step"] = "done"
         return format_confirmation(data, state, results)
 
+    # Ids and the outcome only: this lives in the session cookie.
+    state[PLAN_KEY] = {"submission_id": data.get("submission_id"),
+                       "outcome": duplicate["outcome"],
+                       "profile_id": _existing_id(duplicate)
+                       if duplicate["outcome"] == EXISTING else None}
+    state["step"] = "confirm_write"
+    return render_plan(data, results, duplicate)
+
+
+def render_plan(data: dict, results: dict, duplicate: dict) -> str:
+    """What the second "yes" would write, and nothing more."""
+    from intents.daf_workflow import form_task_type, task_due_date
+
+    org = data.get("organization") or "the organisation"
+    existing = duplicate["outcome"] == EXISTING
+    profile_id = _existing_id(duplicate) if existing else None
+    email = (data.get("email") or "").strip()
+    description = task_description(data)
+    writes = 1 if existing else 2
+
+    lines = ["🔎 **Duplicate check done — nothing has been written yet.**",
+             "", f"🏛️ {org}"]
+    lines += results.get("checks") or []
+    lines += results.get("cross_form") or []
+    lines += ["",
+              (f"**Outcome: EXISTING organisation — profile "
+               f"{mark_id(profile_id)}.** No new profile.") if existing else
+              "**Outcome: NEW organisation.** It is not in CSuite by email "
+              "or by name.",
+              "", f"**A second \"yes\" will make {writes} CSuite "
+                  f"write{'' if writes == 1 else 's'}:**"]
+    step = 1
+    if not existing:
+        sent = ["organisation name", "contact email", "contact phone",
+                "the organisation's address (street, city, state, zip)"]
+        if data.get("website"):
+            sent.append("website")
+        lines += [f"{step}. `profile/create/org` — " + ", ".join(sent) + ".",
+                  "   Not sent (no CSuite field takes them): the contact's "
+                  "name, the EIN, the starting goal, the essays — they go in "
+                  "the task."]
+        step += 1
+    target = (f"profile {mark_id(profile_id)}" if existing
+              else "the new organisation profile")
+    truncated = (", essays shortened to fit" if TRUNCATED in description
+                 else "")
+    lines += [f"{step}. `task/create` — *Endowment inquiry follow-up: "
+              f"{org}" + (f" — {email}" if email else "") + "*",
+              f"   Assigned to employee {assignee()}, task type "
+              f"{form_task_type(_row())}, due "
+              f"{task_due_date(data.get('submitted_at'))}, linked to "
+              f"{target}.",
+              "   Description: organisation, EIN, website, contact, starting "
+              "goal, the three essays, how they heard, submitted date, "
+              f"HubSpot link ({len(description)} characters{truncated}).",
+              "",
+              "No fund, no HubSpot change, no ticket.",
+              "",
+              "---",
+              '• Say *"Yes"* to write it',
+              '• Say *"Cancel"* to stop — nothing has been written',
+              "The check runs again just before writing. If its answer has "
+              "changed by then, nothing is written."]
+    return "\n".join(lines)
+
+
+def step_write(query: str, state: dict, hubspot, csuite) -> str:
+    """The SECOND "yes": re-check, and write only what was approved."""
+    from intents.daf_workflow import (_reset_state, endowment_refusal,
+                                      says_yes)
+
+    if not says_yes(query):
+        return ('❓ Nothing has been written. Say *"Yes"* to write what is '
+                'shown above, or *"Cancel"* to stop.')
+
+    refusal = endowment_refusal()
+    if refusal:
+        state.pop(PLAN_KEY, None)
+        _reset_state(state)
+        return refusal
+    employee = assignee()
+    if not employee:
+        return _refuse_unassigned(state)
+
+    plan = state.get(PLAN_KEY) or {}
+    shown = str((state.get("submission_data") or {}).get("submission_id")
+                or "")
+    if not plan or str(plan.get("submission_id") or "") != shown:
+        state.pop(PLAN_KEY, None)
+        _reset_state(state)
+        return ("⚠️ There is no approved plan for this submission, so nothing "
+                "was written. Start again with *\"new endowment\"*.")
+
+    state["step"] = "processing"
+    data, results, duplicate = _check(state, hubspot, csuite)
+    if data is None:
+        return results
+    now_existing = (_existing_id(duplicate)
+                    if duplicate["outcome"] == EXISTING else None)
+    if duplicate["outcome"] != plan.get("outcome") or \
+            str(now_existing) != str(plan.get("profile_id")):
+        logger.warning("endowment write STOPPED for submission %s: the check "
+                       "changed from %s to %s", data.get("submission_id"),
+                       plan.get("outcome"), duplicate["outcome"])
+        state.pop(PLAN_KEY, None)
+        state["step"] = "done"
+        lines = ["🛑 **Nothing was written — the duplicate check changed "
+                 "since you approved it.**", "",
+                 f"Approved: {plan.get('outcome')}"
+                 + (f" (profile {plan.get('profile_id')})"
+                    if plan.get("profile_id") else ""),
+                 f"Now: {duplicate['outcome']}"
+                 + (f" (profile {now_existing})" if now_existing else ""),
+                 ""]
+        lines += results.get("checks") or []
+        lines += ["", 'Say *"new endowment"* to look at it again.']
+        return "\n".join(lines)
+
+    state.pop(PLAN_KEY, None)
+    return _write(data, state, results, duplicate, csuite, employee)
+
+
+def _write(data, state, results, duplicate, csuite, employee) -> str:
+    """The writes, exactly as approved. Called only from step_write."""
     row = _row()
     meta = {"hubspot_form_id": row["form_id"],
             "hubspot_submission_id": data.get("submission_id")}
 
     if duplicate["outcome"] == EXISTING:
-        # The mirror and the email search both hand back text; CSuite ids are
-        # numbers, and the task's `id` is sent as one, as a created id is.
-        found = str(duplicate["profile_id"]).strip()
-        state["profile_id"] = int(found) if found.isdigit() else found
+        state["profile_id"] = _existing_id(duplicate)
     else:
         try:
             response = csuite.create_org_profile(

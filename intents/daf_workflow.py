@@ -749,6 +749,12 @@ def _handle_active_workflow(query: str, state: dict, hubspot, csuite) -> str:
     if step == "confirm":
         return _step_create(q, state, hubspot, csuite)
 
+    # Endowment only: the second "yes", after the duplicate check has shown
+    # what would be written. DAF never enters this step.
+    if step == "confirm_write":
+        from intents import endowment_inquiry
+        return endowment_inquiry.step_write(q, state, hubspot, csuite)
+
     if step == "done":
         _reset_state(state)
         return "✅ Workflow complete. Let me know if you need anything else!"

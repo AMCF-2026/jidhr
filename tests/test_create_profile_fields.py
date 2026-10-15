@@ -143,15 +143,21 @@ def test_the_org_create_got_the_same_two_renames():
     assert "primary_phone_number" not in client.payload
 
 
-def test_the_org_create_is_marked_unverified():
-    """It has no caller in any commit and the endpoint has never been
-    called. The renames are carried over from the individual endpoint, and
-    carrying over is not confirming — CSuite's vocabularies differ per
-    field, so they may differ per endpoint."""
+def test_the_org_create_records_its_sandbox_verification():
+    """Until 2026-10-15 the endpoint had never been called and the docstring
+    said UNVERIFIED. One sandbox create (profile 21724) and an independent
+    profile/display then showed every name sent was stored. The docstring
+    must say so, name the record, and still say production has not run."""
     doc = CSuiteClient.create_org_profile.__doc__
 
-    assert "UNVERIFIED" in doc
-    assert "never been called" in doc
+    assert "UNVERIFIED" not in doc
+    assert "VERIFIED 2026-10-15" in doc
+    assert "21724" in doc
+    assert "NOT yet run in PRODUCTION" in doc
+    for stored in ("primary_email", "primary_phone_number", "primary_address",
+                   "primary_city", "primary_state", "primary_zipcode",
+                   "website"):
+        assert stored in doc
 
 
 def test_the_dotted_address_keys_are_confirmed_together():
