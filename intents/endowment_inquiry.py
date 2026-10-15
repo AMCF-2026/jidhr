@@ -27,9 +27,14 @@ What it writes, and what it never writes
   when `name` is sent, and a 256-character name is refused), so the task is
   a title — "Endowment inquiry: {org} — EIN {ein} — goal {goal} — {contact}
   <{email}>" — sent as both name and task_description, as DAF does. The
-  essays stay in HubSpot. The contact's name and the nonprofit flag cannot
-  be set on the profile through the API at all (see
-  clients.csuite.ORG_DISPLAY_ONLY).
+  contact's name and the nonprofit flag cannot be set on the profile through
+  the API at all (see clients.csuite.ORG_DISPLAY_ONLY).
+* One `note/create` on the org profile (V5.87): the three essays, the full
+  starting goal, how they heard, and the HubSpot link, first line "Added by
+  Jidhr from HubSpot submission {id}" because CSuite shows the API user as
+  the author. Sent once and never retried; CSuite answers success: 0 with a
+  note_id for a note it did create, and notes cannot be read back by this
+  API user, so the result says so.
 * Never a fund (deferred, as for DAF). Never the HubSpot contact: its
   csuite_profile_id is the PERSON's link, and an org id there would be
   wrong. Never a ticket: the HubSpot workflow creates none (Carl,
@@ -314,6 +319,29 @@ def _shorten(text: str, length: int) -> str:
     return text[:max(length - 1, 0)].rstrip() + ELLIPSIS
 
 
+def note_text(data: dict) -> str:
+    """The note on the org profile: what the 255-character task cannot hold.
+
+    Each section starts with a bracketed heading, so it still reads as
+    sections if CSuite ever collapses the line breaks.
+    """
+    from intents.daf_workflow import format_submitted_at
+
+    sid = data.get("submission_id")
+    lines = [f"Added by Jidhr from HubSpot submission {sid}",
+             f"Endowment inquiry — submitted "
+             f"{format_submitted_at(data.get('submitted_at'))}",
+             f"HubSpot: {submission_link(sid)}",
+             "",
+             f"[Starting goal] {_one_line(data.get('starting_goal')) or 'Not given'}"]
+    for key, label in ESSAYS:
+        lines += ["", f"[{label}]",
+                  str(data.get(key) or "").strip() or "Not given"]
+    lines += ["", f"[How they heard] "
+                  f"{_one_line(data.get('heard_about')) or 'Not given'}"]
+    return "\n".join(lines)
+
+
 def task_title(data: dict, limit: int = TASK_TITLE_MAX) -> str:
     """Endowment inquiry: {org} — EIN {ein} — goal {goal} — {name} <{email}>
 
@@ -589,7 +617,9 @@ def render_plan(data: dict, results: dict, duplicate: dict) -> str:
     title = task_title(data)
     ein_action = (results.get("ein") or {}).get("action")
     sets_ein = existing and ein_action == EIN_SET
-    writes = (1 + (1 if sets_ein else 0)) if existing else 2
+    # The profile step (create, or an EIN edit), the note, the task.
+    writes = (2 + (1 if sets_ein else 0)) if existing else 3
+    note = note_text(data)
 
     lines = ["🔎 **Duplicate check done — nothing has been written yet.**",
              "", f"🏛️ {org}"]
@@ -625,6 +655,13 @@ def render_plan(data: dict, results: dict, duplicate: dict) -> str:
             step += 1
     target = (f"profile {mark_id(profile_id)}" if existing
               else "the new organisation profile")
+    lines += [f"{step}. `note/create` on {target} — the three essays, the "
+              f"full starting goal, how they heard and the HubSpot link "
+              f"({len(note)} characters). First line: \"Added by Jidhr from "
+              f"HubSpot submission {data.get('submission_id')}\".",
+              "   Sent once, never retried. Notes cannot be read back through "
+              "the API, so CSuite's copy will not be checked."]
+    step += 1
     lines += [f"{step}. `task/create` — {target}:",
               f"   *{title}*",
               f"   ({len(title)} of {TASK_TITLE_MAX} characters — a CSuite "
@@ -632,7 +669,7 @@ def render_plan(data: dict, results: dict, duplicate: dict) -> str:
               f"employee {assignee()}, task type {form_task_type(_row())}, "
               f"due {task_due_date(data.get('submitted_at'))}.",
               "",
-              "The rest of the submission stays in HubSpot: "
+              "The submission itself stays in HubSpot: "
               f"{submission_link(data.get('submission_id'))}",
               "",
               "No fund, no HubSpot change, no ticket.",
@@ -757,8 +794,10 @@ def _write(data, state, results, duplicate, csuite, employee) -> str:
                          "submission %s", data.get("submission_id"))
 
     if state.get("profile_id"):
+        _create_note(data, state, results, csuite, meta)
         _create_task(data, state, results, csuite, employee, meta)
     else:
+        results["note_skipped"] = True
         results["task_skipped"] = "no CSuite profile to attach it to"
 
     state["step"] = "done"
@@ -792,6 +831,41 @@ def _set_ein(data, state, results, csuite):
         results["errors"].append(
             f"EIN NOT set on profile {profile_id} ({reason}). Set it by hand.")
         logger.error("EIN NOT set on existing org profile %s", profile_id)
+
+
+def _create_note(data, state, results, csuite, meta):
+    """ONE note/create. Never retried, whatever comes back.
+
+    A note that may exist must not be sent twice: CSuite has no idempotency
+    key, and it reports a created note as success: 0 (the client reads the
+    note_id instead). A failure or an exception is reported, and the task
+    still goes ahead.
+    """
+    profile_id = state["profile_id"]
+    try:
+        response = csuite.create_note(profile_id, note_text(data),
+                                      audit_meta=meta)
+    except Exception as e:
+        results["note_failed"] = (
+            f"the request did not complete ({e}), so the note may or may not "
+            "exist — it was NOT retried. Check the profile's notes in CSuite "
+            "before adding it by hand")
+        logger.error("CSuite note on profile %s: outcome unknown, not "
+                     "retried", profile_id)
+        return
+    note_id = ((response.get("data") or {}).get("note_id")
+               if isinstance(response.get("data"), dict) else None)
+    if response.get("success") and note_id:
+        results["note_id"] = note_id
+        results["note_warning"] = response.get("note_warning")
+        logger.info("CSuite note %s added to profile %s", note_id, profile_id)
+    else:
+        error = response.get("error")
+        # "Unknown error" is the client's word for a success: 0 that named
+        # no error. For a note that means no note_id came back either.
+        results["note_failed"] = (error if error and error != "Unknown error"
+                                  else "CSuite returned no note id")
+        logger.error("CSuite note NOT added to profile %s", profile_id)
 
 
 def _create_task(data, state, results, csuite, employee, meta):
@@ -832,9 +906,22 @@ def _create_task(data, state, results, csuite, employee, meta):
                      state["profile_id"])
 
 
+def _note_lines(data: dict, results: dict) -> list:
+    if results.get("note_id"):
+        out = [f"🗒️ Note {results['note_id']} added to the profile: the "
+               "essays, the full starting goal, how they heard and the "
+               "HubSpot link."]
+        if results.get("note_warning"):
+            out.append(f"   {results['note_warning']}")
+        return out
+    if results.get("note_failed"):
+        return [f"⚠️ Note NOT added ({results['note_failed']}). The essays "
+                f"are in HubSpot: {submission_link(data.get('submission_id'))}"]
+    return []
+
+
 NOT_ON_THE_PROFILE = ("Not on the CSuite profile, because the API cannot set "
-                      "them: the contact's name and the nonprofit flag. The "
-                      "essays stay in HubSpot.")
+                      "them: the contact's name and the nonprofit flag.")
 
 
 def format_confirmation(data: dict, state: dict, results: dict) -> str:
@@ -886,6 +973,7 @@ def format_confirmation(data: dict, state: dict, results: dict) -> str:
                          "on the profile changed.")
         elif (results.get("ein") or {}).get("action") != EIN_SET:
             lines += ein_lines(data, results.get("ein"), profile_id)
+    lines += _note_lines(data, results)
     lines += results.get("checks") or []
     lines += results.get("cross_form") or []
     lines.append("💰 Fund: not opened — a fund is created when the "

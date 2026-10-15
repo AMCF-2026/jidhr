@@ -89,6 +89,8 @@ class Client(CSuiteClient):
         # What profile/display says each profile's fedid is. Updated by a
         # successful profile/edit, as CSuite would.
         self.fedids = {str(k): v for k, v in (fedids or {}).items()}
+        self.notes = []
+        self.note_reply = {"note_id": 303200, "success": 0}
         unreadable = {str(u) for u in unreadable}
 
         class Session:
@@ -126,6 +128,11 @@ class Client(CSuiteClient):
                     payload = {"success": 1, "data": {"profile_id": 40001}}
                 elif endpoint == "task/create":
                     payload = {"success": 1, "data": {"task_id": 2001}}
+                elif endpoint == "note/create":
+                    # CSuite's real reply for a note it DID create (sandbox,
+                    # 2026-10-15): a note_id, and success 0.
+                    outer.notes.append(body)
+                    payload = outer.note_reply
                 else:
                     raise AssertionError(f"unexpected CSuite {endpoint}")
 
@@ -215,7 +222,8 @@ def offer_and_create(hub=None, client=None, second="yes"):
     return review, reply, state, client
 
 
-WRITES = ("profile/create/org", "profile/create/individual", "task/create")
+WRITES = ("profile/create/org", "profile/create/individual", "task/create",
+          "note/create", "profile/edit")
 
 
 # --- the profile is an ORGANISATION, with the organisation's address --------
@@ -227,6 +235,7 @@ def test_the_org_profile_body(world):
     # two writes.
     check = ["profile/list", "profile/list", "profile/list"]
     assert client.endpoints() == check + check + ["profile/create/org",
+                                                  "note/create",
                                                   "task/create"]
     body = client.body("profile/create/org")
     assert body == {
@@ -684,15 +693,16 @@ def test_the_first_yes_reads_only_and_shows_a_new_organisation(world):
     assert state["step"] == "confirm_write"
     assert "nothing has been written yet" in plan
     assert "**Outcome: NEW organisation.**" in plan
-    assert "will make 2 CSuite writes" in plan
+    assert "will make 3 CSuite writes" in plan
     assert "1. `profile/create/org`" in plan
-    assert "2. `task/create`" in plan
+    assert "2. `note/create` on the new organisation profile" in plan
+    assert "3. `task/create`" in plan
     assert "Assigned to employee 1002, task type 1065" in plan
-    assert "2. `task/create` — the new organisation profile:" in plan
+    assert "3. `task/create` — the new organisation profile:" in plan
     assert f"*{TITLE}*" in plan
     assert f"({len(TITLE)} of 255 characters" in plan
-    assert "The rest of the submission stays in HubSpot" in plan
-    assert "essay" not in plan.lower(), "the plan no longer mentions essays"
+    assert "The submission itself stays in HubSpot" in plan
+    assert "the three essays" in plan, "the note carries them now"
     # The EIN and the goal ARE shown: both are written now (the EIN to the
     # profile, both in the task title), and the reviewer approves them.
     assert f"EIN {EIN} (as fedid)" in plan
@@ -708,8 +718,8 @@ def test_the_first_yes_shows_an_existing_organisation(world):
     _review, plan, _state, client = offer_and_create(second=None)
 
     assert "**Outcome: EXISTING organisation — profile 18075.**" in plan
-    # 18075 has no EIN in the double, so the plan includes setting it.
-    assert "will make 2 CSuite writes:" in plan
+    # 18075 has no EIN in the double, so: EIN edit, note, task.
+    assert "will make 3 CSuite writes:" in plan
     assert "`profile/edit` on profile 18075 — sets ONLY fedid" in plan
     assert "profile/create/org" not in plan
     assert "`task/create` — profile 18075:" in plan
@@ -721,7 +731,7 @@ def test_the_second_yes_writes_what_was_shown(world):
 
     assert not [e for e in client.before_second if e in WRITES]
     assert [e for e in client.endpoints() if e in WRITES] == [
-        "profile/create/org", "task/create"]
+        "profile/create/org", "note/create", "task/create"]
     assert "Organisation Profile Created" in reply
 
 
@@ -840,7 +850,7 @@ def test_existing_with_no_ein_gets_one_guarded_edit_setting_only_fedid(world):
 
     writes = [e for e in client.endpoints()
               if e in WRITES or e == "profile/edit"]
-    assert writes == ["profile/edit", "task/create"]
+    assert writes == ["profile/edit", "note/create", "task/create"]
     body = client.body("profile/edit")
     assert {k: v for k, v in body.items() if k not in ("env", "epoch")} \
         == {"profile_id": 18075, "fedid": EIN}
@@ -856,7 +866,7 @@ def test_existing_with_the_same_ein_is_not_written(world, stored):
 
     assert "profile/edit" not in client.endpoints()
     assert "already holds" in client.plan_reply
-    assert "will make 1 CSuite write:" in client.plan_reply
+    assert "will make 2 CSuite writes:" in client.plan_reply
     assert client.body("task/create")["id"] == 18075
 
 
@@ -869,7 +879,7 @@ def test_existing_with_a_different_ein_is_never_overwritten(world):
     assert client.fedids["18075"] == "99-9999999"
     for text in (client.plan_reply, reply):
         assert "EIN MISMATCH" in text and "99-9999999" in text
-    assert "will make 1 CSuite write:" in client.plan_reply
+    assert "will make 2 CSuite writes:" in client.plan_reply
     assert client.body("task/create")["id"] == 18075, "the task still goes"
 
 
@@ -943,3 +953,100 @@ def test_the_display_only_names_are_refused_by_the_gate(name):
     for endpoint in ("profile/create/org", "profile/edit"):
         with pytest.raises(UnconfirmedField):
             check_input_fields([name], endpoint)
+
+
+# --- V5.87: the note ------------------------------------------------------------
+
+def test_the_note_goes_on_the_profile_with_the_essays_and_the_link(world):
+    _review, reply, _state, client = offer_and_create()
+
+    assert len(client.notes) == 1
+    body = client.notes[0]
+    assert body["ref"] == "profile" and body["ref_id"] == 40001
+    text = body["note_text"]
+    assert text.splitlines()[0] == \
+        "Added by Jidhr from HubSpot submission endw0001-aaaa-bbbb"
+    for part in ("FAKEMISSION", "FAKEINTEREST", "FAKEGOALS", GOAL,
+                 "FAKEHEARD", "(submission endw0001-aaaa-bbbb)",
+                 "[Mission and core services/programs]",
+                 "[Main endowment goals]"):
+        assert part in text
+    assert "🗒️ Note 303200 added to the profile" in reply
+    assert "Not read back through the API" in reply
+
+
+def test_the_note_is_made_before_the_task_and_on_an_existing_profile(world):
+    _existing(world)
+    client = Client(fedids={18075: EIN})
+    _review, _reply, _state, client = offer_and_create(client=client)
+
+    writes = [e for e in client.endpoints() if e in WRITES]
+    assert writes == ["note/create", "task/create"]
+    assert client.notes[0]["ref_id"] == 18075
+
+
+def test_success_zero_with_a_note_id_is_a_created_note(world):
+    """CSuite's own reply, 2026-10-15: {"note_id": 303140, "success": 0}."""
+    _review, reply, _state, client = offer_and_create()
+    assert "Note 303200 added" in reply
+    note_rows = [r for r in world["audit"] if r["endpoint"] == "note/create"]
+    assert len(note_rows) == 1
+
+
+@pytest.mark.parametrize("reply_body,shown", [
+    ({"success": 0, "errors": ["Invalid or missing note_text"]},
+     "Invalid or missing note_text"),
+    ({"success": 0}, "CSuite returned no note id"),
+    ({"note_id": 303201, "success": 0, "errors": ["something"]}, "something"),
+])
+def test_a_failed_note_is_reported_never_retried_and_the_task_still_goes(
+        world, reply_body, shown):
+    client = Client()
+    client.note_reply = reply_body
+    _review, reply, _state, client = offer_and_create(client=client)
+
+    assert [e for e in client.endpoints() if e == "note/create"] == \
+        ["note/create"], "exactly one attempt"
+    assert "Note NOT added" in reply and shown in reply
+    assert "task/create" in client.endpoints()
+
+
+def test_a_note_whose_outcome_is_unknown_is_not_retried(world, monkeypatch):
+    calls = []
+
+    def boom(self, profile_id, text, audit_meta=None):
+        calls.append(profile_id)
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(Client, "create_note", boom)
+    _review, reply, _state, client = offer_and_create()
+
+    assert calls == [40001]
+    assert "may or may not exist" in reply and "NOT retried" in reply
+    assert "task/create" in client.endpoints()
+
+
+def test_the_note_text_never_reaches_logs_or_audit(world, caplog):
+    with caplog.at_level(logging.DEBUG):
+        offer_and_create()
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    audited = json.dumps(world["audit"])
+    for secret in SECRETS:
+        assert secret not in logged and secret not in audited
+
+
+def test_the_client_rule_is_note_create_only():
+    from clients.csuite import note_created
+
+    assert note_created("note/create", {"note_id": 5, "success": 0})
+    assert not note_created("note/create", {"success": 0})
+    assert not note_created("note/create", {"note_id": 5, "errors": ["x"]})
+    assert not note_created("task/create", {"note_id": 5, "success": 0})
+    assert not note_created("profile/create/org", {"note_id": 5})
+
+
+def test_the_audit_row_records_the_note_id_as_its_target():
+    from clients.audit import target_id_from_response
+
+    assert target_id_from_response(
+        {"success": 1, "data": {"note_id": 303140}}) == "303140"
