@@ -272,6 +272,10 @@ def test_a_contact_field_with_a_company_name_is_not_read_as_the_company():
     assert parsed["org_address_street"] == ""
 
 
+TITLE = ("Endowment inquiry: Test Peace Academy — EIN 00-FAKE-EIN-0042 — "
+         "goal FAKEGOAL-250000 — Dana Director <director@example.invalid>")
+
+
 def test_the_task(world):
     _review, reply, _state, client = offer_and_create()
     body = client.body("task/create")
@@ -279,47 +283,72 @@ def test_the_task(world):
     assert body["employee_id"] == 1002
     assert body["task_type_id"] == 1065
     assert body["o"] == "profile" and body["id"] == 40001
-    assert body["name"] == ("Endowment inquiry follow-up: Test Peace Academy"
-                            " — director@example.invalid")
     assert "📝 Follow-up task 2001 for 1002" in reply
 
 
-def test_the_task_description_order(world):
+def test_the_task_text_is_the_title_in_both_fields(world):
+    """A CSuite task keeps ONE text: task_description is ignored when name
+    is sent (sandbox, 2026-10-15). The same text goes in both, as DAF."""
     _review, _reply, _state, client = offer_and_create()
-    text = client.body("task/create")["task_description"]
-    order = ["Organization: Test Peace Academy", f"EIN: {EIN}",
-             "Website: https://org.example.invalid", "Contact: Dana Director",
-             "Email: director@example.invalid", "Phone: (703) 555-0123",
-             f"Starting goal: {GOAL}", "Mission and core services",
-             "What prompted the interest", "Main endowment goals",
-             "How they heard: FAKEHEARD", "Submitted:", "HubSpot: https://"]
-    positions = [text.index(item) for item in order]
-    assert positions == sorted(positions)
-    assert "(submission endw0001-aaaa-bbbb)" in text
+    body = client.body("task/create")
+
+    assert body["name"] == TITLE
+    assert body["task_description"] == TITLE
+    for essay in ("FAKEMISSION", "FAKEINTEREST", "FAKEGOALS", "FAKEHEARD"):
+        assert essay not in body["name"], "the essays stay in HubSpot"
 
 
-def test_a_long_description_cuts_the_essays_and_nothing_else():
-    data = daf_workflow._parse_submission(
-        endowment_submission(**{k: "LONGESSAY " * 2000 for k in ESSAYS}),
+def _data(**overrides):
+    return daf_workflow._parse_submission(
+        endowment_submission(**overrides),
         daf_workflow.inquiry_form("endowment")["field_map"])
 
-    text = endowment_inquiry.task_description(data, limit=1500)
 
-    assert len(text) <= 1500
-    assert text.count(endowment_inquiry.TRUNCATED) == 3
-    for kept in (f"EIN: {EIN}", "Contact: Dana Director",
-                 "Email: director@example.invalid", "Phone: (703) 555-0123",
-                 "Organization: Test Peace Academy", "How they heard:",
-                 "HubSpot: "):
-        assert kept in text
+def test_a_short_title_is_not_cut():
+    assert endowment_inquiry.task_title(_data()) == TITLE
 
 
-def test_a_short_description_is_not_cut():
-    data = daf_workflow._parse_submission(
-        endowment_submission(),
-        daf_workflow.inquiry_form("endowment")["field_map"])
-    assert endowment_inquiry.TRUNCATED not in \
-        endowment_inquiry.task_description(data)
+def test_a_long_goal_is_cut_to_40_first():
+    goal = "We hope to raise " + "a great deal " * 30
+    title = endowment_inquiry.task_title(_data(
+        what_is_your_endowment_starting_goal_=goal))
+
+    assert len(title) <= 255
+    cut = title.split(" — goal ")[1].split(" — ")[0]
+    assert len(cut) == 40 and cut.endswith("…")
+    assert "Test Peace Academy" in title, "the org is not cut while goal can be"
+    assert "EIN 00-FAKE-EIN-0042" in title
+    assert "<director@example.invalid>" in title
+
+
+def test_then_the_organisation_name_is_cut(world):
+    org = "The Very Long Named Organisation " * 10
+    title = endowment_inquiry.task_title(_data(
+        name=org, what_is_your_endowment_starting_goal_="g" * 100))
+
+    assert len(title) == 255
+    assert title.split(" — goal ")[1].startswith("g" * 39 + "…")
+    assert title.split(" — EIN ")[0].endswith("…")
+    assert "EIN 00-FAKE-EIN-0042" in title
+    assert title.endswith("Dana Director <director@example.invalid>")
+
+
+@pytest.mark.parametrize("org_len,goal_len", [(400, 400), (1000, 5),
+                                              (230, 0), (5, 1000)])
+def test_the_ein_and_email_are_never_cut(org_len, goal_len):
+    title = endowment_inquiry.task_title(_data(
+        name="O" * org_len,
+        what_is_your_endowment_starting_goal_="G" * goal_len))
+
+    assert len(title) <= 255
+    assert "— EIN 00-FAKE-EIN-0042 —" in title
+    assert title.endswith("<director@example.invalid>")
+
+
+def test_missing_values_are_said_not_dropped():
+    title = endowment_inquiry.task_title(_data(
+        organization_ein="", what_is_your_endowment_starting_goal_=""))
+    assert "— EIN not given — goal not given —" in title
 
 
 # --- EIN, goal and essays: never logged, never audited, never in the cookie ----
@@ -659,12 +688,17 @@ def test_the_first_yes_reads_only_and_shows_a_new_organisation(world):
     assert "1. `profile/create/org`" in plan
     assert "2. `task/create`" in plan
     assert "Assigned to employee 1002, task type 1065" in plan
-    assert "linked to the new organisation profile" in plan
-    # The EIN IS shown: it is written now, and the reviewer approves it.
+    assert "2. `task/create` — the new organisation profile:" in plan
+    assert f"*{TITLE}*" in plan
+    assert f"({len(TITLE)} of 255 characters" in plan
+    assert "The rest of the submission stays in HubSpot" in plan
+    assert "essay" not in plan.lower(), "the plan no longer mentions essays"
+    # The EIN and the goal ARE shown: both are written now (the EIN to the
+    # profile, both in the task title), and the reviewer approves them.
     assert f"EIN {EIN} (as fedid)" in plan
     for secret in SECRETS:
-        if secret != EIN:
-            assert secret not in plan, "goal and essays are never shown"
+        if secret not in (EIN, GOAL):
+            assert secret not in plan, "the essays are never shown"
 
 
 def test_the_first_yes_shows_an_existing_organisation(world):
@@ -678,7 +712,7 @@ def test_the_first_yes_shows_an_existing_organisation(world):
     assert "will make 2 CSuite writes:" in plan
     assert "`profile/edit` on profile 18075 — sets ONLY fedid" in plan
     assert "profile/create/org" not in plan
-    assert "linked to profile 18075" in plan
+    assert "`task/create` — profile 18075:" in plan
     assert not [e for e in client.endpoints() if e in WRITES]
 
 

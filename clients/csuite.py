@@ -1898,8 +1898,10 @@ class CSuiteClient:
         check_input_fields(kwargs, "task/create")
         data.update(kwargs)
 
-        logger.info("Creating CSuite task %r for employee %s%s", name,
-                    employee_id,
+        # The title's LENGTH, not its text: an endowment title carries the
+        # EIN and the starting goal, which never go to a log (V5.86).
+        logger.info("Creating CSuite task (%d-character title) for employee "
+                    "%s%s", len(name or ""), employee_id,
                     f" on profile {linked_profile_id}" if linked_profile_id
                     else " (unlinked)")
         # audit_meta goes to the AUDIT ROW only — _request merges it into the
