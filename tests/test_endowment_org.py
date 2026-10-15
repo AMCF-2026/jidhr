@@ -282,7 +282,7 @@ def test_a_contact_field_with_a_company_name_is_not_read_as_the_company():
 
 
 TITLE = ("Endowment inquiry: Test Peace Academy — EIN 00-FAKE-EIN-0042 — "
-         "goal FAKEGOAL-250000 — Dana Director <director@example.invalid>")
+         "goal FAKEGOAL-250000 — Dana Director (director@example.invalid)")
 
 
 def test_the_task(world):
@@ -327,7 +327,7 @@ def test_a_long_goal_is_cut_to_40_first():
     assert len(cut) == 40 and cut.endswith("…")
     assert "Test Peace Academy" in title, "the org is not cut while goal can be"
     assert "EIN 00-FAKE-EIN-0042" in title
-    assert "<director@example.invalid>" in title
+    assert "(director@example.invalid)" in title
 
 
 def test_then_the_organisation_name_is_cut(world):
@@ -339,7 +339,7 @@ def test_then_the_organisation_name_is_cut(world):
     assert title.split(" — goal ")[1].startswith("g" * 39 + "…")
     assert title.split(" — EIN ")[0].endswith("…")
     assert "EIN 00-FAKE-EIN-0042" in title
-    assert title.endswith("Dana Director <director@example.invalid>")
+    assert title.endswith("Dana Director (director@example.invalid)")
 
 
 @pytest.mark.parametrize("org_len,goal_len", [(400, 400), (1000, 5),
@@ -351,7 +351,7 @@ def test_the_ein_and_email_are_never_cut(org_len, goal_len):
 
     assert len(title) <= 255
     assert "— EIN 00-FAKE-EIN-0042 —" in title
-    assert title.endswith("<director@example.invalid>")
+    assert title.endswith("(director@example.invalid)")
 
 
 def test_missing_values_are_said_not_dropped():
@@ -1050,3 +1050,25 @@ def test_the_audit_row_records_the_note_id_as_its_target():
 
     assert target_id_from_response(
         {"success": 1, "data": {"note_id": 303140}}) == "303140"
+
+
+# --- V5.88: no angle brackets in the title ----------------------------------------
+
+def test_the_email_is_in_parentheses_not_angle_brackets():
+    """CSuite's task page renders HTML: production task 1067 stored
+    "<abanth@...>" and the page showed nothing after the name."""
+    title = endowment_inquiry.task_title(_data())
+    assert title.endswith("— Dana Director (director@example.invalid)")
+    assert "<" not in title and ">" not in title
+
+
+def test_angle_brackets_are_removed_from_every_field():
+    title = endowment_inquiry.task_title(_data(
+        name="<b>Peace</b> Academy", organization_ein="<00-1>",
+        what_is_your_endowment_starting_goal_="> $25,000 <script>",
+        firstname="<Dana>", email="<director@example.invalid>"))
+
+    assert "<" not in title and ">" not in title
+    assert title == ("Endowment inquiry: bPeace/b Academy — EIN 00-1 — "
+                     "goal $25,000 script — Dana Director "
+                     "(director@example.invalid)")
