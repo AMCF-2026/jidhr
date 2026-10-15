@@ -26,7 +26,7 @@ What it writes, and what it never writes
   at most 255 characters (sandbox, 2026-10-15: `task_description` is ignored
   when `name` is sent, and a 256-character name is refused), so the task is
   a title — "Endowment inquiry: {org} — EIN {ein} — goal {goal} — {contact}
-  <{email}>" — sent as both name and task_description, as DAF does. The
+  ({email})" — sent as both name and task_description, as DAF does. The
   contact's name and the nonprofit flag cannot be set on the profile through
   the API at all (see clients.csuite.ORG_DISPLAY_ONLY).
 * One `note/create` on the org profile (V5.87): the three essays, the full
@@ -312,6 +312,17 @@ def _one_line(text) -> str:
     return " ".join(str(text or "").split())
 
 
+def _title_safe(text) -> str:
+    """One line, with no < or >.
+
+    CSuite's task page renders the text as HTML, so anything in angle
+    brackets disappears there. Production task 1067 (2026-10-15) stored
+    "... — Aftab Banth <abanth@...>" in full, and the page showed it ending
+    at the name: the email was read as a tag.
+    """
+    return _one_line(str(text or "").replace("<", "").replace(">", ""))
+
+
 def _shorten(text: str, length: int) -> str:
     """`text` cut to `length` characters, ending in an ellipsis if cut."""
     if len(text) <= length:
@@ -343,22 +354,23 @@ def note_text(data: dict) -> str:
 
 
 def task_title(data: dict, limit: int = TASK_TITLE_MAX) -> str:
-    """Endowment inquiry: {org} — EIN {ein} — goal {goal} — {name} <{email}>
+    """Endowment inquiry: {org} — EIN {ein} — goal {goal} — {name} ({email})
 
     Over `limit`: the goal is cut to GOAL_TRIMMED_TO, then the organisation
     name, then the contact's name — each only as far as needed. The EIN and
     the email are never cut. (If those two alone exceed the limit, CSuite
     refuses the task and the reply says so; nothing is invented to fit.)
     """
-    org = _one_line(data.get("organization")) or "unnamed organisation"
-    ein = _one_line(data.get("ein")) or "not given"
-    goal = _one_line(data.get("starting_goal")) or "not given"
-    who = _one_line(contact_name(data)) or "no name given"
-    email = _one_line(data.get("email")) or "no email"
+    # No < or > in any field: the task page renders HTML (see _title_safe).
+    org = _title_safe(data.get("organization")) or "unnamed organisation"
+    ein = _title_safe(data.get("ein")) or "not given"
+    goal = _title_safe(data.get("starting_goal")) or "not given"
+    who = _title_safe(contact_name(data)) or "no name given"
+    email = _title_safe(data.get("email")) or "no email"
 
     def build():
         return (f"Endowment inquiry: {org} — EIN {ein} — goal {goal} — "
-                f"{who} <{email}>")
+                f"{who} ({email})")
 
     title = build()
     if len(title) > limit:
