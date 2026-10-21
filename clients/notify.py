@@ -280,3 +280,21 @@ def safe_notify(subject, body, kind=KIND_ALERT, **context) -> dict:
     except Exception as e:
         logger.error("notify() itself failed: %s: %s", type(e).__name__, e)
         return {"configured": False, "sent": [], "failed": ["notify"]}
+
+
+def send_report(recipients, subject, text) -> dict:
+    """Email a report to explicit recipients, with the subject as given.
+
+    For reports with their own audience and wording (the nightly DAF email,
+    V5.90), not alerts: no [Jidhr …] prefix and not NOTIFY_EMAIL_TO. Uses
+    the same SMTP settings. Never raises; {"sent": [...], "failed": [...]}.
+    """
+    out = {"sent": [], "failed": []}
+    for address in [a for a in (recipients or ()) if a]:
+        try:
+            ok = _send_email(address, subject, text)
+        except Exception as e:                    # pragma: no cover
+            logger.warning("report email failed: %s", type(e).__name__)
+            ok = False
+        (out["sent"] if ok else out["failed"]).append(address)
+    return out

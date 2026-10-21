@@ -267,6 +267,25 @@ class Config:
         'live' if (os.environ.get('SCHEDULED_SYNC_MODE', 'preview')
                    .strip().lower() == 'live') else 'preview')
 
+    # The nightly DAF step (V5.90, sync/daf_sync.py). Its own mode, not
+    # SCHEDULED_SYNC_MODE: DAF writes CSuite donor records, the chain writes
+    # HubSpot events, and each is switched on when it is ready.
+    #   preview (default)  reads only; emails what it WOULD add and hold
+    #   live               writes, exactly as "new daf" would
+    # Same fail-closed parsing: only the word "live" writes.
+    JIDHR_DAF_MODE = (
+        'live' if (os.environ.get('JIDHR_DAF_MODE', 'preview')
+                   .strip().lower() == 'live') else 'preview')
+    # Only submissions made on or after this date (YYYY-MM-DD) are picked up.
+    # Unset or unreadable = the step does nothing: without it the first run
+    # would take on every historic submission (83 on 2026-10-21), which stay
+    # with the chat by decision.
+    JIDHR_DAF_SINCE = os.environ.get('JIDHR_DAF_SINCE', '').strip()
+    # Who gets the DAF email, comma-separated. Unset = no email is sent.
+    JIDHR_DAF_REPORT_TO = tuple(
+        a.strip() for a in os.environ.get('JIDHR_DAF_REPORT_TO', '').split(',')
+        if a.strip())
+
     # How far back the window reaches, in days before today. 1 means "today
     # and anything later, plus yesterday" — the slack covers an event whose
     # date has just passed in a timezone the sync does not model.

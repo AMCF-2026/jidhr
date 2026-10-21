@@ -227,3 +227,13 @@ def record_reconcile(monkeypatch) -> dict:
     monkeypatch.setattr(clients.csuite, "CSuiteClient", lambda: csuite)
     reply = sync_commands.handle("reconcile daf tasks dry run", None)
     return {"reply": reply, "hub_calls": [list(c) for c in hub.calls]}
+
+
+def GOLDEN_NEW_DONOR_SENT():
+    """The CSuite requests the chat sent for the fresh donor (V5.80
+    golden), for comparing the nightly step's requests against."""
+    from pathlib import Path
+
+    golden = json.loads((Path(__file__).parent / "fixtures" /
+                         "daf_v580_golden.json").read_text())
+    return golden["new_donor"]["sent"]

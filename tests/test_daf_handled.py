@@ -705,20 +705,27 @@ def test_the_protected_modules_have_zero_diff():
     found = subprocess.run(
         ["git", "diff", "--stat", "4cfe93a", "--",
          "sync/registrations.py", "sync/contact_create.py",
-         "clients/notify.py", "sync/scheduled.py",
-         "jobs/handlers/registrations_sync.py"],
+         "sync/scheduled.py", "jobs/handlers/registrations_sync.py"],
+        # clients/notify.py left this list in V5.90: it gained send_report
+        # for the DAF email, an addition that changes no existing call.
         capture_output=True, text=True)
     assert found.returncode == 0, found.stderr
     assert found.stdout.strip() == "", found.stdout
 
 
-def test_no_daf_create_was_automated():
-    """CHANGE 1 records an id; it adds no trigger. Nothing outside the chat
-    flow calls the profile or task create."""
+def test_the_only_automated_daf_create_is_the_nightly_step():
+    """Until V5.90 nothing outside the chat created a DAF profile or task.
+    V5.90 automates it deliberately — and ONLY through run_daf_writes, the
+    chat's own write sequence, called from sync/daf_sync.py. Nothing in
+    jobs/ or sync/ calls the profile or task create directly."""
     import subprocess
 
-    found = subprocess.run(
+    direct = subprocess.run(
         ["grep", "-rln", "--include=*.py", "-e", "create_individual_profile(",
          "-e", "create_task(", "jobs/", "sync/"],
         capture_output=True, text=True)
-    assert found.stdout.strip() == "", found.stdout
+    assert direct.stdout.strip() == "", direct.stdout
+    via = subprocess.run(
+        ["grep", "-rln", "--include=*.py", "-e", "run_daf_writes(",
+         "jobs/", "sync/"], capture_output=True, text=True)
+    assert via.stdout.split() == ["sync/daf_sync.py"]

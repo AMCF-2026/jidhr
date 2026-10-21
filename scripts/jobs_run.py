@@ -64,6 +64,18 @@ REGISTRATIONS_SEED = {
     "max_attempts": 1,
 }
 
+# The nightly DAF intake (jobs/handlers/daf_sync.py), V5.90. Priority 45:
+# after registrations_sync (40), before the mirror (50). max_attempts 1 for
+# the same reason as registrations: a run that held something did so for a
+# reason a person should read, and tomorrow's run is a fresh run.
+DAF_JOB_TYPE = "daf_sync"
+DAF_SEED = {
+    "job_type": DAF_JOB_TYPE,
+    "payload": {"recurring": "daily", "at": "06:00"},
+    "priority": 45,
+    "max_attempts": 1,
+}
+
 _INSERT_SQL = """
     INSERT INTO jobs (job_type, payload, status, priority, run_after)
     VALUES (%s, %s::jsonb, 'queued', %s, %s)
@@ -149,6 +161,12 @@ def seed(now=None) -> str:
             f"for {when.isoformat()}")
 
 
+def ensure_daf_sync(now=None) -> str:
+    """Keep exactly one live recurring daf_sync row. Same rules as
+    ensure_registrations_sync: idempotent, and due now when first added."""
+    return _ensure_recurring(DAF_JOB_TYPE, DAF_SEED, now)
+
+
 def ensure_registrations_sync(now=None) -> str:
     """Keep exactly one live recurring registrations_sync row.
 
@@ -165,10 +183,15 @@ def ensure_registrations_sync(now=None) -> str:
     decides — disabled logs and exits with no email — so arming the
     schedule stays a single flag, with no seed step to forget.
     """
+    return _ensure_recurring(REGISTRATIONS_JOB_TYPE, REGISTRATIONS_SEED, now)
+
+
+def _ensure_recurring(job_type, seed_row, now=None) -> str:
+    """One live recurring row for `job_type`, added due now if missing."""
     existing = _first(database.execute_query(
-        _ACTIVE_RECURRING_SQL, (REGISTRATIONS_JOB_TYPE,), fetch=True))
+        _ACTIVE_RECURRING_SQL, (job_type,), fetch=True))
     if existing is not None:
-        return (f"daily {REGISTRATIONS_JOB_TYPE} already "
+        return (f"daily {job_type} already "
                 f"{_get(existing, 'status', 1)} as job "
                 f"{_get(existing, 'id', 0)} for "
                 f"{_get(existing, 'run_after', 2)} — nothing added")
@@ -176,12 +199,12 @@ def ensure_registrations_sync(now=None) -> str:
     when = now or datetime.now(timezone.utc)
     inserted = _first(database.execute_query(
         _INSERT_WITH_ATTEMPTS_SQL,
-        (REGISTRATIONS_JOB_TYPE,
-         json.dumps(REGISTRATIONS_SEED["payload"], sort_keys=True),
-         REGISTRATIONS_SEED["priority"], when,
-         REGISTRATIONS_SEED["max_attempts"]),
+        (job_type,
+         json.dumps(seed_row["payload"], sort_keys=True),
+         seed_row["priority"], when,
+         seed_row["max_attempts"]),
         fetch=True))
-    return (f"queued daily {REGISTRATIONS_JOB_TYPE} as job "
+    return (f"queued daily {job_type} as job "
             f"{_get(inserted, 'id')}, due now ({when.isoformat()}); the "
             f"runner re-queues 06:00 UTC daily from here")
 
@@ -223,11 +246,14 @@ def run_once() -> int:
     # Self-maintaining schedule. A failure here is logged and the run goes
     # on: the jobs already queued — the mirror among them — must not be
     # held hostage to a seed that could not write.
-    try:
-        logger.info(ensure_registrations_sync())
-    except Exception as exc:
-        logger.error("could not ensure the %s job: %s: %s",
-                     REGISTRATIONS_JOB_TYPE, type(exc).__name__, exc)
+    for ensure, job_type in ((ensure_registrations_sync,
+                              REGISTRATIONS_JOB_TYPE),
+                             (ensure_daf_sync, DAF_JOB_TYPE)):
+        try:
+            logger.info(ensure())
+        except Exception as exc:
+            logger.error("could not ensure the %s job: %s: %s",
+                         job_type, type(exc).__name__, exc)
     try:
         summaries = runner.run_until_empty(worker)
     except Exception as exc:
@@ -290,6 +316,7 @@ def main(argv=None) -> int:
     if args.seed:
         print(seed())
         print(ensure_registrations_sync())
+        print(ensure_daf_sync())
         return EXIT_OK
     if args.now:
         try:

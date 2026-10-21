@@ -1257,6 +1257,15 @@ def task_assignee_for_form(form_id):
     return getattr(Config, row["assignee_env"], None) or None
 
 
+def followup_task_title(data: dict, label: str = "DAF") -> str:
+    """The follow-up task's title (and description). One place, so the
+    nightly preview (V5.90) reports exactly what the chat would create."""
+    name = (data.get("first_name", "") + " " + data.get("last_name", "")).strip()
+    email = (data.get("email") or "").strip()
+    return (f"{label} inquiry follow-up: {name or 'unnamed'}"
+            + (f" — {email}" if email else ""))
+
+
 def _create_followup_task(data, state, results, csuite, wf_type, type_label):
     """Create the CSuite follow-up task, or record why it was not created.
 
@@ -1287,8 +1296,7 @@ def _create_followup_task(data, state, results, csuite, wf_type, type_label):
 
     name = (data.get("first_name", "") + " " + data.get("last_name", "")).strip()
     email = (data.get("email") or "").strip()
-    subject = (f"{label} inquiry follow-up: {name or 'unnamed'}"
-               + (f" — {email}" if email else ""))
+    subject = followup_task_title(data, label)
     due = task_due_date(data.get("submitted_at"))
 
     try:
@@ -1490,6 +1498,22 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         from intents import endowment_inquiry
         return endowment_inquiry.step_create(state, hubspot, csuite)
 
+    results = run_daf_writes(state, hubspot, csuite)
+    return _format_confirmation(state["submission_data"], state, results,
+                                "DAF" if state["type"] == "daf"
+                                else "Endowment")
+
+
+def run_daf_writes(state: dict, hubspot, csuite,
+                   allow_contact_create: bool = True) -> dict:
+    """The DAF write sequence after a yes. Returns the results dict.
+
+    Shared by the chat ("new daf", via _step_create, which formats the
+    reply) and the nightly daf_sync (V5.90), so both run exactly the same
+    plan: the duplicate guard, then the profile, the task and the HubSpot
+    link. `allow_contact_create=False` is the one difference: unattended,
+    a missing HubSpot contact is reported, never created.
+    """
     state["step"] = "processing"
     # The API base URL of the client doing the work, so every UI link in the
     # confirmation points at the host that actually holds the record. Without
@@ -1618,9 +1642,11 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
             else:
                 _backfill_hubspot_link(data, state, results, hubspot,
                                        duplicate.profile_id)
-            return _format_confirmation(data, state, results, type_label)
+            return results
 
-        logger.info(f"Creating CSuite profile for {data.get('first_name')} {data.get('last_name')}...")
+        # Ids only: no donor name or email in a log line (V5.90).
+        logger.info("Creating CSuite profile for submission %s",
+                    data.get("submission_id"))
         try:
             profile_result = csuite.create_individual_profile(
                 # Recorded on the audit row, never sent to CSuite: it is what
@@ -1746,7 +1772,8 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
 
     # --- 3. Update (or create) HubSpot contact with CSuite IDs ---
     if results["profile_created"] and data.get("email"):
-        logger.info(f"Updating HubSpot contact for {data['email']}...")
+        logger.info("Updating the HubSpot contact for submission %s",
+                    data.get("submission_id"))
         try:
             update_props = {
                 "csuite_profile_id": str(state["profile_id"]),
@@ -1785,9 +1812,19 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
                 results["hubspot_updated"] = True
                 state["hubspot_contact_id"] = hs_result.get("id")
                 logger.info("HubSpot contact updated")
+            elif hs_result and "Contact not found" in hs_result.get(
+                    "error", "") and not allow_contact_create:
+                # Unattended (daf_sync): a form submission with no HubSpot
+                # contact behind it is an anomaly to report, not to paper
+                # over by creating one. The profile stands; the link waits.
+                results["hubspot_contact_missing"] = True
+                results["errors"].append(
+                    "HubSpot has no contact for this address, so none was "
+                    "created and csuite_profile_id was not set.")
             elif hs_result and "Contact not found" in hs_result.get("error", ""):
                 # No existing contact — create one with CSuite IDs pre-populated
-                logger.info(f"No HubSpot contact found — creating for {data['email']}...")
+                logger.info("No HubSpot contact for submission %s — creating "
+                            "one", data.get("submission_id"))
                 create_props = {
                     "firstname": data.get("first_name", ""),
                     "lastname": data.get("last_name", ""),
@@ -1887,7 +1924,7 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
 
     # --- Build confirmation ---
     state["step"] = "done"
-    return _format_confirmation(data, state, results, type_label)
+    return results
 
 
 # ---------------------------------------------------------------------------

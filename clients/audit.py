@@ -706,3 +706,55 @@ def handled_tasks(form_id) -> dict:
         else:
             found.setdefault(str(sid), None)
     return found
+
+
+# Submissions the nightly DAF step HELD (V5.90): it would not guess, so a
+# person decides in chat. A hold row is local bookkeeping like a link row —
+# target_system 'jidhr', ids only, the reason in the endpoint — but it is
+# NOT "handled": endpoint submission/held/<reason> never matches the
+# processed query's submission/link/%, so the chat keeps offering it. The
+# nightly step skips anything held; handling it in chat makes it processed,
+# which the nightly step skips as well. Live rows only, as for processed.
+SUBMISSION_HOLD_ENDPOINT = "submission/held"
+
+_HELD_SQL = """
+    SELECT payload_meta->'ids'->>'hubspot_submission_id' AS submission_id,
+           endpoint
+      FROM write_audit
+     WHERE status = 'success'
+       AND csuite_env = 'live'
+       AND target_system = %s
+       AND endpoint LIKE %s
+       AND payload_meta->'ids'->>'hubspot_form_id' = %s
+       AND payload_meta->'ids'->>'hubspot_submission_id' IS NOT NULL
+     ORDER BY id
+"""
+
+
+def held_submissions(form_id) -> dict:
+    """{submission_id: reason code} for every held submission on a form.
+
+    Raises ProcessedHistoryUnavailable when it cannot be read: a nightly run
+    that cannot see its holds must not act, or it would retry them.
+    """
+    if not form_id:
+        return {}
+    try:
+        from clients.database import execute_query
+        rows = execute_query(
+            _HELD_SQL,
+            (LINK_TARGET_SYSTEM, f"{SUBMISSION_HOLD_ENDPOINT}/%",
+             str(form_id)),
+            fetch=True)
+    except Exception as e:
+        raise ProcessedHistoryUnavailable(
+            f"could not read the held submissions for form {form_id}: "
+            f"{e}") from e
+    held = {}
+    for row in rows or []:
+        sid = (row or {}).get("submission_id")
+        if sid in (None, ""):
+            continue
+        reason = str(row.get("endpoint") or "").rsplit("/", 1)[-1]
+        held.setdefault(str(sid), reason)
+    return held
