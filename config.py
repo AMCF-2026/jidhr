@@ -514,11 +514,12 @@ class Config:
         ("*", "email"): "email",
         ("*", "phone"): "phone",
         ("*", "mobilephone"): "phone",
-        # TODO(hotfix-63): these never match. The live DAF form calls them
-        # "what_would_you_like_to_name_your_fund_" and
-        # "estimated_initial_contribution_amount" (Step 0, 2026-10-14), so
-        # every DAF review prints "Not specified" for both. Left as-is here:
-        # V5.81 moves DAF without changing what it does.
+        # The live DAF form's names (hotfix-70, 2026-10-21: present on all 50
+        # newest submissions). Until then only the legacy names below were
+        # mapped, none of which the form uses, so every DAF review printed
+        # "Not specified" for both.
+        ("*", "what_would_you_like_to_name_your_fund_"): "fund_name",
+        ("*", "estimated_initial_contribution_amount"): "initial_contribution",
         ("*", "fund_name"): "fund_name",
         ("*", "fund name"): "fund_name",
         ("*", "requested_fund_name"): "fund_name",

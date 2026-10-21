@@ -1190,8 +1190,14 @@ def _report_daf_inquiry_summary(query: str, hubspot) -> str:
                     'first_name': values.get('firstname') or values.get('first_name', ''),
                     'last_name': values.get('lastname') or values.get('last_name', ''),
                     'email': values.get('email', ''),
-                    'fund_name': values.get('fund_name') or values.get('requested_fund_name', ''),
-                    'contribution': values.get('initial_contribution') or values.get('amount', ''),
+                    # The live DAF form's names first (hotfix-70); the legacy
+                    # names never matched anything the form sends.
+                    'fund_name': (values.get('what_would_you_like_to_name_your_fund_')
+                                  or values.get('fund_name')
+                                  or values.get('requested_fund_name', '')),
+                    'contribution': (values.get('estimated_initial_contribution_amount')
+                                     or values.get('initial_contribution')
+                                     or values.get('amount', '')),
                     'date': datetime.fromtimestamp(submitted_at / 1000).strftime('%b %d'),
                 })
         return filtered
@@ -1228,7 +1234,9 @@ def _report_daf_inquiry_summary(query: str, hubspot) -> str:
         for s in daf_subs:
             name = f"{s['first_name']} {s['last_name']}".strip() or s['email'] or 'Unknown'
             fund = s['fund_name'] or 'Fund name not provided'
-            contrib = f" — ${s['contribution']}" if s['contribution'] else ''
+            # The form's own band, e.g. "$10,001-$25,000" or "Under $2,500":
+            # it carries its currency, so none is added.
+            contrib = f" — {s['contribution']}" if s['contribution'] else ''
             lines.append(f"• {s['date']}: **{name}** | {fund}{contrib}")
         lines.append("")
 
@@ -1237,7 +1245,9 @@ def _report_daf_inquiry_summary(query: str, hubspot) -> str:
         for s in endowment_subs:
             name = f"{s['first_name']} {s['last_name']}".strip() or s['email'] or 'Unknown'
             fund = s['fund_name'] or 'Fund name not provided'
-            contrib = f" — ${s['contribution']}" if s['contribution'] else ''
+            # The form's own band, e.g. "$10,001-$25,000" or "Under $2,500":
+            # it carries its currency, so none is added.
+            contrib = f" — {s['contribution']}" if s['contribution'] else ''
             lines.append(f"• {s['date']}: **{name}** | {fund}{contrib}")
         lines.append("")
 

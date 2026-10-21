@@ -437,9 +437,6 @@ def _donor_label(parsed: dict) -> str:
 def _render_submission(parsed: dict, wf_type: str, note: str = None) -> str:
     """The review block for one submission. Shared by initiation and skip."""
     type_label = "DAF" if wf_type == "daf" else "Endowment"
-    # TODO(hotfix-63): always "Not specified" on the live DAF form, whose
-    # fields are what_would_you_like_to_name_your_fund_ and
-    # estimated_initial_contribution_amount. See Config._DAF_FIELD_MAP.
     fund_name = parsed.get("fund_name") or "Not specified"
     contribution = parsed.get("initial_contribution") or "Not specified"
     lines = [f"📋 **New {type_label} Inquiry**", ""]
