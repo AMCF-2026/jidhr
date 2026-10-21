@@ -81,11 +81,15 @@ def test_the_profile_and_task_bodies_are_the_ones_expected():
     assert bodies["task/create"]["employee_id"] == 1012
 
 
-def test_the_known_not_specified_bug_is_still_there(recorded):
-    """hotfix-63, not V5.81. Pinned so a fix is a deliberate change."""
+def test_the_fund_name_and_contribution_are_parsed(recorded):
+    """hotfix-70: the live DAF form's field names are mapped. Until then
+    every review said "Not specified" for both. The golden replies were
+    edited in exactly these two lines and nothing else, so every other
+    character of every reply is still pinned to V5.80."""
     offer = recorded["new_donor"]["replies"][0]
-    assert "💰 **Requested Fund Name:** Not specified" in offer
-    assert "💵 **Initial Contribution:** Not specified" in offer
+    assert "💰 **Requested Fund Name:** Fresh Family Fund" in offer
+    assert "💵 **Initial Contribution:** 25000" in offer
+    assert "Not specified" not in offer
 
 
 # --- the new daf reply -------------------------------------------------------

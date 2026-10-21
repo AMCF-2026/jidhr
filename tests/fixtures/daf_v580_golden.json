@@ -2,7 +2,7 @@
  "create_off": {
   "audit": [],
   "replies": [
-   "📋 **New DAF Inquiry**\n\n⏭️ The newest DAF submission has already been processed — Handled Already is profile 21000. Showing the next one.\n\n👤 **Name:** Fresh Donor\n📧 **Email:** fresh.donor@example.invalid\n📱 **Phone:** (703) 555-0177\n💰 **Requested Fund Name:** Not specified\n💵 **Initial Contribution:** Not specified\n📅 **Submitted:** Sun Mar 17, 2030 11:00 AM ET\n\n---\n**Shall I create the CSuite profile and fund?**\n• Say *\"Yes\"* or *\"Create it\"* to proceed\n• Say *\"Skip\"* to move to the next submission\n• Say *\"Cancel\"* to stop",
+   "📋 **New DAF Inquiry**\n\n⏭️ The newest DAF submission has already been processed — Handled Already is profile 21000. Showing the next one.\n\n👤 **Name:** Fresh Donor\n📧 **Email:** fresh.donor@example.invalid\n📱 **Phone:** (703) 555-0177\n💰 **Requested Fund Name:** Fresh Family Fund\n💵 **Initial Contribution:** 25000\n📅 **Submitted:** Sun Mar 17, 2030 11:00 AM ET\n\n---\n**Shall I create the CSuite profile and fund?**\n• Say *\"Yes\"* or *\"Create it\"* to proceed\n• Say *\"Skip\"* to move to the next submission\n• Say *\"Cancel\"* to stop",
    "⏸️ **DAF Not Created**\n\n⏸️ Profile: **not created — CSuite profile creation is turned off.** CSuite silently discards the email, phone and address this path sends, so a profile made now would be missing them. Create it in CSuite by hand, or set CSUITE_DAF_CREATE_ENABLED once the field names are fixed.\n📝 No task: no CSuite profile to attach it to\n🎫 Ticket close: off\n\nSay anything to continue, or start a new workflow."
   ],
   "sent": []
@@ -56,7 +56,7 @@
    }
   ],
   "replies": [
-   "📋 **New DAF Inquiry**\n\n⏭️ The newest DAF submission has already been processed — Handled Already is profile 21000. Showing the next one.\n\n👤 **Name:** Fresh Donor\n📧 **Email:** fresh.donor@example.invalid\n📱 **Phone:** (703) 555-0177\n💰 **Requested Fund Name:** Not specified\n💵 **Initial Contribution:** Not specified\n📅 **Submitted:** Sun Mar 17, 2030 11:00 AM ET\n\n---\n**Shall I create the CSuite profile and fund?**\n• Say *\"Yes\"* or *\"Create it\"* to proceed\n• Say *\"Skip\"* to move to the next submission\n• Say *\"Cancel\"* to stop",
+   "📋 **New DAF Inquiry**\n\n⏭️ The newest DAF submission has already been processed — Handled Already is profile 21000. Showing the next one.\n\n👤 **Name:** Fresh Donor\n📧 **Email:** fresh.donor@example.invalid\n📱 **Phone:** (703) 555-0177\n💰 **Requested Fund Name:** Fresh Family Fund\n💵 **Initial Contribution:** 25000\n📅 **Submitted:** Sun Mar 17, 2030 11:00 AM ET\n\n---\n**Shall I create the CSuite profile and fund?**\n• Say *\"Yes\"* or *\"Create it\"* to proceed\n• Say *\"Skip\"* to move to the next submission\n• Say *\"Cancel\"* to stop",
    "✅ **DAF Inquiry — Profile Created**\n\n👤 Profile: Fresh Donor — [CSuite](https://amuslimcf.fcsuite.com/erp/profile/display?profile_id=31337)\n💰 Fund: not opened yet — a fund is created when the donor commits, not at inquiry.\n🎯 HubSpot contact updated — [View](https://app-na2.hubspot.com/contacts/243832852/contact/70123)\n📝 Follow-up task 1099 for 1012 — re: Fresh Donor — due 2030-03-19 — [View](https://amuslimcf.fcsuite.com/erp/task/display?task_id=1099)\n🎫 Ticket close: off\n\nSay anything to continue, or start a new workflow."
   ],
   "sent": [
@@ -164,8 +164,8 @@
    }
   ],
   "replies": [
-   "📋 **New DAF Inquiry**\n\n⏭️ The newest DAF submission has already been processed — Handled Already is profile 21000. Showing the next one.\n\n👤 **Name:** Fresh Donor\n📧 **Email:** fresh.donor@example.invalid\n📱 **Phone:** (703) 555-0177\n💰 **Requested Fund Name:** Not specified\n💵 **Initial Contribution:** Not specified\n📅 **Submitted:** Sun Mar 17, 2030 11:00 AM ET\n\n---\n**Shall I create the CSuite profile and fund?**\n• Say *\"Yes\"* or *\"Create it\"* to proceed\n• Say *\"Skip\"* to move to the next submission\n• Say *\"Cancel\"* to stop",
-   "📋 **New DAF Inquiry**\n\n⏭️ Skipped. Submission 3 of 3.\n\n👤 **Name:** Returning Donor\n📧 **Email:** returning.donor@example.invalid\n📱 **Phone:** (703) 555-0177\n💰 **Requested Fund Name:** Not specified\n💵 **Initial Contribution:** Not specified\n📅 **Submitted:** Sun Mar 17, 2030 8:13 AM ET\n\n---\n**Shall I create the CSuite profile and fund?**\n• Say *\"Yes\"* or *\"Create it\"* to proceed\n• Say *\"Skip\"* to move to the next submission\n• Say *\"Cancel\"* to stop",
+   "📋 **New DAF Inquiry**\n\n⏭️ The newest DAF submission has already been processed — Handled Already is profile 21000. Showing the next one.\n\n👤 **Name:** Fresh Donor\n📧 **Email:** fresh.donor@example.invalid\n📱 **Phone:** (703) 555-0177\n💰 **Requested Fund Name:** Fresh Family Fund\n💵 **Initial Contribution:** 25000\n📅 **Submitted:** Sun Mar 17, 2030 11:00 AM ET\n\n---\n**Shall I create the CSuite profile and fund?**\n• Say *\"Yes\"* or *\"Create it\"* to proceed\n• Say *\"Skip\"* to move to the next submission\n• Say *\"Cancel\"* to stop",
+   "📋 **New DAF Inquiry**\n\n⏭️ Skipped. Submission 3 of 3.\n\n👤 **Name:** Returning Donor\n📧 **Email:** returning.donor@example.invalid\n📱 **Phone:** (703) 555-0177\n💰 **Requested Fund Name:** Fresh Family Fund\n💵 **Initial Contribution:** 25000\n📅 **Submitted:** Sun Mar 17, 2030 8:13 AM ET\n\n---\n**Shall I create the CSuite profile and fund?**\n• Say *\"Yes\"* or *\"Create it\"* to proceed\n• Say *\"Skip\"* to move to the next submission\n• Say *\"Cancel\"* to stop",
    "♻️ **Already in CSuite — no new profile created**\n\n👤 Profile 21999 — [CSuite](https://amuslimcf.fcsuite.com/erp/profile/display?profile_id=21999)\n   Found via: CSuite primary_email search\n🔗 skipped: HubSpot backfill is turned off\n📝 Follow-up task 1099 for 1012 — re: Returning Donor — due 2030-03-19 — [View](https://amuslimcf.fcsuite.com/erp/task/display?task_id=1099)\n\nSay anything to continue, or start a new workflow."
   ],
   "sent": [
@@ -238,7 +238,7 @@
    }
   ],
   "replies": [
-   "📋 **New DAF Inquiry**\n\n⏭️ The newest DAF submission has already been processed — Handled Already is profile 21000. Showing the next one.\n\n👤 **Name:** Fresh Donor\n📧 **Email:** fresh.donor@example.invalid\n📱 **Phone:** (703) 555-0177\n💰 **Requested Fund Name:** Not specified\n💵 **Initial Contribution:** Not specified\n📅 **Submitted:** Sun Mar 17, 2030 11:00 AM ET\n\n---\n**Shall I create the CSuite profile and fund?**\n• Say *\"Yes\"* or *\"Create it\"* to proceed\n• Say *\"Skip\"* to move to the next submission\n• Say *\"Cancel\"* to stop",
+   "📋 **New DAF Inquiry**\n\n⏭️ The newest DAF submission has already been processed — Handled Already is profile 21000. Showing the next one.\n\n👤 **Name:** Fresh Donor\n📧 **Email:** fresh.donor@example.invalid\n📱 **Phone:** (703) 555-0177\n💰 **Requested Fund Name:** Fresh Family Fund\n💵 **Initial Contribution:** 25000\n📅 **Submitted:** Sun Mar 17, 2030 11:00 AM ET\n\n---\n**Shall I create the CSuite profile and fund?**\n• Say *\"Yes\"* or *\"Create it\"* to proceed\n• Say *\"Skip\"* to move to the next submission\n• Say *\"Cancel\"* to stop",
    "✅ **DAF Inquiry — Profile Created**\n\n👤 Profile: Fresh Donor — [CSuite](https://amuslimcf.fcsuite.com/erp/profile/display?profile_id=31337)\n💰 Fund: not opened yet — a fund is created when the donor commits, not at inquiry.\n🎯 HubSpot contact updated — [View](https://app-na2.hubspot.com/contacts/243832852/contact/70123)\n📝 No task: follow-up tasks are turned off\n🎫 Ticket close: off\n\nSay anything to continue, or start a new workflow."
   ],
   "sent": [
