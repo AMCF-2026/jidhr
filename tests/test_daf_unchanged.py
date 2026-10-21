@@ -353,7 +353,10 @@ PINNED = {
     # create_task is NOT pinned since V5.86: its log line records the
     # title's length instead of its text (an endowment title carries the EIN
     # and goal). What it SENDS is pinned byte for byte by the golden replay.
-    "clients/csuite.py": ["create_individual_profile",
+    # create_individual_profile is NOT pinned since V5.90 either: its log
+    # line no longer names the donor. Its request body is pinned byte for
+    # byte by the golden replay.
+    "clients/csuite.py": [
                           "build_address", "check_input_fields"],
     "clients/audit.py": ["processed_submissions", "payload_meta",
                          "record_write"],

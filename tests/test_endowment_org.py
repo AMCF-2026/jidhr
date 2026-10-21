@@ -674,10 +674,14 @@ def test_nothing_the_scheduled_run_executes_has_changed():
     import subprocess
 
     found = subprocess.run(
-        ["git", "diff", "--stat", "de92baa", "--", "jobs/",
-         "scripts/jobs_run.py",
+        # jobs/, scripts/jobs_run.py and clients/notify.py left this list in
+        # V5.90, which adds the daf_sync job, its seeding and send_report.
+        # The runner itself and the two existing handlers stay pinned.
+        ["git", "diff", "--stat", "de92baa", "--", "jobs/runner.py",
+         "jobs/handlers/registrations_sync.py",
+         "jobs/handlers/mirror_refresh.py",
          "sync/scheduled.py", "sync/registrations.py",
-         "sync/contact_create.py", "sync/mirror.py", "clients/notify.py",
+         "sync/contact_create.py", "sync/mirror.py",
          "clients/database.py", "clients/mirror_read.py"],
         capture_output=True, text=True)
     assert found.returncode == 0, found.stderr

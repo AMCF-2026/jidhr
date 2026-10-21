@@ -1335,7 +1335,8 @@ class CSuiteClient:
         check_input_fields(kwargs, "profile/create/individual")
         data.update(kwargs)
 
-        logger.info(f"Creating individual profile: {first_name} {last_name}")
+        # No donor name in a log line (V5.90); the audit row carries the ids.
+        logger.info("Creating individual profile")
         # Passed only when there is something to record, so a narrower
         # _request override — a proxy, a double — is not forced to know about
         # an argument that never reaches CSuite. The audit payload itself is
