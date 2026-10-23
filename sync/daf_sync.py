@@ -111,6 +111,37 @@ class Refused(RuntimeError):
     """The whole step cannot run. Nothing was written, nobody was held."""
 
 
+class BadSetting(Refused):
+    """A setting on the service is wrong. The step stands down with an
+    [Jidhr ALERT] naming it; the job itself does NOT fail, because nothing
+    crashed — the run exits 0 and tomorrow's runs again."""
+
+
+def budget_problem():
+    """Why CSUITE_WRITE_BUDGET cannot be used, or None.
+
+    Anything but a whole number is refused, never read as 0: read as 0, a
+    live run holds every submission for good as "nightly limit reached".
+    An unset or 0 budget is refused too — it lets nothing be written.
+    """
+    import re
+
+    raw = str(getattr(Config, "CSUITE_WRITE_BUDGET_RAW", "") or "").strip()
+    if raw and not re.fullmatch(r"\d+", raw):
+        shown = raw if len(raw) <= 20 else raw[:20] + "…"
+        return (f"CSUITE_WRITE_BUDGET is set to {shown!r}, which is not a "
+                "whole number. It must be the number of CSuite changes "
+                "allowed per night, e.g. 10. The nightly DAF step did "
+                "nothing and held nothing; fix the variable on this "
+                "service.")
+    if int(getattr(Config, "CSUITE_WRITE_BUDGET", 0) or 0) < 1:
+        return ("CSUITE_WRITE_BUDGET is not set (or is 0), so the nightly "
+                "DAF step could not add anything. It did nothing and held "
+                "nothing; set it to the number of CSuite changes allowed "
+                "per night, e.g. 10.")
+    return None
+
+
 def mode() -> str:
     raw = str(getattr(Config, "JIDHR_DAF_MODE", MODE_PREVIEW) or "")
     return MODE_LIVE if raw.strip().lower() == MODE_LIVE else MODE_PREVIEW
@@ -206,6 +237,9 @@ def run(hubspot=None, csuite=None, run_mode=None) -> dict:
                                       followup_task_title, inquiry_form)
 
     run_mode = run_mode or mode()
+    problem = budget_problem()
+    if problem:
+        raise BadSetting(problem)
     floor = since()
     if run_mode == MODE_LIVE:
         refusal = _live_refusal()

@@ -586,6 +586,8 @@ def test_a_refused_step_alerts_and_fails_the_job(monkeypatch):
 
     alerts = []
     _setting(monkeypatch, "SCHEDULED_SYNC_ENABLED", True)
+    _setting(monkeypatch, "CSUITE_WRITE_BUDGET", 10)
+    _setting(monkeypatch, "CSUITE_WRITE_BUDGET_RAW", "10")
     _setting(monkeypatch, "JIDHR_DAF_SINCE", "")
     monkeypatch.setattr("clients.notify.safe_notify",
                         lambda *a, **k: alerts.append(a) or {})
@@ -616,3 +618,104 @@ def test_the_job_is_seeded_after_registrations_and_before_the_mirror():
     assert jr.REGISTRATIONS_SEED["priority"] < jr.DAF_SEED["priority"] < \
         jr.MIRROR_SEED["priority"]
     assert jr.DAF_SEED["max_attempts"] == 1
+
+
+# --- hotfix-71: CSUITE_WRITE_BUDGET must be a whole number ---------------------------
+
+@pytest.mark.parametrize("raw", ["true", "1.5", "-3", "10abc", "ten", "1e3"])
+def test_a_budget_that_is_not_a_whole_number_is_refused(world, monkeypatch,
+                                                        raw):
+    """2026-10-23: the jobs service had CSUITE_WRITE_BUDGET=true. Read as 0,
+    a live run would have held every submission for good."""
+    import config
+
+    monkeypatch.setenv("CSUITE_WRITE_BUDGET", raw)
+    importlib_reload_config()
+    try:
+        _setting(monkeypatch, "CSUITE_WRITE_BUDGET",
+                 config.Config.CSUITE_WRITE_BUDGET)
+        _setting(monkeypatch, "CSUITE_WRITE_BUDGET_RAW", raw)
+        hub, client = Hub([FRESH]), Client()
+        with pytest.raises(daf_sync.BadSetting, match="CSUITE_WRITE_BUDGET"):
+            run(hub, client)
+        assert client.sent == [] and world["holds"] == []
+    finally:
+        monkeypatch.delenv("CSUITE_WRITE_BUDGET", raising=False)
+        importlib_reload_config()
+
+
+def importlib_reload_config():
+    import importlib
+
+    import config
+    importlib.reload(config)
+
+
+@pytest.mark.parametrize("raw,value", [("", 0), ("0", 0)])
+@pytest.mark.parametrize("mode", ["live", "preview"])
+def test_an_unset_or_zero_budget_is_refused_not_held(world, monkeypatch, raw,
+                                                    value, mode):
+    _setting(monkeypatch, "CSUITE_WRITE_BUDGET", value)
+    _setting(monkeypatch, "CSUITE_WRITE_BUDGET_RAW", raw)
+    hub, client = Hub([FRESH]), Client()
+    with pytest.raises(daf_sync.BadSetting, match="not set"):
+        run(hub, client, mode=mode)
+    assert client.sent == [] and world["holds"] == []
+
+
+@pytest.mark.parametrize("raw", ["10", " 10 ", "3"])
+def test_a_whole_number_is_accepted(world, monkeypatch, raw):
+    _setting(monkeypatch, "CSUITE_WRITE_BUDGET", int(raw))
+    _setting(monkeypatch, "CSUITE_WRITE_BUDGET_RAW", raw)
+    assert daf_sync.budget_problem() is None
+    assert len(run(Hub([FRESH]), Client())["added"]) == 1
+
+
+def test_a_bad_budget_alerts_by_name_and_the_job_does_not_fail(monkeypatch):
+    from jobs.handlers import daf_sync as job
+
+    alerts = []
+    _setting(monkeypatch, "SCHEDULED_SYNC_ENABLED", True)
+    _setting(monkeypatch, "CSUITE_WRITE_BUDGET", 0)
+    _setting(monkeypatch, "CSUITE_WRITE_BUDGET_RAW", "true")
+    monkeypatch.setattr("clients.notify.safe_notify",
+                        lambda subject, body, **k: alerts.append(
+                            (subject, body, k)) or {})
+
+    result = job.handle({})            # no JobFailed: nothing crashed
+
+    assert result["stood_down"] is True
+    [(subject, body, kwargs)] = alerts
+    assert kwargs["kind"] == "alert"
+    assert "CSUITE_WRITE_BUDGET" in body and "'true'" in body
+    assert "not a whole number" in body
+
+
+def test_a_bad_budget_run_exits_zero(monkeypatch):
+    """Through the REAL runner.run and jobs_run --once: the job completes,
+    so the run reports success to Railway, not a crash. Only the database
+    the runner records into is stubbed."""
+    import scripts.jobs_run as jr
+    from jobs import runner
+
+    job = {"id": 9, "job_type": "daf_sync", "payload": {}, "attempts": 0,
+           "max_attempts": 1, "priority": 45}
+    summaries = []
+    _setting(monkeypatch, "SCHEDULED_SYNC_ENABLED", True)
+    _setting(monkeypatch, "CSUITE_WRITE_BUDGET", 0)
+    _setting(monkeypatch, "CSUITE_WRITE_BUDGET_RAW", "true")
+    monkeypatch.setattr("clients.notify.safe_notify", lambda *a, **k: {})
+    monkeypatch.setattr(jr.database, "is_configured", lambda: True)
+    monkeypatch.setattr(jr, "ensure_registrations_sync", lambda: "ok")
+    monkeypatch.setattr(jr, "ensure_daf_sync", lambda: "ok")
+    monkeypatch.setattr(runner.database, "execute_query",
+                        lambda *a, **k: [])
+    monkeypatch.setattr(runner, "queue_next_occurrence", lambda job: None)
+    monkeypatch.setattr(runner, "run_until_empty",
+                        lambda worker: summaries.append(runner.run(job))
+                        or summaries)
+
+    code = jr.main(["--once"])
+
+    assert summaries[0]["status"] == runner.STATUS_COMPLETE
+    assert code == jr.EXIT_OK
