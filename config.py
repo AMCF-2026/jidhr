@@ -137,6 +137,12 @@ class Config:
     # unlimited: a typo must fail closed.
     CSUITE_WRITE_BUDGET = _int_or_zero(
         os.environ.get('CSUITE_WRITE_BUDGET', '0'))
+    # The text as set, so a value that is not a whole number can be NAMED
+    # rather than silently read as 0. On 2026-10-23 the jobs service had
+    # CSUITE_WRITE_BUDGET=true (copied from a flag); _int_or_zero made that
+    # 0, and the nightly DAF step would have held every submission for good
+    # as "nightly limit reached". sync/daf_sync.budget_problem checks it.
+    CSUITE_WRITE_BUDGET_RAW = os.environ.get('CSUITE_WRITE_BUDGET', '')
 
     # Whether an inquiry also OPENS A FUND. Off, and separate from
     # CSUITE_DAF_CREATE_ENABLED on purpose.

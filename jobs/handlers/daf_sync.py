@@ -34,6 +34,15 @@ def handle(job) -> dict:
 
     try:
         out = daf_sync.run()
+    except daf_sync.BadSetting as bad:
+        # A wrong setting is not a crash: alert, stand down, finish the job
+        # normally so the run exits 0. Nothing was written or held.
+        from clients.notify import KIND_ALERT, safe_notify
+
+        safe_notify("nightly DAF step: a setting needs fixing", str(bad),
+                    kind=KIND_ALERT, mode=daf_sync.mode())
+        logger.error("nightly DAF step stood down: a setting needs fixing")
+        return {"enabled": True, "refused": str(bad), "stood_down": True}
     except daf_sync.Refused as refused:
         from clients.notify import KIND_ALERT, safe_notify
 
