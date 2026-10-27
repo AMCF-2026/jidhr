@@ -216,6 +216,26 @@ def test_a_new_donor_gets_the_chat_profile_task_and_link(world):
     assert out["held"] == []
 
 
+def test_a_rejected_hubspot_link_is_a_problem_not_a_success(world):
+    """V5.93: HubSpot answers a rejected PATCH with its own JSON, which has
+    no "error" key. It was reported as "HubSpot contact updated"."""
+    class Rejecting(Hub):
+        def update_contact_by_email(self, email, properties):
+            self.patched.append(("rejected", dict(properties)))
+            return {"status": "error", "category": "VALIDATION_ERROR",
+                    "message": "Property values were not valid"}
+
+    hub, client = Rejecting([FRESH]), Client()
+    out = run(hub, client)
+
+    [added] = out["added"]
+    assert added["profile_created"] and added["task_id"] == 1099
+    assert added["problems"] == [
+        "HubSpot update: VALIDATION_ERROR: Property values were not valid"]
+    text = daf_sync.email_text([out])
+    assert "Needs Carl (1)" in text and "Added to CSuite (1)" not in text
+
+
 def test_a_returning_donor_gets_the_task_only(world):
     hub = Hub([BACK])
     client = Client(existing={"returning.donor@example.invalid": [21999]})
@@ -235,8 +255,6 @@ def test_a_returning_donor_gets_the_task_only(world):
     (lambda: (Hub([sub("m1", "", "Donor", "m@example.invalid")]),
               Client()), "missing_fields"),
     (lambda: (Hub([FRESH], contacts={}), Client()), "no_hubspot_contact"),
-    (lambda: (Hub([FRESH], unreadable={"fresh.donor@example.invalid"}),
-              Client()), "hubspot_unreadable"),
     (lambda: (Hub([FRESH]),
               Client(existing={"fresh.donor@example.invalid": [1, 2]})),
      "multiple_profiles"),
@@ -247,9 +265,6 @@ def test_a_returning_donor_gets_the_task_only(world):
                                      ("70fre", "777")}),
               Client(existing={"fresh.donor@example.invalid": [888]})),
      "conflicting_link"),
-    (lambda: (Hub([FRESH]),
-              Client(unreadable={"fresh.donor@example.invalid"})),
-     "check_failed"),
 ])
 def test_anything_uncertain_is_held_and_nothing_written(world, make, reason):
     hub, client = make()
@@ -264,6 +279,43 @@ def test_anything_uncertain_is_held_and_nothing_written(world, make, reason):
     assert row["endpoint"] == f"submission/held/{reason}"
     assert set(row["meta"]["ids"]) == {"hubspot_form_id",
                                        "hubspot_submission_id"}
+
+
+# --- deferred: about tonight, not the submission (V5.93) -----------------------------
+
+@pytest.mark.parametrize("make,reason", [
+    (lambda: (Hub([FRESH], unreadable={"fresh.donor@example.invalid"}),
+              Client()), "hubspot_unreadable"),
+    (lambda: (Hub([FRESH]),
+              Client(unreadable={"fresh.donor@example.invalid"})),
+     "check_failed"),
+])
+def test_a_bad_night_is_deferred_not_held(world, make, reason):
+    hub, client = make()
+    out = run(hub, client)
+
+    assert client.writes() == [] and hub.patched == []
+    assert out["held"] == []
+    [deferred] = out["deferred"]
+    assert deferred["reason"] == reason and "recorded" not in deferred
+    assert "try again tomorrow night" in deferred["why"]
+    assert world["holds"] == [], "no hold row: tomorrow sees it as new"
+
+
+def test_a_deferred_submission_is_tried_again_the_next_night(world):
+    hub = Hub([FRESH], unreadable={"fresh.donor@example.invalid"})
+    first = run(hub, Client())
+    assert first["deferred"] and world["holds"] == []
+
+    second = run(Hub([FRESH]), Client())
+    assert [e["submission_id"] for e in second["added"]] == \
+        [first["deferred"][0]["submission_id"]]
+
+
+def test_the_deferred_reasons_are_exactly_the_three():
+    assert daf_sync.DEFERRED_REASONS == {"nightly_limit",
+                                         "hubspot_unreadable", "check_failed"}
+    assert daf_sync.DEFERRED_REASONS <= set(daf_sync.HOLD_REASONS)
 
 
 def test_a_csuite_error_while_writing_is_held(world):
@@ -283,7 +335,7 @@ def test_no_contact_is_never_papered_over(world):
 
 # --- the budget ----------------------------------------------------------------------
 
-def test_the_budget_runs_out_and_the_rest_are_held_not_dropped(world):
+def test_the_budget_runs_out_and_the_rest_are_deferred_not_held(world):
     a = sub("aaaa0001", "Ann", "One", "a@example.invalid", AFTER)
     b = sub("bbbb0002", "Ben", "Two", "b@example.invalid", AFTER + 1000)
     hub, client = Hub([b, a]), Client(budget=3)
@@ -291,11 +343,21 @@ def test_the_budget_runs_out_and_the_rest_are_held_not_dropped(world):
 
     assert [e["submission_id"] for e in out["added"]] == ["aaaa0001"], \
         "oldest first"
-    [held] = out["held"]
-    assert held["submission_id"] == "bbbb0002"
-    assert held["reason"] == "nightly_limit"
-    assert "Nightly limit reached" in held["why"]
+    assert out["held"] == []
+    [deferred] = out["deferred"]
+    assert deferred["submission_id"] == "bbbb0002"
+    assert deferred["reason"] == "nightly_limit"
+    assert "Nightly limit reached" in deferred["why"]
     assert client.write_budget.used == 2
+    assert world["holds"] == [], \
+        "a spent budget must never hold a submission for good"
+
+
+def test_the_deferred_one_goes_through_the_next_night(world):
+    b = sub("bbbb0002", "Ben", "Two", "b@example.invalid", AFTER + 1000)
+    run(Hub([b]), Client(budget=1))
+    out = run(Hub([b]), Client(budget=10))
+    assert [e["submission_id"] for e in out["added"]] == ["bbbb0002"]
 
 
 def test_preview_reports_what_the_budget_would_have_allowed(world,
@@ -307,7 +369,8 @@ def test_preview_reports_what_the_budget_would_have_allowed(world,
 
     assert out["budget"] == 3
     assert out["budget_needed"] == 4 and out["budget_allowed"] == 2
-    assert out["held"][0]["reason"] == "nightly_limit"
+    assert out["held"] == []
+    assert out["deferred"][0]["reason"] == "nightly_limit"
 
 
 # --- preview writes nothing at all -------------------------------------------------
@@ -488,6 +551,8 @@ HELD = {"submission_id": "s2", "submitted_at": AFTER, "name": "Ben Two",
                   "(1 added)"),
     ([], [HELD], "New donor inquiries added to CSuite — Thu Oct 22 "
                  "(1 needs Carl)"),
+    ([], [HELD, dict(HELD, submission_id="s3")],
+     "New donor inquiries added to CSuite — Thu Oct 22 (2 need Carl)"),
 ])
 def test_the_subject_drops_a_zero_part(added, held, expected):
     assert daf_sync.subject([section(added, held)], WHEN) == expected
@@ -510,8 +575,6 @@ def test_the_body_is_plain_and_complete():
                  "Fund name: not given · Contribution: not given",
                  "Why: More than one CSuite profile already uses this email "
                  "address", "HubSpot: https://hs/2",
-                 'To handle it in Jidhr chat: "new daf", or "mark inquiry '
-                 'handled daf s2" if it has already been dealt with.',
                  "Jidhr won't try these again by itself.",
                  "Nothing was sent to any donor."):
         assert part in text, part
@@ -719,3 +782,48 @@ def test_a_bad_budget_run_exits_zero(monkeypatch):
 
     assert summaries[0]["status"] == runner.STATUS_COMPLETE
     assert code == jr.EXIT_OK
+
+
+# --- V5.93: the email's deferred part, and no chat commands in the body ---------------
+
+DEFERRED = dict(HELD, submission_id="s4", name="Cy Four", reason="nightly_limit",
+                why=daf_sync.HOLD_REASONS["nightly_limit"])
+
+
+def test_chat_commands_are_only_in_the_footer_for_carl():
+    text = daf_sync.email_text([section([ADDED], [HELD])])
+    body, footer = text.split("— Jidhr")
+    for command in ("new daf", "mark inquiry handled", "Jidhr chat"):
+        assert command not in body, command
+    assert footer.lstrip("\n").startswith("-----\n(for Carl)")
+    assert '"mark inquiry handled daf <id>"' in footer
+    assert "Ben Two: s2" in footer
+
+
+def test_no_footer_when_nothing_is_held():
+    text = daf_sync.email_text([section([ADDED], [])])
+    assert "(for Carl)" not in text and "Jidhr chat" not in text
+
+
+def test_the_deferred_are_listed_and_counted():
+    s = section([], [], deferred=[DEFERRED])
+    text = daf_sync.email_text([s])
+    assert "Deferred to tomorrow night (1)" in text
+    assert "Cy Four" in text
+    assert "Jidhr will try them again tomorrow night by itself." in text
+    assert "(for Carl)" not in text, "nothing for Carl to do about these"
+    assert daf_sync.subject([s], WHEN) == \
+        "New donor inquiries added to CSuite — Thu Oct 22 (1 deferred)"
+
+
+def test_an_all_deferred_night_still_sends_the_email(monkeypatch):
+    sent = []
+    monkeypatch.setattr(Config, "JIDHR_DAF_REPORT_TO", ("r@example.invalid",),
+                        raising=False)
+    import clients.notify as notify
+    monkeypatch.setattr(notify, "send_report",
+                        lambda to, subj, body: sent.append(subj) or
+                        {"sent": list(to), "failed": []})
+    daf_sync.send_email([section([], [], deferred=[DEFERRED])], WHEN)
+    assert sent == ["New donor inquiries added to CSuite — Thu Oct 22 "
+                    "(1 deferred)"]

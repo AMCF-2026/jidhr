@@ -17,7 +17,7 @@ Workflow steps:
 import logging
 from clients.audit import AuditUnavailable, record_write
 from clients.csuite import mark_id, ui_url
-from clients.hubspot import hubspot_writes_allowed
+from clients.hubspot import hubspot_error, hubspot_writes_allowed
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -452,7 +452,7 @@ def _render_submission(parsed: dict, wf_type: str, note: str = None) -> str:
         f"📅 **Submitted:** {format_submitted_at(parsed.get('submitted_at'))}",
         "",
         "---",
-        "**Shall I create the CSuite profile and fund?**",
+        "**Shall I create the CSuite profile and follow-up task?**",
         '• Say *"Yes"* or *"Create it"* to proceed',
         '• Say *"Skip"* to move to the next submission',
         '• Say *"Cancel"* to stop',
@@ -1482,7 +1482,7 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
     # Only proceed on a clear affirmative, matched as whole words.
     if not says_yes(query):
         return (
-            "❓ I need a clear confirmation. Say *\"Yes\"* to create the profile and fund, "
+            "❓ I need a clear confirmation. Say *\"Yes\"* to create the profile and follow-up task, "
             "or *\"Cancel\"* to abort."
         )
 
@@ -1808,7 +1808,10 @@ def run_daf_writes(state: dict, hubspot, csuite,
                 raise _SkipHubSpotUpdate
 
             hs_result = hubspot.update_contact_by_email(data["email"], update_props)
-            if hs_result and "error" not in hs_result:
+            # hubspot_error, not `"error" not in`: a rejected PATCH comes back
+            # as HubSpot's own JSON, which has no "error" key, and was being
+            # reported as "HubSpot contact updated" (V5.93).
+            if hs_result and hubspot_error(hs_result) is None:
                 results["hubspot_updated"] = True
                 state["hubspot_contact_id"] = hs_result.get("id")
                 logger.info("HubSpot contact updated")
@@ -1848,7 +1851,8 @@ def run_daf_writes(state: dict, hubspot, csuite,
                 results["hubspot_refused"] = True
                 logger.info("HubSpot not updated: sandbox run")
             else:
-                error = hs_result.get('error', 'Unknown error') if hs_result else 'No response'
+                error = (hubspot_error(hs_result) or 'Unknown error') \
+                    if hs_result else 'No response'
                 results["errors"].append(f"HubSpot update: {error}")
         except _SkipHubSpotUpdate:
             pass            # already explained in results["errors"]

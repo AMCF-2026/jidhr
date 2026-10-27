@@ -10,7 +10,7 @@ Armed like the chain: nothing happens unless SCHEDULED_SYNC_ENABLED is
 true. Then JIDHR_DAF_MODE decides — preview (default) writes nothing.
 
 One email, to JIDHR_DAF_REPORT_TO, and only when at least one submission
-was added or held. A step that cannot run at all (no JIDHR_DAF_SINCE, a
+was added, held or deferred. A step that cannot run at all (no JIDHR_DAF_SINCE, a
 live run without the DAF switches, an unreadable history) sends an
 [Jidhr ALERT] instead and fails the job; the next night runs again.
 """
@@ -57,10 +57,14 @@ def handle(job) -> dict:
     out["email_failed"] = delivery.get("failed") or []
     out["email_skipped"] = delivery.get("skipped")
     logger.info("nightly DAF step (%s): %d candidate(s), %d added, %d held, "
-                "%d already handled, %d already held", out["mode"],
-                out["candidates"], len(out["added"]), len(out["held"]),
+                "%d deferred, %d already handled, %d already held",
+                out["mode"], out["candidates"], len(out["added"]),
+                len(out["held"]), len(out.get("deferred") or []),
                 out["skipped_handled"], out["skipped_held"])
     # The email carries names; the job row keeps ids and counts only.
-    return {k: v for k, v in out.items() if k not in ("added", "held")} | {
+    return {k: v for k, v in out.items()
+            if k not in ("added", "held", "deferred")} | {
         "added_ids": [e["submission_id"] for e in out["added"]],
-        "held_ids": {e["submission_id"]: e["reason"] for e in out["held"]}}
+        "held_ids": {e["submission_id"]: e["reason"] for e in out["held"]},
+        "deferred_ids": {e["submission_id"]: e["reason"]
+                         for e in out.get("deferred") or []}}
