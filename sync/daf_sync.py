@@ -45,13 +45,18 @@ night tries it again. Recording them is how one bad night — or a budget of
   check_failed            the duplicate check could not be completed
   task_check_failed       CSuite's task list could not be read completely
 
-Open task already there (V5.95)
--------------------------------
+Open task already there (V5.95, aged V5.95.1)
+---------------------------------------------
 A returning donor whose CSuite profile already has an OPEN task gets no
-second one: nothing is proposed or written, and the email shows "existing
-open task N (created ...)" in its own section and its own count. Nothing is
-recorded either, so it is shown again each night until it is handled in
-chat ("mark inquiry handled daf <id>") — an open task is a person's to close.
+second one. sync.open_tasks.judge compares the task's created date with the
+submission date:
+
+  within 30 days  somebody is following it up. Live: recorded as handled
+                  (submission/link/existing_open_task), shown once in its
+                  own section and count, never again. Preview: shown, not
+                  recorded.
+  older           a stale task is not handling: HELD for Carl
+                  (stale_open_task), showing both dates.
 
 No double-creates
 -----------------
@@ -113,6 +118,7 @@ HOLD_REASONS = {
                           "whether this donor already has an open task, so "
                           "nothing was added. Jidhr will try again tomorrow "
                           "night."),
+    "stale_open_task": ("{text}"),
     "nightly_limit": ("Nightly limit reached: tonight's allowance of CSuite "
                       "changes ran out before this one. Jidhr will try "
                       "again tomorrow night."),
@@ -378,13 +384,25 @@ def run(hubspot=None, csuite=None, run_mode=None) -> dict:
                 hold("task_check_failed", contact_id)
                 continue
             if open_tasks:
+                from sync import open_tasks as ot
+
+                task = open_tasks[0]
+                verdict, days = ot.judge(task, data.get("submitted_at"))
+                if verdict == ot.STALE:
+                    hold("stale_open_task", contact_id,
+                         text=ot.outcome_text(verdict, task,
+                                              data.get("submitted_at")))
+                    continue
+                recorded = (ot.record(verdict, form_id, sid,
+                                      existing_profile, task)
+                            if run_mode == MODE_LIVE else False)
                 out["existing_task"].append(dict(
                     _entry(data, contact_id), plan=plan,
-                    existing_profile=existing_profile,
-                    open_task=open_tasks[0]))
-                logger.info("DAF submission %s: profile %s already has open "
-                            "task %s; none proposed", sid, existing_profile,
-                            open_tasks[0]["task_id"])
+                    existing_profile=existing_profile, open_task=task,
+                    recorded=recorded, days=days))
+                logger.info("DAF submission %s: profile %s has open task %s "
+                            "(%s days); none proposed", sid, existing_profile,
+                            task["task_id"], days)
                 continue
 
         needed = WRITES_NEW if plan == "new" else WRITES_RETURNING
@@ -442,9 +460,16 @@ def _classify(out, entry, results, state, hold, contact_id, sid):
     task_id = results.get("task_id")
     if results.get("task_existing") and not task_id:
         # The write-time re-check found an open task the plan did not see.
-        out["existing_task"].append(dict(
-            entry, existing_profile=state.get("profile_id"),
-            open_task=results["task_existing"]))
+        # _create_followup_task already judged and recorded it.
+        found = results["task_existing"]
+        if found.get("verdict") == "stale":
+            out["held"].append(dict(
+                entry, reason="stale_open_task",
+                why=found.get("text") or "", recorded=found.get("recorded")))
+        else:
+            out["existing_task"].append(dict(
+                entry, existing_profile=state.get("profile_id"),
+                open_task=found, recorded=found.get("recorded")))
         return
     if results.get("task_check_failed") and not task_id and \
             not results.get("profile_created"):
@@ -569,7 +594,10 @@ def carl_footer(sections) -> list:
     """The chat commands, for Carl only, after the signature. Staff read
     the body; nothing in it asks them to type anything into Jidhr."""
     held = [e for s in sections for e in s.get("held") or []]
-    open_task = [e for s in sections for e in s.get("existing_task") or []]
+    # Only an open-task row whose "handled" could not be recorded needs Carl:
+    # the rest are recorded and will not come back (V5.95.1).
+    open_task = [e for s in sections for e in s.get("existing_task") or []
+                 if s.get("mode") != MODE_PREVIEW and not e.get("recorded")]
     if not (held or open_task):
         return []
     lines = ["", "-----", "(for Carl)"]
@@ -580,8 +608,9 @@ def carl_footer(sections) -> list:
         lines += [f"  {e.get('name') or '(no name given)'}: {_short_id(e)}"
                   for e in held]
     if open_task:
-        lines.append('Open task already there — these show every night until '
-                     '"mark inquiry handled daf <id>":')
+        lines.append('Open task found but "handled" not recorded — '
+                     '"mark inquiry handled daf <id>" to stop them coming '
+                     'back:')
         lines += [f"  {e.get('name') or '(no name given)'}: {_short_id(e)}"
                   for e in open_task]
     return lines
@@ -654,15 +683,16 @@ def section_text(section) -> list:
         lines.append("Jidhr won't try these again by itself.")
         lines.append("")
     if open_task:
-        from sync.open_tasks import describe
+        from sync.open_tasks import WITHIN, outcome_text
 
         lines.append(f"Already has an open CSuite task ({len(open_task)})")
         for i, e in enumerate(open_task, 1):
             lines += _person_lines(i, e)
-            text = describe(e["open_task"])
-            lines.append(f"   {text[:1].upper()}{text[1:]} on CSuite profile "
-                         f"{e.get('existing_profile')}, so no new task was "
-                         f"{'proposed' if preview else 'added'}.")
+            lines.append(f"   CSuite profile {e.get('existing_profile')}. "
+                         + outcome_text(WITHIN, e["open_task"],
+                                        e.get("submitted_at"),
+                                        recorded=e.get("recorded", True),
+                                        preview=preview))
             lines.append(f"   HubSpot: {e['hubspot_link']}")
         lines.append("")
     if deferred:

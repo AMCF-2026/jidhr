@@ -1308,7 +1308,7 @@ def _create_followup_task(data, state, results, csuite, wf_type, type_label):
     if not results.get("profile_created"):
         # V5.95: an EXISTING profile may already carry someone's open task.
         # A profile made a moment ago cannot, so it is not asked.
-        from sync.open_tasks import describe, open_tasks_on_profile
+        from sync.open_tasks import open_tasks_on_profile
 
         found, problem = open_tasks_on_profile(csuite, profile_id)
         if problem:
@@ -1318,11 +1318,23 @@ def _create_followup_task(data, state, results, csuite, wf_type, type_label):
                 f"{profile_id} ({problem}), so none was created")
             return
         if found:
-            results["task_existing"] = found[0]
-            results["task_skipped"] = (f"{describe(found[0])} on this "
-                                       "profile — no second task created")
-            logger.info("follow-up task NOT created: profile %s already has "
-                        "open task %s", profile_id, found[0]["task_id"])
+            # V5.95.1: within 30 days of the inquiry it is handling, and is
+            # recorded as such; older, it is stale and the submission is
+            # held for Carl. Either way, no second task.
+            from sync import open_tasks as ot
+
+            task = found[0]
+            verdict, days = ot.judge(task, data.get("submitted_at"))
+            recorded = ot.record(verdict, state.get("form_id"),
+                                 data.get("submission_id"), profile_id, task)
+            text = ot.outcome_text(verdict, task, data.get("submitted_at"),
+                                   recorded=recorded)
+            results["task_existing"] = dict(task, verdict=verdict, days=days,
+                                            recorded=recorded, text=text)
+            results["task_skipped"] = text
+            logger.info("follow-up task NOT created: profile %s has open task "
+                        "%s (%s days, %s)", profile_id, task["task_id"], days,
+                        verdict)
             return
 
     name = (data.get("first_name", "") + " " + data.get("last_name", "")).strip()

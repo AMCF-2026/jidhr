@@ -641,21 +641,63 @@ def test_the_old_endowment_assignee_no_longer_makes_a_task(monkeypatch):
     assert "Endowment inquiries are turned off" in reply
 
 
-# --- V5.95: an open task already on the profile -----------------------------
+# --- V5.95/V5.95.1: an open task already on the profile --------------------
+# The submission is 2026-10-01; 30 days before is 2026-09-01.
 
-OPEN = {"task_id": 1099, "o": "profile", "id": 19999,
-        "created_date": "2026-10-23 10:00:00", "complete_date": None}
+def open_task(created):
+    return {"task_id": 1099, "o": "profile", "id": 19999,
+            "created_date": f"{created} 10:00:00", "complete_date": None}
 
 
-def test_a_returning_donor_with_an_open_task_gets_no_second_one(monkeypatch):
+@pytest.fixture
+def recorded(monkeypatch):
+    from clients import audit
+    rows = []
+    monkeypatch.setattr(audit, "record_write",
+                        lambda system, method, endpoint, **k:
+                        rows.append((endpoint, k.get("payload"))) or True)
+    return rows
+
+
+@pytest.mark.parametrize("created", ["2026-09-25", "2026-09-01",
+                                     "2026-10-23"])
+def test_within_30_days_is_recorded_handled_no_task(monkeypatch, recorded,
+                                                    created):
     class Busy(DuplicateCSuite):
-        task_rows = (OPEN,)
+        task_rows = (open_task(created),)
 
     csuite = Busy()
     reply, state = run(monkeypatch, csuite=csuite)
     assert "task" not in csuite.kinds
-    assert ("📝 No task: existing open task 1099 (created Fri Oct 23) on "
-            "this profile — no second task created") in reply
+    assert "recorded as handled, no new task" in reply
+    [(endpoint, payload)] = recorded
+    assert endpoint == "submission/link/existing_open_task"
+    assert payload["linked_task_id"] == 1099
+    assert payload["linked_profile_id"] == 19999
+
+
+def test_older_than_30_days_is_held_for_carl(monkeypatch, recorded):
+    class Stale(DuplicateCSuite):
+        task_rows = (open_task("2026-08-31"),)             # 31 days
+
+    csuite = Stale()
+    reply, state = run(monkeypatch, csuite=csuite)
+    assert "task" not in csuite.kinds
+    assert "created Mon Aug 31, 2026" in reply
+    assert "submitted Thu Oct 1, 2026" in reply and "held for Carl" in reply
+    assert [e for e, _ in recorded] == ["submission/held/stale_open_task"]
+
+
+def test_judge_at_the_line():
+    from sync import open_tasks as ot
+    task = lambda d: {"task_id": 1, "created": d}
+    assert ot.judge(task("2026-09-01"), "2026-10-01") == (ot.WITHIN, 30)
+    assert ot.judge(task("2026-08-31"), "2026-10-01") == (ot.STALE, 31)
+    assert ot.judge(task("2026-09-02"), "2026-10-01") == (ot.WITHIN, 29)
+    assert ot.judge(task("2026-10-05"), "2026-10-01") == (ot.WITHIN, -4)
+    assert ot.judge(task(None), "2026-10-01") == (ot.STALE, None)
+    assert ot.reason(task("2026-09-01")) == \
+        "existing open task 1 (2026-09-01)"
 
 
 def test_an_unreadable_task_list_creates_no_task_and_says_why(monkeypatch):
