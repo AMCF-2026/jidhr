@@ -771,6 +771,7 @@ def test_a_bad_budget_run_exits_zero(monkeypatch):
     monkeypatch.setattr(jr.database, "is_configured", lambda: True)
     monkeypatch.setattr(jr, "ensure_registrations_sync", lambda: "ok")
     monkeypatch.setattr(jr, "ensure_daf_sync", lambda: "ok")
+    monkeypatch.setattr(jr, "ensure_forms_sync", lambda: "ok")
     monkeypatch.setattr(runner.database, "execute_query",
                         lambda *a, **k: [])
     monkeypatch.setattr(runner, "queue_next_occurrence", lambda job: None)
