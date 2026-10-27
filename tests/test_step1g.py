@@ -308,7 +308,11 @@ def test_chat_no_longer_truncates_at_one_hundred_characters():
 
     assert "message[:100]" not in source
     assert "response[:100]" not in source
-    assert 'log_user_action("Chat request", flatten_for_log(message))' in source
+    # V5.93: the request is logged by length only, never its text.
+    assert 'log_user_action("Chat request", flatten_for_log(message))' \
+        not in source
+    assert 'log_user_action("Chat request", f"{len(message)} chars")' \
+        in source
     # V5.93: the reply is logged by length only, never its text.
     assert 'log_user_action("Chat response", flatten_for_log(response))' \
         not in source
@@ -335,3 +339,32 @@ def test_the_request_log_line_carries_the_actor_email(app_module, caplog):
     assert "staff@amuslimcf.org" in message
     assert "Chat request" in message
     assert "balance for Ramadan" in message
+
+
+def test_a_chat_round_trip_logs_lengths_not_text(app_module, caplog,
+                                                 monkeypatch):
+    """V5.93: an EIN typed in, or shown back, never reaches the log."""
+    import logging
+
+    class FakeUser:
+        is_authenticated = True
+        id, email, role, csuite_profile_id = 7, "staff@amuslimcf.org", \
+            "staff", None
+
+    class FakeAssistant:
+        def process_query(self, message, actor, flask_session=None):
+            return "EIN on file: 98-7654321"
+
+    monkeypatch.setattr(app_module, "current_user", FakeUser())
+    monkeypatch.setattr(app_module, "get_assistant",
+                        lambda user_id: FakeAssistant())
+    app_module.app.config["LOGIN_DISABLED"] = True
+    client = app_module.app.test_client()
+    with caplog.at_level(logging.INFO, logger="app"):
+        reply = client.post("/chat", json={"message": "ein 12-3456789"})
+
+    assert reply.get_json() == {"response": "EIN on file: 98-7654321"}
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "12-3456789" not in logged and "98-7654321" not in logged
+    assert "Chat request: 14 chars" in logged
+    assert "Chat response: 23 chars" in logged
