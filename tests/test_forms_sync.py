@@ -50,8 +50,9 @@ def test_owners_are_exactly_the_ones_carl_confirmed():
         "daf": ("munira",), "nonprofit_directory": ("munira",),
         "endowment": ("ola",), "endowment_distribution": ("ola",),
         "ach_request": ("kods",), "investment": ("kods", "nora"),
+        "asset_donation": ("kods",),
     }
-    assert registry.BY_KEY["asset_donation"]["owners"] == ()
+    assert registry.task_assignee(registry.BY_KEY["asset_donation"]) == 1007
 
 
 def test_owner_ids_are_the_ones_production_runs():
@@ -62,8 +63,7 @@ def test_owner_ids_are_the_ones_production_runs():
     assert registry.OWNERS["nora"]["employee_id"] == 1004
 
 
-@pytest.mark.parametrize("key", ["asset_donation", "investment",
-                                 "general_signup"])
+@pytest.mark.parametrize("key", ["investment", "general_signup"])
 def test_no_single_owner_means_no_task(key):
     with pytest.raises(registry.NoOwner):
         registry.task_assignee(registry.BY_KEY[key])
@@ -279,7 +279,7 @@ def test_switches_and_owners_show_for_b_and_d_forms():
     assert ("• Investment Form: on, preview, 2026-11-01 — owner: "
             "Zouita, Kods, Moorefield, Nora") in text
     assert "• AMCF Asset Donation Transfer Form: off, preview, no " \
-           "since-date — owner: no owner" in text
+           "since-date — owner: Zouita, Kods" in text
 
 
 def test_no_recipients_no_email(monkeypatch):

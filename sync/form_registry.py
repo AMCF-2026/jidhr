@@ -25,8 +25,8 @@ Categories
 Owners and recipients are different fields
 ------------------------------------------
 `owners` are the people a form belongs to: the CSuite task assignee and,
-from V5.96, the digest recipients. Confirmed by Carl, 2026-10-27, and the
-ONLY names allowed here (OWNERS). A form with no owner gets no task: a
+from V5.96, the digest recipients. Confirmed by Carl, 2026-10-27 (Asset
+Donation -> Kods the same day), and the ONLY names allowed here (OWNERS). A form with no owner gets no task: a
 create refuses until one is set.
 
 `report_to_env` names the Railway variable holding who gets the nightly
@@ -83,7 +83,7 @@ FORMS = (
     _form("asset_donation", "f45f230b-e7ed-4bdb-90fe-ae00a1af1ec2",
           "AMCF Asset Donation Transfer Form", "D",
           "stock-transfer heads-up; B (note 1071 Stock Contribution) after "
-          "DAF live", owners=(), note_type=1071,
+          "DAF live", owners=("kods",), note_type=1071,
           sensitive={"what_is_your_daf_fund": LAST4,
                      "number_of_shares": OUT,
                      "what_stocksmutual_funds_are_you_donating": OUT,
