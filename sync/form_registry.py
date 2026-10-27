@@ -32,6 +32,10 @@ create refuses until one is set.
 `report_to_env` names the Railway variable holding who gets the nightly
 sync REPORT (e.g. Shazeen for DAF). A recipient, not an owner.
 
+`observe_only` pins a form to counting only, whatever its switches say:
+turning it on or live refuses with an [Jidhr ALERT]. Set on the ACH Request
+Form by Carl, 2026-10-27, until he says otherwise.
+
 `sensitive` lists the fields whose values must never reach a CSuite note,
 task, log line, audit row, preview, email or chat reply. "out" means the
 value is never shown at all; "last4" means at most its last four
@@ -58,12 +62,13 @@ DEFAULT_REPORT_TO_ENV = "JIDHR_FORMS_REPORT_TO"
 
 
 def _form(key, form_id, name, category, why, owners=(), sensitive=None,
-          report_to_env=DEFAULT_REPORT_TO_ENV, handler=None, note_type=None):
+          report_to_env=DEFAULT_REPORT_TO_ENV, handler=None, note_type=None,
+          observe_only=False):
     return {"key": key, "form_id": form_id, "name": name,
             "category": category, "why": why, "owners": tuple(owners),
             "sensitive": dict(sensitive or {}),
             "report_to_env": report_to_env, "handler": handler,
-            "note_type": note_type}
+            "note_type": note_type, "observe_only": observe_only}
 
 
 FORMS = (
@@ -91,8 +96,9 @@ FORMS = (
                      "_if_yes_at_what_amount": OUT}),
     _form("ach_request", "dc28c638-b179-43e7-a291-a4008632e62e",
           "ACH Request Form", "D",
-          "bank details: organisation and date only, values never read",
-          owners=("kods",),
+          "bank details: observe only, by Carl's decision (2026-10-27) — "
+          "counted, never acted on, until Carl says otherwise",
+          owners=("kods",), observe_only=True,
           sensitive={"routing_number": OUT, "account_number": OUT,
                      "confirm_account_number": OUT, "ein": OUT,
                      "bank_name": OUT, "vender_id": LAST4}),
@@ -209,6 +215,10 @@ def switches(form, environ) -> dict:
         except ValueError:
             raise BadSetting(f"{env_name(key, 'SINCE')} is {since_raw!r}, "
                              "which is not a real date.")
+    if form.get("observe_only") and (on_raw == "true" or mode == "live"):
+        raise BadSetting(f"{form['name']} is observe-only until Carl says "
+                         f"otherwise; {env_name(key, 'ON')} and "
+                         f"{env_name(key, 'MODE')} cannot turn it on.")
     return {"on": on_raw == "true", "mode": mode, "since": since}
 
 

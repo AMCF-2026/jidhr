@@ -353,3 +353,24 @@ def test_the_seed_runs_after_daf_and_before_the_mirror():
     assert jr.FORMS_SEED["max_attempts"] == 1
     from jobs import runner
     assert "forms_sync" in runner.HANDLERS
+
+
+# --- ACH stays observe-only (Carl, 2026-10-27) --------------------------------------
+
+def test_only_the_ach_form_is_observe_only():
+    assert [f["key"] for f in registry.FORMS if f["observe_only"]] == \
+        ["ach_request"]
+
+
+@pytest.mark.parametrize("env", [{"JIDHR_FORM_ACH_REQUEST_ON": "true"},
+                                 {"JIDHR_FORM_ACH_REQUEST_MODE": "live"}])
+def test_the_ach_form_cannot_be_switched_on(env):
+    with pytest.raises(forms_sync.BadSetting) as caught:
+        forms_sync.read_switches(env)
+    assert "observe-only" in str(caught.value)
+
+
+def test_the_ach_form_is_still_counted():
+    out = observe(Hub({ACH: [ms(NOW)]}))
+    row = next(f for f in out["forms"] if f["key"] == "ach_request")
+    assert row["last_24h"] == 1
