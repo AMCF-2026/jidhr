@@ -5,6 +5,8 @@
         --assume-eastern --show-payload 1430
     python scripts/event_backfill.py --since 2026-01-01 --include-archived \
         --assume-eastern --apply
+    python scripts/event_backfill.py --since 2026-01-01 --include-archived \
+        --assume-eastern --exclude csuite-1161,csuite-1264
 
 Preview unless --apply. Never updates or adopts an event HubSpot already has.
 See sync/event_backfill.py for the rules.
@@ -26,6 +28,9 @@ def main(argv=None) -> int:
     parser.add_argument("--assume-eastern", action="store_true")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--limit", type=int, default=backfill.DEFAULT_LIMIT)
+    parser.add_argument("--exclude", default="", metavar="csuite-ID,...",
+                        help="event dates to leave out, listed separately "
+                             "in the preview")
     parser.add_argument("--show-payload", metavar="EVENT_DATE_ID",
                         help="print the HubSpot payload for this event "
                              "(the first one if it is not released)")
@@ -34,7 +39,8 @@ def main(argv=None) -> int:
         out = backfill.run(since=args.since,
                            include_archived=args.include_archived,
                            assume_eastern=args.assume_eastern,
-                           apply=args.apply, limit=args.limit)
+                           apply=args.apply, limit=args.limit,
+                           exclude=args.exclude)
     except backfill.Refused as e:
         print(f"Event backfill did not run: {e}", file=sys.stderr)
         return 2

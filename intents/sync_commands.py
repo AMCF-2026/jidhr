@@ -303,8 +303,8 @@ def backfill_options(query_lower: str) -> dict:
     """The chat form of scripts/event_backfill.py's flags.
 
     "backfill events since 2026-01-01 include archived assume eastern apply
-    limit 10". Both flags also accept their --dashed spelling. Without
-    "since <date>" there is no run.
+    limit 10 exclude csuite-1161, csuite-1264". Both flags also accept their
+    --dashed spelling. Without "since <date>" there is no run.
     """
     import re
 
@@ -312,6 +312,8 @@ def backfill_options(query_lower: str) -> dict:
 
     since = re.search(r"\bsince\s+(\d{4}-\d{2}-\d{2})", query_lower)
     limit = re.search(r"\blimit\s+(\d+)", query_lower)
+    exclude = re.search(r"(?:--)?\bexclude\s+((?:csuite-)?\d+"
+                        r"(?:\s*,\s*(?:csuite-)?\d+)*)", query_lower)
     return {
         "since": since.group(1) if since else None,
         "include_archived": bool(re.search(r"include[\s-]+archived",
@@ -320,6 +322,7 @@ def backfill_options(query_lower: str) -> dict:
                                          query_lower)),
         "apply": bool(re.search(r"\bapply\b", query_lower)),
         "limit": int(limit.group(1)) if limit else DEFAULT_LIMIT,
+        "exclude": exclude.group(1) if exclude else "",
     }
 
 

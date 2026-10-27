@@ -185,7 +185,9 @@ def chat():
                 f"{current_user.id} ({current_user.email}): {e}")
             return jsonify({"error": f"Something went wrong processing your request: {e}"}), 500
 
-        log_user_action("Chat response", flatten_for_log(response))
+        # Length only (V5.93). A reply can carry what a form held — an EIN, a
+        # starting goal, a contribution — and this line went to the logs whole.
+        log_user_action("Chat response", f"{len(str(response or ''))} chars")
 
         return jsonify({"response": response})
 

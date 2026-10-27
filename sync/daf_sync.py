@@ -20,21 +20,29 @@ Hold, don't guess
 Any of these HOLDS the submission and writes nothing for it:
 
   missing_fields          no first name, last name or email
-  hubspot_unreadable      HubSpot did not answer the contact lookup
   no_hubspot_contact      no HubSpot contact behind the form submission (an
                           anomaly to report; creating one is never done here)
   multiple_profiles       more than one CSuite profile carries the email
-  check_failed            the duplicate check could not be completed
   stale_link              HubSpot points at a CSuite profile that is gone
   stale_link_other_match  ...and a different profile carries the email
   conflicting_link        HubSpot and CSuite point at different profiles
-  nightly_limit           CSUITE_WRITE_BUDGET would run out
   csuite_error            CSuite refused or did not answer while writing
 
 A hold is a write_audit row (target_system 'jidhr', endpoint
 submission/held/<reason>, ids only). It is never retried automatically: the
 next night skips it, and it stays held until it is handled in chat ("new
 daf", or "mark inquiry handled daf <id>"), which makes it processed.
+
+Defer, don't hold, what tomorrow can fix (V5.93)
+------------------------------------------------
+These say nothing about the submission, only about tonight, so they are
+DEFERRED: nothing is written for it, no hold row is recorded, and the next
+night tries it again. Recording them is how one bad night — or a budget of
+0 — would have held every submission for good.
+
+  nightly_limit           CSUITE_WRITE_BUDGET ran out before this one
+  hubspot_unreadable      HubSpot did not answer the contact lookup
+  check_failed            the duplicate check could not be completed
 
 No double-creates
 -----------------
@@ -74,7 +82,8 @@ WRITES_RETURNING = 1    # task on the existing profile
 HOLD_REASONS = {
     "missing_fields": "The form is missing the donor's {fields}.",
     "hubspot_unreadable": ("HubSpot didn't answer when Jidhr looked this "
-                           "donor up, so nothing was added."),
+                           "donor up, so nothing was added. Jidhr will try "
+                           "again tomorrow night."),
     "no_hubspot_contact": ("There's no HubSpot contact for this email "
                            "address. Every form submission should create "
                            "one, so something went wrong on the HubSpot "
@@ -82,7 +91,8 @@ HOLD_REASONS = {
     "multiple_profiles": ("More than one CSuite profile already uses this "
                           "email address, so Jidhr didn't pick one."),
     "check_failed": ("Jidhr couldn't finish checking CSuite for an existing "
-                     "profile, so nothing was added."),
+                     "profile, so nothing was added. Jidhr will try again "
+                     "tomorrow night."),
     "stale_link": ("HubSpot links this person to a CSuite profile that no "
                    "longer exists."),
     "stale_link_other_match": ("HubSpot links this person to a CSuite "
@@ -91,11 +101,17 @@ HOLD_REASONS = {
     "conflicting_link": ("HubSpot and CSuite point to two different "
                          "profiles for this person."),
     "nightly_limit": ("Nightly limit reached: tonight's allowance of CSuite "
-                      "changes ran out before this one."),
+                      "changes ran out before this one. Jidhr will try "
+                      "again tomorrow night."),
     "csuite_error": ("CSuite returned an error or didn't answer while "
                      "adding this one. Check CSuite before trying again — "
                      "part of it may already be there."),
 }
+
+# Reasons about tonight, not about the submission: deferred to the next
+# night, never recorded as a hold. See "Defer, don't hold" above.
+DEFERRED_REASONS = frozenset({"nightly_limit", "hubspot_unreadable",
+                              "check_failed"})
 
 # DuplicateProfile.kind -> hold reason.
 _DUPLICATE_HOLDS = {
@@ -258,7 +274,7 @@ def run(hubspot=None, csuite=None, run_mode=None) -> dict:
     budget_total = int(getattr(Config, "CSUITE_WRITE_BUDGET", 0) or 0)
     out = {"form": FORM_KEY, "label": row["label"], "mode": run_mode,
            "since": floor.isoformat(), "candidates": 0, "added": [],
-           "held": [], "skipped_handled": 0, "skipped_held": 0,
+           "held": [], "deferred": [], "skipped_handled": 0, "skipped_held": 0,
            "budget": budget_total, "budget_needed": 0,
            "budget_allowed": 0}
 
@@ -303,6 +319,11 @@ def run(hubspot=None, csuite=None, run_mode=None) -> dict:
         def hold(reason, contact_id=None, **details):
             entry = dict(_entry(data, contact_id), reason=reason,
                          why=HOLD_REASONS[reason].format(**details))
+            if reason in DEFERRED_REASONS:
+                # Nothing recorded: tomorrow night sees it as new again.
+                out["deferred"].append(entry)
+                logger.warning("DAF submission %s deferred: %s", sid, reason)
+                return
             if run_mode == MODE_LIVE:
                 entry["recorded"] = _record_hold(form_id, sid, reason)
             out["held"].append(entry)
@@ -428,9 +449,14 @@ def counts(sections) -> tuple:
     return added, needs
 
 
+def deferred_count(sections) -> int:
+    """Submissions put off to the next night (DEFERRED_REASONS)."""
+    return sum(len(s.get("deferred") or []) for s in sections)
+
+
 def subject(sections, when=None) -> str:
     """New donor inquiries added to CSuite — Wed Oct 22 (2 added, 1 needs
-    Carl). A zero part is dropped; a preview says so."""
+    Carl, 1 deferred). A zero part is dropped; a preview says so."""
     from zoneinfo import ZoneInfo
 
     when = when or datetime.now(timezone.utc)
@@ -442,7 +468,10 @@ def subject(sections, when=None) -> str:
     if added:
         parts.append(f"{added} {'would be added' if preview else 'added'}")
     if needs:
-        parts.append(f"{needs} needs Carl")
+        parts.append(f"{needs} {'needs' if needs == 1 else 'need'} Carl")
+    deferred = deferred_count(sections)
+    if deferred:
+        parts.append(f"{deferred} deferred")
     tail = f" ({', '.join(parts)})" if parts else ""
     if preview:
         return f"[Preview] New donor inquiries for CSuite — {day}{tail}"
@@ -467,10 +496,22 @@ def _day(iso) -> str:
     return f"{d:%a %b} {d.day}"
 
 
-def _handle_line(entry) -> str:
-    sid = str(entry.get("submission_id") or "")
-    return (f'   To handle it in Jidhr chat: "new daf", or "mark inquiry '
-            f'handled daf {sid[:8]}" if it has already been dealt with.')
+def _short_id(entry) -> str:
+    return str(entry.get("submission_id") or "")[:8]
+
+
+def carl_footer(sections) -> list:
+    """The chat commands, for Carl only, after the signature. Staff read
+    the body; nothing in it asks them to type anything into Jidhr."""
+    held = [e for s in sections for e in s.get("held") or []]
+    if not held:
+        return []
+    lines = ["", "-----", "(for Carl)",
+             'Held inquiries, in Jidhr chat: "new daf" to add one, or '
+             '"mark inquiry handled daf <id>" if it was dealt with already.']
+    lines += [f"  {e.get('name') or '(no name given)'}: {_short_id(e)}"
+              for e in held]
+    return lines
 
 
 def _person_lines(index, entry) -> list:
@@ -489,7 +530,8 @@ def section_text(section) -> list:
     clean = [e for e in section.get("added") or [] if not e.get("problems")]
     rough = [e for e in section.get("added") or [] if e.get("problems")]
     held = section.get("held") or []
-    if not (clean or rough or held):
+    deferred = section.get("deferred") or []
+    if not (clean or rough or held or deferred):
         return []
     lines = [f"{label} INQUIRIES", ""]
     if clean:
@@ -521,7 +563,6 @@ def section_text(section) -> list:
             lines += _person_lines(i, e)
             lines.append(f"   Why: {e['why']}")
             lines.append(f"   HubSpot: {e['hubspot_link']}")
-            lines.append(_handle_line(e))
         for e in rough:
             i += 1
             lines += _person_lines(i, e)
@@ -531,6 +572,15 @@ def section_text(section) -> list:
             lines.append(f"   HubSpot: {e['hubspot_link']}")
         lines.append("")
         lines.append("Jidhr won't try these again by itself.")
+        lines.append("")
+    if deferred:
+        lines.append(f"Deferred to tomorrow night ({len(deferred)})")
+        for i, e in enumerate(deferred, 1):
+            lines += _person_lines(i, e)
+            lines.append(f"   Why: {e['why']}")
+        lines.append("")
+        lines.append("Nothing was added for these. Jidhr will try them again "
+                     "tomorrow night by itself.")
         lines.append("")
     if preview:
         lines.append(f"Tonight's limit of {section.get('budget')} CSuite "
@@ -551,16 +601,18 @@ def email_text(sections) -> str:
     for section in sections:
         lines += section_text(section)
     lines += ["Nothing was sent to any donor.", "", "— Jidhr"]
+    lines += carl_footer(sections)
     return "\n".join(lines)
 
 
 def send_email(sections, when=None) -> dict:
-    """Send only when at least one submission was added or held."""
+    """Send only when at least one submission was added, held or
+    deferred."""
     from clients.notify import send_report
 
     added, needs = counts(sections)
     recipients = tuple(getattr(Config, "JIDHR_DAF_REPORT_TO", ()) or ())
-    if not (added or needs):
+    if not (added or needs or deferred_count(sections)):
         return {"sent": [], "failed": [], "skipped": "nothing to report"}
     if not recipients:
         logger.warning("DAF email not sent: JIDHR_DAF_REPORT_TO is not set")

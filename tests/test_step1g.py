@@ -309,7 +309,11 @@ def test_chat_no_longer_truncates_at_one_hundred_characters():
     assert "message[:100]" not in source
     assert "response[:100]" not in source
     assert 'log_user_action("Chat request", flatten_for_log(message))' in source
-    assert 'log_user_action("Chat response", flatten_for_log(response))' in source
+    # V5.93: the reply is logged by length only, never its text.
+    assert 'log_user_action("Chat response", flatten_for_log(response))' \
+        not in source
+    assert ('log_user_action("Chat response", '
+            'f"{len(str(response or \'\'))} chars")') in source
 
 
 def test_the_request_log_line_carries_the_actor_email(app_module, caplog):

@@ -45,6 +45,13 @@ is still excluded, even with include_archived, if CSuite ever marks one:
 a cancelled/canceled status field, or "cancel" in the event's name. The
 preview lists those separately.
 
+EXCLUDE (V5.93)
+---------------
+--exclude csuite-1161,csuite-1264 (chat: "exclude csuite-1161, csuite-1264")
+leaves those event dates out whatever the flags say. The preview lists them
+separately, and names any excluded id that is not in the range at all, so a
+typo shows instead of silently excluding nothing.
+
 AFTERWARDS
 ----------
 Each created event gets its event_map row at once, with the mapped content
@@ -107,6 +114,23 @@ def parse_since(text) -> date:
         raise Refused(f"{text!r} is not a date (YYYY-MM-DD).")
 
 
+def parse_exclude(text) -> tuple:
+    """'csuite-1161, 1264' -> ('1161', '1264'). Refuses anything else."""
+    if isinstance(text, (list, tuple, set, frozenset)):
+        text = ",".join(str(t) for t in text)
+    ids = []
+    for part in re.split(r"[\s,]+", str(text or "").strip()):
+        if not part:
+            continue
+        match = re.fullmatch(r"(?:csuite-)?(\d+)", part.lower())
+        if not match:
+            raise Refused(f"{part!r} is not an event id to exclude (use "
+                          "csuite-1161 or 1161).")
+        if match.group(1) not in ids:
+            ids.append(match.group(1))
+    return tuple(ids)
+
+
 def clause_flag(clause: str):
     """The flag that releases one review clause, or None."""
     clause = clause.strip()
@@ -146,14 +170,16 @@ def cancelled_reason(row) -> str | None:
 
 
 def plan(rows, existing_map, index, since, window_start,
-         include_archived=False, assume_eastern=False) -> dict:
+         include_archived=False, assume_eastern=False, exclude=()) -> dict:
     """Every event date in [since, window_start), sorted out. No calls."""
     from sync import event_hubspot as eh
     from sync.event_apply import DEFAULT_ORGANIZER, contacts_only_reason
 
     allowed = {FLAG_ARCHIVED: include_archived, FLAG_EASTERN: assume_eastern}
+    excluded_ids = set(parse_exclude(exclude))
     out = {"release": [], "held": [], "cancelled": [], "in_hubspot": [],
-           "needs_person": [], "skipped": [], "nightly": 0, "out_of_range": 0}
+           "needs_person": [], "skipped": [], "excluded": [],
+           "exclude_not_found": [], "nightly": 0, "out_of_range": 0}
     for row in rows or []:
         day_text = str((row or {}).get("event_date") or "")[:10]
         try:
@@ -170,6 +196,9 @@ def plan(rows, existing_map, index, since, window_start,
         mapped = eh.map_event_date(row, DEFAULT_ORGANIZER)
         entry = {"id": mapped.csuite_eventdate_id, "name": mapped.source_name,
                  "date": day_text, "mapped": mapped}
+        if str(mapped.csuite_eventdate_id) in excluded_ids:
+            out["excluded"].append(dict(entry, why="excluded by --exclude"))
+            continue
         if not mapped.csuite_eventdate_id or not mapped.syncable:
             out["skipped"].append(dict(entry, why=mapped.review_reason
                                        or "not syncable"))
@@ -206,6 +235,9 @@ def plan(rows, existing_map, index, since, window_start,
             continue
         out["release"].append(dict(entry, flags=needed))
     out["release"].sort(key=lambda e: (e["date"], e["id"]))
+    seen = {str(e["id"]) for e in out["excluded"]}
+    out["exclude_not_found"] = [f"csuite-{i}" for i in
+                                parse_exclude(exclude) if i not in seen]
     return out
 
 
@@ -257,7 +289,8 @@ def _absent_in_hubspot(hubspot, external_event_id):
 
 
 def run(since, include_archived=False, assume_eastern=False, apply=False,
-        limit=DEFAULT_LIMIT, hubspot=None, csuite=None, today=None) -> dict:
+        limit=DEFAULT_LIMIT, hubspot=None, csuite=None, today=None,
+        exclude=()) -> dict:
     """Preview, or (apply=True) create. Raises Refused when it cannot run."""
     from clients.csuite import CSuiteClient
     from clients.hubspot import HubSpotClient
@@ -269,6 +302,7 @@ def run(since, include_archived=False, assume_eastern=False, apply=False,
     if limit is None or int(limit) < 0:
         raise Refused("a backfill needs a limit (0 or more).")
     limit = int(limit)
+    exclude = parse_exclude(exclude)          # a typo refuses before any read
     window_start = window_floor(today)
     have_tables = ea.migration_applied()
     if apply and not have_tables:
@@ -280,6 +314,7 @@ def run(since, include_archived=False, assume_eastern=False, apply=False,
            "flags": [FLAG_LABELS[f] for f, on in
                      ((FLAG_ARCHIVED, include_archived),
                       (FLAG_EASTERN, assume_eastern)) if on],
+           "exclude": [f"csuite-{i}" for i in exclude],
            "map_read": have_tables, "error": None, "stopped": None,
            "outcomes": [], "created": 0, "failed": 0, "deferred": 0,
            "skipped_existing": 0, "csuite_calls": 0, "hubspot_calls": 0,
@@ -308,10 +343,11 @@ def run(since, include_archived=False, assume_eastern=False, apply=False,
                           f"({hs_error}). Nothing was planned.")
         result = plan(fetched.rows, ea.load_map() if have_tables else {},
                       index, since, window_start, include_archived,
-                      assume_eastern)
+                      assume_eastern, exclude)
         out.update({k: result[k] for k in (
             "release", "held", "cancelled", "in_hubspot", "needs_person",
-            "skipped", "nightly", "out_of_range")})
+            "skipped", "excluded", "exclude_not_found", "nightly",
+            "out_of_range")})
         if not apply:
             return out
         _apply(out, hubspot, run_id)
@@ -385,7 +421,9 @@ def report(out, show_payload_for=None) -> str:
     lines = [head, "",
              f"CSuite event dates from {out['since']} up to {out['window_start']}"
              f" (the nightly job covers {out['window_start']} onward). "
-             f"Flags: {', '.join(out['flags']) or 'none'}.",
+             f"Flags: {', '.join(out['flags']) or 'none'}."
+             + (f" Excluding: {', '.join(out['exclude'])}."
+                if out.get("exclude") else ""),
              f"Create-only: events already in HubSpot are never touched. "
              f"Limit {out['limit']}."]
     if not out.get("map_read"):
@@ -401,7 +439,8 @@ def report(out, show_payload_for=None) -> str:
         made = f" → HubSpot {e['hubspot_id']}" if e.get("hubspot_id") else ""
         lines.append(f"• {e['date']} — {e['name'] or '(no name)'} "
                      f"(csuite-{e['id']}) — released by {flags}{made}")
-    for title, key in (("Held back", "held"), ("Cancelled — never created",
+    for title, key in (("Excluded — never created", "excluded"),
+                       ("Held back", "held"), ("Cancelled — never created",
                                                 "cancelled"),
                        ("Needs a person", "needs_person"),
                        ("Skipped", "skipped")):
@@ -411,6 +450,9 @@ def report(out, show_payload_for=None) -> str:
             for e in rows:
                 lines.append(f"• {e['date']} — {e['name'] or '(no name)'} "
                              f"(csuite-{e['id']}) — {e['why']}")
+    if out.get("exclude_not_found"):
+        lines += ["", f"⚠️ Asked to exclude, but not in this range: "
+                      f"{', '.join(out['exclude_not_found'])}."]
     existing = out.get("in_hubspot") or []
     lines += ["", f"Already in HubSpot, left untouched: {len(existing)}. "
                   f"In the nightly window (not this backfill's): "

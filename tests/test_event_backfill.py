@@ -346,7 +346,8 @@ def test_the_chat_options():
         "backfill events since 2026-01-01 include archived --assume-eastern "
         "apply limit 5")
     assert opts == {"since": "2026-01-01", "include_archived": True,
-                    "assume_eastern": True, "apply": True, "limit": 5}
+                    "assume_eastern": True, "apply": True, "limit": 5,
+                    "exclude": ""}
     preview = sync_commands.backfill_options(
         "backfill events since 2026-01-01")
     assert preview["apply"] is False and preview["limit"] == 23
@@ -379,3 +380,71 @@ def test_the_preview_names_the_releasing_flag():
             "--include-archived") in text
     assert '"externalEventId": "csuite-1161"' in text
     assert "Add `apply` to create them." in text
+
+
+# --- V5.93: --exclude ----------------------------------------------------------------
+
+def test_an_excluded_event_is_never_released_and_is_listed_separately():
+    out = plan([ARCHIVED, NO_TZ], include_archived=True, assume_eastern=True,
+               exclude="csuite-1161")
+    assert [e["id"] for e in out["release"]] == ["1150"]
+    [excluded] = out["excluded"]
+    assert excluded["id"] == "1161" and out["held"] == []
+    assert out["exclude_not_found"] == []
+
+
+def test_exclude_accepts_both_spellings_and_reports_an_unknown_id():
+    out = plan([ARCHIVED, NO_TZ], include_archived=True,
+               exclude="csuite-1150, 9999")
+    assert [e["id"] for e in out["excluded"]] == ["1150"]
+    assert out["exclude_not_found"] == ["csuite-9999"]
+
+
+@pytest.mark.parametrize("bad", ["csuite-x", "1161;drop", "event-1161"])
+def test_a_malformed_exclude_refuses(bad):
+    with pytest.raises(backfill.Refused):
+        backfill.parse_exclude(bad)
+
+
+def test_a_malformed_exclude_refuses_before_any_read(monkeypatch):
+    monkeypatch.setattr(ea, "migration_applied", lambda: True)
+    with pytest.raises(backfill.Refused):
+        backfill.run(SINCE, exclude="nope", csuite=object(), hubspot=object())
+
+
+def test_the_chat_and_cli_take_exclude(monkeypatch):
+    opts = sync_commands.backfill_options(
+        "backfill events since 2026-01-01 include archived exclude "
+        "csuite-1161, csuite-1264")
+    assert opts["exclude"] == "csuite-1161, csuite-1264"
+    assert backfill.parse_exclude(opts["exclude"]) == ("1161", "1264")
+
+    from scripts import event_backfill as cli
+    seen = {}
+    monkeypatch.setattr(backfill, "run",
+                        lambda **k: seen.update(k) or {"stopped": None})
+    monkeypatch.setattr(backfill, "report", lambda out, **k: "")
+    cli.main(["--since", "2026-01-01", "--exclude", "csuite-1161,csuite-1264"])
+    assert seen["exclude"] == "csuite-1161,csuite-1264"
+
+
+def test_the_preview_lists_excluded_events_on_their_own():
+    out = {"since": "2026-01-01", "window_start": "2026-10-26",
+           "apply": False, "limit": 23, "flags": ["--include-archived"],
+           "exclude": ["csuite-1161", "csuite-9999"],
+           "map_read": True, "created": 0, "csuite_calls": 1,
+           "hubspot_calls": 1, "nightly": 0, "in_hubspot": [],
+           "release": released(ARCHIVED),
+           "excluded": [{"id": "1161", "name": "Luncheon",
+                         "date": "2026-04-11",
+                         "why": "excluded by --exclude"}],
+           "exclude_not_found": ["csuite-9999"],
+           "held": [], "cancelled": [], "needs_person": [], "skipped": []}
+    text = backfill.report(out)
+    assert "Excluding: csuite-1161, csuite-9999." in text
+    assert "**Excluded — never created (1)**" in text
+    assert "• 2026-04-11 — Luncheon (csuite-1161) — excluded by --exclude" \
+        in text
+    assert "not in this range: csuite-9999" in text
+    would = text.split("**Would create")[1].split("**Excluded")[0]
+    assert "csuite-1161" not in would

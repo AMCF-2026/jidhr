@@ -342,13 +342,17 @@ PINNED = {
         "already_in_csuite", "existing_hubspot_link", "_backfill_hubspot_link",
         "_format_confirmation", "_task_lines", "open_inquiry_tickets",
         "task_due_date", "record_unprocessed_submission", "says_yes",
-        "says_no", "_render_submission", "_skipped_note",
+        "says_no", "_skipped_note",
         "_all_processed_message", "_next_unprocessed", "_is_processed",
         "is_newest_first", "format_submitted_at", "submitted_address",
         "_log_skipped_create", "_hubspot_contact_id",
         # _skip_to_next is NOT pinned: it re-reads the list since V5.81
         # (the session is a cookie). Its replies are pinned by the golden
         # returning_donor scenario, which skips once.
+        # _render_submission is NOT pinned since V5.93: its question says
+        # "profile and follow-up task", not "profile and fund" — no fund is
+        # created at inquiry. Its full text is pinned by the golden replay,
+        # whose only diff is that wording.
     ],
     # create_task is NOT pinned since V5.86: its log line records the
     # title's length instead of its text (an endowment title carries the EIN
