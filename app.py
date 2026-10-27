@@ -158,7 +158,9 @@ def chat():
             logger.warning("Empty message received")
             return jsonify({"error": "No message provided"}), 400
 
-        log_user_action("Chat request", flatten_for_log(message))
+        # Length only (V5.93), like the reply: a request can carry an EIN or
+        # an amount pasted from a form.
+        log_user_action("Chat request", f"{len(message)} chars")
 
         # Get per-user assistant (reconstructed if this worker doesn't have it)
         try:
