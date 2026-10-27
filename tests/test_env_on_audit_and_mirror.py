@@ -104,15 +104,72 @@ def test_a_missing_column_is_detected_and_names_the_migration(caplog):
                for r in caplog.records)
 
 
-def test_a_failed_probe_assumes_ABSENT_rather_than_blocking_writes():
-    """reserve_write REFUSES the write when it cannot record a row, so writing
-    a column the table might not have would stop every CSuite and HubSpot
-    write. Fail-closed is right for a missing audit and wrong for a column
-    ordering mistake."""
-    def broken(sql, params=None):
-        raise RuntimeError("information_schema unavailable")
+def test_a_failed_probe_is_a_connection_failure_not_a_missing_column(caplog):
+    """V5.95: a probe that cannot reach the database raises, says so, and
+    names no migration."""
+    import logging
 
-    assert audit._csuite_env_column_exists(query=broken) is False
+    def broken(sql, params=None):
+        raise RuntimeError("could not translate host name")
+
+    with caplog.at_level(logging.WARNING, logger="clients.audit"):
+        with pytest.raises(audit.ColumnCheckFailed) as caught:
+            audit._csuite_env_column_exists(query=broken)
+    assert "did not answer" in str(caught.value)
+    assert audit._HAS_CSUITE_ENV is None, "a failure is never remembered"
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "002_write_audit_csuite_env" not in logged
+
+
+def test_one_failed_check_then_a_successful_one():
+    calls = []
+
+    def flaky(sql, params=None):
+        calls.append(sql)
+        if len(calls) == 1:
+            raise RuntimeError("connection refused")
+        return [{"?column?": 1}]
+
+    with pytest.raises(audit.ColumnCheckFailed):
+        audit._csuite_env_column_exists(query=flaky)
+    assert audit._csuite_env_column_exists(query=flaky) is True
+    assert audit._csuite_env_column_exists(query=flaky) is True
+    assert len(calls) == 2, "asked again after the failure, then remembered"
+
+
+def test_a_confirmed_missing_column_is_remembered():
+    calls = []
+
+    def empty(sql, params=None):
+        calls.append(sql)
+        return []
+
+    assert audit._csuite_env_column_exists(query=empty) is False
+    assert audit._csuite_env_column_exists(query=empty) is False
+    assert len(calls) == 1
+
+
+def test_a_failed_probe_lets_this_write_try_the_base_shape(monkeypatch):
+    """The write path does not raise on the probe; its insert meets the same
+    database and refuses as AuditUnavailable. Nothing is cached."""
+    monkeypatch.setattr(audit, "_csuite_env_column_exists",
+                        lambda: (_ for _ in ()).throw(
+                            audit.ColumnCheckFailed("down")))
+    sql, append_env = audit._insert_sql()
+    assert append_env is False and "csuite_env" not in sql
+
+
+def test_processed_history_names_the_connection_not_the_migration(monkeypatch):
+    monkeypatch.setattr("clients.database.is_configured", lambda: True)
+    monkeypatch.setattr(audit, "_csuite_env_column_exists",
+                        lambda: (_ for _ in ()).throw(
+                            audit.ColumnCheckFailed("the database did not "
+                                                    "answer (OperationalError)")))
+    with pytest.raises(audit.ProcessedHistoryUnavailable) as caught:
+        audit.processed_submissions("form-1")
+    message = str(caught.value)
+    assert "could not be reached" in message and "connection problem" in message
+    assert "002_write_audit_csuite_env" not in message
 
 
 def test_the_column_is_the_last_value_so_the_base_row_is_untouched(monkeypatch):

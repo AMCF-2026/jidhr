@@ -1257,10 +1257,21 @@ def task_assignee_for_form(form_id):
     return getattr(Config, row["assignee_env"], None) or None
 
 
+def title_case_name(name: str) -> str:
+    """'mustafa azhar' -> 'Mustafa Azhar'. Only each word's FIRST letter is
+    raised; the rest stays as typed, so 'McDonald' and 'al-Hassan' survive."""
+    return " ".join(word[:1].upper() + word[1:]
+                    for word in str(name or "").split())
+
+
 def followup_task_title(data: dict, label: str = "DAF") -> str:
     """The follow-up task's title (and description). One place, so the
-    nightly preview (V5.90) reports exactly what the chat would create."""
-    name = (data.get("first_name", "") + " " + data.get("last_name", "")).strip()
+    nightly preview (V5.90) reports exactly what the chat would create.
+
+    The name's words are capitalised here (V5.95) — only in the task. The
+    review and the email keep what the donor typed."""
+    name = title_case_name(
+        (data.get("first_name", "") + " " + data.get("last_name", "")).strip())
     email = (data.get("email") or "").strip()
     return (f"{label} inquiry follow-up: {name or 'unnamed'}"
             + (f" — {email}" if email else ""))
@@ -1293,6 +1304,26 @@ def _create_followup_task(data, state, results, csuite, wf_type, type_label):
         results["task_skipped"] = (
             f"no assignee set for {form_label(form_id)}")
         return
+
+    if not results.get("profile_created"):
+        # V5.95: an EXISTING profile may already carry someone's open task.
+        # A profile made a moment ago cannot, so it is not asked.
+        from sync.open_tasks import describe, open_tasks_on_profile
+
+        found, problem = open_tasks_on_profile(csuite, profile_id)
+        if problem:
+            results["task_check_failed"] = problem
+            results["task_skipped"] = (
+                f"CSuite couldn't be checked for an open task on profile "
+                f"{profile_id} ({problem}), so none was created")
+            return
+        if found:
+            results["task_existing"] = found[0]
+            results["task_skipped"] = (f"{describe(found[0])} on this "
+                                       "profile — no second task created")
+            logger.info("follow-up task NOT created: profile %s already has "
+                        "open task %s", profile_id, found[0]["task_id"])
+            return
 
     name = (data.get("first_name", "") + " " + data.get("last_name", "")).strip()
     email = (data.get("email") or "").strip()
@@ -1573,7 +1604,11 @@ def run_daf_writes(state: dict, hubspot, csuite,
         "replay_recorded": None,
         # The follow-up task. Exactly one of these is set: task_id on success,
         # task_failed when a create was attempted and did not work,
-        # task_skipped when none was attempted and why.
+        # task_skipped when none was attempted and why. task_existing is the
+        # open task that made a second one unnecessary (V5.95);
+        # task_check_failed is why that could not be checked.
+        "task_existing": None,
+        "task_check_failed": None,
         "task_id": None,
         "task_due": None,
         "task_subject": None,

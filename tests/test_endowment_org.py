@@ -91,6 +91,7 @@ class Client(CSuiteClient):
         self.fedids = {str(k): v for k, v in (fedids or {}).items()}
         self.notes = []
         self.note_reply = {"note_id": 303200, "success": 0}
+        self.task_rows = ()
         unreadable = {str(u) for u in unreadable}
 
         class Session:
@@ -128,6 +129,11 @@ class Client(CSuiteClient):
                     payload = {"success": 1, "data": {"profile_id": 40001}}
                 elif endpoint == "task/create":
                     payload = {"success": 1, "data": {"task_id": 2001}}
+                elif endpoint == "task/list":
+                    # V5.95 open-task guard. None open unless a test says so.
+                    rows = [dict(r) for r in outer.task_rows]
+                    payload = {"success": 1, "data": {
+                        "count": len(rows), "results": rows}}
                 elif endpoint == "note/create":
                     # CSuite's real reply for a note it DID create (sandbox,
                     # 2026-10-15): a note_id, and success 0.
@@ -1076,3 +1082,50 @@ def test_angle_brackets_are_removed_from_every_field():
     assert title == ("Endowment inquiry: bPeace/b Academy — EIN 00-1 — "
                      "goal $25,000 script — Dana Director "
                      "(director@example.invalid)")
+
+
+# --- V5.95: an existing organisation that already has an open task -----------
+
+OPEN_TASK = {"task_id": 1067, "o": "profile", "id": 18075,
+             "created_date": "2026-10-15 09:00:00", "complete_date": None}
+
+
+def _existing_org(world):
+    world["mirror"].append({"profile_id": "18075",
+                            "organization": "The Test Peace Academy, Inc.",
+                            "ptype": "org"})
+
+
+def test_an_open_task_on_the_existing_org_means_no_second_task(world):
+    _existing_org(world)
+    client = Client()
+    client.task_rows = (OPEN_TASK,)
+    _review, reply, state, client = offer_and_create(client=client)
+
+    assert "task/create" not in client.endpoints()
+    assert "note/create" in client.endpoints(), "the note still goes on"
+    assert ("No `task/create`: profile 18075 already has an existing open "
+            "task 1067 (created Thu Oct 15). No second task.") in \
+        client.plan_reply
+    assert "existing open task 1067 (created Thu Oct 15) on this profile" \
+        in reply
+
+
+def test_a_new_org_is_never_asked_about_tasks(world):
+    _review, reply, state, client = offer_and_create()
+    assert "task/list" not in client.endpoints()
+    assert "task/create" in client.endpoints()
+
+
+def test_an_open_task_seen_only_at_the_write_still_stops_it(world):
+    _existing_org(world)
+    client = Client()
+    hub = Hub()
+    state = daf_workflow.default_workflow_state()
+    daf_workflow._initiate_workflow("new endowment", state, hub)
+    plan = daf_workflow._handle_active_workflow("yes", state, hub, client)
+    assert "`task/create`" in plan
+    client.task_rows = (OPEN_TASK,)          # someone added one meanwhile
+    reply = daf_workflow._handle_active_workflow("yes", state, hub, client)
+    assert "task/create" not in client.endpoints()
+    assert "existing open task 1067" in reply

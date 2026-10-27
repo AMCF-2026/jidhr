@@ -122,6 +122,10 @@ class RealRequestClient(CSuiteClient):
                     payload = {"success": 1, "data": {"profile_id": 31337}}
                 elif endpoint == "task/create":
                     payload = {"success": 1, "data": {"task_id": 1099}}
+                elif endpoint == "task/list":
+                    # V5.95: the open-task guard's read. No open task.
+                    payload = {"success": 1,
+                               "data": {"count": 0, "results": []}}
                 else:
                     raise AssertionError(f"unexpected CSuite {endpoint}")
 

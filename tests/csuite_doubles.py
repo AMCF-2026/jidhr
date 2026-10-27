@@ -33,15 +33,21 @@ class _ProfileListDouble:
     # Everything is assumed to exist unless a subclass narrows it.
     live_profile_ids = None          # None = "any id exists"
     unreadable_profile_ids = ()
+    # V5.95: task/list, read before a task goes on an EXISTING profile. Rows
+    # shaped like CSuite's; none by default, so no profile has an open task.
+    task_rows = ()
 
     def _request(self, endpoint, data=None):
         data = data or {}
         if endpoint == "profile/display":
             return self._display(data.get("profile_id"))
+        if endpoint == "task/list":
+            rows = [dict(r) for r in self.task_rows]
+            return self._page(len(rows), rows)
         if endpoint != "profile/list":
             raise AssertionError(
-                f"this double only answers profile/list and profile/display, "
-                f"not {endpoint!r}")
+                f"this double only answers profile/list, profile/display "
+                f"and task/list, not {endpoint!r}")
 
         if "primary_email" not in data:
             return self._page(self.unfiltered_total, [])

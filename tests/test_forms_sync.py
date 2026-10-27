@@ -395,3 +395,30 @@ def test_the_report_says_why_ach_is_missing():
     assert "ACH Request Form" not in [f["name"] for f in
                                       forms_sync.quiet(out)]
     assert "ACH Request Form (last:" not in text
+
+
+# --- V5.95 wording ----------------------------------------------------------------------
+
+def test_the_report_says_which_form_was_not_read():
+    text = forms_sync.email_text(observe(Hub()))
+    assert ("Jidhr read every website form in HubSpot overnight except the "
+            "ACH Request Form. This is OBSERVE mode") in text
+
+
+def test_the_ach_switch_reads_locked():
+    out = observe(Hub(), {"JIDHR_FORM_ACH_REQUEST_SINCE": "2026-11-01"})
+    text = forms_sync.email_text(out)
+    assert "• ACH Request Form: locked (observe-only) — owner: Zouita, Kods" \
+        in text
+
+
+def test_new_in_the_subject_leaves_out_ignored_forms():
+    BLANK = registry.BY_KEY["blank_form"]["form_id"]
+    COMMENTS = registry.BY_KEY["commentform"]["form_id"]
+    out = observe(Hub({GENERAL: [ms(NOW)], BLANK: [ms(NOW)],
+                       COMMENTS: [ms(NOW), ms(NOW)]}))
+    assert forms_sync.new_today(out) == 1
+    assert forms_sync.subject(out) == \
+        "[Observe] Website forms — Wed Oct 28 (1 new)"
+    assert "• #commentform .comment-form (collected): 2 · 2 · 2" in \
+        forms_sync.email_text(out), "still counted in its own line"

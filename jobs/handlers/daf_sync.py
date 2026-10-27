@@ -63,7 +63,9 @@ def handle(job) -> dict:
                 out["skipped_handled"], out["skipped_held"])
     # The email carries names; the job row keeps ids and counts only.
     return {k: v for k, v in out.items()
-            if k not in ("added", "held", "deferred")} | {
+            if k not in ("added", "held", "deferred", "existing_task")} | {
+        "existing_task_ids": {e["submission_id"]: e["open_task"]["task_id"]
+                              for e in out.get("existing_task") or []},
         "added_ids": [e["submission_id"] for e in out["added"]],
         "held_ids": {e["submission_id"]: e["reason"] for e in out["held"]},
         "deferred_ids": {e["submission_id"]: e["reason"]

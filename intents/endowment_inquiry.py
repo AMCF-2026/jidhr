@@ -608,6 +608,14 @@ def step_create(state: dict, hubspot, csuite) -> str:
         state["step"] = "done"
         return format_confirmation(data, state, results)
 
+    if duplicate["outcome"] == EXISTING:
+        # V5.95: shown now so the plan is honest; checked again at the write.
+        from sync.open_tasks import open_tasks_on_profile
+
+        found, problem = open_tasks_on_profile(csuite, _existing_id(duplicate))
+        results["open_task"] = found[0] if found else None
+        results["open_task_problem"] = problem
+
     # Ids and the outcome only: this lives in the session cookie.
     state[PLAN_KEY] = {"submission_id": data.get("submission_id"),
                        "outcome": duplicate["outcome"],
@@ -629,8 +637,11 @@ def render_plan(data: dict, results: dict, duplicate: dict) -> str:
     title = task_title(data)
     ein_action = (results.get("ein") or {}).get("action")
     sets_ein = existing and ein_action == EIN_SET
-    # The profile step (create, or an EIN edit), the note, the task.
-    writes = (2 + (1 if sets_ein else 0)) if existing else 3
+    open_task = results.get("open_task") if existing else None
+    # The profile step (create, or an EIN edit), the note, the task — no task
+    # when the existing profile already has an open one (V5.95).
+    writes = ((2 + (1 if sets_ein else 0)) if existing else 3) - \
+        (1 if open_task else 0)
     note = note_text(data)
 
     lines = ["🔎 **Duplicate check done — nothing has been written yet.**",
@@ -674,13 +685,26 @@ def render_plan(data: dict, results: dict, duplicate: dict) -> str:
               "   Sent once, never retried. Notes cannot be read back through "
               "the API, so CSuite's copy will not be checked."]
     step += 1
-    lines += [f"{step}. `task/create` — {target}:",
-              f"   *{title}*",
-              f"   ({len(title)} of {TASK_TITLE_MAX} characters — a CSuite "
-              f"task holds this one line and nothing else.) Assigned to "
-              f"employee {assignee()}, task type {form_task_type(_row())}, "
-              f"due {task_due_date(data.get('submitted_at'))}.",
-              "",
+    if open_task:
+        from sync.open_tasks import describe
+
+        lines += [f"No `task/create`: profile {mark_id(profile_id)} already "
+                  f"has an {describe(open_task)}. No second task.", ""]
+    else:
+        lines += [f"{step}. `task/create` — {target}:",
+                  f"   *{title}*",
+                  f"   ({len(title)} of {TASK_TITLE_MAX} characters — a "
+                  f"CSuite task holds this one line and nothing else.) "
+                  f"Assigned to employee {assignee()}, task type "
+                  f"{form_task_type(_row())}, due "
+                  f"{task_due_date(data.get('submitted_at'))}."]
+        if existing and results.get("open_task_problem"):
+            lines.append(f"   ⚠️ CSuite couldn't be checked for an open task "
+                         f"on this profile ({results['open_task_problem']}). "
+                         "It is checked again before writing; if it still "
+                         "can't be, no task is created.")
+        lines.append("")
+    lines += [
               "The submission itself stays in HubSpot: "
               f"{submission_link(data.get('submission_id'))}",
               "",
@@ -890,6 +914,25 @@ def _create_task(data, state, results, csuite, employee, meta):
     # is present (sandbox, 2026-10-15).
     title = task_title(data)
     due = task_due_date(data.get("submitted_at"))
+    if not results.get("profile_created"):
+        # V5.95: an existing organisation may already have an open task.
+        from sync.open_tasks import describe, open_tasks_on_profile
+
+        found, problem = open_tasks_on_profile(csuite, state["profile_id"])
+        if problem:
+            results["task_check_failed"] = problem
+            results["task_skipped"] = (
+                f"CSuite couldn't be checked for an open task on profile "
+                f"{state['profile_id']} ({problem}), so none was created")
+            return
+        if found:
+            results["task_existing"] = found[0]
+            results["task_skipped"] = (f"{describe(found[0])} on this "
+                                       "profile — no second task created")
+            logger.info("endowment task NOT created: profile %s already has "
+                        "open task %s", state["profile_id"],
+                        found[0]["task_id"])
+            return
     try:
         response = csuite.create_task(
             name=title, employee_id=employee, due_date=due,
