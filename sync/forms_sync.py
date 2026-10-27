@@ -64,6 +64,10 @@ def read_switches(environ=None) -> dict:
             found[form["key"]] = registry.switches(form, environ)
         except registry.BadSetting as bad:
             problems.append(str(bad))
+    if not problems:
+        from sync.form_digests import check_live_owners
+
+        problems += check_live_owners(found, environ)     # V5.96
     if problems:
         raise BadSetting(" ".join(problems))
     return found
@@ -125,7 +129,10 @@ def run(hubspot=None, now=None, environ=None) -> dict:
                               for fid, name in listed.items()
                               if fid not in registry.BY_ID),
                              key=lambda f: f["name"].lower()),
-           "not_listed": [], "read_errors": []}
+           "not_listed": [], "read_errors": [],
+           # Raw submissions for the digests (V5.96). Kept in memory only:
+           # the job handler pops it before anything is stored or logged.
+           "_raw": {}}
     for form in registry.FORMS:
         row = {"key": form["key"], "name": form["name"],
                "category": form["category"], "why": form["why"],
@@ -147,6 +154,7 @@ def run(hubspot=None, now=None, environ=None) -> dict:
         else:
             row.update(_stats(raw, now))
             row["complete"] = complete
+            out["_raw"][form["key"]] = raw
         out["forms"].append(row)
     return out
 

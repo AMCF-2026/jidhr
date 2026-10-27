@@ -2,7 +2,8 @@
 Job: forms_sync (V5.94)
 =======================
 The nightly forms report (sync/forms_sync.py), OBSERVE mode: reads, counts,
-writes nothing. Priority 46, right after daf_sync (45), before the mirror
+writes nothing. Then (V5.96) one digest per switched-on D form
+(sync/form_digests.py), from the submissions already read. Priority 46, right after daf_sync (45), before the mirror
 (50).
 
 Armed by two words: SCHEDULED_SYNC_ENABLED=true and
@@ -45,7 +46,22 @@ def handle(job) -> dict:
         raise JobFailed(f"forms_sync refused: {refused}",
                         result={"enabled": True, "refused": str(refused)})
 
+    raw = out.pop("_raw", {})
     delivery = forms_sync.send_email(out)
+
+    # V5.96: the D-form digests, from the submissions already read.
+    import os
+    from datetime import datetime, timezone
+
+    from sync import form_digests
+
+    now = datetime.now(timezone.utc)
+    switches = {f["key"]: f["switches"] for f in out["forms"]}
+    start = form_digests.window_start(
+        now, form_digests.last_success((job or {}).get("id")))
+    digests = form_digests.build_all(raw, switches, now, start)
+    sent = form_digests.send(digests, switches, os.environ)
+    del raw
     logger.info("nightly forms report: %d form(s), %d new in 24h, %d "
                 "unknown, %d unreadable", len(out["forms"]),
                 forms_sync.new_today(out), len(out["unknown"]),
@@ -56,6 +72,8 @@ def handle(job) -> dict:
             "unknown": [f["form_id"] for f in out["unknown"]],
             "not_listed": out["not_listed"],
             "read_errors": out["read_errors"],
+            "digests": {key: {"sent": len(ok), "failed": len(bad)}
+                        for key, ok, bad in sent},
             "emailed": delivery.get("sent") or [],
             "email_failed": delivery.get("failed") or [],
             "email_skipped": delivery.get("skipped")}
