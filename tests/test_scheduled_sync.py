@@ -547,7 +547,7 @@ def test_contacts_only_events_are_named_in_the_summary(monkeypatch, chain,
 def test_the_handler_is_registered_in_the_existing_runner():
     """No new mechanism, no new service."""
     assert HANDLERS.get("registrations_sync") is handler.handle
-    assert sorted(HANDLERS) == ["daf_sync", "mirror_refresh",
+    assert sorted(HANDLERS) == ["daf_sync", "forms_sync", "mirror_refresh",
                                 "registrations_sync"]
 
 

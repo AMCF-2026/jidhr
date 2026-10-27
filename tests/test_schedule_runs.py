@@ -168,11 +168,12 @@ def test_seed_also_ensures_the_registrations_job(monkeypatch, capsys):
     monkeypatch.setattr(jr, "ensure_registrations_sync",
                         lambda now=None: "registrations ok")
     monkeypatch.setattr(jr, "ensure_daf_sync", lambda now=None: "daf ok")
+    monkeypatch.setattr(jr, "ensure_forms_sync", lambda now=None: "forms ok")
 
     assert jr.main(["--seed"]) == jr.EXIT_OK
     out = capsys.readouterr().out
     assert "mirror ok" in out and "registrations ok" in out
-    assert "daf ok" in out
+    assert "daf ok" in out and "forms ok" in out
 
 
 # ---------------------------------------------------------------------------

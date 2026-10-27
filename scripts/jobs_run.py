@@ -76,6 +76,16 @@ DAF_SEED = {
     "max_attempts": 1,
 }
 
+# The nightly forms report (jobs/handlers/forms_sync.py), V5.94, observe
+# mode. Priority 46: right after daf_sync (45), before the mirror (50).
+FORMS_JOB_TYPE = "forms_sync"
+FORMS_SEED = {
+    "job_type": FORMS_JOB_TYPE,
+    "payload": {"recurring": "daily", "at": "06:00"},
+    "priority": 46,
+    "max_attempts": 1,
+}
+
 _INSERT_SQL = """
     INSERT INTO jobs (job_type, payload, status, priority, run_after)
     VALUES (%s, %s::jsonb, 'queued', %s, %s)
@@ -167,6 +177,12 @@ def ensure_daf_sync(now=None) -> str:
     return _ensure_recurring(DAF_JOB_TYPE, DAF_SEED, now)
 
 
+def ensure_forms_sync(now=None) -> str:
+    """Keep exactly one live recurring forms_sync row. Same rules as
+    ensure_daf_sync."""
+    return _ensure_recurring(FORMS_JOB_TYPE, FORMS_SEED, now)
+
+
 def ensure_registrations_sync(now=None) -> str:
     """Keep exactly one live recurring registrations_sync row.
 
@@ -248,7 +264,8 @@ def run_once() -> int:
     # held hostage to a seed that could not write.
     for ensure, job_type in ((ensure_registrations_sync,
                               REGISTRATIONS_JOB_TYPE),
-                             (ensure_daf_sync, DAF_JOB_TYPE)):
+                             (ensure_daf_sync, DAF_JOB_TYPE),
+                             (ensure_forms_sync, FORMS_JOB_TYPE)):
         try:
             logger.info(ensure())
         except Exception as exc:
@@ -317,6 +334,7 @@ def main(argv=None) -> int:
         print(seed())
         print(ensure_registrations_sync())
         print(ensure_daf_sync())
+        print(ensure_forms_sync())
         return EXIT_OK
     if args.now:
         try:

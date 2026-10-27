@@ -292,6 +292,17 @@ class Config:
         a.strip() for a in os.environ.get('JIDHR_DAF_REPORT_TO', '').split(',')
         if a.strip())
 
+    # Nightly forms report (V5.94), OBSERVE mode: reads every registered form
+    # (sync/form_registry.py) and writes nothing. Only the exact word "true"
+    # turns it on; it also needs SCHEDULED_SYNC_ENABLED like the rest.
+    JIDHR_FORMS_SYNC_ENABLED = (
+        os.environ.get('JIDHR_FORMS_SYNC_ENABLED', '').strip() == 'true')
+    # Who gets the forms report, comma-separated. Unset = no email. A
+    # RECIPIENT list, kept apart from each form's owners in the registry.
+    JIDHR_FORMS_REPORT_TO = tuple(
+        a.strip() for a in os.environ.get('JIDHR_FORMS_REPORT_TO', '').split(',')
+        if a.strip())
+
     # How far back the window reaches, in days before today. 1 means "today
     # and anything later, plus yesterday" — the slack covers an event whose
     # date has just passed in a timezone the sync does not model.
