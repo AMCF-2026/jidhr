@@ -226,8 +226,9 @@ def test_a_form_hubspot_no_longer_lists_is_named():
 
 
 def test_one_unreadable_form_does_not_stop_the_rest():
-    out = observe(Hub({GENERAL: [ms(NOW)]}, broken={ACH}))
-    assert out["read_errors"] == ["ach_request"]
+    INVESTMENT = registry.BY_KEY["investment"]["form_id"]
+    out = observe(Hub({GENERAL: [ms(NOW)]}, broken={INVESTMENT}))
+    assert out["read_errors"] == ["investment"]
     assert forms_sync.new_today(out) == 1
     assert "1 unreadable" in forms_sync.subject(out)
 
@@ -267,7 +268,8 @@ def test_the_report_groups_by_category_and_says_observe():
 def test_quiet_c_and_d_forms_are_listed_but_e_forms_are_not():
     out = observe(Hub())
     quiet = {f["key"] for f in forms_sync.quiet(out)}
-    assert "ach_request" in quiet and "general_signup" in quiet
+    assert "investment" in quiet and "general_signup" in quiet
+    assert "ach_request" not in quiet, "not counted, so never 'quiet'"
     assert not quiet & {f["key"] for f in registry.FORMS
                         if f["category"] in ("A", "E")}
 
@@ -370,7 +372,26 @@ def test_the_ach_form_cannot_be_switched_on(env):
     assert "observe-only" in str(caught.value)
 
 
-def test_the_ach_form_is_still_counted():
-    out = observe(Hub({ACH: [ms(NOW)]}))
+def test_the_ach_form_is_never_downloaded():
+    hub = Hub({ACH: [ms(NOW)]})
+    out = observe(hub)
+    assert not [c for c in hub.calls if c[1] == "submissions"
+                and c[2] == ACH], "no request to ACH's submissions endpoint"
+    assert len([c for c in hub.calls if c[1] == "submissions"]) == 27
     row = next(f for f in out["forms"] if f["key"] == "ach_request")
-    assert row["last_24h"] == 1
+    assert row["not_counted"] is True and "last_24h" not in row
+    assert forms_sync.new_today(out) == 0
+
+
+def test_only_the_ach_form_is_not_counted():
+    assert [f["key"] for f in registry.FORMS if not f["counted"]] == \
+        ["ach_request"]
+
+
+def test_the_report_says_why_ach_is_missing():
+    out = observe(Hub())
+    text = forms_sync.email_text(out)
+    assert "• ACH Request Form: not counted (by policy)" in text
+    assert "ACH Request Form" not in [f["name"] for f in
+                                      forms_sync.quiet(out)]
+    assert "ACH Request Form (last:" not in text

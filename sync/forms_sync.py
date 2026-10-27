@@ -13,6 +13,9 @@ JIDHR_FORMS_REPORT_TO one plain report:
   * registry forms HubSpot no longer lists (archived, or deleted);
   * each form's Railway switches, as read.
 
+A form marked counted=False in the registry (the ACH Request Form) is never
+downloaded at all and shows as "not counted (by policy)".
+
 OBSERVE MEANS READ-ONLY
 -----------------------
 No CSuite client is ever made, nothing is written anywhere — not even an
@@ -131,6 +134,11 @@ def run(hubspot=None, now=None, environ=None) -> dict:
                "listed": form["form_id"] in listed}
         if not row["listed"]:
             out["not_listed"].append(form["key"])
+        if not form.get("counted", True):
+            # Never downloaded: a submission arrives with every field value.
+            row["not_counted"] = True
+            out["forms"].append(row)
+            continue
         raw, problem, complete = fetch_all_submissions(hubspot,
                                                        form["form_id"])
         if problem:
@@ -160,7 +168,8 @@ def new_today(out) -> int:
 def quiet(out) -> list:
     """C and D forms with nothing in QUIET_DAYS days."""
     return [f for f in out["forms"] if f["category"] in ("C", "D")
-            and "error" not in f and not f.get("last_30d")]
+            and "error" not in f and not f.get("not_counted")
+            and not f.get("last_30d")]
 
 
 def subject(out, now=None) -> str:
@@ -198,6 +207,9 @@ def email_text(out) -> str:
             "B": "CSuite note", "C": "HubSpot only",
             "D": "a person acts", "E": "ignored"}[category]]
         for f in rows:
+            if f.get("not_counted"):
+                lines.append(f"• {f['name']}: not counted (by policy)")
+                continue
             if "error" in f:
                 lines.append(f"• {f['name']}: could not be read "
                              f"({f['error']})")

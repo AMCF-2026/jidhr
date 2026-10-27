@@ -36,6 +36,11 @@ sync REPORT (e.g. Shazeen for DAF). A recipient, not an owner.
 turning it on or live refuses with an [Jidhr ALERT]. Set on the ACH Request
 Form by Carl, 2026-10-27, until he says otherwise.
 
+`counted=False` keeps a form's submissions from being downloaded at all —
+HubSpot sends every field value with a submission, so counting means
+receiving them. The report lists it as "not counted (by policy)". Also the
+ACH Request Form, same decision.
+
 `sensitive` lists the fields whose values must never reach a CSuite note,
 task, log line, audit row, preview, email or chat reply. "out" means the
 value is never shown at all; "last4" means at most its last four
@@ -63,12 +68,13 @@ DEFAULT_REPORT_TO_ENV = "JIDHR_FORMS_REPORT_TO"
 
 def _form(key, form_id, name, category, why, owners=(), sensitive=None,
           report_to_env=DEFAULT_REPORT_TO_ENV, handler=None, note_type=None,
-          observe_only=False):
+          observe_only=False, counted=True):
     return {"key": key, "form_id": form_id, "name": name,
             "category": category, "why": why, "owners": tuple(owners),
             "sensitive": dict(sensitive or {}),
             "report_to_env": report_to_env, "handler": handler,
-            "note_type": note_type, "observe_only": observe_only}
+            "note_type": note_type, "observe_only": observe_only,
+            "counted": counted}
 
 
 FORMS = (
@@ -96,9 +102,10 @@ FORMS = (
                      "_if_yes_at_what_amount": OUT}),
     _form("ach_request", "dc28c638-b179-43e7-a291-a4008632e62e",
           "ACH Request Form", "D",
-          "bank details: observe only, by Carl's decision (2026-10-27) — "
-          "counted, never acted on, until Carl says otherwise",
-          owners=("kods",), observe_only=True,
+          "bank details: by Carl's decision (2026-10-27) never acted on "
+          "and not even downloaded to be counted, until Carl says "
+          "otherwise",
+          owners=("kods",), observe_only=True, counted=False,
           sensitive={"routing_number": OUT, "account_number": OUT,
                      "confirm_account_number": OUT, "ein": OUT,
                      "bank_name": OUT, "vender_id": LAST4}),
