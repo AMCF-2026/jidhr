@@ -140,6 +140,10 @@ def test_the_daf_workflow_passes_the_submission_to_the_task(monkeypatch):
     seen = {}
 
     class Recorder:
+        def _request(self, endpoint, data=None):
+            assert endpoint == "task/list"      # V5.95 open-task guard
+            return {"success": True, "data": {"count": 0, "results": []}}
+
         def create_task(self, **kwargs):
             seen.update(kwargs)
             return {"success": True, "data": {"task_id": 1039}}

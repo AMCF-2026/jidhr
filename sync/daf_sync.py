@@ -43,6 +43,15 @@ night tries it again. Recording them is how one bad night — or a budget of
   nightly_limit           CSUITE_WRITE_BUDGET ran out before this one
   hubspot_unreadable      HubSpot did not answer the contact lookup
   check_failed            the duplicate check could not be completed
+  task_check_failed       CSuite's task list could not be read completely
+
+Open task already there (V5.95)
+-------------------------------
+A returning donor whose CSuite profile already has an OPEN task gets no
+second one: nothing is proposed or written, and the email shows "existing
+open task N (created ...)" in its own section and its own count. Nothing is
+recorded either, so it is shown again each night until it is handled in
+chat ("mark inquiry handled daf <id>") — an open task is a person's to close.
 
 No double-creates
 -----------------
@@ -100,6 +109,10 @@ HOLD_REASONS = {
                                "different profile has their email address."),
     "conflicting_link": ("HubSpot and CSuite point to two different "
                          "profiles for this person."),
+    "task_check_failed": ("Jidhr couldn't read CSuite's task list to see "
+                          "whether this donor already has an open task, so "
+                          "nothing was added. Jidhr will try again tomorrow "
+                          "night."),
     "nightly_limit": ("Nightly limit reached: tonight's allowance of CSuite "
                       "changes ran out before this one. Jidhr will try "
                       "again tomorrow night."),
@@ -111,7 +124,7 @@ HOLD_REASONS = {
 # Reasons about tonight, not about the submission: deferred to the next
 # night, never recorded as a hold. See "Defer, don't hold" above.
 DEFERRED_REASONS = frozenset({"nightly_limit", "hubspot_unreadable",
-                              "check_failed"})
+                              "check_failed", "task_check_failed"})
 
 # DuplicateProfile.kind -> hold reason.
 _DUPLICATE_HOLDS = {
@@ -274,7 +287,8 @@ def run(hubspot=None, csuite=None, run_mode=None) -> dict:
     budget_total = int(getattr(Config, "CSUITE_WRITE_BUDGET", 0) or 0)
     out = {"form": FORM_KEY, "label": row["label"], "mode": run_mode,
            "since": floor.isoformat(), "candidates": 0, "added": [],
-           "held": [], "deferred": [], "skipped_handled": 0, "skipped_held": 0,
+           "held": [], "deferred": [], "existing_task": [],
+           "skipped_handled": 0, "skipped_held": 0,
            "budget": budget_total, "budget_needed": 0,
            "budget_allowed": 0}
 
@@ -307,6 +321,7 @@ def run(hubspot=None, csuite=None, run_mode=None) -> dict:
     else:
         remaining = budget_total
 
+    task_cache = {}                 # one task/list read for the whole run
     for _moment_, data in subs:
         sid = data.get("submission_id")
         if sid in processed:
@@ -352,6 +367,24 @@ def run(hubspot=None, csuite=None, run_mode=None) -> dict:
             else:
                 hold(_DUPLICATE_HOLDS.get(duplicate.kind, "check_failed"),
                      contact_id)
+                continue
+
+        if plan == "returning":
+            from sync.open_tasks import open_tasks_on_profile
+
+            open_tasks, problem = open_tasks_on_profile(
+                csuite, existing_profile, task_cache)
+            if problem:
+                hold("task_check_failed", contact_id)
+                continue
+            if open_tasks:
+                out["existing_task"].append(dict(
+                    _entry(data, contact_id), plan=plan,
+                    existing_profile=existing_profile,
+                    open_task=open_tasks[0]))
+                logger.info("DAF submission %s: profile %s already has open "
+                            "task %s; none proposed", sid, existing_profile,
+                            open_tasks[0]["task_id"])
                 continue
 
         needed = WRITES_NEW if plan == "new" else WRITES_RETURNING
@@ -407,6 +440,16 @@ def run(hubspot=None, csuite=None, run_mode=None) -> dict:
 def _classify(out, entry, results, state, hold, contact_id, sid):
     """Turn run_daf_writes' results into added / needs-a-person."""
     task_id = results.get("task_id")
+    if results.get("task_existing") and not task_id:
+        # The write-time re-check found an open task the plan did not see.
+        out["existing_task"].append(dict(
+            entry, existing_profile=state.get("profile_id"),
+            open_task=results["task_existing"]))
+        return
+    if results.get("task_check_failed") and not task_id and \
+            not results.get("profile_created"):
+        hold("task_check_failed", contact_id)
+        return
     problems = list(results.get("errors") or [])
     if results.get("task_failed"):
         problems.append(f"the follow-up task wasn't created "
@@ -449,26 +492,48 @@ def counts(sections) -> tuple:
     return added, needs
 
 
+def _clean(sections, returning):
+    return [e for s in sections for e in s.get("added") or []
+            if not e.get("problems")
+            and (e.get("plan") == "returning") is returning]
+
+
+def existing_task_count(sections) -> int:
+    """Returning donors whose profile already has an open task (V5.95)."""
+    return sum(len(s.get("existing_task") or []) for s in sections)
+
+
 def deferred_count(sections) -> int:
     """Submissions put off to the next night (DEFERRED_REASONS)."""
     return sum(len(s.get("deferred") or []) for s in sections)
 
 
 def subject(sections, when=None) -> str:
-    """New donor inquiries added to CSuite — Wed Oct 22 (2 added, 1 needs
-    Carl, 1 deferred). A zero part is dropped; a preview says so."""
+    """New donor inquiries added to CSuite — Wed Oct 22 (2 added, 1 follow-up
+    task, 1 needs Carl, 1 has an open task, 1 deferred). A zero part is
+    dropped; a preview says so. A returning donor gets a follow-up task, not
+    "added" (V5.95)."""
     from zoneinfo import ZoneInfo
 
     when = when or datetime.now(timezone.utc)
     local = when.astimezone(ZoneInfo("America/New_York"))
     day = f"{local:%a %b} {local.day}"
     preview = any(s.get("mode") == MODE_PREVIEW for s in sections)
-    added, needs = counts(sections)
+    _added, needs = counts(sections)
+    new = len(_clean(sections, returning=False))
+    followups = len(_clean(sections, returning=True))
     parts = []
-    if added:
-        parts.append(f"{added} {'would be added' if preview else 'added'}")
+    if new:
+        parts.append(f"{new} {'would be added' if preview else 'added'}")
+    if followups:
+        parts.append(f"{followups} follow-up task"
+                     f"{'' if followups == 1 else 's'}")
     if needs:
         parts.append(f"{needs} {'needs' if needs == 1 else 'need'} Carl")
+    open_tasks = existing_task_count(sections)
+    if open_tasks:
+        parts.append(f"{open_tasks} {'has' if open_tasks == 1 else 'have'} "
+                     "an open task")
     deferred = deferred_count(sections)
     if deferred:
         parts.append(f"{deferred} deferred")
@@ -504,13 +569,21 @@ def carl_footer(sections) -> list:
     """The chat commands, for Carl only, after the signature. Staff read
     the body; nothing in it asks them to type anything into Jidhr."""
     held = [e for s in sections for e in s.get("held") or []]
-    if not held:
+    open_task = [e for s in sections for e in s.get("existing_task") or []]
+    if not (held or open_task):
         return []
-    lines = ["", "-----", "(for Carl)",
-             'Held inquiries, in Jidhr chat: "new daf" to add one, or '
-             '"mark inquiry handled daf <id>" if it was dealt with already.']
-    lines += [f"  {e.get('name') or '(no name given)'}: {_short_id(e)}"
-              for e in held]
+    lines = ["", "-----", "(for Carl)"]
+    if held:
+        lines.append('Held inquiries, in Jidhr chat: "new daf" to add one, or '
+                     '"mark inquiry handled daf <id>" if it was dealt with '
+                     'already.')
+        lines += [f"  {e.get('name') or '(no name given)'}: {_short_id(e)}"
+                  for e in held]
+    if open_task:
+        lines.append('Open task already there — these show every night until '
+                     '"mark inquiry handled daf <id>":')
+        lines += [f"  {e.get('name') or '(no name given)'}: {_short_id(e)}"
+                  for e in open_task]
     return lines
 
 
@@ -531,13 +604,20 @@ def section_text(section) -> list:
     rough = [e for e in section.get("added") or [] if e.get("problems")]
     held = section.get("held") or []
     deferred = section.get("deferred") or []
-    if not (clean or rough or held or deferred):
+    open_task = section.get("existing_task") or []
+    if not (clean or rough or held or deferred or open_task):
         return []
     lines = [f"{label} INQUIRIES", ""]
-    if clean:
-        lines.append(f"{'Would be added' if preview else 'Added to CSuite'} "
-                     f"({len(clean)})")
-        for i, e in enumerate(clean, 1):
+    new = [e for e in clean if e.get("plan") != "returning"]
+    returning = [e for e in clean if e.get("plan") == "returning"]
+    groups = [(new, "Would be added" if preview else "Added to CSuite"),
+              (returning, "Would get a follow-up task" if preview
+               else "Follow-up task added")]
+    for group, heading in groups:
+        if not group:
+            continue
+        lines.append(f"{heading} ({len(group)})")
+        for i, e in enumerate(group, 1):
             lines += _person_lines(i, e)
             if preview:
                 what = ("a new CSuite profile and a follow-up task"
@@ -573,6 +653,18 @@ def section_text(section) -> list:
         lines.append("")
         lines.append("Jidhr won't try these again by itself.")
         lines.append("")
+    if open_task:
+        from sync.open_tasks import describe
+
+        lines.append(f"Already has an open CSuite task ({len(open_task)})")
+        for i, e in enumerate(open_task, 1):
+            lines += _person_lines(i, e)
+            text = describe(e["open_task"])
+            lines.append(f"   {text[:1].upper()}{text[1:]} on CSuite profile "
+                         f"{e.get('existing_profile')}, so no new task was "
+                         f"{'proposed' if preview else 'added'}.")
+            lines.append(f"   HubSpot: {e['hubspot_link']}")
+        lines.append("")
     if deferred:
         lines.append(f"Deferred to tomorrow night ({len(deferred)})")
         for i, e in enumerate(deferred, 1):
@@ -606,13 +698,14 @@ def email_text(sections) -> str:
 
 
 def send_email(sections, when=None) -> dict:
-    """Send only when at least one submission was added, held or
-    deferred."""
+    """Send only when at least one submission was added, held, deferred or
+    found with an open task."""
     from clients.notify import send_report
 
     added, needs = counts(sections)
     recipients = tuple(getattr(Config, "JIDHR_DAF_REPORT_TO", ()) or ())
-    if not (added or needs or deferred_count(sections)):
+    if not (added or needs or deferred_count(sections)
+            or existing_task_count(sections)):
         return {"sent": [], "failed": [], "skipped": "nothing to report"}
     if not recipients:
         logger.warning("DAF email not sent: JIDHR_DAF_REPORT_TO is not set")

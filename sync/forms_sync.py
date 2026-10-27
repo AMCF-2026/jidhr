@@ -162,7 +162,9 @@ def _day(now) -> str:
 
 
 def new_today(out) -> int:
-    return sum(f.get("last_24h") or 0 for f in out["forms"])
+    """New in the last 24 hours, NOT counting ignored (E) forms (V5.95)."""
+    return sum(f.get("last_24h") or 0 for f in out["forms"]
+               if f["category"] != "E")
 
 
 def quiet(out) -> list:
@@ -184,15 +186,21 @@ def subject(out, now=None) -> str:
     return f"[Observe] Website forms — {_day(now)} ({', '.join(parts)})"
 
 
-def _switch_text(s) -> str:
+def _switch_text(s, form=None) -> str:
+    if (form or {}).get("observe_only"):
+        return "locked (observe-only)"
     since = s["since"].isoformat() if s["since"] else "no since-date"
     return f"{'on' if s['on'] else 'off'}, {s['mode']}, {since}"
 
 
 def email_text(out) -> str:
+    skipped = [registry.BY_KEY[f["key"]]["name"] for f in out["forms"]
+               if f.get("not_counted")]
+    read = ("Jidhr read every website form in HubSpot overnight"
+            + (f" except the {', '.join(skipped)}" if skipped else "") + ".")
     lines = ["Good morning,", "",
-             "Jidhr read every website form in HubSpot overnight. This is "
-             "OBSERVE mode: it counts and writes nothing, anywhere.", ""]
+             f"{read} This is OBSERVE mode: it counts and writes nothing, "
+             "anywhere.", ""]
     if out["unknown"]:
         lines += [f"NEW FORMS NOBODY HAS DECIDED ON ({len(out['unknown'])})"]
         lines += [f"• {f['name']} ({f['form_id']})" for f in out["unknown"]]
@@ -231,7 +239,8 @@ def email_text(out) -> str:
     for f in out["forms"]:
         if f["category"] in ("B", "D") or f["switches"]["on"]:
             owners = ", ".join(f["owners"]) or "no owner"
-            lines.append(f"• {f['name']}: {_switch_text(f['switches'])} "
+            lines.append(f"• {f['name']}: "
+                         f"{_switch_text(f['switches'], registry.BY_KEY[f['key']])} "
                          f"— owner: {owners}")
     lines += ["", "Nothing was written to CSuite or HubSpot.", "", "— Jidhr"]
     return "\n".join(lines)

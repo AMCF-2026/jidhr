@@ -362,8 +362,11 @@ PINNED = {
     # byte by the golden replay.
     "clients/csuite.py": [
                           "build_address", "check_input_fields"],
-    "clients/audit.py": ["processed_submissions", "payload_meta",
-                         "record_write"],
+    # processed_submissions is NOT pinned since V5.95: a database that
+    # cannot be reached is now reported as that, not as a missing csuite_env
+    # column. Its query and parameters are unchanged and pinned by
+    # test_processed_submissions.py.
+    "clients/audit.py": ["payload_meta", "record_write"],
     "sync/daf_reconcile.py": ["task_profile", "profiles_for"],
 }
 

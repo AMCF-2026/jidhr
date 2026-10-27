@@ -73,7 +73,8 @@ _INSERT_SQL_ENV = f"""
     VALUES ({_BASE_PLACEHOLDERS}, %s)
 """
 
-# Resolved once per process, then cached. None means "not looked yet".
+# A CONFIRMED answer is cached for the process; a failed probe never is
+# (V5.95). None means "not known yet".
 #
 # Checked rather than assumed because reserve_write REFUSES the write when it
 # cannot record a row: if the code wrote a column the table did not have, every
@@ -83,11 +84,44 @@ _INSERT_SQL_ENV = f"""
 _HAS_CSUITE_ENV = None
 
 
+class ColumnCheckFailed(RuntimeError):
+    """The database did not answer, so whether write_audit has csuite_env is
+    UNKNOWN. Not the same as "the column is missing" (V5.95)."""
+
+
 def _csuite_env_column_exists(query=None) -> bool:
-    """Does write_audit have csuite_env? Asked once, then remembered."""
+    """Does write_audit have csuite_env? A confirmed answer is remembered.
+
+    A probe that FAILS raises ColumnCheckFailed and is NOT remembered: a
+    connection failure says nothing about the table, and until V5.95 one
+    blip at the first check was cached as "column missing" for the life of
+    the process — processed tracking off until a restart, with a message
+    blaming a migration that had been run.
+    """
     global _HAS_CSUITE_ENV
     if _HAS_CSUITE_ENV is not None:
         return _HAS_CSUITE_ENV
+    if query is None:
+        from clients.database import execute_query as query
+    try:
+        rows = query(
+            """
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'write_audit' AND column_name = 'csuite_env'
+            """) or []
+    except Exception as e:
+        logger.warning("could not check for write_audit.csuite_env — the "
+                       "database did not answer (%s); not remembered, it "
+                       "will be asked again", type(e).__name__)
+        raise ColumnCheckFailed(
+            f"the database did not answer ({type(e).__name__}: "
+            f"{str(e)[:160]})") from e
+    _HAS_CSUITE_ENV = bool(rows)
+    if not _HAS_CSUITE_ENV:
+        logger.warning("write_audit has no csuite_env column; audit rows will "
+                       "not record the environment. Run "
+                       "migrations/002_write_audit_csuite_env.sql.")
+    return _HAS_CSUITE_ENV
     if query is None:
         from clients.database import execute_query as query
     try:
@@ -139,8 +173,18 @@ _RESERVE_SQL_ENV = _INSERT_SQL_ENV + " RETURNING id"
 
 
 def _insert_sql(reserve: bool = False):
-    """(sql, append_env) for whichever shape the table currently has."""
-    if _csuite_env_column_exists():
+    """(sql, append_env) for whichever shape the table currently has.
+
+    If the database cannot even be asked, the base shape is used for THIS
+    write only (nothing is remembered): the insert then meets the same
+    unreachable database and fails as AuditUnavailable, which refuses the
+    write — the right direction, without blaming the table.
+    """
+    try:
+        has_env = _csuite_env_column_exists()
+    except ColumnCheckFailed:
+        has_env = False
+    if has_env:
         return (_RESERVE_SQL_ENV if reserve else _INSERT_SQL_ENV), True
     return (_RESERVE_SQL if reserve else _INSERT_SQL), False
 
@@ -628,7 +672,14 @@ def processed_submissions(form_id,
         raise ProcessedHistoryUnavailable(
             "DATABASE_URL is not set, so no processing history can be read.")
 
-    if not _csuite_env_column_exists():
+    try:
+        has_env = _csuite_env_column_exists()
+    except ColumnCheckFailed as e:
+        raise ProcessedHistoryUnavailable(
+            f"the database could not be reached to read the processing "
+            f"history ({e}). Nothing is known to be wrong with write_audit; "
+            f"this is a connection problem.") from e
+    if not has_env:
         raise ProcessedHistoryUnavailable(
             "write_audit has no csuite_env column, so a production create "
             "cannot be told from a sandbox one. Run "

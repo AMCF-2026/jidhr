@@ -68,13 +68,15 @@ class Client(CSuiteClient):
     """The real _request. existing: email -> [profile ids]."""
 
     def __init__(self, existing=None, missing=(), unreadable=(), budget=10,
-                 fail_profile=False):
+                 fail_profile=False, task_rows=(), tasks_unreadable=False):
         self.api_key, self.api_secret = "k", "s"
         self.base_url = "https://amuslimcf.fcsuite.com/api/v2"
         self.env = "live"
         self.verify_writes = False
         self.write_budget = WriteBudget(budget)
         self.sent = []
+        self.task_rows = tuple(task_rows)
+        self.tasks_unreadable = tasks_unreadable
         outer, existing = self, existing or {}
         missing = {str(m) for m in missing}
         unreadable = set(unreadable)
@@ -111,6 +113,13 @@ class Client(CSuiteClient):
                                {"success": 1, "data": {"profile_id": 31337}})
                 elif endpoint == "task/create":
                     payload = {"success": 1, "data": {"task_id": 1099}}
+                elif endpoint == "task/list":
+                    if outer.tasks_unreadable:
+                        payload = {"success": 0, "errors": ["boom"]}
+                    else:
+                        rows = [dict(r) for r in outer.task_rows]
+                        payload = {"success": 1, "data": {
+                            "count": len(rows), "results": rows}}
                 else:
                     raise AssertionError(f"unexpected CSuite {endpoint}")
 
@@ -312,9 +321,10 @@ def test_a_deferred_submission_is_tried_again_the_next_night(world):
         [first["deferred"][0]["submission_id"]]
 
 
-def test_the_deferred_reasons_are_exactly_the_three():
+def test_the_deferred_reasons_are_exactly_these():
     assert daf_sync.DEFERRED_REASONS == {"nightly_limit",
-                                         "hubspot_unreadable", "check_failed"}
+                                         "hubspot_unreadable", "check_failed",
+                                         "task_check_failed"}
     assert daf_sync.DEFERRED_REASONS <= set(daf_sync.HOLD_REASONS)
 
 
@@ -828,3 +838,139 @@ def test_an_all_deferred_night_still_sends_the_email(monkeypatch):
     daf_sync.send_email([section([], [], deferred=[DEFERRED])], WHEN)
     assert sent == ["New donor inquiries added to CSuite — Thu Oct 22 "
                     "(1 deferred)"]
+
+
+# --- V5.95: an open task already there --------------------------------------------------
+
+OPEN_1099 = {"task_id": 1099, "o": "profile", "id": 21999,
+             "created_date": "2026-10-23 10:00:00", "complete_date": None}
+BACK_EMAIL = "returning.donor@example.invalid"
+
+
+@pytest.mark.parametrize("mode", ["preview", "live"])
+def test_an_open_task_on_the_profile_means_no_second_one(world, mode):
+    client = Client(existing={BACK_EMAIL: [21999]}, task_rows=[OPEN_1099])
+    out = run(Hub([BACK]), client, mode=mode)
+
+    assert client.writes() == [] and out["added"] == []
+    assert out["held"] == [] and out["deferred"] == []
+    [found] = out["existing_task"]
+    assert found["open_task"] == {"task_id": 1099, "created": "2026-10-23"}
+    assert found["existing_profile"] == 21999
+    assert out["budget_needed"] == 0, "no write proposed, no budget spent"
+    assert world["holds"] == [], "nothing recorded: shown again tomorrow"
+
+
+def test_a_completed_or_unlinked_task_does_not_count(world):
+    done = dict(OPEN_1099, complete_date="2026-10-24 09:00:00")
+    other = dict(OPEN_1099, task_id=1100, id=55555)
+    unlinked = dict(OPEN_1099, task_id=1101, o=None)
+    client = Client(existing={BACK_EMAIL: [21999]},
+                    task_rows=[done, other, unlinked])
+    out = run(Hub([BACK]), client)
+    assert out["existing_task"] == []
+    assert client.writes() == ["task/create"]
+
+
+def test_an_unreadable_task_list_defers(world):
+    client = Client(existing={BACK_EMAIL: [21999]}, tasks_unreadable=True)
+    out = run(Hub([BACK]), client)
+    assert client.writes() == []
+    assert [e["reason"] for e in out["deferred"]] == ["task_check_failed"]
+    assert world["holds"] == []
+
+
+def test_a_short_task_list_is_not_trusted():
+    from sync import open_tasks
+
+    class Short:
+        def _request(self, endpoint, data=None):
+            return {"success": 1, "data": {"count": 1500, "results": []}}
+
+    found, problem = open_tasks.open_tasks_on_profile(Short(), 21999)
+    assert found == [] and "0 of 1500" in problem
+
+
+def test_one_task_list_read_serves_the_whole_night(world):
+    b2 = sub("back0002-dddd", "Second", "Return", "second@example.invalid",
+             AFTER + 1000)
+    client = Client(existing={BACK_EMAIL: [21999],
+                              "second@example.invalid": [22000]})
+    run(Hub([BACK, b2]), client, mode="preview")
+    assert [s["endpoint"] for s in client.sent].count("task/list") == 1
+
+
+def test_a_new_donor_is_never_asked_about_tasks(world):
+    client = Client()
+    run(Hub([FRESH]), client)
+    assert "task/list" not in [s["endpoint"] for s in client.sent]
+
+
+def test_the_email_shows_the_open_task_and_counts_it():
+    entry = dict(ADDED, submission_id="s5", name="Dee Five", plan="returning",
+                 existing_profile=21999,
+                 open_task={"task_id": 1099, "created": "2026-10-23"})
+    s = section([], [], mode="preview", existing_task=[entry])
+    text = daf_sync.email_text([s])
+    assert "Already has an open CSuite task (1)" in text
+    assert ("Existing open task 1099 (created Fri Oct 23) on CSuite profile "
+            "21999, so no new task was proposed.") in text
+    body = text.split("— Jidhr")[0]
+    assert "mark inquiry" not in body
+    assert "Dee Five: s5" in text.split("(for Carl)")[1]
+    assert daf_sync.subject([s], WHEN) == \
+        "[Preview] New donor inquiries for CSuite — Thu Oct 22 " \
+        "(1 has an open task)"
+
+
+def test_a_returning_donor_is_a_follow_up_task_not_added():
+    back = dict(ADDED, submission_id="s6", plan="returning",
+                existing_profile=21999)
+    s = section([ADDED, back, dict(back, submission_id="s7")], [],
+                mode="preview")
+    assert daf_sync.subject([s], WHEN) == \
+        "[Preview] New donor inquiries for CSuite — Thu Oct 22 " \
+        "(1 would be added, 2 follow-up tasks)"
+    text = daf_sync.email_text([s])
+    assert "Would be added (1)" in text
+    assert "Would get a follow-up task (2)" in text
+
+
+def test_the_subject_counts_every_part():
+    back = dict(ADDED, submission_id="s6", plan="returning")
+    opened = dict(back, submission_id="s8",
+                  open_task={"task_id": 1, "created": None})
+    s = section([ADDED, back], [HELD, dict(HELD, submission_id="s9")],
+                existing_task=[opened, dict(opened, submission_id="s10")],
+                deferred=[DEFERRED])
+    assert daf_sync.subject([s], WHEN) == (
+        "New donor inquiries added to CSuite — Thu Oct 22 (1 added, 1 "
+        "follow-up task, 2 need Carl, 2 have an open task, 1 deferred)")
+
+
+def test_the_task_title_capitalises_the_name_but_the_body_keeps_it(world):
+    lower = sub("lower001-eeee", "mustafa", "al-hassan van dyke",
+                "lower@example.invalid", AFTER)
+    out = run(Hub([lower]), Client(), mode="preview")
+    [entry] = out["added"]
+    assert entry["task_title"] == ("DAF inquiry follow-up: Mustafa Al-hassan "
+                                   "Van Dyke — lower@example.invalid")
+    assert entry["name"] == "mustafa al-hassan van dyke"
+    assert "1. mustafa al-hassan van dyke —" in daf_sync.email_text([out])
+
+
+def test_an_open_task_seen_only_at_the_write_still_stops_it(world):
+    class Racing(Client):
+        """No open task at the plan; one at the write-time re-check."""
+        def _request(self, endpoint, data=None, **kwargs):
+            if endpoint == "task/list":
+                self.task_rows = () if not getattr(self, "_seen", 0) \
+                    else (OPEN_1099,)
+                self._seen = getattr(self, "_seen", 0) + 1
+            return super()._request(endpoint, data, **kwargs)
+
+    client = Racing(existing={BACK_EMAIL: [21999]})
+    out = run(Hub([BACK]), client)
+    assert client.writes() == []
+    assert [e["open_task"]["task_id"] for e in out["existing_task"]] == [1099]
+    assert out["held"] == []

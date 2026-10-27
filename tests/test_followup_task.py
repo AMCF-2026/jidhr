@@ -639,3 +639,56 @@ def test_the_old_endowment_assignee_no_longer_makes_a_task(monkeypatch):
     assert csuite.kinds == []
     assert "📝 Follow-up task" not in reply
     assert "Endowment inquiries are turned off" in reply
+
+
+# --- V5.95: an open task already on the profile -----------------------------
+
+OPEN = {"task_id": 1099, "o": "profile", "id": 19999,
+        "created_date": "2026-10-23 10:00:00", "complete_date": None}
+
+
+def test_a_returning_donor_with_an_open_task_gets_no_second_one(monkeypatch):
+    class Busy(DuplicateCSuite):
+        task_rows = (OPEN,)
+
+    csuite = Busy()
+    reply, state = run(monkeypatch, csuite=csuite)
+    assert "task" not in csuite.kinds
+    assert ("📝 No task: existing open task 1099 (created Fri Oct 23) on "
+            "this profile — no second task created") in reply
+
+
+def test_an_unreadable_task_list_creates_no_task_and_says_why(monkeypatch):
+    class Unreadable(DuplicateCSuite):
+        def _request(self, endpoint, data=None):
+            if endpoint == "task/list":
+                return {"success": False, "error": "HTTP 503"}
+            return super()._request(endpoint, data)
+
+    csuite = Unreadable()
+    reply, state = run(monkeypatch, csuite=csuite)
+    assert "task" not in csuite.kinds
+    assert "couldn't be checked for an open task on profile 19999" in reply
+
+
+def test_a_brand_new_profile_is_not_asked_about_tasks(monkeypatch):
+    asked = []
+
+    class Fresh(CSuite):
+        def _request(self, endpoint, data=None):
+            asked.append(endpoint)
+            return super()._request(endpoint, data)
+
+    csuite = Fresh()
+    run(monkeypatch, csuite=csuite)
+    assert "task/list" not in asked
+    assert "task" in csuite.kinds
+
+
+def test_the_task_title_capitalises_each_name_word():
+    from intents.daf_workflow import followup_task_title, title_case_name
+    assert title_case_name("mustafa azhar") == "Mustafa Azhar"
+    assert title_case_name("sara McDonald") == "Sara McDonald"
+    assert followup_task_title({"first_name": "aisha", "last_name": "khan",
+                                "email": "a@example.invalid"}) == \
+        "DAF inquiry follow-up: Aisha Khan — a@example.invalid"
