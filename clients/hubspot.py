@@ -272,7 +272,7 @@ class HubSpotClient:
         return result
 
     def _send_with_status(self, method: str, endpoint: str,
-                          data: dict = None) -> tuple:
+                          data: dict = None, audit_meta: dict = None) -> tuple:
         """As _send, but also returns the HTTP status code.
 
         Needed because a 4xx with a JSON body parses into an ordinary-looking
@@ -299,6 +299,14 @@ class HubSpotClient:
         # and it is checked here rather than at a call site because every write
         # funnels through this method. A refusal at one call site is a refusal
         # one caller honours.
+        # audit_meta goes on the AUDIT ROW only (V5.92, e.g. tagging a
+        # backfill); `data` is what HubSpot receives, unchanged. Only key
+        # names and id-shaped values survive into payload_meta.
+        audit_payload = data
+        if audit_meta:
+            audit_payload = dict(data or {})
+            audit_payload.update({k: v for k, v in audit_meta.items()
+                                  if v not in (None, "")})
         if is_hubspot_write(method, endpoint) and not hubspot_writes_allowed():
             refusal = (f"HubSpot writes are refused while CSUITE_ENV is "
                        f"{csuite_env()!r}: one HubSpot portal, two CSuite "
@@ -308,7 +316,7 @@ class HubSpotClient:
                            method, endpoint, refusal)
             try:
                 record_write(
-                    "hubspot", method, endpoint, payload=data,
+                    "hubspot", method, endpoint, payload=audit_payload,
                     status="skipped", error=refusal, duration_ms=0)
             except AuditUnavailable as e:
                 logger.warning("refused write not audited: %s", e)
@@ -323,7 +331,7 @@ class HubSpotClient:
                 # nothing and must not become a second error.
                 try:
                     record_write(
-                        "hubspot", method, endpoint, payload=data,
+                        "hubspot", method, endpoint, payload=audit_payload,
                         status="skipped", error=result["error"],
                         duration_ms=0)
                 except AuditUnavailable as e:
@@ -339,7 +347,7 @@ class HubSpotClient:
             # request does not go out — see clients/audit.reserve_write.
             try:
                 reservation = reserve_write(
-                    "hubspot", method, endpoint, payload=data)
+                    "hubspot", method, endpoint, payload=audit_payload)
             except AuditUnavailable as e:
                 # Raised, not returned. A refusal that comes back as an
                 # ordinary error dict is indistinguishable from HubSpot

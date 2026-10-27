@@ -70,6 +70,9 @@ DAF_RECONCILE_PHRASES = ['reconcile daf tasks', 'reconcile daf task']
 # The same reconcile for any Config.INQUIRY_FORMS row: "reconcile inquiries
 # <key> [dry run]". "reconcile daf tasks" is an exact alias for the daf row.
 INQUIRY_RECONCILE_PHRASES = ['reconcile inquiries', 'reconcile inquiry']
+# The one-off past-event backfill (V5.92). Its own verb: it is not a sync,
+# and nothing that means "sync everything" may reach it.
+EVENT_BACKFILL_PHRASES = ['backfill events', 'backfill event']
 ALL_SYNC_PHRASES = ['sync all', 'sync everything', 'run all syncs']
 
 
@@ -97,6 +100,7 @@ def can_handle(query: str, **kwargs) -> bool:
         anchors.anchored(q, SCHEDULED_RUN_PHRASES) or
         anchors.anchored(q, DAF_RECONCILE_PHRASES) or
         anchors.anchored(q, INQUIRY_RECONCILE_PHRASES) or
+        anchors.anchored(q, EVENT_BACKFILL_PHRASES) or
         q in ALL_SYNC_PHRASES
     )
 
@@ -120,6 +124,9 @@ def handle(query: str, ctx) -> str:
 
     if any(p in q for p in INQUIRY_RECONCILE_PHRASES):
         return _reconcile_inquiries(q)
+
+    if any(p in q for p in EVENT_BACKFILL_PHRASES):
+        return _backfill_events(q)
 
     if any(p in q for p in SCHEDULED_RUN_PHRASES):
         return _run_scheduled_now()
@@ -290,6 +297,50 @@ def _non_marketing_shown() -> int:
 def _new_contact_marketing_note() -> str:
     from sync.contact_create import NEW_CONTACT_MARKETING_NOTE
     return NEW_CONTACT_MARKETING_NOTE
+
+
+def backfill_options(query_lower: str) -> dict:
+    """The chat form of scripts/event_backfill.py's flags.
+
+    "backfill events since 2026-01-01 include archived assume eastern apply
+    limit 10". Both flags also accept their --dashed spelling. Without
+    "since <date>" there is no run.
+    """
+    import re
+
+    from sync.event_backfill import DEFAULT_LIMIT
+
+    since = re.search(r"\bsince\s+(\d{4}-\d{2}-\d{2})", query_lower)
+    limit = re.search(r"\blimit\s+(\d+)", query_lower)
+    return {
+        "since": since.group(1) if since else None,
+        "include_archived": bool(re.search(r"include[\s-]+archived",
+                                           query_lower)),
+        "assume_eastern": bool(re.search(r"assume[\s-]+eastern",
+                                         query_lower)),
+        "apply": bool(re.search(r"\bapply\b", query_lower)),
+        "limit": int(limit.group(1)) if limit else DEFAULT_LIMIT,
+    }
+
+
+def _backfill_events(query_lower: str) -> str:
+    """Preview, or create, past CSuite events in HubSpot. Create-only."""
+    from sync import event_backfill as backfill
+
+    options = backfill_options(query_lower)
+    if not options["since"]:
+        return ('❓ From when? Say *"backfill events since 2026-01-01"* '
+                "(add *include archived* and/or *assume eastern* to release "
+                "those events, and *apply* to create them). Nothing was "
+                "read.")
+    try:
+        out = backfill.run(**options)
+    except backfill.Refused as e:
+        return f"🛑 **Event backfill did not run.**\n\n{e}"
+    except Exception as e:
+        logger.error("event backfill failed: %s", e, exc_info=True)
+        return f"❌ Event backfill failed: {e}"
+    return backfill.report(out)
 
 
 def _reconcile_daf_tasks(query_lower: str) -> str:
