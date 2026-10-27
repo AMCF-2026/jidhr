@@ -63,7 +63,7 @@ class WriteFailed(Exception):
         self.reason = reason
 
 
-def _write_event(hubspot, mapped, body=None):
+def _write_event(hubspot, mapped, body=None, audit_meta=None):
     """PUT one marketing event. Returns (hubspot_id, error, ambiguous).
 
     PUT to /events/{externalEventId} is an UPSERT, and it is the only write
@@ -93,8 +93,15 @@ def _write_event(hubspot, mapped, body=None):
     make.
     """
     url = marketing_event_url(mapped.external_event_id)
-    result, status = hubspot._send_with_status(
-        "PUT", url, body if body is not None else mapped.payload)
+    # audit_meta (V5.92, the backfill's tag) is passed only when there is
+    # one, so a narrower _send_with_status — a test double — is unaffected.
+    if audit_meta:
+        result, status = hubspot._send_with_status(
+            "PUT", url, body if body is not None else mapped.payload,
+            audit_meta=audit_meta)
+    else:
+        result, status = hubspot._send_with_status(
+            "PUT", url, body if body is not None else mapped.payload)
 
     if status is None:
         # No status means we never learned what happened.
