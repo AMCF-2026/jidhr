@@ -1084,10 +1084,12 @@ def test_angle_brackets_are_removed_from_every_field():
                      "(director@example.invalid)")
 
 
-# --- V5.95: an existing organisation that already has an open task -----------
+# --- V5.95/V5.95.1: an existing organisation that already has an open task ---
+# The submission is 2030-03-17; 30 days before is 2030-02-15.
 
-OPEN_TASK = {"task_id": 1067, "o": "profile", "id": 18075,
-             "created_date": "2026-10-15 09:00:00", "complete_date": None}
+def open_task(created):
+    return {"task_id": 1067, "o": "profile", "id": 18075,
+            "created_date": f"{created} 09:00:00", "complete_date": None}
 
 
 def _existing_org(world):
@@ -1096,19 +1098,36 @@ def _existing_org(world):
                             "ptype": "org"})
 
 
-def test_an_open_task_on_the_existing_org_means_no_second_task(world):
+@pytest.mark.parametrize("created", ["2030-03-10", "2030-02-15"])
+def test_within_30_days_records_handled_and_makes_no_task(world, created):
     _existing_org(world)
     client = Client()
-    client.task_rows = (OPEN_TASK,)
+    client.task_rows = (open_task(created),)
     _review, reply, state, client = offer_and_create(client=client)
 
     assert "task/create" not in client.endpoints()
     assert "note/create" in client.endpoints(), "the note still goes on"
-    assert ("No `task/create`: profile 18075 already has an existing open "
-            "task 1067 (created Thu Oct 15). No second task.") in \
-        client.plan_reply
-    assert "existing open task 1067 (created Thu Oct 15) on this profile" \
-        in reply
+    assert "it will be recorded as handled" in client.plan_reply
+    assert "recorded as handled, no new task" in reply
+    [row] = [r for r in world["records"]
+             if r["endpoint"].startswith("submission/")]
+    assert row["endpoint"] == "submission/link/existing_open_task"
+    assert row["meta"]["ids"]["linked_task_id"] == 1067
+
+
+def test_older_than_30_days_is_held_and_makes_no_task(world):
+    _existing_org(world)
+    client = Client()
+    client.task_rows = (open_task("2030-02-14"),)       # 31 days
+    _review, reply, state, client = offer_and_create(client=client)
+
+    assert "task/create" not in client.endpoints()
+    assert "will be HELD for Carl" in client.plan_reply
+    assert "created Thu Feb 14, 2030" in reply
+    assert "submitted Sun Mar 17, 2030" in reply and "held for Carl" in reply
+    [row] = [r for r in world["records"]
+             if r["endpoint"].startswith("submission/")]
+    assert row["endpoint"] == "submission/held/stale_open_task"
 
 
 def test_a_new_org_is_never_asked_about_tasks(world):
@@ -1125,7 +1144,7 @@ def test_an_open_task_seen_only_at_the_write_still_stops_it(world):
     daf_workflow._initiate_workflow("new endowment", state, hub)
     plan = daf_workflow._handle_active_workflow("yes", state, hub, client)
     assert "`task/create`" in plan
-    client.task_rows = (OPEN_TASK,)          # someone added one meanwhile
+    client.task_rows = (open_task("2030-03-16"),)    # someone added one
     reply = daf_workflow._handle_active_workflow("yes", state, hub, client)
     assert "task/create" not in client.endpoints()
-    assert "existing open task 1067" in reply
+    assert "open task 1067" in reply

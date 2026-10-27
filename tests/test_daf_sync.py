@@ -175,6 +175,9 @@ def world(monkeypatch):
         if endpoint.startswith("submission/held/"):
             state["held"][payload["hubspot_submission_id"]] = \
                 endpoint.rsplit("/", 1)[-1]
+        if endpoint.startswith("submission/link/"):
+            state["processed"][payload["hubspot_submission_id"]] = \
+                str(payload.get("linked_profile_id"))
         return True
 
     monkeypatch.setattr(mod, "reserve_write", reserve)
@@ -847,18 +850,6 @@ OPEN_1099 = {"task_id": 1099, "o": "profile", "id": 21999,
 BACK_EMAIL = "returning.donor@example.invalid"
 
 
-@pytest.mark.parametrize("mode", ["preview", "live"])
-def test_an_open_task_on_the_profile_means_no_second_one(world, mode):
-    client = Client(existing={BACK_EMAIL: [21999]}, task_rows=[OPEN_1099])
-    out = run(Hub([BACK]), client, mode=mode)
-
-    assert client.writes() == [] and out["added"] == []
-    assert out["held"] == [] and out["deferred"] == []
-    [found] = out["existing_task"]
-    assert found["open_task"] == {"task_id": 1099, "created": "2026-10-23"}
-    assert found["existing_profile"] == 21999
-    assert out["budget_needed"] == 0, "no write proposed, no budget spent"
-    assert world["holds"] == [], "nothing recorded: shown again tomorrow"
 
 
 def test_a_completed_or_unlinked_task_does_not_count(world):
@@ -906,23 +897,6 @@ def test_a_new_donor_is_never_asked_about_tasks(world):
     assert "task/list" not in [s["endpoint"] for s in client.sent]
 
 
-def test_the_email_shows_the_open_task_and_counts_it():
-    entry = dict(ADDED, submission_id="s5", name="Dee Five", plan="returning",
-                 existing_profile=21999,
-                 open_task={"task_id": 1099, "created": "2026-10-23"})
-    s = section([], [], mode="preview", existing_task=[entry])
-    text = daf_sync.email_text([s])
-    assert "Already has an open CSuite task (1)" in text
-    assert ("Existing open task 1099 (created Fri Oct 23) on CSuite profile "
-            "21999, so no new task was proposed.") in text
-    body = text.split("— Jidhr")[0]
-    assert "mark inquiry" not in body
-    assert "Dee Five: s5" in text.split("(for Carl)")[1]
-    assert daf_sync.subject([s], WHEN) == \
-        "[Preview] New donor inquiries for CSuite — Thu Oct 22 " \
-        "(1 has an open task)"
-
-
 def test_a_returning_donor_is_a_follow_up_task_not_added():
     back = dict(ADDED, submission_id="s6", plan="returning",
                 existing_profile=21999)
@@ -959,18 +933,99 @@ def test_the_task_title_capitalises_the_name_but_the_body_keeps_it(world):
     assert "1. mustafa al-hassan van dyke —" in daf_sync.email_text([out])
 
 
-def test_an_open_task_seen_only_at_the_write_still_stops_it(world):
+# --- V5.95.1: how old is the open task? ---------------------------------------------
+# BACK is submitted at AFTER, 2027-01-15. 30 days before is 2026-12-16.
+
+def open_task(created, task_id=1099):
+    return dict(OPEN_1099, task_id=task_id,
+                created_date=f"{created} 10:00:00")
+
+
+@pytest.mark.parametrize("created,days", [
+    ("2027-01-10", 5), ("2026-12-17", 29), ("2026-12-16", 30),
+    ("2027-01-20", -5)])
+def test_within_30_days_is_recorded_handled_and_shown_once(world, created,
+                                                           days):
+    client = Client(existing={BACK_EMAIL: [21999]},
+                    task_rows=[open_task(created)])
+    out = run(Hub([BACK]), client)
+
+    assert client.writes() == [] and out["held"] == []
+    [found] = out["existing_task"]
+    assert found["recorded"] is True and found["days"] == days
+    [row] = world["holds"]
+    assert row["endpoint"] == "submission/link/existing_open_task"
+    assert row["meta"]["ids"]["linked_task_id"] == 1099
+    assert row["meta"]["ids"]["linked_profile_id"] == 21999
+    again = run(Hub([BACK]), Client(existing={BACK_EMAIL: [21999]},
+                                    task_rows=[open_task(created)]))
+    assert again["existing_task"] == [] and again["skipped_handled"] == 1, \
+        "shown once, then stop"
+
+
+@pytest.mark.parametrize("created,days", [("2026-12-15", 31),
+                                          ("2026-10-23", 84)])
+def test_older_than_30_days_is_held_with_both_dates(world, created, days):
+    client = Client(existing={BACK_EMAIL: [21999]},
+                    task_rows=[open_task(created)])
+    out = run(Hub([BACK]), client)
+
+    assert client.writes() == [] and out["existing_task"] == []
+    [held] = out["held"]
+    assert held["reason"] == "stale_open_task" and held["recorded"] is True
+    when = __import__("datetime").date.fromisoformat(created)
+    assert f"created {when:%a %b} {when.day}, {when.year}" in held["why"]
+    assert "submitted Fri Jan 15, 2027" in held["why"]
+    assert "held for Carl" in held["why"]
+    assert world["held"] == {"back0001-cccc": "stale_open_task"}
+
+
+def test_preview_shows_the_verdict_and_records_nothing(world):
+    for created in ("2027-01-10", "2026-10-23"):
+        world["holds"].clear()
+        client = Client(existing={BACK_EMAIL: [21999]},
+                        task_rows=[open_task(created)])
+        out = run(Hub([BACK]), client, mode="preview")
+        assert world["holds"] == [] and client.writes() == []
+    text = daf_sync.email_text([out])
+    assert "Needs Carl (1)" in text and "more than 30 days before" in text
+
+
+def test_the_email_shows_a_recorded_open_task_once():
+    entry = dict(ADDED, submission_id="s5", name="Dee Five", plan="returning",
+                 submitted_at="2026-10-21T21:50:00Z", existing_profile=21999,
+                 open_task={"task_id": 1099, "created": "2026-10-23"},
+                 recorded=True)
+    s = section([], [], existing_task=[entry])
+    text = daf_sync.email_text([s])
+    assert "Already has an open CSuite task (1)" in text
+    assert ("CSuite profile 21999. Existing open task 1099 (created Fri Oct "
+            "23, 2026), within 30 days of this inquiry (submitted Wed Oct 21, "
+            "2026): recorded as handled, no new task. It won't be shown "
+            "again.") in text
+    assert "(for Carl)" not in text, "recorded: nothing for Carl to do"
+    assert daf_sync.subject([s], WHEN) == \
+        "New donor inquiries added to CSuite — Thu Oct 22 (1 has an open task)"
+    unrecorded = dict(entry, recorded=False)
+    text = daf_sync.email_text([section([], [], existing_task=[unrecorded])])
+    assert "recording it as handled FAILED" in text
+    assert "Dee Five: s5" in text.split("(for Carl)")[1]
+
+
+def test_an_open_task_seen_only_at_the_write_is_judged_the_same(world):
     class Racing(Client):
-        """No open task at the plan; one at the write-time re-check."""
+        """No open task at the plan; a fresh one at the write-time re-check."""
         def _request(self, endpoint, data=None, **kwargs):
             if endpoint == "task/list":
-                self.task_rows = () if not getattr(self, "_seen", 0) \
-                    else (OPEN_1099,)
-                self._seen = getattr(self, "_seen", 0) + 1
+                seen = getattr(self, "_seen", 0)
+                self.task_rows = () if not seen else (open_task("2027-01-10"),)
+                self._seen = seen + 1
             return super()._request(endpoint, data, **kwargs)
 
     client = Racing(existing={BACK_EMAIL: [21999]})
     out = run(Hub([BACK]), client)
     assert client.writes() == []
     assert [e["open_task"]["task_id"] for e in out["existing_task"]] == [1099]
-    assert out["held"] == []
+    assert [r["endpoint"] for r in world["holds"]] == \
+        ["submission/link/existing_open_task"]
+

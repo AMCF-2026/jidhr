@@ -686,10 +686,15 @@ def render_plan(data: dict, results: dict, duplicate: dict) -> str:
               "the API, so CSuite's copy will not be checked."]
     step += 1
     if open_task:
-        from sync.open_tasks import describe
+        from sync import open_tasks as ot
 
+        verdict, _days = ot.judge(open_task, data.get("submitted_at"))
+        then = ("it will be recorded as handled" if verdict == ot.WITHIN
+                else "it is more than 30 days older than this inquiry, so "
+                     "the submission will be HELD for Carl")
         lines += [f"No `task/create`: profile {mark_id(profile_id)} already "
-                  f"has an {describe(open_task)}. No second task.", ""]
+                  f"has an {ot.describe(open_task)}; {then}. No second "
+                  "task.", ""]
     else:
         lines += [f"{step}. `task/create` — {target}:",
                   f"   *{title}*",
@@ -916,7 +921,7 @@ def _create_task(data, state, results, csuite, employee, meta):
     due = task_due_date(data.get("submitted_at"))
     if not results.get("profile_created"):
         # V5.95: an existing organisation may already have an open task.
-        from sync.open_tasks import describe, open_tasks_on_profile
+        from sync.open_tasks import open_tasks_on_profile
 
         found, problem = open_tasks_on_profile(csuite, state["profile_id"])
         if problem:
@@ -926,12 +931,22 @@ def _create_task(data, state, results, csuite, employee, meta):
                 f"{state['profile_id']} ({problem}), so none was created")
             return
         if found:
-            results["task_existing"] = found[0]
-            results["task_skipped"] = (f"{describe(found[0])} on this "
-                                       "profile — no second task created")
-            logger.info("endowment task NOT created: profile %s already has "
-                        "open task %s", state["profile_id"],
-                        found[0]["task_id"])
+            # V5.95.1: within 30 days, recorded as handled; older, held.
+            from sync import open_tasks as ot
+
+            task = found[0]
+            verdict, days = ot.judge(task, data.get("submitted_at"))
+            recorded = ot.record(verdict, meta["hubspot_form_id"],
+                                 data.get("submission_id"),
+                                 state["profile_id"], task)
+            text = ot.outcome_text(verdict, task, data.get("submitted_at"),
+                                   recorded=recorded)
+            results["task_existing"] = dict(task, verdict=verdict, days=days,
+                                            recorded=recorded, text=text)
+            results["task_skipped"] = text
+            logger.info("endowment task NOT created: profile %s has open "
+                        "task %s (%s days, %s)", state["profile_id"],
+                        task["task_id"], days, verdict)
             return
     try:
         response = csuite.create_task(
