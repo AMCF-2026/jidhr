@@ -41,6 +41,11 @@ HubSpot sends every field value with a submission, so counting means
 receiving them. The report lists it as "not counted (by policy)". Also the
 ACH Request Form, same decision.
 
+`digest` (V5.96) is the ONLY list of fields a daily digest may show, each
+with how: SHOW, LAST4 (numbers masked to their last four; a name is shown),
+or DATE. `presence_only` fields say "given" and never their value. A
+sensitive OUT field may appear in neither — a test holds that.
+
 `sensitive` lists the fields whose values must never reach a CSuite note,
 task, log line, audit row, preview, email or chat reply. "out" means the
 value is never shown at all; "last4" means at most its last four
@@ -62,19 +67,25 @@ OWNERS = {
 }
 
 OUT, LAST4 = "out", "last4"
+# How a digest shows a field it is allowed to show (V5.96). A field that is
+# not in a form's `digest` list is never shown at all; `presence_only` says
+# "given" or "not given" and never the value.
+SHOW, DATE = "show", "date"
 
 DEFAULT_REPORT_TO_ENV = "JIDHR_FORMS_REPORT_TO"
 
 
 def _form(key, form_id, name, category, why, owners=(), sensitive=None,
           report_to_env=DEFAULT_REPORT_TO_ENV, handler=None, note_type=None,
-          observe_only=False, counted=True):
+          observe_only=False, counted=True, digest=(), group_by=None,
+          presence_only=()):
     return {"key": key, "form_id": form_id, "name": name,
             "category": category, "why": why, "owners": tuple(owners),
             "sensitive": dict(sensitive or {}),
             "report_to_env": report_to_env, "handler": handler,
             "note_type": note_type, "observe_only": observe_only,
-            "counted": counted}
+            "counted": counted, "digest": tuple(digest),
+            "group_by": group_by, "presence_only": tuple(presence_only)}
 
 
 FORMS = (
@@ -95,6 +106,19 @@ FORMS = (
           "AMCF Asset Donation Transfer Form", "D",
           "stock-transfer heads-up; B (note 1071 Stock Contribution) after "
           "DAF live", owners=("kods",), note_type=1071,
+          digest=(("where_are_you_sending_your_transfer", "Sending to", SHOW),
+                  ("is_this_a_daf_donor_advised_fund_transfer",
+                   "Restricted fund", SHOW),
+                  ("what_is_your_daf_fund", "Fund", LAST4),
+                  ("what_brokerage_firm_will_the_gift_be_coming_from",
+                   "Brokerage", SHOW),
+                  ("what_date_do_you_anticipate_making_the_trade",
+                   "Trade date", DATE),
+                  ("what_is_the_intended_purpose_for_the_gift", "Purpose",
+                   SHOW),
+                  ("is_this_a_zakat_gift", "Zakat", SHOW)),
+          presence_only=(("what_stocksmutual_funds_are_you_donating",
+                          "Securities"), ("number_of_shares", "Shares")),
           sensitive={"what_is_your_daf_fund": LAST4,
                      "number_of_shares": OUT,
                      "what_stocksmutual_funds_are_you_donating": OUT,
@@ -112,13 +136,26 @@ FORMS = (
     _form("endowment_distribution", "fcb0cd2f-0c98-438d-9ed7-2b3bf2b03f25",
           "Endowment Distribution Request", "D", "moves money",
           owners=("ola",),
+          digest=(("endowment_fund_name", "Endowment fund", SHOW),
+                  ("daf_endowment_account_number", "Fund #", LAST4),
+                  ("endowment_distribution_needed_by", "Needed by", DATE)),
+          presence_only=(("endowment_distribution_amount2", "Amount"),
+                         ("endowment_distribution_reason", "Reason")),
           sensitive={"daf_endowment_account_number": LAST4,
                      "endowment_distribution_amount2": OUT,
                      "endowment_distribution_reason": OUT,
                      "address": OUT, "city": OUT, "state": OUT, "zip": OUT}),
     _form("investment", "39cde168-0903-4237-a267-777607128c98",
           "Investment Form", "D", "grouped by investment cycle",
-          owners=("kods", "nora"),
+          owners=("kods", "nora"), group_by="investment_cycle_selection",
+          digest=(("daf_endowment_account_number", "DAF/Endowment #", LAST4),
+                  ("where_are_you_sending_your_transfer", "Sending to", SHOW),
+                  ("are_you_adding_in_new_funds_for_this_investment_",
+                   "New funds", SHOW),
+                  ("which_sharia_compliant__socially_conscience_portfolio_"
+                   "would_you_like_to_invest_in_", "Portfolio", SHOW)),
+          presence_only=(("how_much_are_you_putting_in_to_this_investment_"
+                          "cycle_", "Amount"),),
           sensitive={"daf_endowment_account_number": LAST4,
                      "how_much_are_you_putting_in_to_this_investment_cycle_":
                          OUT}),
@@ -126,6 +163,13 @@ FORMS = (
           "Nonprofit Directory Application", "D",
           "applicants are not grantees; HubSpot makes the ticket and list",
           owners=("munira",),
+          digest=(("company", "Organization", SHOW),
+                  ("city", "City", SHOW), ("state", "State", SHOW),
+                  ("service_area", "Service area", SHOW),
+                  ("organization_budget", "Budget", SHOW),
+                  ("is_your_organization_fiscally_sponsored",
+                   "Fiscally sponsored", SHOW),
+                  ("website", "Website", SHOW)),
           sensitive={"organization_ein": OUT, "fiscal_sponsor_ein": OUT}),
 
     # --- C: HubSpot only ----------------------------------------------------------

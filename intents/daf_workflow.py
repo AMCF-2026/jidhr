@@ -182,6 +182,9 @@ def can_handle(query: str, workflow_state: dict = None, **kwargs) -> bool:
     from intents.mark_handled import MARK_HANDLED_PHRASES
     if anchors.anchored(q, MARK_HANDLED_PHRASES) and not _is_prose(q):
         return True
+    from intents.mark_handled_bulk import is_bulk
+    if is_bulk(q) and not _is_prose(q):
+        return True
 
     # Don't match summary/report queries that happen to contain "daf inquiry"
     if any(ex in q for ex in _EXCLUDE_PHRASES):
@@ -211,7 +214,10 @@ def handle(query: str, ctx) -> str:
     if state.get("active"):
         return _handle_active_workflow(query, state, hubspot, csuite)
 
-    from intents import mark_handled
+    from intents import mark_handled, mark_handled_bulk
+    if mark_handled_bulk.is_bulk(query):
+        actor = getattr(getattr(ctx, "actor", None), "user_id", None)
+        return mark_handled_bulk.handle(query, hubspot, actor)
     if anchors.anchored(query.lower().strip(),
                         mark_handled.MARK_HANDLED_PHRASES):
         actor = getattr(getattr(ctx, "actor", None), "user_id", None)

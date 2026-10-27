@@ -73,6 +73,7 @@ INQUIRY_RECONCILE_PHRASES = ['reconcile inquiries', 'reconcile inquiry']
 # The one-off past-event backfill (V5.92). Its own verb: it is not a sync,
 # and nothing that means "sync everything" may reach it.
 EVENT_BACKFILL_PHRASES = ['backfill events', 'backfill event']
+EVENT_MAP_RECONCILE_PHRASES = ['reconcile event map']
 ALL_SYNC_PHRASES = ['sync all', 'sync everything', 'run all syncs']
 
 
@@ -101,6 +102,7 @@ def can_handle(query: str, **kwargs) -> bool:
         anchors.anchored(q, DAF_RECONCILE_PHRASES) or
         anchors.anchored(q, INQUIRY_RECONCILE_PHRASES) or
         anchors.anchored(q, EVENT_BACKFILL_PHRASES) or
+        anchors.anchored(q, EVENT_MAP_RECONCILE_PHRASES) or
         q in ALL_SYNC_PHRASES
     )
 
@@ -127,6 +129,9 @@ def handle(query: str, ctx) -> str:
 
     if any(p in q for p in EVENT_BACKFILL_PHRASES):
         return _backfill_events(q)
+
+    if any(p in q for p in EVENT_MAP_RECONCILE_PHRASES):
+        return _reconcile_event_map(q)
 
     if any(p in q for p in SCHEDULED_RUN_PHRASES):
         return _run_scheduled_now()
@@ -344,6 +349,24 @@ def _backfill_events(query_lower: str) -> str:
         logger.error("event backfill failed: %s", e, exc_info=True)
         return f"❌ Event backfill failed: {e}"
     return backfill.report(out)
+
+
+def _reconcile_event_map(query_lower: str) -> str:
+    """Preview, or with "apply" write, the pending event_map rows that
+    HubSpot already has. Map-only (sync/event_map_reconcile.py)."""
+    import re
+
+    from sync import event_map_reconcile as recon
+
+    try:
+        out = recon.run(apply=bool(re.search(r"\bapply\b", query_lower)))
+    except recon.Refused as e:
+        return f"🛑 **Event map reconcile did not run.**\n\n{e}"
+    except Exception as e:
+        logger.error("event map reconcile failed: %s", type(e).__name__,
+                     exc_info=True)
+        return f"❌ Event map reconcile failed: {type(e).__name__}"
+    return recon.report(out)
 
 
 def _reconcile_daf_tasks(query_lower: str) -> str:
