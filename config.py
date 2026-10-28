@@ -144,6 +144,14 @@ class Config:
     # as "nightly limit reached". sync/daf_sync.budget_problem checks it.
     CSUITE_WRITE_BUDGET_RAW = os.environ.get('CSUITE_WRITE_BUDGET', '')
 
+    # The key for write_audit.payload_hash (V5.97, clients/redact.py). An
+    # unkeyed sha256 of {"email": x} confirms any guessed x; keyed, the hash
+    # still spots two identical writes and says nothing else. No default:
+    # unset or under 32 characters, rows carry NO hash rather than an
+    # unkeyed one. The SAME value on every service that writes, or their
+    # hashes never match each other.
+    JIDHR_AUDIT_HASH_KEY = os.environ.get('JIDHR_AUDIT_HASH_KEY', '')
+
     # Whether an inquiry also OPENS A FUND. Off, and separate from
     # CSUITE_DAF_CREATE_ENABLED on purpose.
     #

@@ -11,14 +11,17 @@ forgotten when a new handler is added.
 What is recorded, and what is deliberately not:
 
     recorded      who, when, which system, which endpoint, which record id,
-                  whether it worked, how long it took, and a hash of the
-                  payload so two identical writes can be spotted
-    NOT recorded  any field VALUE — no emails, no amounts, no note bodies
+                  whether it worked, how long it took, and a keyed hash of
+                  the payload so two identical writes can be spotted
+    NOT recorded  any field VALUE — no emails, no amounts, no note bodies,
+                  and none echoed back in an error (clients/redact.py, V5.97)
 
 payload_meta carries the *shape* of a payload (its top-level key names, list
 lengths, and any id values) so a row is diagnosable without the audit table
 becoming a second copy of the donor database. A hash lets you prove two
-writes carried the same payload without being able to read either.
+writes carried the same payload without being able to read either — keyed
+since V5.97, because an unkeyed hash of a small payload can be confirmed by
+guessing it.
 
 Auditing never changes what a caller sees. Every failure in here is caught
 and logged; the real write's result is returned untouched. An audit trail
@@ -27,10 +30,11 @@ that can take down a donation sync is worse than no audit trail.
 The `write_audit` table is created out of band — this module only inserts.
 """
 
-import hashlib
 import json
 import logging
 import re
+
+from clients.redact import keyed_hash, safe_id, scrub_error, scrub_text
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +119,7 @@ def _csuite_env_column_exists(query=None) -> bool:
                        "will be asked again", type(e).__name__)
         raise ColumnCheckFailed(
             f"the database did not answer ({type(e).__name__}: "
-            f"{str(e)[:160]})") from e
+            f"{scrub_text(e)[:160]})") from e
     _HAS_CSUITE_ENV = bool(rows)
     if not _HAS_CSUITE_ENV:
         logger.warning("write_audit has no csuite_env column; audit rows will "
@@ -230,26 +234,22 @@ _warned_no_database = False
 # ---------------------------------------------------------------------------
 
 def payload_hash(payload) -> str | None:
-    """sha256 of the payload in canonical JSON form.
+    """HMAC-SHA256 of the payload in canonical JSON form, or None.
 
-    Canonical = sorted keys and tight separators, so the same payload always
-    hashes the same regardless of dict ordering.
+    None when there is no payload, and when JIDHR_AUDIT_HASH_KEY is unset —
+    never an unkeyed sha256 (V5.97, clients/redact.keyed_hash). Rows from
+    before V5.97 carry plain sha256 and do not compare with later ones.
     """
-    if payload is None:
-        return None
-    try:
-        canonical = json.dumps(
-            payload, sort_keys=True, separators=(",", ":"), default=str)
-    except (TypeError, ValueError):
-        canonical = repr(payload)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return keyed_hash(payload)
 
 
 def _collect_ids(payload, prefix="", depth=0):
     """Id-looking values from a payload, one level into nested dicts.
 
     Ids are identifiers, not content: recording that a write targeted
-    contact 701 is the point of the audit. Everything else stays out.
+    contact 701 is the point of the audit. Everything else stays out —
+    including a value under an id-named key that is not an id: an email
+    sent as HubSpot's `id`, or a tax_id (V5.97, clients/redact.safe_id).
     """
     found = {}
     if not isinstance(payload, dict) or depth > 1:
@@ -260,7 +260,7 @@ def _collect_ids(payload, prefix="", depth=0):
         if isinstance(value, dict):
             found.update(_collect_ids(value, f"{path}.", depth + 1))
         elif isinstance(value, (str, int)) and _ID_KEY_RE.search(str(key)):
-            found[path] = value
+            found[path] = safe_id(key, value)
     return found
 
 
@@ -419,7 +419,7 @@ def _row_values(target_system, http_method, endpoint, target_id, payload,
         json.dumps(payload_meta(payload), default=str),
         status,
         http_status,
-        str(error)[:MAX_ERROR_CHARS] if error else None,
+        scrub_error(error, MAX_ERROR_CHARS),
         int(duration_ms) if duration_ms is not None else None,
         sync_run_id,
     )
@@ -463,7 +463,7 @@ def reserve_write(target_system: str, http_method: str, endpoint: str,
     except Exception as e:
         raise AuditUnavailable(
             f"could not reserve an audit row for {http_method} {endpoint}, "
-            f"so the write was not attempted: {e}") from e
+            f"so the write was not attempted: {scrub_text(e)}") from e
 
     row = found[0] if isinstance(found, (list, tuple)) and found else None
     if row is None:
@@ -513,7 +513,7 @@ def complete_write(reservation, status: str = "success", http_status=None,
         execute_query(
             _COMPLETE_SQL,
             (status, http_status,
-             str(error)[:MAX_ERROR_CHARS] if error else None,
+             scrub_error(error, MAX_ERROR_CHARS),
              int(duration_ms) if duration_ms is not None else None,
              str(target_id) if target_id is not None else None,
              reservation),
@@ -521,9 +521,12 @@ def complete_write(reservation, status: str = "success", http_status=None,
         )
         return True
     except Exception as e:
+        # No exc_info: a driver error can quote the row it failed on, and a
+        # traceback prints it unscrubbed (V5.97).
         logger.error(
             "audit row %s stays 'attempted' — the write happened but its "
-            "outcome could not be stored: %s", reservation, e, exc_info=True)
+            "outcome could not be stored: %s: %s", reservation,
+            type(e).__name__, scrub_text(e))
         return False
 
 
@@ -695,7 +698,7 @@ def processed_submissions(form_id,
     except Exception as e:
         raise ProcessedHistoryUnavailable(
             f"could not read the processing history for form {form_id}: "
-            f"{e}") from e
+            f"{scrub_text(e)}") from e
 
     processed = {}
     for row in rows or []:
@@ -745,7 +748,8 @@ def handled_tasks(form_id) -> dict:
             fetch=True)
     except Exception as e:
         raise ProcessedHistoryUnavailable(
-            f"could not read the task history for form {form_id}: {e}") from e
+            f"could not read the task history for form {form_id}: "
+            f"{scrub_text(e)}") from e
     found = {}
     for row in rows or []:
         sid = (row or {}).get("submission_id")
@@ -800,7 +804,7 @@ def held_submissions(form_id) -> dict:
     except Exception as e:
         raise ProcessedHistoryUnavailable(
             f"could not read the held submissions for form {form_id}: "
-            f"{e}") from e
+            f"{scrub_text(e)}") from e
     held = {}
     for row in rows or []:
         sid = (row or {}).get("submission_id")

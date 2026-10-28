@@ -42,6 +42,8 @@ PLACEHOLDER_CREDENTIALS = {
     "CSUITE_SANDBOX_KEY": "placeholder-csuite-sandbox-key-not-real",
     "CSUITE_SANDBOX_SECRET": "placeholder-csuite-sandbox-secret-not-real",
     "HUBSPOT_ACCESS_TOKEN": "placeholder-hubspot-token-not-real",
+    # V5.97: long enough to be used, so audit rows carry a hash in tests.
+    "JIDHR_AUDIT_HASH_KEY": "placeholder-audit-hash-key-not-real-0000",
 }
 
 
