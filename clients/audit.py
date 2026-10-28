@@ -566,7 +566,7 @@ def record_write(target_system: str, http_method: str, endpoint: str,
     except Exception as e:
         raise AuditUnavailable(
             f"could not record the audit row for {http_method} {endpoint}: "
-            f"{e}") from e
+            f"{scrub_text(e)}") from e
 
 
 # ---------------------------------------------------------------------------

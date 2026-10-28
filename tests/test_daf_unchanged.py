@@ -366,7 +366,10 @@ PINNED = {
     # cannot be reached is now reported as that, not as a missing csuite_env
     # column. Its query and parameters are unchanged and pinned by
     # test_processed_submissions.py.
-    "clients/audit.py": ["payload_meta", "record_write"],
+    # record_write is NOT pinned to V5.80 since V5.97.1: its AuditUnavailable
+    # message scrubs the database error (a driver error can quote the row).
+    # It is re-pinned below, against the commit that made that change.
+    "clients/audit.py": ["payload_meta"],
     "sync/daf_reconcile.py": ["task_profile", "profiles_for"],
 }
 
