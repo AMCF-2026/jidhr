@@ -13,11 +13,17 @@ Updated for v1.3 - Full feature build:
 """
 
 import os
+import sys
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-# Load .env file if present
-load_dotenv()
+# Load .env file if present — but never under pytest (V5.97.2). The suite
+# must see the same environment on every machine: with a real .env in the
+# folder its flags (CSUITE_ENV, the DAF switches, SCHEDULED_SYNC_ENABLED)
+# leaked into the tests and 152 failed on 2026-10-28. No app code imports
+# pytest, so the app always loads .env as before.
+if "pytest" not in sys.modules:
+    load_dotenv()
 
 
 def _int_or_zero(raw):

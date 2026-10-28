@@ -8,3 +8,4 @@ venv/
 tickets_open_*.csv
 tickets_summary_*.csv
 reports/
+.vscode/
