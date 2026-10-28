@@ -382,6 +382,25 @@ def test_the_daf_only_functions_have_not_changed(path):
     assert changed == [], f"{path}: {changed} changed since {BASE}"
 
 
+# Pinned against a LATER commit than V5.80: the function changed on purpose,
+# and from that commit on it must not change again. A squash or rebase that
+# drops the commit fails this loudly (git show), not silently.
+REPINNED = {
+    # V5.97.1, with DAF live: the scrubbed AuditUnavailable message.
+    ("clients/audit.py", "record_write"): "d7fb636848bf869fb4d65bc898ce38f446494547",
+}
+
+
+@pytest.mark.parametrize("path, name", sorted(REPINNED))
+def test_the_repinned_functions_have_not_changed(path, name):
+    base = REPINNED[(path, name)]
+    then = _functions(subprocess.run(
+        ["git", "show", f"{base}:{path}"], capture_output=True, text=True,
+        check=True).stdout)
+    now = _functions(Path(path).read_text())
+    assert then[name] == now[name], f"{path}: {name} changed since {base}"
+
+
 def test_the_daf_dependencies_have_zero_diff():
     found = subprocess.run(
         ["git", "diff", "--stat", BASE, "--", "sync/filter_trust.py",
