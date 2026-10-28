@@ -366,7 +366,10 @@ PINNED = {
     # cannot be reached is now reported as that, not as a missing csuite_env
     # column. Its query and parameters are unchanged and pinned by
     # test_processed_submissions.py.
-    "clients/audit.py": ["payload_meta", "record_write"],
+    # record_write is NOT pinned to V5.80 since V5.97.1: its AuditUnavailable
+    # message scrubs the database error (a driver error can quote the row).
+    # It is re-pinned below, against the commit that made that change.
+    "clients/audit.py": ["payload_meta"],
     "sync/daf_reconcile.py": ["task_profile", "profiles_for"],
 }
 
@@ -377,6 +380,25 @@ def test_the_daf_only_functions_have_not_changed(path):
     now = _functions(Path(path).read_text())
     changed = [name for name in PINNED[path] if then[name] != now[name]]
     assert changed == [], f"{path}: {changed} changed since {BASE}"
+
+
+# Pinned against a LATER commit than V5.80: the function changed on purpose,
+# and from that commit on it must not change again. A squash or rebase that
+# drops the commit fails this loudly (git show), not silently.
+REPINNED = {
+    # V5.97.1, with DAF live: the scrubbed AuditUnavailable message.
+    ("clients/audit.py", "record_write"): "d7fb636848bf869fb4d65bc898ce38f446494547",
+}
+
+
+@pytest.mark.parametrize("path, name", sorted(REPINNED))
+def test_the_repinned_functions_have_not_changed(path, name):
+    base = REPINNED[(path, name)]
+    then = _functions(subprocess.run(
+        ["git", "show", f"{base}:{path}"], capture_output=True, text=True,
+        check=True).stdout)
+    now = _functions(Path(path).read_text())
+    assert then[name] == now[name], f"{path}: {name} changed since {base}"
 
 
 def test_the_daf_dependencies_have_zero_diff():

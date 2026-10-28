@@ -247,6 +247,22 @@ class TestErrorTextReachingTheRow:
         assert SECRET_EMAIL not in str(raised.value)
         assert "violates check constraint" in str(raised.value)
 
+    def test_record_write_scrubs_the_database_error(self, monkeypatch):
+        # V5.97.1: record_write was pinned to V5.80 and left unscrubbed.
+        def failing(sql, params=None, fetch=True):
+            raise RuntimeError("new row violates check constraint\nDETAIL: "
+                               f"Failing row contains ({SECRET_EMAIL}).")
+
+        monkeypatch.setattr("clients.database.execute_query", failing)
+        monkeypatch.setattr("clients.database.is_configured", lambda: True)
+        monkeypatch.setattr(audit, "_HAS_CSUITE_ENV", False)
+
+        with pytest.raises(audit.AuditUnavailable) as raised:
+            audit.record_write(audit.LINK_TARGET_SYSTEM, "HOLD",
+                               "submission/held/ambiguous")
+        assert SECRET_EMAIL not in str(raised.value)
+        assert "violates check constraint" in str(raised.value)
+
     def test_a_lost_completion_logs_no_value(self, monkeypatch, caplog):
         def failing(sql, params=None, fetch=True):
             raise RuntimeError(f"Failing row contains ({SECRET_EMAIL}).")
