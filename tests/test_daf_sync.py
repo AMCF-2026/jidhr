@@ -113,6 +113,8 @@ class Client(CSuiteClient):
                                {"success": 1, "data": {"profile_id": 31337}})
                 elif endpoint == "task/create":
                     payload = {"success": 1, "data": {"task_id": 1099}}
+                elif endpoint == "funit/create":
+                    payload = {"success": 1, "data": {"funit_id": 1663}}
                 elif endpoint == "task/list":
                     if outer.tasks_unreadable:
                         payload = {"success": 0, "errors": ["boom"]}
@@ -1029,3 +1031,102 @@ def test_an_open_task_seen_only_at_the_write_is_judged_the_same(world):
     assert [r["endpoint"] for r in world["holds"]] == \
         ["submission/link/existing_open_task"]
 
+
+
+# --- what is switched on, counted; the ticket line ----------------------------
+#
+# 2026-11-01: a new donor spent 3 writes (profile 21903, fund 1663, task 1165)
+# against a plan of 2, because the fund switch was on. Tickets are closed by
+# staff; CSUITE_TICKET_CLOSE_ENABLED is off (2026-11-05).
+
+@pytest.mark.parametrize("plan,fund,expected", [
+    ("new", False, 2), ("new", True, 3),
+    ("returning", False, 1), ("returning", True, 1),
+])
+def test_the_write_count_follows_the_switches(monkeypatch, plan, fund,
+                                              expected):
+    monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", fund)
+    assert daf_sync.writes_needed(plan) == expected
+
+
+def test_a_fund_night_counts_three_and_defers_rather_than_half_writes(
+        world, monkeypatch):
+    monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", True)
+    client = Client(budget=2)
+    out = run(Hub([FRESH]), client)
+
+    assert out["budget_needed"] == 3
+    assert [e["reason"] for e in out["deferred"]] == ["nightly_limit"]
+    assert client.writes() == [], "a half-written donor: profile, no task"
+
+
+def test_a_fund_night_live_reports_the_fund(world, monkeypatch):
+    monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", True)
+    client = Client(budget=3)
+    out = run(Hub([FRESH]), client)
+
+    assert client.writes() == ["profile/create/individual", "funit/create",
+                               "task/create"]
+    assert out["budget_allowed"] == 3
+    [added] = out["added"]
+    assert added["fund_id"] == 1663
+    text = daf_sync.email_text([dict(out)])
+    assert "New CSuite profile 31337, fund 1663; follow-up task 1099" in text
+
+
+def test_preview_counts_and_names_the_fund_when_it_is_on(world, monkeypatch):
+    monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", True)
+    out = run(Hub([FRESH]), Client(), mode="preview")
+
+    assert out["budget_needed"] == 3
+    text = daf_sync.email_text([dict(out)])
+    assert "Would create a new CSuite profile, a fund and a follow-up task." \
+        in text
+
+
+def test_preview_says_the_ticket_is_left_open(world):
+    out = run(Hub([FRESH]), Client(), mode="preview")
+    text = daf_sync.email_text([dict(out)])
+
+    assert "   HubSpot ticket left open (close disabled)." in text
+    assert "Would create a new CSuite profile and a follow-up task." in text
+
+
+def test_preview_with_close_on_says_what_would_happen(world, monkeypatch):
+    monkeypatch.setattr(Config, "CSUITE_TICKET_CLOSE_ENABLED", True)
+    out = run(Hub([FRESH]), Client(), mode="preview")
+    text = daf_sync.email_text([dict(out)])
+
+    assert "HubSpot ticket: would be closed if exactly one open ticket " \
+        "carries this email." in text
+    assert "left open (close disabled)" not in text
+
+
+def test_live_with_close_off_leaves_the_ticket_and_says_so(world):
+    hub = Hub([FRESH])
+    out = run(hub, Client())
+
+    [added] = out["added"]
+    assert added["ticket"] == daf_sync.TICKET_LEFT_OPEN
+    assert "HubSpot ticket left open (close disabled)." in \
+        daf_sync.email_text([dict(out)])
+
+
+@pytest.mark.parametrize("results,state,expected", [
+    ({"ticket_skipped": "off"}, {}, "left open (close disabled)"),
+    ({"ticket_closed": True}, {"ticket_id": "77"}, "HubSpot ticket 77 closed"),
+    ({"ticket_close_failed": "HTTP 500"}, {"ticket_id": "77"}, "NOT closed"),
+    ({"ticket_error": "boom"}, {}, "NOT closed"),
+    ({"ticket_matches": [{"id": 1}, {"id": 2}]}, {}, "2 open tickets"),
+    ({"ticket_matches": []}, {}, "No open HubSpot ticket"),
+])
+def test_every_ticket_outcome_has_a_line(results, state, expected):
+    assert expected in daf_sync.ticket_outcome(results, state)
+
+
+def test_an_added_one_with_a_problem_still_shows_its_ticket_line():
+    rough = dict(ADDED, problems=["the HubSpot link failed"],
+                 ticket=daf_sync.TICKET_LEFT_OPEN)
+    text = daf_sync.email_text([section([rough], [])])
+    needs = text.split("Needs Carl")[1]
+    assert "HubSpot ticket left open (close disabled)." in needs
