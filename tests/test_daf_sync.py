@@ -68,7 +68,8 @@ class Client(CSuiteClient):
     """The real _request. existing: email -> [profile ids]."""
 
     def __init__(self, existing=None, missing=(), unreadable=(), budget=10,
-                 fail_profile=False, task_rows=(), tasks_unreadable=False):
+                 fail_profile=False, task_rows=(), tasks_unreadable=False,
+                 opp_rows=(), opp_partial=False, opp_fail=False):
         self.api_key, self.api_secret = "k", "s"
         self.base_url = "https://amuslimcf.fcsuite.com/api/v2"
         self.env = "live"
@@ -77,6 +78,10 @@ class Client(CSuiteClient):
         self.sent = []
         self.task_rows = tuple(task_rows)
         self.tasks_unreadable = tasks_unreadable
+        # opportunity/list rows; a create appends one (op_id 1036, 1037...).
+        self.opp_rows = [dict(r) for r in opp_rows]
+        self.opp_partial = opp_partial
+        self.opp_fail = opp_fail
         outer, existing = self, existing or {}
         missing = {str(m) for m in missing}
         unreadable = set(unreadable)
@@ -113,6 +118,8 @@ class Client(CSuiteClient):
                                {"success": 1, "data": {"profile_id": 31337}})
                 elif endpoint == "task/create":
                     payload = {"success": 1, "data": {"task_id": 1099}}
+                elif endpoint == "funit/create":
+                    payload = {"success": 1, "data": {"funit_id": 1663}}
                 elif endpoint == "task/list":
                     if outer.tasks_unreadable:
                         payload = {"success": 0, "errors": ["boom"]}
@@ -120,6 +127,32 @@ class Client(CSuiteClient):
                         rows = [dict(r) for r in outer.task_rows]
                         payload = {"success": 1, "data": {
                             "count": len(rows), "results": rows}}
+                elif endpoint == "opportunity/list":
+                    rows = [dict(r) for r in outer.opp_rows]
+                    payload = {"success": 1, "data": {
+                        "count": len(rows) + (1 if outer.opp_partial else 0),
+                        "results": rows}}
+                elif endpoint == "opportunity/create":
+                    if outer.opp_fail:
+                        payload = {"success": 0, "errors": ["server error"]}
+                    else:
+                        op_id = 1036 + sum(
+                            1 for s in outer.sent
+                            if s["endpoint"] == "opportunity/create") - 1
+                        outer.opp_rows.append({
+                            "op_id": op_id, "otype_id": body["otype_id"],
+                            "profile_id": body["profile_id"],
+                            "opportunity_status": "open",
+                            "stage_name": "Outreach",
+                            "assigned_employee_id": None})
+                        # The id beside `success`, as the sandbox answers.
+                        payload = {"op_id": op_id, "success": 1,
+                                   "opportunity_guid": f"guid-{op_id}"}
+                elif endpoint == "opportunity/display":
+                    found = [r for r in outer.opp_rows
+                             if r["op_id"] == body.get("op_id")]
+                    payload = ({"success": 1, "data": found[0]} if found
+                               else {"success": 0, "errors": ["not found"]})
                 else:
                     raise AssertionError(f"unexpected CSuite {endpoint}")
 
@@ -151,6 +184,7 @@ def world(monkeypatch):
                         ("CSUITE_DAF_CREATE_ENABLED", True),
                         ("CSUITE_DAF_TASK_CREATE_ENABLED", True),
                         ("CSUITE_DAF_FUND_CREATE_ENABLED", False),
+                        ("CSUITE_DAF_OPPORTUNITY_CREATE_ENABLED", False),
                         ("CSUITE_HUBSPOT_BACKFILL_ENABLED", False),
                         ("CSUITE_TICKET_CLOSE_ENABLED", False),
                         ("CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY", 1012),
@@ -1029,3 +1063,271 @@ def test_an_open_task_seen_only_at_the_write_is_judged_the_same(world):
     assert [r["endpoint"] for r in world["holds"]] == \
         ["submission/link/existing_open_task"]
 
+
+
+# --- what is switched on, counted; the ticket line ----------------------------
+#
+# 2026-11-01: a new donor spent 3 writes (profile 21903, fund 1663, task 1165)
+# against a plan of 2, because the fund switch was on. Tickets are closed by
+# staff; CSUITE_TICKET_CLOSE_ENABLED is off (2026-11-05).
+
+@pytest.mark.parametrize("plan,fund,expected", [
+    ("new", False, 2), ("new", True, 3),
+    ("returning", False, 1), ("returning", True, 1),
+])
+def test_the_write_count_follows_the_switches(monkeypatch, plan, fund,
+                                              expected):
+    monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", fund)
+    assert daf_sync.writes_needed(plan) == expected
+
+
+def test_a_fund_night_counts_three_and_defers_rather_than_half_writes(
+        world, monkeypatch):
+    monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", True)
+    client = Client(budget=2)
+    out = run(Hub([FRESH]), client)
+
+    assert out["budget_needed"] == 3
+    assert [e["reason"] for e in out["deferred"]] == ["nightly_limit"]
+    assert client.writes() == [], "a half-written donor: profile, no task"
+
+
+def test_a_fund_night_live_reports_the_fund(world, monkeypatch):
+    monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", True)
+    client = Client(budget=3)
+    out = run(Hub([FRESH]), client)
+
+    assert client.writes() == ["profile/create/individual", "funit/create",
+                               "task/create"]
+    assert out["budget_allowed"] == 3
+    [added] = out["added"]
+    assert added["fund_id"] == 1663
+    text = daf_sync.email_text([dict(out)])
+    assert "New CSuite profile 31337, fund 1663; follow-up task 1099" in text
+
+
+def test_preview_counts_and_names_the_fund_when_it_is_on(world, monkeypatch):
+    monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", True)
+    out = run(Hub([FRESH]), Client(), mode="preview")
+
+    assert out["budget_needed"] == 3
+    text = daf_sync.email_text([dict(out)])
+    assert "Would create a new CSuite profile, a fund and a follow-up task." \
+        in text
+
+
+def test_preview_says_the_ticket_is_left_open(world):
+    out = run(Hub([FRESH]), Client(), mode="preview")
+    text = daf_sync.email_text([dict(out)])
+
+    assert "   HubSpot ticket left open (close disabled)." in text
+    assert "Would create a new CSuite profile and a follow-up task." in text
+
+
+def test_preview_with_close_on_says_what_would_happen(world, monkeypatch):
+    monkeypatch.setattr(Config, "CSUITE_TICKET_CLOSE_ENABLED", True)
+    out = run(Hub([FRESH]), Client(), mode="preview")
+    text = daf_sync.email_text([dict(out)])
+
+    assert "HubSpot ticket: would be closed if exactly one open ticket " \
+        "carries this email." in text
+    assert "left open (close disabled)" not in text
+
+
+def test_live_with_close_off_leaves_the_ticket_and_says_so(world):
+    hub = Hub([FRESH])
+    out = run(hub, Client())
+
+    [added] = out["added"]
+    assert added["ticket"] == daf_sync.TICKET_LEFT_OPEN
+    assert "HubSpot ticket left open (close disabled)." in \
+        daf_sync.email_text([dict(out)])
+
+
+@pytest.mark.parametrize("results,state,expected", [
+    ({"ticket_skipped": "off"}, {}, "left open (close disabled)"),
+    ({"ticket_closed": True}, {"ticket_id": "77"}, "HubSpot ticket 77 closed"),
+    ({"ticket_close_failed": "HTTP 500"}, {"ticket_id": "77"}, "NOT closed"),
+    ({"ticket_error": "boom"}, {}, "NOT closed"),
+    ({"ticket_matches": [{"id": 1}, {"id": 2}]}, {}, "2 open tickets"),
+    ({"ticket_matches": []}, {}, "No open HubSpot ticket"),
+])
+def test_every_ticket_outcome_has_a_line(results, state, expected):
+    assert expected in daf_sync.ticket_outcome(results, state)
+
+
+def test_an_added_one_with_a_problem_still_shows_its_ticket_line():
+    rough = dict(ADDED, problems=["the HubSpot link failed"],
+                 ticket=daf_sync.TICKET_LEFT_OPEN)
+    text = daf_sync.email_text([section([rough], [])])
+    needs = text.split("Needs Carl")[1]
+    assert "HubSpot ticket left open (close disabled)." in needs
+
+
+# --- DAF Recruitment pipeline record (nightly only) ---------------------------
+#
+# Shazeen, 2026-11-05: every added DAF inquiry gets a DAF Recruitment
+# opportunity (otype_id 1003) on the profile, unlinked and unowned. Off by
+# default: a live night with it off says what it WOULD create.
+
+PIPE_ON = ("CSUITE_DAF_OPPORTUNITY_CREATE_ENABLED", True)
+WOULD_LINE = "Would create pipeline record at Outreach (unowned)."
+
+
+def opp_creates(client):
+    return [s["body"] for s in client.sent
+            if s["endpoint"] == "opportunity/create"]
+
+
+@pytest.mark.parametrize("plan,fund,pipe,expected", [
+    ("new", False, True, 3), ("new", True, True, 4),
+    ("returning", False, True, 2), ("new", False, False, 2),
+])
+def test_the_pipeline_record_is_counted_while_it_is_on(monkeypatch, plan,
+                                                       fund, pipe, expected):
+    monkeypatch.setattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", fund)
+    monkeypatch.setattr(Config, *PIPE_ON[:1], pipe)
+    assert daf_sync.writes_needed(plan) == expected
+
+
+def test_off_a_live_night_creates_none_and_says_what_it_would(world):
+    client = Client()
+    out = run(Hub([FRESH]), client)
+
+    assert opp_creates(client) == []
+    assert client.writes() == ["profile/create/individual", "task/create"]
+    text = daf_sync.email_text([dict(out)])
+    assert f"   {WOULD_LINE}" in text
+
+
+def test_on_a_new_donor_gets_one_record_on_the_new_profile(world,
+                                                           monkeypatch):
+    monkeypatch.setattr(Config, *PIPE_ON)
+    client = Client()
+    out = run(Hub([FRESH]), client)
+
+    assert client.writes() == ["profile/create/individual", "task/create",
+                               "opportunity/create"]
+    [body] = opp_creates(client)
+    assert {k: v for k, v in body.items() if k not in ("env", "epoch")} == \
+        {"otype_id": 1003, "profile_id": 31337}, "unlinked, unowned, no stage"
+    assert out["budget_needed"] == 3 and out["budget_allowed"] == 3
+    [added] = out["added"]
+    assert added["pipeline"]["op_id"] == 1036
+    text = daf_sync.email_text([dict(out)])
+    assert "Pipeline record 1036 created at Outreach (unowned)." in text
+    assert "Needs Carl" not in text
+
+
+def test_the_task_stays_on_the_profile(world, monkeypatch):
+    monkeypatch.setattr(Config, *PIPE_ON)
+    client = Client()
+    run(Hub([FRESH]), client)
+
+    [task] = [s["body"] for s in client.sent
+              if s["endpoint"] == "task/create"]
+    assert task["o"] == "profile" and task["id"] == 31337
+
+
+def test_a_rerun_makes_no_second_record(world, monkeypatch):
+    monkeypatch.setattr(Config, *PIPE_ON)
+    client = Client()
+    run(Hub([FRESH]), client)
+    out = run(Hub([FRESH]), client)
+
+    assert len(opp_creates(client)) == 1
+    assert out["skipped_handled"] == 1 and out["added"] == []
+
+
+def test_an_open_record_on_the_profile_is_not_duplicated(world, monkeypatch):
+    monkeypatch.setattr(Config, *PIPE_ON)
+    client = Client(existing={BACK_EMAIL: [21999]}, opp_rows=[
+        {"op_id": 1000, "otype_id": 1003, "profile_id": 21999,
+         "opportunity_status": "open"}])
+    out = run(Hub([BACK]), client)
+
+    assert opp_creates(client) == []
+    assert client.writes() == ["task/create"]
+    text = daf_sync.email_text([dict(out)])
+    assert "Already has open pipeline record 1000; no second one." in text
+
+
+@pytest.mark.parametrize("row", [
+    {"op_id": 990, "otype_id": 1003, "profile_id": 21999,
+     "opportunity_status": "closed"},
+    {"op_id": 991, "otype_id": 1001, "profile_id": 21999,
+     "opportunity_status": "open"},
+])
+def test_a_closed_or_other_type_record_does_not_count(world, monkeypatch, row):
+    monkeypatch.setattr(Config, *PIPE_ON)
+    client = Client(existing={BACK_EMAIL: [21999]}, opp_rows=[row])
+    run(Hub([BACK]), client)
+    assert len(opp_creates(client)) == 1
+
+
+def test_a_partial_list_makes_none_and_the_inquiry_still_goes_in(
+        world, monkeypatch):
+    monkeypatch.setattr(Config, *PIPE_ON)
+    client = Client(opp_partial=True)
+    out = run(Hub([FRESH]), client)
+
+    assert opp_creates(client) == []
+    assert client.writes() == ["profile/create/individual", "task/create"]
+    [added] = out["added"]
+    assert added["task_id"] == 1099 and added["profile_id"] == 31337
+    text = daf_sync.email_text([dict(out)])
+    needs = text.split("Needs Carl")[1]
+    assert "pipeline list couldn't be read completely" in needs
+    assert "add it by hand at Outreach" in needs
+
+
+def test_a_refused_create_leaves_the_inquiry_added(world, monkeypatch):
+    monkeypatch.setattr(Config, *PIPE_ON)
+    client = Client(opp_fail=True)
+    out = run(Hub([FRESH]), client)
+
+    [added] = out["added"]
+    assert added["task_id"] == 1099
+    assert any("pipeline record wasn't created" in p
+               for p in added["problems"])
+    assert world["holds"] == [], "a missing record never holds the inquiry"
+
+
+def test_preview_with_it_on_writes_nothing_and_counts_it(world, monkeypatch):
+    monkeypatch.setattr(Config, *PIPE_ON)
+    client = Client()
+    out = run(Hub([FRESH]), client, mode="preview")
+
+    assert client.writes() == []
+    assert out["budget_needed"] == 3
+    assert f"   {WOULD_LINE}" in daf_sync.email_text([dict(out)])
+
+
+def test_preview_sees_an_open_record_on_a_returning_donor(world):
+    client = Client(existing={BACK_EMAIL: [21999]}, opp_rows=[
+        {"op_id": 1000, "otype_id": 1003, "profile_id": 21999,
+         "opportunity_status": "open"}])
+    out = run(Hub([BACK]), client, mode="preview")
+    assert "Already has open pipeline record 1000" in \
+        daf_sync.email_text([dict(out)])
+
+
+def test_an_open_task_night_creates_no_record(world, monkeypatch):
+    monkeypatch.setattr(Config, *PIPE_ON)
+    client = Client(existing={BACK_EMAIL: [21999]},
+                    task_rows=[open_task("2027-01-10")])
+    run(Hub([BACK]), client)
+    assert opp_creates(client) == []
+
+
+def test_the_record_create_is_audited_with_ids_only(world, monkeypatch):
+    monkeypatch.setattr(Config, *PIPE_ON)
+    run(Hub([FRESH]), Client())
+
+    [row] = [a for a in world["audit"]
+             if a["endpoint"] == "opportunity/create"]
+    assert row["meta"]["ids"] == {
+        "otype_id": 1003, "profile_id": 31337,
+        "hubspot_form_id": FORM,
+        "hubspot_submission_id": "fresh001-bbbb",
+        "linked_profile_id": 31337}

@@ -145,6 +145,20 @@ def note_created(endpoint, body) -> bool:
             and not body.get("errors"))
 
 
+OPPORTUNITY_CREATE_ENDPOINT = "opportunity/create"
+
+
+def opportunity_created(endpoint, body) -> bool:
+    """True for an opportunity/create success, whose new id is at the TOP of
+    the body — {"op_id": 1034, "opportunity_guid": ..., "success": 1}
+    (sandbox, 2026-10-28) — where _request, which keeps only `data`, would
+    lose it."""
+    return (str(endpoint or "").strip("/") == OPPORTUNITY_CREATE_ENDPOINT
+            and isinstance(body, dict) and body.get("success") == 1
+            and body.get("op_id") not in (None, "", 0)
+            and not body.get("data") and not body.get("errors"))
+
+
 def _safe_body(response) -> str:
     """The response body, length-capped, for a diagnosable error."""
     try:
@@ -245,6 +259,13 @@ ENDPOINT_CONFIRMED_FIELDS = {
     "task_type_id": ("task/create",),    # 1065 -> task_type "DIY Form-Contact"
     "o": ("task/create",),               # "profile" -> o "profile"
     "id": ("task/create",),              # 21661 -> id 21661
+    # VERIFIED 2026-10-28 in the sandbox (opportunities 1033-1035, read back
+    # with opportunity/display and opportunity/list): otype_id is required
+    # ("otype_id: otype_id is required" without it) and 1003 is DAF
+    # Recruitment; profile_id (global) links the profile. stage_name and
+    # assigned_employee_id were sent and IGNORED — a new opportunity always
+    # lands at the first stage, Outreach, with no owner.
+    "otype_id": ("opportunity/create",),
 }
 
 # Names refused on specific endpoints EVEN THOUGH they are globally confirmed.
@@ -1104,6 +1125,12 @@ class CSuiteClient:
                     json_response = dict(
                         json_response, success=1,
                         data={"note_id": json_response["note_id"]})
+                # opportunity/create's id sits beside `success`, not in data.
+                if opportunity_created(endpoint, json_response):
+                    json_response = dict(json_response, data={
+                        "op_id": json_response["op_id"],
+                        "opportunity_guid":
+                            json_response.get("opportunity_guid")})
 
                 if json_response.get("success") == 1:
                     audit("success", status_code, body=json_response)
@@ -2051,7 +2078,32 @@ class CSuiteClient:
         if task_guid:
             data["task_guid"] = task_guid
         return self._request("task/edit/complete", data)
-    
+
+    # =========================================================================
+    # OPPORTUNITIES (DAF Recruitment pipeline)
+    # =========================================================================
+    #
+    # Sandbox, 2026-10-28: list, display and create work for this API user;
+    # edit and delete answer "main_api not available". So a created
+    # opportunity cannot be moved, assigned, closed or removed from here.
+
+    def list_opportunities(self, limit: int = 1000) -> dict:
+        """Every opportunity, one page. opportunity/list takes no filter we
+        have verified, so callers read it whole and match locally."""
+        return self._request("opportunity/list", {"view_limit": limit})
+
+    def get_opportunity(self, op_id: int) -> dict:
+        return self._request("opportunity/display", {"op_id": op_id})
+
+    def create_opportunity(self, profile_id: int, otype_id: int,
+                           audit_meta: dict = None) -> dict:
+        """Create an opportunity of type `otype_id` on a profile. It lands at
+        the type's first stage with no owner; neither can be set (above)."""
+        data = {"otype_id": otype_id, "profile_id": profile_id}
+        check_input_fields(data, OPPORTUNITY_CREATE_ENDPOINT)
+        return self._request(OPPORTUNITY_CREATE_ENDPOINT, data,
+                             audit_meta=audit_meta)
+
     # =========================================================================
     # ACCOUNTS
     # =========================================================================
