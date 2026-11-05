@@ -101,6 +101,25 @@ def test_the_new_daf_reply_is_the_v580_reply(recorded):
         "📋 **New DAF Inquiry**")
 
 
+@pytest.mark.parametrize("scenario", SCENARIOS)
+def test_the_chat_says_no_pipeline_record_was_made(recorded, scenario):
+    """2026-11-05: the nightly step makes DAF Recruitment records; chat does
+    not, and says so. The golden replies were edited by exactly this
+    appended line — once per scenario, on the confirmation — so every other
+    character is still pinned to V5.80."""
+    note = "\n\n" + daf_workflow.CHAT_NO_PIPELINE_NOTE
+    replies = recorded[scenario]["replies"]
+    assert sum(r.endswith(note) for r in replies) == 1
+    assert sum(daf_workflow.CHAT_NO_PIPELINE_NOTE in r for r in replies) == 1
+    assert "No DAF Recruitment pipeline record was made" in note
+
+
+def test_chat_never_asks_csuite_about_opportunities(recorded):
+    for scenario in SCENARIOS:
+        assert not any("opportunity" in s["endpoint"]
+                       for s in recorded[scenario]["sent"]), scenario
+
+
 # --- processed_submissions ---------------------------------------------------
 
 def test_the_chat_flow_asks_for_daf_history_exactly_as_before(monkeypatch):

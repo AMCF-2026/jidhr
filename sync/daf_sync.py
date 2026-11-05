@@ -107,12 +107,21 @@ def fund_enabled() -> bool:
     return bool(getattr(Config, "CSUITE_DAF_FUND_CREATE_ENABLED", False))
 
 
+WRITES_OPPORTUNITY = 1  # the DAF Recruitment record, while its switch is on
+
+
 def writes_needed(plan) -> int:
     """What one submission will spend from CSUITE_WRITE_BUDGET. A fund is
-    only ever opened with a new profile (run_daf_writes, step 2)."""
+    only ever opened with a new profile (run_daf_writes, step 2); the
+    pipeline record (sync/daf_pipeline.py) is counted for every added
+    inquiry while it is switched on — one already open costs nothing, so
+    this can over-count, never under-count."""
+    from sync import daf_pipeline
+
+    pipeline = WRITES_OPPORTUNITY if daf_pipeline.enabled() else 0
     if plan != "new":
-        return WRITES_RETURNING
-    return WRITES_NEW + (WRITES_FUND if fund_enabled() else 0)
+        return WRITES_RETURNING + pipeline
+    return WRITES_NEW + (WRITES_FUND if fund_enabled() else 0) + pipeline
 
 
 # The morning report's ticket line. Jidhr writes nothing to a ticket unless
@@ -468,8 +477,12 @@ def run(hubspot=None, csuite=None, run_mode=None) -> dict:
                      task_title=followup_task_title(data, "DAF"),
                      writes=needed)
         if run_mode == MODE_PREVIEW:
+            from sync import daf_pipeline
+
             entry.update(fund=plan == "new" and fund_enabled(),
-                         ticket=preview_ticket_line())
+                         ticket=preview_ticket_line(),
+                         pipeline=daf_pipeline.plan(
+                             csuite, existing_profile, task_cache))
             remaining -= needed
             out["budget_allowed"] += needed
             out["added"].append(entry)
@@ -501,12 +514,34 @@ def run(hubspot=None, csuite=None, run_mode=None) -> dict:
                          type(e).__name__)
             hold("csuite_error", contact_id)
             continue
+        _classify(out, entry, results, state, hold, contact_id, sid)
+        if out["added"] and out["added"][-1] is entry:
+            _pipeline_step(entry, csuite, state, task_cache, form_id, sid)
         used = (csuite.write_budget.used - before) if getattr(
             csuite, "write_budget", None) else needed
         remaining -= used
         out["budget_allowed"] += used
-        _classify(out, entry, results, state, hold, contact_id, sid)
     return out
+
+
+def _pipeline_step(entry, csuite, state, cache, form_id, sid):
+    """The DAF Recruitment record for an inquiry that was just added. Off:
+    a read-only plan (the production preview). On: create unless one is
+    open. A miss is a problem for a person; the inquiry stands either way."""
+    from sync import daf_pipeline
+
+    profile_id = state.get("profile_id")
+    if not daf_pipeline.enabled():
+        entry["pipeline"] = daf_pipeline.plan(csuite, profile_id, cache)
+        return
+    result = daf_pipeline.ensure(
+        csuite, profile_id, cache,
+        audit_meta={"hubspot_form_id": form_id,
+                    "hubspot_submission_id": sid,
+                    "linked_profile_id": profile_id})
+    entry["pipeline"] = result
+    if result["outcome"] in (daf_pipeline.FAILED, daf_pipeline.UNCHECKED):
+        entry.setdefault("problems", []).append(daf_pipeline.problem(result))
 
 
 def _classify(out, entry, results, state, hold, contact_id, sid):
@@ -682,6 +717,18 @@ def _person_lines(index, entry) -> list:
     return lines
 
 
+def _extra_lines(entry) -> list:
+    """The ticket and pipeline-record lines under an added inquiry."""
+    from sync import daf_pipeline
+
+    lines = []
+    if entry.get("ticket"):
+        lines.append(f"   {entry['ticket']}")
+    if entry.get("pipeline"):
+        lines.append(f"   {daf_pipeline.line(entry['pipeline'])}")
+    return lines
+
+
 def section_text(section) -> list:
     """One form's part of the email. Endowment can add its own later."""
     preview = section.get("mode") == MODE_PREVIEW
@@ -723,8 +770,7 @@ def section_text(section) -> list:
                 lines.append(f"   {made}; follow-up task {e.get('task_id')} "
                              f"for {e.get('assignee') or 'the DAF assignee'}"
                              f", due {_day(e.get('task_due'))}.")
-            if e.get("ticket"):
-                lines.append(f"   {e['ticket']}")
+            lines += _extra_lines(e)
             lines.append(f"   HubSpot: {e['hubspot_link']}")
         lines.append("")
     if held or rough:
@@ -741,8 +787,7 @@ def section_text(section) -> list:
             lines.append(f"   Added to CSuite (profile {e.get('profile_id')}"
                          f"{', task ' + str(e['task_id']) if e.get('task_id') else ''}"
                          "), but: " + "; ".join(e["problems"]))
-            if e.get("ticket"):
-                lines.append(f"   {e['ticket']}")
+            lines += _extra_lines(e)
             lines.append(f"   HubSpot: {e['hubspot_link']}")
         lines.append("")
         lines.append("Jidhr won't try these again by itself.")

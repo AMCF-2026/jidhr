@@ -340,7 +340,7 @@ _PAYLOAD_TARGET_KEYS = {
 # only place a create's target exists — before it, the record does not.
 _RESPONSE_ID_KEYS = ("id", "objectId", "emailId", "profile_id", "funit_id",
                      "donation_id", "grant_id", "task_id", "event_date_id",
-                     "note_id")
+                     "note_id", "op_id")
 
 
 def _is_create(endpoint: str) -> bool:

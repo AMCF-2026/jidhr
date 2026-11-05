@@ -174,6 +174,20 @@ class Config:
         os.environ.get('CSUITE_DAF_FUND_CREATE_ENABLED', 'False')
         .strip().lower() == 'true')
 
+    # Whether the NIGHTLY DAF step creates a DAF Recruitment opportunity
+    # (sync/daf_pipeline.py). Off. Its own switch because the nightly step
+    # already runs live: without it, the first night after a deploy would
+    # create opportunities unwatched. Off, a live night reports what it
+    # WOULD create ("would create pipeline record at Outreach (unowned)"),
+    # which is the production preview. Chat "new daf" never creates one.
+    # Same fail-closed parsing: only the exact string "true".
+    CSUITE_DAF_OPPORTUNITY_CREATE_ENABLED = (
+        os.environ.get('CSUITE_DAF_OPPORTUNITY_CREATE_ENABLED', 'False')
+        .strip().lower() == 'true')
+    # The DAF Recruitment opportunity type. Production UI, 2026-10-28: id
+    # 1003, active; sandbox: 1003 accepted by opportunity/create.
+    DAF_RECRUITMENT_OTYPE_ID = 1003
+
     # Whether "sync newsletter" may WRITE to HubSpot. Off.
     #
     # It POSTs communication-preferences/v3/subscribe once per CSuite profile

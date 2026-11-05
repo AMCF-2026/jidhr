@@ -1548,9 +1548,17 @@ def _step_create(query: str, state: dict, hubspot, csuite) -> str:
         return endowment_inquiry.step_create(state, hubspot, csuite)
 
     results = run_daf_writes(state, hubspot, csuite)
-    return _format_confirmation(state["submission_data"], state, results,
-                                "DAF" if state["type"] == "daf"
-                                else "Endowment")
+    reply = _format_confirmation(state["submission_data"], state, results,
+                                 "DAF" if state["type"] == "daf"
+                                 else "Endowment")
+    # The nightly step makes DAF Recruitment records (sync/daf_pipeline.py);
+    # chat does not yet, and says so, so nobody assumes one was made.
+    return f"{reply}\n\n{CHAT_NO_PIPELINE_NOTE}"
+
+
+CHAT_NO_PIPELINE_NOTE = ("ℹ️ No DAF Recruitment pipeline record was made: "
+                         "chat doesn't create them. Add one in CSuite if "
+                         "this donor needs it now.")
 
 
 def run_daf_writes(state: dict, hubspot, csuite,
