@@ -3,6 +3,8 @@ __pycache__/
 .venv/
 venv/
 .env
+.env.*
+!.env.example
 .DS_Store
 .pytest_cache/
 tickets_open_*.csv
