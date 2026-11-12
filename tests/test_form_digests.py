@@ -215,3 +215,144 @@ def test_the_raw_submissions_never_reach_the_job_row(monkeypatch):
     result = handler.handle({"id": 9})
     assert "Privatename" not in repr(result)
     assert "_raw" not in result and "digests" in result
+
+
+# --- JIDHR_FORMS_LIVE_CC ---------------------------------------------------------
+#
+# Pinned against main (1c2616d): with the variable unset, send() calls
+# send_report(to, subject, text) with exactly those three arguments, and
+# send_report sends one message per address with no Cc line. Set, live
+# digests gain a Cc; preview never does.
+
+OWNERS_ENV = {"JIDHR_OWNER_EMAIL_KODS": "kods@example.invalid",
+              "JIDHR_OWNER_EMAIL_NORA": "nora@example.invalid",
+              "JIDHR_OWNER_EMAIL_MUNIRA": "munira@example.invalid"}
+
+
+def _record_send_report(monkeypatch):
+    import clients.notify as notify
+    calls = []
+
+    def fake(*args, **kwargs):
+        calls.append((args, kwargs))
+        to = list(args[0]) + list(kwargs.get("cc") or ())
+        return {"sent": to, "failed": []}
+
+    monkeypatch.setattr(notify, "send_report", fake)
+    return calls
+
+
+def _digest(key, mode):
+    form = registry.BY_KEY[key]
+    return fd.build(form, [sub("a0000001-x", NOW)], on(mode), START, NOW)
+
+
+@pytest.mark.parametrize("env_cc", [None, "", " , ,"])
+def test_cc_unset_sends_exactly_as_main(monkeypatch, env_cc):
+    monkeypatch.setattr(Config, "JIDHR_FORMS_REPORT_TO",
+                        ("carl@example.invalid",), raising=False)
+    calls = _record_send_report(monkeypatch)
+    env = dict(OWNERS_ENV)
+    if env_cc is not None:
+        env["JIDHR_FORMS_LIVE_CC"] = env_cc
+    live = _digest("investment", "live")
+    preview = _digest("nonprofit_directory", "preview")
+    result = fd.send([live, preview], {"investment": on("live"),
+                                       "nonprofit_directory": on()}, env)
+    assert calls == [
+        ((("kods@example.invalid", "nora@example.invalid"),
+          live["subject"], live["text"]), {}),
+        ((("carl@example.invalid",), preview["subject"], preview["text"]),
+         {}),
+    ]
+    assert result == [
+        ("investment", ["kods@example.invalid", "nora@example.invalid"], []),
+        ("nonprofit_directory", ["carl@example.invalid"], []),
+    ]
+
+
+def test_cc_set_is_added_to_live_digests_only(monkeypatch):
+    monkeypatch.setattr(Config, "JIDHR_FORMS_REPORT_TO",
+                        ("carl@example.invalid",), raising=False)
+    calls = _record_send_report(monkeypatch)
+    env = dict(OWNERS_ENV, JIDHR_FORMS_LIVE_CC=(
+        " carl@example.invalid, ops@example.invalid ,,CARL@example.invalid"))
+    live = _digest("nonprofit_directory", "live")
+    preview = _digest("asset_donation", "preview")
+    fd.send([live, preview], {"nonprofit_directory": on("live"),
+                              "asset_donation": on()}, env)
+    assert calls == [
+        ((("munira@example.invalid",), live["subject"], live["text"]),
+         {"cc": ("carl@example.invalid", "ops@example.invalid")}),
+        ((("carl@example.invalid",), preview["subject"], preview["text"]),
+         {}),
+    ]
+    # The To line is the owners, whatever the CC says.
+    to, problem = fd.recipients(registry.BY_KEY["nonprofit_directory"],
+                                on("live"), env)
+    assert to == ("munira@example.invalid",) and problem is None
+    # The subject and text do not change with the CC.
+    assert live == _digest("nonprofit_directory", "live")
+
+
+class _FakeSMTP:
+    sent = []
+
+    def __init__(self, host, port, timeout=None):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def starttls(self):
+        pass
+
+    def login(self, user, password):
+        pass
+
+    def send_message(self, message):
+        _FakeSMTP.sent.append(message)
+
+
+@pytest.fixture
+def smtp(monkeypatch):
+    import smtplib
+    _FakeSMTP.sent = []
+    monkeypatch.setattr(smtplib, "SMTP", _FakeSMTP)
+    monkeypatch.setenv("NOTIFY_SMTP_HOST", "smtp.example.invalid")
+    for name in ("NOTIFY_SMTP_PORT", "NOTIFY_SMTP_USER",
+                 "NOTIFY_SMTP_PASSWORD"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("NOTIFY_EMAIL_FROM", "jidhr@example.invalid")
+    return _FakeSMTP.sent
+
+
+def test_send_report_without_cc_is_one_message_per_address(smtp):
+    from clients.notify import send_report
+
+    out = send_report(["kods@example.invalid", "nora@example.invalid"],
+                      "Subject", "Body")
+    assert out == {"sent": ["kods@example.invalid", "nora@example.invalid"],
+                   "failed": []}
+    assert [m["To"] for m in smtp] == ["kods@example.invalid",
+                                       "nora@example.invalid"]
+    assert all(m["Cc"] is None for m in smtp)
+    assert all(m["From"] == "jidhr@example.invalid" for m in smtp)
+
+
+def test_send_report_with_cc_is_one_message_with_a_cc_line(smtp):
+    from clients.notify import send_report
+
+    out = send_report(["kods@example.invalid", "nora@example.invalid"],
+                      "Subject", "Body",
+                      cc=("carl@example.invalid", "NORA@example.invalid"))
+    assert len(smtp) == 1
+    message = smtp[0]
+    assert message["To"] == "kods@example.invalid, nora@example.invalid"
+    assert message["Cc"] == "carl@example.invalid"
+    assert message["Subject"] == "Subject"
+    assert out == {"sent": ["kods@example.invalid", "nora@example.invalid",
+                            "carl@example.invalid"], "failed": []}

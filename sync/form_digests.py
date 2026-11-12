@@ -12,6 +12,9 @@ since-date. No email when there are none.
     live               to the form's owners: JIDHR_OWNER_EMAIL_<OWNER>
                        (e.g. JIDHR_OWNER_EMAIL_KODS). A live form whose owner
                        has no address set refuses with an [Jidhr ALERT].
+                       JIDHR_FORMS_LIVE_CC (optional, comma-separated) is
+                       CC'd on every live digest; unset, no CC. Preview
+                       never reads it.
 
 WHAT A DIGEST MAY SHOW
 ----------------------
@@ -80,6 +83,21 @@ def recipients(form, switches, environ) -> tuple:
         return (), (f"{form['name']} is live but {', '.join(missing) or 'an owner address'}"
                     " is not set, so its digest has nobody to go to.")
     return tuple(out), None
+
+
+LIVE_CC_ENV = "JIDHR_FORMS_LIVE_CC"
+
+
+def live_cc(environ) -> tuple:
+    """JIDHR_FORMS_LIVE_CC as addresses: comma-separated, blanks dropped,
+    repeats dropped. Unset or empty is (), which is no CC."""
+    raw = str((environ or {}).get(LIVE_CC_ENV, "") or "")
+    out = []
+    for part in raw.split(","):
+        address = part.strip()
+        if address and address.lower() not in {a.lower() for a in out}:
+            out.append(address)
+    return tuple(out)
 
 
 def check_live_owners(switches, environ) -> list:
@@ -237,7 +255,12 @@ def send(digests, switches, environ) -> list:
         if problem or not to:
             results.append((d["key"], [], ["no recipients"]))
             continue
-        delivery = send_report(to, d["subject"], d["text"])
+        # Live only. No CC is the call exactly as it was before the option.
+        cc = live_cc(environ) if d["mode"] == "live" else ()
+        if cc:
+            delivery = send_report(to, d["subject"], d["text"], cc=cc)
+        else:
+            delivery = send_report(to, d["subject"], d["text"])
         results.append((d["key"], delivery.get("sent") or [],
                         delivery.get("failed") or []))
         logger.info("digest %s: %d submission(s), %d recipient(s)", d["key"],
