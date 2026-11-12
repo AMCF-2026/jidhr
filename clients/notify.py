@@ -225,13 +225,17 @@ def _send_slack(url, text) -> bool:
         return False
 
 
-def _send_email(to_address, subject, text) -> bool:
+def _send_email(to_address, subject, text, cc=()) -> bool:
     """Email is sent only if an SMTP host is configured as well.
 
     Kept deliberately simple: there is no mail client in this repo, and
     adding a dependency for a notifier would make the notifier the riskiest
     thing in the process. With NOTIFY_EMAIL_TO set and no SMTP host, the
     address is logged as unreachable rather than silently dropped.
+
+    `to_address` is one address, or a list that all go on one message's To
+    line (send_report with a CC, for JIDHR_FORMS_LIVE_CC). `cc` adds a Cc
+    line; empty, the message is exactly what it was before.
     """
     import os
     import smtplib
@@ -245,9 +249,13 @@ def _send_email(to_address, subject, text) -> bool:
     try:
         message = EmailMessage()
         message["Subject"] = subject
+        to_list = ([to_address] if isinstance(to_address, str)
+                   else list(to_address))
         message["From"] = (os.environ.get("NOTIFY_EMAIL_FROM")
-                           or to_address)
-        message["To"] = to_address
+                           or to_list[0])
+        message["To"] = ", ".join(to_list)
+        if cc:
+            message["Cc"] = ", ".join(cc)
         message.set_content(text)
         port = smtp_port()
         user = os.environ.get("NOTIFY_SMTP_USER") or ""
@@ -282,15 +290,32 @@ def safe_notify(subject, body, kind=KIND_ALERT, **context) -> dict:
         return {"configured": False, "sent": [], "failed": ["notify"]}
 
 
-def send_report(recipients, subject, text) -> dict:
+def send_report(recipients, subject, text, cc=()) -> dict:
     """Email a report to explicit recipients, with the subject as given.
 
     For reports with their own audience and wording (the nightly DAF email,
     V5.90), not alerts: no [Jidhr …] prefix and not NOTIFY_EMAIL_TO. Uses
     the same SMTP settings. Never raises; {"sent": [...], "failed": [...]}.
+
+    No `cc` (every caller before JIDHR_FORMS_LIVE_CC): one message per
+    recipient, exactly as before. With `cc`: ONE message, every recipient on To and the CC
+    addresses on Cc, so a CC'd person gets one copy and everyone sees who
+    else got it. A CC address already on To is not repeated. That message
+    succeeds or fails as a whole, so every address lands in one list.
     """
     out = {"sent": [], "failed": []}
-    for address in [a for a in (recipients or ()) if a]:
+    to = [a for a in (recipients or ()) if a]
+    on_to = {a.lower() for a in to}
+    copy = [a for a in (cc or ()) if a and a.lower() not in on_to]
+    if to and copy:
+        try:
+            ok = _send_email(to, subject, text, cc=copy)
+        except Exception as e:                    # pragma: no cover
+            logger.warning("report email failed: %s", type(e).__name__)
+            ok = False
+        out["sent" if ok else "failed"].extend(to + copy)
+        return out
+    for address in to:
         try:
             ok = _send_email(address, subject, text)
         except Exception as e:                    # pragma: no cover
