@@ -24,6 +24,9 @@ Nothing else is read into the text — not the sensitive fields, not free
 text. The submitter is shown by name with a masked email and a HubSpot link.
 The ACH Request Form is never downloaded (counted=False), so it has no
 digest. Nothing is written anywhere and nothing is logged but counts.
+
+A digest that fails for any recipient, or has none, sends one [Jidhr ALERT]
+per form (safe_notify): form name, mode and counts, never submitter data.
 """
 
 import logging
@@ -254,6 +257,7 @@ def send(digests, switches, environ) -> list:
         to, problem = recipients(form, switches[d["key"]], environ)
         if problem or not to:
             results.append((d["key"], [], ["no recipients"]))
+            _alert_failed(form, d, failed=0, attempted=0)
             continue
         # Live only. No CC is the call exactly as it was before the option.
         cc = live_cc(environ) if d["mode"] == "live" else ()
@@ -265,4 +269,34 @@ def send(digests, switches, environ) -> list:
                         delivery.get("failed") or []))
         logger.info("digest %s: %d submission(s), %d recipient(s)", d["key"],
                     d["count"], len(delivery.get("sent") or []))
+        failed = len(delivery.get("failed") or [])
+        if failed:
+            _alert_failed(form, d, failed=failed,
+                          attempted=failed + len(delivery.get("sent") or []))
     return results
+
+
+def _alert_failed(form, digest, failed, attempted):
+    """One [Jidhr ALERT] for a digest that did not fully go out, live or
+    preview. Form name and counts only: no submitter, no addresses.
+
+    The job still completes, so the next digest starts after this run and
+    these submissions are NOT in it. The alert says so.
+    """
+    from clients.notify import KIND_ALERT, safe_notify
+
+    n = digest["count"]
+    what = (f"{n} submission{'' if n == 1 else 's'}")
+    if attempted:
+        why = (f"failed for {failed} of {attempted} "
+               f"recipient{'' if attempted == 1 else 's'}")
+    else:
+        why = "had no recipients, so it was not sent"
+    safe_notify(
+        f"{form['name']} digest not delivered",
+        f"The {digest['mode']} digest for {form['name']} ({what}) {why}. "
+        "Tomorrow's digest will not repeat these submissions; read them in "
+        "HubSpot: "
+        + Config.HUBSPOT_FORM_SUBMISSIONS_URL.format(form_id=form["form_id"]),
+        kind=KIND_ALERT, form=form["key"], mode=digest["mode"],
+        submissions=n, failed_recipients=failed)

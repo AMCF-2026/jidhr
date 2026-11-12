@@ -356,3 +356,121 @@ def test_send_report_with_cc_is_one_message_with_a_cc_line(smtp):
     assert message["Subject"] == "Subject"
     assert out == {"sent": ["kods@example.invalid", "nora@example.invalid",
                             "carl@example.invalid"], "failed": []}
+
+
+# --- a failed digest raises one alert per form -------------------------------------
+#
+# Pinned against 69aa62a: a clean send calls nothing new and returns the same
+# results. A failure (any recipient, live or preview, or no recipients at
+# all) adds exactly one safe_notify per form, carrying counts only.
+
+def _record_alerts(monkeypatch):
+    import clients.notify as notify
+    alerts = []
+    monkeypatch.setattr(notify, "safe_notify",
+                        lambda subject, body, kind=None, **context:
+                        alerts.append((subject, body, kind, context)))
+    return alerts
+
+
+def _send_report_failing(monkeypatch, failing):
+    import clients.notify as notify
+
+    def fake(to, subject, text, cc=()):
+        everyone = list(to) + list(cc)
+        return {"sent": [a for a in everyone if a not in failing],
+                "failed": [a for a in everyone if a in failing]}
+
+    monkeypatch.setattr(notify, "send_report", fake)
+
+
+def _private_sub(conv):
+    return sub(conv, NOW, firstname="Zainab", lastname="Qureshi",
+               email="zainab.private@example.invalid", company="Private Org")
+
+
+def test_a_clean_send_raises_no_alert(monkeypatch):
+    monkeypatch.setattr(Config, "JIDHR_FORMS_REPORT_TO",
+                        ("carl@example.invalid",), raising=False)
+    alerts = _record_alerts(monkeypatch)
+    _send_report_failing(monkeypatch, failing=())
+    live = _digest("investment", "live")
+    preview = _digest("nonprofit_directory", "preview")
+    result = fd.send([live, preview], {"investment": on("live"),
+                                       "nonprofit_directory": on()},
+                     dict(OWNERS_ENV, JIDHR_FORMS_LIVE_CC="ops@example.invalid"))
+    assert alerts == []
+    assert result == [
+        ("investment", ["kods@example.invalid", "nora@example.invalid",
+                        "ops@example.invalid"], []),
+        ("nonprofit_directory", ["carl@example.invalid"], []),
+    ]
+
+
+def test_a_failed_send_raises_exactly_one_alert_per_form(monkeypatch):
+    from clients.notify import KIND_ALERT
+
+    monkeypatch.setattr(Config, "JIDHR_FORMS_REPORT_TO",
+                        ("carl@example.invalid",), raising=False)
+    alerts = _record_alerts(monkeypatch)
+    # Investment live: one of two owners fails. Asset Donation preview: its
+    # only recipient fails. Nonprofit Directory live: clean.
+    _send_report_failing(monkeypatch, failing=("nora@example.invalid",
+                                               "carl@example.invalid"))
+    form = registry.BY_KEY
+    inv = fd.build(form["investment"], [_private_sub("a1"), _private_sub("a2")],
+                   on("live"), START, NOW)
+    asset = fd.build(form["asset_donation"], [_private_sub("b1")], on(),
+                     START, NOW)
+    npd = fd.build(form["nonprofit_directory"], [_private_sub("c1")],
+                   on("live"), START, NOW)
+    fd.send([inv, asset, npd], {"investment": on("live"),
+                                "asset_donation": on(),
+                                "nonprofit_directory": on("live")},
+            OWNERS_ENV)
+
+    assert len(alerts) == 2
+    (s1, b1, k1, c1), (s2, b2, k2, c2) = alerts
+    assert k1 == k2 == KIND_ALERT
+    assert "Investment Form" in s1 and "Investment Form" in b1
+    assert c1 == {"form": "investment", "mode": "live", "submissions": 2,
+                  "failed_recipients": 1}
+    assert "2 submissions" in b1 and "1 of 2 recipients" in b1
+    assert "AMCF Asset Donation Transfer Form" in s2
+    assert c2 == {"form": "asset_donation", "mode": "preview",
+                  "submissions": 1, "failed_recipients": 1}
+    for alert in alerts:
+        text = repr(alert)
+        for private in ("Zainab", "Qureshi", "zainab", "Private Org",
+                        "@example.invalid"):
+            assert private not in text, private
+
+
+def test_a_digest_with_no_recipients_raises_one_alert(monkeypatch):
+    monkeypatch.setattr(Config, "JIDHR_FORMS_REPORT_TO", (), raising=False)
+    alerts = _record_alerts(monkeypatch)
+    _send_report_failing(monkeypatch, failing=())
+    d = _digest("nonprofit_directory", "preview")
+    result = fd.send([d], {"nonprofit_directory": on()}, {})
+    assert result == [("nonprofit_directory", [], ["no recipients"])]
+    assert len(alerts) == 1
+    assert "no recipients" in alerts[0][1]
+    assert alerts[0][3]["failed_recipients"] == 0
+
+
+def test_the_alert_is_a_real_jidhr_alert(monkeypatch):
+    """Through the real safe_notify: the subject carries the prefix."""
+    import clients.notify as notify
+    seen = []
+    monkeypatch.setattr(notify, "_targets",
+                        lambda: ("https://hooks.example.invalid/x", None))
+    monkeypatch.setattr(notify, "_send_slack",
+                        lambda url, text: seen.append(text) or True)
+    monkeypatch.setattr(Config, "JIDHR_FORMS_REPORT_TO",
+                        ("carl@example.invalid",), raising=False)
+    _send_report_failing(monkeypatch, failing=("carl@example.invalid",))
+    d = _digest("nonprofit_directory", "preview")
+    fd.send([d], {"nonprofit_directory": on()}, {})
+    assert len(seen) == 1
+    assert seen[0].startswith("[Jidhr ALERT] Nonprofit Directory Application")
+    assert "carl@example.invalid" not in seen[0]
