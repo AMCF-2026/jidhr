@@ -447,12 +447,14 @@ def run(hubspot=None, csuite=None, run_mode=None) -> dict:
             if open_tasks:
                 from sync import open_tasks as ot
 
-                task = open_tasks[0]
-                verdict, days = ot.judge(task, data.get("submitted_at"))
+                decided = ot.decide(open_tasks, data.get("submitted_at"))
+                task, verdict, days = (decided["task"], decided["verdict"],
+                                       decided["days"])
                 if verdict == ot.STALE:
                     hold("stale_open_task", contact_id,
                          text=ot.outcome_text(verdict, task,
-                                              data.get("submitted_at")))
+                                              data.get("submitted_at"),
+                                              count=decided["count"]))
                     continue
                 recorded = (ot.record(verdict, form_id, sid,
                                       existing_profile, task)

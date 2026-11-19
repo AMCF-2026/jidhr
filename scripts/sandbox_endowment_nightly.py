@@ -288,12 +288,169 @@ def run_cases(no_fedid_id, fedid_id):
     print(daf_sync.email_text([merged]))
 
 
+# --- round 16: whose open tasks count -------------------------------------------
+
+USED = {"21762", "21856", "21955"}
+
+
+def discover_owner():
+    """Reads only: two org profiles with no open task (not used before), and
+    every task type the sandbox's tasks carry, from task/display."""
+    from sync.open_tasks import load_open_tasks
+
+    lock_down()
+    client = sandbox_client(0)
+    tasks, error = load_open_tasks(client, with_employee=True)
+    if error:
+        print(json.dumps({"task_list": error}))
+        return
+    rows = ((client._request("task/list", {"view_limit": 1000})
+             .get("data") or {}).get("results") or [])
+    types = {}
+    for row in rows:
+        data = (client._request("task/display",
+                                {"task_id": row.get("task_id")})
+                .get("data") or {})
+        kind = (data.get("task_type") or {})
+        types.setdefault(str(kind.get("task_type_id")),
+                         kind.get("task_type_name"))
+    orgs = []
+    listing = client.get_profiles(limit=200, offset=0)
+    for row in ((listing.get("data") or {}).get("results") or []):
+        pid = str(row.get("profile_id"))
+        if len(orgs) >= 2 or pid in USED or pid in tasks:
+            continue
+        record = client.get_profile(pid).get("data") or {}
+        if str(record.get("ptype") or "").lower() == "org" and \
+                record.get("organization"):
+            orgs.append({"profile_id": pid,
+                         "organization": record.get("organization")})
+    print(json.dumps({"task_types_seen": types, "orgs": orgs}, indent=2))
+
+
+def counting(client):
+    """Log every CSuite request the client makes, reads included."""
+    calls = []
+    inner = client._request
+
+    def _request(endpoint, data=None, **kwargs):
+        calls.append(endpoint)
+        return inner(endpoint, data, **kwargs)
+    client._request = _request
+    return calls
+
+
+def run_owner_cases(other_type_org, other_assignee_org, other_type):
+    """Setup: one task on each org (listed apart). Then three matched
+    submissions: 21762 (open task 1199, Ola, 1065), an org whose only open
+    task is 1065 for another assignee, an org whose only open task is Ola's
+    of another type."""
+    from intents.daf_workflow import form_task_type, inquiry_form
+    from sync import endowment_sync, org_match
+
+    state = lock_down()
+    stamp = datetime.now(timezone.utc).strftime("%m%d%H%M")
+    now_ms = int(time.time() * 1000)
+    today = datetime.now(timezone.utc).date().isoformat()
+    for name, value in (("JIDHR_ENDOWMENT_SINCE", today),
+                        ("CSUITE_ENDOWMENT_CREATE_RAW", "true"),
+                        ("CSUITE_ENDOWMENT_CREATE_ENABLED", True),
+                        ("CSUITE_ENDOWMENT_ASSIGNEE", 1002),
+                        ("CSUITE_WRITE_BUDGET", 10),
+                        ("CSUITE_WRITE_BUDGET_RAW", "10")):
+        setattr(Config, name, value)
+    endowment_type = form_task_type(inquiry_form("endowment"))
+
+    reader = sandbox_client(0)
+    names = {pid: profile_snapshot(reader, pid).get("organization")
+             for pid in ("21762", other_assignee_org, other_type_org)}
+    mirror = [{"profile_id": pid, "ptype": "org", "organization": name}
+              for pid, name in names.items()]
+    org_match.mirror_org_rows = lambda: (list(mirror),
+                                         datetime.now(timezone.utc))
+
+    # --- setup writes, counted apart from the cases
+    setup = sandbox_client(2)
+    made = []
+    for pid, employee, kind in ((other_assignee_org, 1007, endowment_type),
+                                (other_type_org, 1002, int(other_type))):
+        response = setup.create_task(
+            name=f"Jidhr sandbox setup {stamp}: open task, employee "
+                 f"{employee}, type {kind}",
+            employee_id=employee, due_date=today,
+            description="Sandbox setup for the endowment open-task filter.",
+            linked_profile_id=int(pid), task_type_id=kind,
+            audit_meta={"sandbox_setup": stamp})
+        made.append({"profile_id": pid, "employee_id": employee,
+                     "task_type_id": kind,
+                     "task_id": (response.get("data") or {}).get("task_id"),
+                     "success": bool(response.get("success"))})
+
+    def case(label, pid, letter, budget):
+        sub = submission(f"sbx{stamp}-{letter}", names[pid],
+                         f"jidhr-sbx-{stamp}-{letter}@example.invalid", "",
+                         now_ms + ord(letter))
+        client = sandbox_client(budget)
+        calls = counting(client)
+        out = endowment_sync.run(hubspot=Hub([sub]), csuite=client,
+                                 run_mode="live", budget_left=budget)
+        reads = [c for c in calls if c not in ("note/create", "task/create")]
+        return {"case": label, "profile_id": pid,
+                "writes": list(client.write_budget.log),
+                "reads": {e: reads.count(e) for e in sorted(set(reads))},
+                "reads_total": len(reads),
+                "added": [{k: e.get(k) for k in ("plan", "profile_id",
+                                                 "note_id", "task_id")}
+                          for e in out["added"]],
+                "existing_task": [
+                    {"task_id": e["open_task"]["task_id"],
+                     "recorded": e.get("recorded")}
+                    for e in out["existing_task"]],
+                "held": [e["reason"] for e in out["held"]],
+                "deferred": [e["reason"] for e in out["deferred"]]}, out
+
+    rows, sections = [], []
+    for label, pid, letter, budget in (
+            ("A 21762: open task 1199, Ola, endowment type", "21762", "g", 2),
+            ("B only open task: endowment type, another assignee",
+             other_assignee_org, "h", 2),
+            ("C only open task: Ola, another type", other_type_org, "i", 2)):
+        row, out = case(label, pid, letter, budget)
+        rows.append(row)
+        sections.append(out)
+
+    from sync import daf_sync
+    print(json.dumps({"stamp": stamp, "endowment_task_type": endowment_type,
+                      "setup_writes": made, "cases": rows,
+                      "case_writes_total": sum(len(r["writes"])
+                                               for r in rows),
+                      "jidhr_rows": [x["endpoint"] for x in state["records"]],
+                      "database_touched": False}, indent=2, default=str))
+    print("----- the endowment block")
+    merged = {"form": "endowment", "label": "Endowment", "mode": "live",
+              "added": [x for s in sections for x in s["added"]],
+              "held": [x for s in sections for x in s["held"]],
+              "deferred": [x for s in sections for x in s["deferred"]],
+              "existing_task": [x for s in sections
+                                for x in s["existing_task"]],
+              "budget": 10, "budget_needed": 0, "budget_allowed": 0}
+    print("\n".join(endowment_sync.section_text(merged)))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--discover", action="store_true")
     parser.add_argument("--run", nargs=2, metavar=("NOFEDID_ID", "FEDID_ID"))
+    parser.add_argument("--discover-owner", action="store_true")
+    parser.add_argument("--run-owner", nargs=3,
+                        metavar=("OTHER_TYPE_ORG", "OTHER_ASSIGNEE_ORG",
+                                 "OTHER_TYPE"))
     args = parser.parse_args()
-    if args.discover:
+    if args.discover_owner:
+        discover_owner()
+    elif args.run_owner:
+        run_owner_cases(*args.run_owner)
+    elif args.discover:
         discover()
     elif args.run:
         run_cases(*args.run)

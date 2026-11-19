@@ -1329,12 +1329,14 @@ def _create_followup_task(data, state, results, csuite, wf_type, type_label):
             # held for Carl. Either way, no second task.
             from sync import open_tasks as ot
 
-            task = found[0]
-            verdict, days = ot.judge(task, data.get("submitted_at"))
+            decided = ot.decide(found, data.get("submitted_at"))
+            task, verdict, days = (decided["task"], decided["verdict"],
+                                   decided["days"])
             recorded = ot.record(verdict, state.get("form_id"),
                                  data.get("submission_id"), profile_id, task)
             text = ot.outcome_text(verdict, task, data.get("submitted_at"),
-                                   recorded=recorded)
+                                   recorded=recorded,
+                                   count=decided["count"])
             results["task_existing"] = dict(task, verdict=verdict, days=days,
                                             recorded=recorded, text=text)
             results["task_skipped"] = text

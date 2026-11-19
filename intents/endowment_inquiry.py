@@ -612,8 +612,11 @@ def step_create(state: dict, hubspot, csuite) -> str:
         # V5.95: shown now so the plan is honest; checked again at the write.
         from sync.open_tasks import open_tasks_on_profile
 
+        from sync.open_tasks import decide
+
         found, problem = open_tasks_on_profile(csuite, _existing_id(duplicate))
-        results["open_task"] = found[0] if found else None
+        decided = decide(found, data.get("submitted_at"))
+        results["open_task"] = decided["task"] if decided else None
         results["open_task_problem"] = problem
 
     # Ids and the outcome only: this lives in the session cookie.
@@ -808,18 +811,98 @@ def _write(data, state, results, duplicate, csuite, employee) -> str:
     return format_confirmation(data, state, results)
 
 
+def own_open_tasks(csuite, profile_id, cache=None, displays=None):
+    """([open tasks], problem): the open tasks on the profile that are the
+    endowment step's OWN kind, for the nightly step only.
+
+    A task counts only when it is assigned to CSUITE_ENDOWMENT_ASSIGNEE
+    (task/list's employee_name_link_id) AND its type, read by task/display,
+    is the type this step writes (form_task_type of the endowment row). The
+    assignee is checked first, so only that person's open tasks on the
+    profile cost a display read. `displays` ({task_id: type}) keeps those
+    reads for the run. A failed read is a problem (the caller defers); a
+    task that fails either test is simply not returned: it neither covers
+    the submission nor holds it."""
+    from intents.daf_workflow import form_task_type
+    from sync.open_tasks import open_tasks_on_profile
+
+    employee, wanted = assignee(), form_task_type(_row())
+    found, problem = open_tasks_on_profile(csuite, profile_id, cache,
+                                           with_employee=True)
+    if problem:
+        return [], problem
+    mine = [t for t in found
+            if employee and str(t.get("employee_id") or "") == str(employee)]
+    own = []
+    for task in mine:
+        tid = task.get("task_id")
+        if displays is not None and tid in displays:
+            kind = displays[tid]
+        else:
+            try:
+                response = csuite._request("task/display", {"task_id": tid})
+            except Exception as e:
+                return [], f"task {tid} could not be read ({type(e).__name__})"
+            if not isinstance(response, dict) or not response.get("success"):
+                return [], f"task {tid} could not be read"
+            data = response.get("data") or {}
+            kind = data.get("task_type_id")
+            if kind is None:
+                kind = (data.get("task_type") or {}).get("task_type_id")
+            if displays is not None:
+                displays[tid] = kind
+        if kind is not None and str(kind) == str(wanted):
+            own.append(task)
+    return own, None
+
+
 def run_endowment_writes(data, state, results, csuite, employee, meta,
-                         new_org) -> bool:
+                         new_org, displays=None) -> str:
     """The nightly step's write sequence (sync/endowment_sync.py), built
-    from the chat's own pieces: for a NEW organisation create_org first,
-    then the note and the task on state["profile_id"]. Never profile/edit.
-    False when a new organisation's profile was not created (nothing else
-    is then sent)."""
-    if new_org and not create_org(data, state, results, csuite, meta):
-        return False
+    from the chat's own pieces. Never profile/edit. Returns:
+
+      "written"         profile (new org), note and task were attempted
+      "profile_failed"  a new organisation's profile was not created;
+                        nothing else was sent
+      "deferred"        matched org: the write-time open-task recheck could
+                        not be read (results["task_check_failed"]); nothing
+                        was sent
+      "covered"         matched org: the recheck found an own open task
+                        (results["task_existing"], judged and recorded);
+                        nothing was sent
+
+    For a matched organisation the write-time recheck (own_open_tasks, a
+    fresh task/list) runs BEFORE the note, so a deferred or covered
+    submission has no note to repeat; the task step then does not check
+    again."""
+    if new_org:
+        if not create_org(data, state, results, csuite, meta):
+            return "profile_failed"
+    else:
+        from sync import open_tasks as ot
+
+        found, problem = own_open_tasks(csuite, state["profile_id"],
+                                        displays=displays)
+        if problem:
+            results["task_check_failed"] = problem
+            return "deferred"
+        decided = ot.decide(found, data.get("submitted_at"))
+        if decided:
+            task, verdict, days = (decided["task"], decided["verdict"],
+                                   decided["days"])
+            recorded = ot.record(verdict, meta["hubspot_form_id"],
+                                 data.get("submission_id"),
+                                 state["profile_id"], task)
+            text = ot.outcome_text(verdict, task, data.get("submitted_at"),
+                                   recorded=recorded,
+                                   count=decided["count"])
+            results["task_existing"] = dict(task, verdict=verdict, days=days,
+                                            recorded=recorded, text=text)
+            return "covered"
     _create_note(data, state, results, csuite, meta)
-    _create_task(data, state, results, csuite, employee, meta)
-    return True
+    _create_task(data, state, results, csuite, employee, meta,
+                 check_open_tasks=False)
+    return "written"
 
 
 def create_org(data, state, results, csuite, meta):
@@ -932,7 +1015,8 @@ def _create_note(data, state, results, csuite, meta):
         logger.error("CSuite note NOT added to profile %s", profile_id)
 
 
-def _create_task(data, state, results, csuite, employee, meta):
+def _create_task(data, state, results, csuite, employee, meta,
+                 check_open_tasks=True):
     from intents.daf_workflow import form_task_type, task_due_date
 
     row = _row()
@@ -942,8 +1026,9 @@ def _create_task(data, state, results, csuite, employee, meta):
     # is present (sandbox, 2026-10-15).
     title = task_title(data)
     due = task_due_date(data.get("submitted_at"))
-    if not results.get("profile_created"):
+    if check_open_tasks and not results.get("profile_created"):
         # V5.95: an existing organisation may already have an open task.
+        # (The nightly step checks before its note instead: False there.)
         from sync.open_tasks import open_tasks_on_profile
 
         found, problem = open_tasks_on_profile(csuite, state["profile_id"])
@@ -957,13 +1042,15 @@ def _create_task(data, state, results, csuite, employee, meta):
             # V5.95.1: within 30 days, recorded as handled; older, held.
             from sync import open_tasks as ot
 
-            task = found[0]
-            verdict, days = ot.judge(task, data.get("submitted_at"))
+            decided = ot.decide(found, data.get("submitted_at"))
+            task, verdict, days = (decided["task"], decided["verdict"],
+                                   decided["days"])
             recorded = ot.record(verdict, meta["hubspot_form_id"],
                                  data.get("submission_id"),
                                  state["profile_id"], task)
             text = ot.outcome_text(verdict, task, data.get("submitted_at"),
-                                   recorded=recorded)
+                                   recorded=recorded,
+                                   count=decided["count"])
             results["task_existing"] = dict(task, verdict=verdict, days=days,
                                             recorded=recorded, text=text)
             results["task_skipped"] = text
