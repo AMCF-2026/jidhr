@@ -34,9 +34,11 @@ class NClient(Client):
     """Client with failures on chosen endpoints, a budget, and profile/edit
     forbidden outright."""
 
-    def __init__(self, fail=(), budget=10, **kwargs):
+    def __init__(self, fail=(), budget=10, task_types=None, **kwargs):
         super().__init__(**kwargs)
         self.write_budget = WriteBudget(budget)
+        # task/display: task_id -> type id, or "fail" for an unreadable one.
+        self.task_types = dict(task_types or {})
         inner, outer = self.session, self
 
         class Session:
@@ -45,24 +47,45 @@ class NClient(Client):
                 if endpoint == "profile/edit":
                     raise AssertionError("the nightly step called "
                                          "profile/edit")
-                if endpoint in fail:
+                if endpoint == "task/display":
+                    body = json.loads(data)
+                    outer.sent.append({"endpoint": endpoint, "body": body,
+                                       "raw": data})
+                    kind = outer.task_types.get(body.get("task_id"))
+                    payload = ({"success": 0, "errors": ["server error"]}
+                               if kind == "fail" else
+                               {"success": 1, "data": {
+                                   "task_id": body.get("task_id"),
+                                   "task_type_id": kind,
+                                   "task_type": ({"task_type_id": kind}
+                                                 if kind else None)}})
+                elif endpoint in fail:
                     outer.sent.append({"endpoint": endpoint,
                                        "body": json.loads(data), "raw": data})
                     payload = {"success": 0, "errors": ["server error"]}
+                else:
+                    return inner.post(url, data=data, **kw)
 
-                    class R:
-                        status_code = 200
-                        text = json.dumps(payload)
+                class R:
+                    status_code = 200
+                    text = json.dumps(payload)
 
-                        def json(self):
-                            return payload
-                    return R()
-                return inner.post(url, data=data, **kw)
+                    def json(self):
+                        return payload
+                return R()
 
         self.session = Session()
 
     def writes(self):
         return [e for e in self.endpoints() if e in WRITE_ENDPOINTS]
+
+
+OLA, OTHER = 1002, 1007
+
+
+def task_row(task_id, created, profile=18075, employee=OLA):
+    return {"task_id": task_id, "o": "profile", "id": profile,
+            "created_date": created, "employee_name_link_id": employee}
 
 
 @pytest.fixture
@@ -285,9 +308,8 @@ def test_a_missing_organisation_name_is_held(world):
 
 def test_a_matched_org_with_a_recent_open_task_gets_nothing(world):
     world["mirror"].append(EXACT)
-    client = NClient()
-    client.task_rows = ({"task_id": 777, "o": "profile", "id": 18075,
-                         "created_date": "2030-03-16"},)
+    client = NClient(task_types={777: 1065})
+    client.task_rows = (task_row(777, "2030-03-16"),)
     out = run(client=client)
     assert client.writes() == []
     [found] = out["existing_task"]
@@ -297,11 +319,9 @@ def test_a_matched_org_with_a_recent_open_task_gets_nothing(world):
 def test_a_recent_open_task_covers_even_beside_an_old_one(world):
     """Every open task is judged (sync/open_tasks.decide), as for DAF."""
     world["mirror"].append(EXACT)
-    client = NClient()
-    client.task_rows = ({"task_id": 700, "o": "profile", "id": 18075,
-                         "created_date": "2029-01-01"},
-                        {"task_id": 777, "o": "profile", "id": 18075,
-                         "created_date": "2030-03-16"})
+    client = NClient(task_types={700: 1065, 777: 1065})
+    client.task_rows = (task_row(700, "2029-01-01"),
+                        task_row(777, "2030-03-16"))
     out = run(client=client)
     assert client.writes() == [] and out["held"] == []
     assert out["existing_task"][0]["open_task"]["task_id"] == 777
@@ -309,16 +329,154 @@ def test_a_recent_open_task_covers_even_beside_an_old_one(world):
 
 def test_all_old_open_tasks_hold_naming_the_newest(world):
     world["mirror"].append(EXACT)
-    client = NClient()
-    client.task_rows = ({"task_id": 700, "o": "profile", "id": 18075,
-                         "created_date": "2029-01-01"},
-                        {"task_id": 701, "o": "profile", "id": 18075,
-                         "created_date": "2029-06-01"})
+    client = NClient(task_types={700: 1065, 701: 1065})
+    client.task_rows = (task_row(700, "2029-01-01"),
+                        task_row(701, "2029-06-01"))
     out = run(client=client)
     [held] = out["held"]
     assert held["reason"] == "stale_open_task"
     assert held["why"].startswith("The newest of the profile's 2 open "
                                   "tasks is open task 701")
+
+
+# --- whose open tasks count (endowment only) ---------------------------------
+
+def displayed(client):
+    return [s["body"]["task_id"] for s in client.sent
+            if s["endpoint"] == "task/display"]
+
+
+def test_another_assignees_task_of_the_same_type_does_not_count(world):
+    world["mirror"].append(EXACT)
+    client = NClient(task_types={801: 1065})
+    client.task_rows = (task_row(801, "2030-03-16", employee=OTHER),)
+    out = run(client=client)
+    assert client.writes() == ["note/create", "task/create"]
+    assert out["existing_task"] == [] and out["held"] == []
+    assert displayed(client) == []          # assignee first: no read
+
+
+def test_the_assignees_task_of_another_type_does_not_count(world):
+    world["mirror"].append(EXACT)
+    client = NClient(task_types={802: 1040})
+    client.task_rows = (task_row(802, "2030-03-16"),)
+    out = run(client=client)
+    assert client.writes() == ["note/create", "task/create"]
+    assert out["existing_task"] == []
+    assert displayed(client) == [802]       # read once, kept for the run
+
+
+def test_an_old_task_that_is_not_ours_does_not_hold(world):
+    world["mirror"].append(EXACT)
+    client = NClient(task_types={803: 1040})
+    client.task_rows = (task_row(803, "2025-01-01"),
+                        task_row(804, "2025-01-01", employee=OTHER))
+    out = run(client=client)
+    assert out["held"] == []
+    assert client.writes() == ["note/create", "task/create"]
+
+
+def test_only_the_assignees_tasks_are_displayed(world):
+    world["mirror"].append(EXACT)
+    client = NClient(task_types={901: 1065, 902: 1065, 903: 1065})
+    client.task_rows = (task_row(901, "2030-03-16", employee=OTHER),
+                        task_row(902, "2030-03-10"),
+                        task_row(903, "2030-03-01", employee=OTHER))
+    out = run(client=client)
+    assert displayed(client) == [902]
+    assert out["existing_task"][0]["open_task"]["task_id"] == 902
+
+
+def test_a_failed_display_read_defers(world):
+    world["mirror"].append(EXACT)
+    client = NClient(task_types={805: "fail"})
+    client.task_rows = (task_row(805, "2030-03-16"),)
+    out = run(client=client)
+    assert client.writes() == []
+    assert out["deferred"][0]["reason"] == "task_check_failed"
+    assert world["records"] == []
+
+
+def test_the_write_time_recheck_uses_the_same_filter(world):
+    """An own task that appears between the plan and the write covers the
+    submission before any note is sent; a foreign one does not."""
+    world["mirror"].append(EXACT)
+
+    class Racing(NClient):
+        lists = 0
+
+        def _request(self, endpoint, data=None, **kwargs):
+            if endpoint == "task/list":
+                Racing.lists += 1
+                if Racing.lists > 1:
+                    self.task_rows = (task_row(806, "2030-03-16"),)
+            return super()._request(endpoint, data, **kwargs)
+
+    client = Racing(task_types={806: 1065})
+    out = run(client=client)
+    assert client.writes() == []            # no note, no task
+    [found] = out["existing_task"]
+    assert found["open_task"]["task_id"] == 806 and found["recorded"]
+
+    Racing.lists = 0
+    world["processed"].clear()
+    world["held"].clear()
+    client = Racing(task_types={806: 1040})
+    out = run(client=client)
+    assert client.writes() == ["note/create", "task/create"]
+
+
+def test_a_failed_read_at_the_write_defers_with_nothing_sent(world):
+    world["mirror"].append(EXACT)
+
+    class Racing(NClient):
+        lists = 0
+
+        def _request(self, endpoint, data=None, **kwargs):
+            if endpoint == "task/list":
+                Racing.lists += 1
+                if Racing.lists > 1:
+                    self.task_rows = (task_row(807, "2030-03-16"),)
+            return super()._request(endpoint, data, **kwargs)
+
+    client = Racing(task_types={807: "fail"})
+    out = run(client=client)
+    assert client.writes() == []
+    assert out["deferred"][0]["reason"] == "task_check_failed"
+    assert world["records"] == [] and world["held"] == {}
+
+
+def test_preview_without_an_assignee_skips_the_check_and_says_so(
+        world, monkeypatch):
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_ASSIGNEE", None)
+    world["mirror"].append(EXACT)
+    client = NClient(task_types={808: 1065})
+    client.task_rows = (task_row(808, "2030-03-16"),)
+    out = run(client=client, mode="preview")
+    [entry] = out["added"]
+    assert entry["open_task_check_skipped"]
+    assert "task/list" not in client.endpoints()
+    assert displayed(client) == []
+    assert "Open-task check skipped: CSUITE_ENDOWMENT_ASSIGNEE isn't set" \
+        in email(out)
+
+
+def test_live_without_an_assignee_still_refuses(world, monkeypatch):
+    monkeypatch.setattr(Config, "CSUITE_ENDOWMENT_ASSIGNEE", None)
+    with pytest.raises(daf_sync.Refused):
+        run()
+
+
+def test_the_type_is_the_one_the_step_writes(world, monkeypatch):
+    """Not a literal: form_task_type of the endowment row."""
+    from intents import daf_workflow
+
+    monkeypatch.setattr(daf_workflow, "form_task_type", lambda row: 4242)
+    world["mirror"].append(EXACT)
+    client = NClient(task_types={809: 4242})
+    client.task_rows = (task_row(809, "2030-03-16"),)
+    out = run(client=client)
+    assert out["existing_task"][0]["open_task"]["task_id"] == 809
 
 
 @pytest.mark.parametrize("left,plan_mirror,added", [

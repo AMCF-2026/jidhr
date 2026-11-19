@@ -23,8 +23,12 @@ Read-only: task/list is never a write.
 LIST_LIMIT = 1000
 
 
-def load_open_tasks(csuite) -> tuple:
-    """({profile_id: [{"task_id", "created"}]}, error). One CSuite read."""
+def load_open_tasks(csuite, with_employee=False) -> tuple:
+    """({profile_id: [{"task_id", "created"}]}, error). One CSuite read.
+
+    `with_employee` adds "employee_id" (task/list's employee_name_link_id,
+    the assignee) for the endowment step's filter; DAF never asks, so its
+    task dicts are exactly what they were."""
     try:
         response = csuite._request("task/list", {"view_limit": LIST_LIMIT})
     except Exception as e:
@@ -48,21 +52,24 @@ def load_open_tasks(csuite) -> tuple:
         profile_id = str(row.get("id") or "").strip()
         if not profile_id:
             continue
-        found.setdefault(profile_id, []).append({
-            "task_id": row.get("task_id"),
-            "created": str(row.get("created_date") or "")[:10] or None})
+        task = {"task_id": row.get("task_id"),
+                "created": str(row.get("created_date") or "")[:10] or None}
+        if with_employee:
+            task["employee_id"] = row.get("employee_name_link_id")
+        found.setdefault(profile_id, []).append(task)
     for tasks in found.values():
         tasks.sort(key=lambda t: int(t["task_id"] or 0))
     return found, None
 
 
-def open_tasks_on_profile(csuite, profile_id, cache=None) -> tuple:
+def open_tasks_on_profile(csuite, profile_id, cache=None,
+                          with_employee=False) -> tuple:
     """([{"task_id", "created"}], error) for one profile. `cache` (a dict)
     lets one run read task/list once for every profile it checks."""
     if cache is not None and "tasks" in cache:
         found, error = cache["tasks"]
     else:
-        found, error = load_open_tasks(csuite)
+        found, error = load_open_tasks(csuite, with_employee=with_employee)
         if cache is not None:
             cache["tasks"] = (found, error)
     if error:

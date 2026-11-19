@@ -195,3 +195,64 @@ def test_same_day_tasks_break_ties_by_the_higher_task_id():
     decided = ot.decide([task("2027-01-10", 7), task("2027-01-10", 9)],
                         BACK_SUBMITTED)
     assert decided["task"]["task_id"] == 9
+
+
+# --- DAF is untouched by the endowment-only filter (pinned against cf60d3e) -------
+
+AFTER_COMMIT_1 = "cf60d3e"
+
+
+def _rows(spec):
+    return tuple(dict(open_task(created, task_id),
+                      employee_name_link_id=employee)
+                 for created, task_id, employee in spec)
+
+
+def _daf_night(daf_sync_module, rows, mode):
+    client = Client(existing={BACK_EMAIL: [21999]}, task_rows=rows)
+    out = daf_sync_module.run(hubspot=Hub([BACK]), csuite=client,
+                              run_mode=mode)
+    return {"out": json.loads(json.dumps(out, default=str)),
+            "sent": [s["endpoint"] for s in client.sent],
+            "email": daf_sync_module.email_text([out])}
+
+
+@pytest.mark.parametrize("spec", [
+    [("2027-01-10", 1099, 1002)],
+    [("2026-09-01", 1099, 1007), ("2027-01-10", 1100, 1002)],
+    [("2026-08-01", 1099, 1002), ("2026-10-02", 1100, 1012),
+     ("2026-11-20", 1101, 1007)],
+    [("2027-01-12", 1099, 1012), ("2027-01-02", 1100, 1002)]])
+@pytest.mark.parametrize("mode", ["live", "preview"])
+def test_daf_nights_are_identical_before_and_after_the_endowment_filter(
+        world, monkeypatch, spec, mode):
+    from sync import daf_sync
+
+    rows = _rows(spec)
+    now = _daf_night(daf_sync, rows, mode)
+    holds_now = list(world["holds"])
+    for key in ("holds",):
+        world[key].clear()
+    world["held"].clear()
+    world["processed"].clear()
+
+    old = {"sync.open_tasks": old_module("sync.open_tasks",
+                                         "sync/open_tasks.py",
+                                         AFTER_COMMIT_1),
+           "sync.daf_sync": old_module("sync.daf_sync", "sync/daf_sync.py",
+                                       AFTER_COMMIT_1),
+           "intents.daf_workflow": old_module("intents.daf_workflow",
+                                              "intents/daf_workflow.py",
+                                              AFTER_COMMIT_1)}
+    from tests.test_daf_sync import Config as patched
+    for module in old.values():
+        if hasattr(module, "Config"):
+            module.Config = patched
+    with monkeypatch.context() as m:
+        use_modules(m, old)
+        then = _daf_night(old["sync.daf_sync"], rows, mode)
+    assert now == then
+    assert holds_now == world["holds"]
+    # DAF's task dicts never carry the assignee.
+    for entry in now["out"].get("existing_task") or []:
+        assert "employee_id" not in entry["open_task"]

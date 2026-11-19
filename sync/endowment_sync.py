@@ -88,10 +88,10 @@ HOLD_REASONS = {
     "check_failed": ("Jidhr couldn't finish checking CSuite for this "
                      "organization, so nothing was added. Jidhr will try "
                      "again tomorrow night."),
-    "task_check_failed": ("Jidhr couldn't read CSuite's task list to see "
+    "task_check_failed": ("Jidhr couldn't read CSuite's tasks to see "
                           "whether this organization already has an open "
-                          "task, so nothing was added. Jidhr will try again "
-                          "tomorrow night."),
+                          "endowment task, so nothing was added. Jidhr will "
+                          "try again tomorrow night."),
     "nightly_limit": ("Nightly limit reached: tonight's allowance of CSuite "
                       "changes ran out before this one. Jidhr will try "
                       "again tomorrow night."),
@@ -265,6 +265,7 @@ def run(hubspot=None, csuite=None, run_mode=None, budget_left=None):
         remaining = allowance
     employee = ei.assignee()
     task_cache = {}
+    displays = {}                   # task/display reads, once per task
 
     for _moment_, data in subs:
         sid = data.get("submission_id")
@@ -313,10 +314,17 @@ def run(hubspot=None, csuite=None, run_mode=None, budget_left=None):
         profile_id = ei._existing_id(duplicate) if plan == "returning" \
             else None
         ein_action = None
+        check_skipped = False
         if plan == "returning":
             ein_action = ei.ein_plan(data, duplicate, csuite).get("action")
-            found, problem = ot.open_tasks_on_profile(csuite, profile_id,
-                                                      task_cache)
+        if plan == "returning" and not employee:
+            # Preview only (live refuses without the assignee): whose open
+            # tasks count can't be told, so the check is skipped and the
+            # block says so.
+            check_skipped = True
+        elif plan == "returning":
+            found, problem = ei.own_open_tasks(csuite, profile_id,
+                                               task_cache, displays)
             if problem:
                 hold("task_check_failed")
                 continue
@@ -346,7 +354,8 @@ def run(hubspot=None, csuite=None, run_mode=None, budget_left=None):
 
         entry = dict(_entry(data), plan=plan, existing_profile=profile_id,
                      writes=needed, ein=EIN_TEXT.get(ein_action),
-                     task_title_length=len(ei.task_title(data)))
+                     task_title_length=len(ei.task_title(data)),
+                     open_task_check_skipped=check_skipped)
         if run_mode == MODE_PREVIEW:
             remaining -= needed
             out["budget_allowed"] += needed
@@ -366,7 +375,7 @@ def run(hubspot=None, csuite=None, run_mode=None, budget_left=None):
         before = csuite.write_budget.used if getattr(
             csuite, "write_budget", None) else 0
         _write(out, entry, data, plan, profile_id, csuite, employee,
-               form_id, hold)
+               form_id, hold, displays)
         used = (csuite.write_budget.used - before) if getattr(
             csuite, "write_budget", None) else needed
         remaining -= used
@@ -375,7 +384,7 @@ def run(hubspot=None, csuite=None, run_mode=None, budget_left=None):
 
 
 def _write(out, entry, data, plan, profile_id, csuite, employee, form_id,
-           hold):
+           hold, displays=None):
     """The writes for one submission, then where it goes in the report."""
     from intents import endowment_inquiry as ei
 
@@ -387,10 +396,17 @@ def _write(out, entry, data, plan, profile_id, csuite, employee, form_id,
     state = {"profile_id": profile_id}
     sid = data.get("submission_id")
     try:
-        if not ei.run_endowment_writes(data, state, results, csuite,
-                                       employee, meta,
-                                       new_org=plan == "new"):
+        status = ei.run_endowment_writes(data, state, results, csuite,
+                                         employee, meta,
+                                         new_org=plan == "new",
+                                         displays=displays)
+        if status == "profile_failed":
             hold("csuite_error")
+            return
+        if status == "deferred":
+            # The write-time open-task recheck could not be read. Nothing
+            # was sent; the next night tries again.
+            hold("task_check_failed")
             return
     except Exception as e:
         logger.error("endowment submission %s: write raised %s", sid,
@@ -404,8 +420,8 @@ def _write(out, entry, data, plan, profile_id, csuite, employee, form_id,
     pid = state.get("profile_id")
     existing = results.get("task_existing")
     if existing and not results.get("task_id"):
-        # The write-time check found an open task the plan did not see.
-        # _create_task judged it and recorded the link or the hold.
+        # The write-time recheck (before the note) found an own open task
+        # the plan did not see; run_endowment_writes judged and recorded it.
         if existing.get("verdict") == "stale":
             out["held"].append(dict(entry, reason="stale_open_task",
                                     why=existing.get("text") or "",
@@ -512,6 +528,11 @@ def section_text(section, mark_preview=False) -> list:
                              f", due {_day(e.get('task_due'))}.")
             if e.get("ein"):
                 lines.append(f"   {e['ein']}")
+            if e.get("open_task_check_skipped"):
+                lines.append("   Open-task check skipped: "
+                             "CSUITE_ENDOWMENT_ASSIGNEE isn't set, so whose "
+                             "open tasks count can't be told. Live would "
+                             "check first.")
             lines.append(f"   HubSpot: {e['hubspot_link']}")
         lines.append("")
     if held or rough:
