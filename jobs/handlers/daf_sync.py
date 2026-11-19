@@ -124,6 +124,21 @@ def _endowment(daf_out):
                     "still went out.", kind=KIND_ALERT)
         logger.error("nightly endowment step raised %s", type(e).__name__)
         return None
+    if section is not None and section.get("stopped"):
+        from clients.notify import KIND_ALERT, safe_notify
+
+        stop = section["stopped"]
+        rest = sum(1 for e in section["deferred"]
+                   if e.get("reason") == "assignee_refused")
+        safe_notify("nightly endowment step stopped: the assignee isn't a "
+                    "valid CSuite employee",
+                    f"CSuite refused a follow-up task for employee "
+                    f"{stop.get('employee')} (CSUITE_ENDOWMENT_ASSIGNEE): "
+                    f"{stop.get('error')}. Submission "
+                    f"{stop.get('submission_id')} is in Needs Carl; "
+                    f"{rest} later submission(s) got no writes and will be "
+                    "tried again tomorrow night. Fix the variable.",
+                    kind=KIND_ALERT, mode=endowment_sync.mode())
     if section is not None:
         logger.info("nightly endowment step (%s): %d candidate(s), %d "
                     "added, %d held, %d deferred, %d already handled, %d "
@@ -147,4 +162,5 @@ def _endowment_ids(section) -> dict:
                 for e in section["existing_task"]},
             "skipped_handled": section["skipped_handled"],
             "skipped_held": section["skipped_held"],
-            "budget_allowed": section["budget_allowed"]}
+            "budget_allowed": section["budget_allowed"],
+            "stopped": (section.get("stopped") or {}).get("submission_id")}

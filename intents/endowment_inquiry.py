@@ -887,7 +887,7 @@ def own_open_tasks(csuite, profile_id, cache=None, displays=None):
 
 
 def run_endowment_writes(data, state, results, csuite, employee, meta,
-                         new_org, displays=None) -> str:
+                         new_org, displays=None, lists=None) -> str:
     """The nightly step's write sequence (sync/endowment_sync.py), built
     from the chat's own pieces. Never profile/edit. Returns:
 
@@ -911,8 +911,11 @@ def run_endowment_writes(data, state, results, csuite, employee, meta,
     else:
         from sync import open_tasks as ot
 
+        fresh = {}                  # a fresh task/list read, kept so the
         found, problem = own_open_tasks(csuite, state["profile_id"],
-                                        displays=displays)
+                                        fresh, displays=displays)
+        if lists is not None:       # caller can name the assignee from it
+            lists.append(fresh)
         if problem:
             results["task_check_failed"] = problem
             return "deferred"

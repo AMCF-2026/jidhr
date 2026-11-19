@@ -95,9 +95,19 @@ HOLD_REASONS = {
     "nightly_limit": ("Nightly limit reached: tonight's allowance of CSuite "
                       "changes ran out before this one. Jidhr will try "
                       "again tomorrow night."),
+    "assignee_refused": ("Tonight's run stopped before this one: CSuite "
+                         "refused a follow-up task for employee {employee} "
+                         "as not a valid employee. Nothing was added for "
+                         "this one; Jidhr will try it again tomorrow "
+                         "night."),
 }
 DEFERRED_REASONS = frozenset({"check_failed", "task_check_failed",
-                              "nightly_limit"})
+                              "nightly_limit", "assignee_refused"})
+
+# What CSuite says when task/create names an employee that doesn't exist
+# (sandbox, 2026-11-19: HTTP 400, "employee_id: employee_id 999999 is not
+# a valid employee").
+NOT_A_VALID_EMPLOYEE = "is not a valid employee"
 
 EIN_TEXT = {
     "set": ("EIN: the form has one and the CSuite profile has none. Jidhr "
@@ -268,9 +278,23 @@ def run(hubspot=None, csuite=None, run_mode=None, budget_left=None):
     employee = ei.assignee()
     task_cache = {}
     displays = {}                   # task/display reads, once per task
+    lists = [task_cache]            # every task/list read tonight (names)
 
-    for _moment_, data in subs:
+    for position, (_moment_, data) in enumerate(subs):
         sid = data.get("submission_id")
+        if out.get("stopped"):
+            # CSuite refused the assignee earlier tonight: nothing more is
+            # written. Not recorded, so the next night takes these up.
+            if sid in processed:
+                out["skipped_handled"] += 1
+            elif sid in held:
+                out["skipped_held"] += 1
+            else:
+                out["deferred"].append(dict(
+                    _entry(data), reason="assignee_refused",
+                    why=HOLD_REASONS["assignee_refused"].format(
+                        employee=employee)))
+            continue
         if sid in processed:
             out["skipped_handled"] += 1
             continue
@@ -376,17 +400,45 @@ def run(hubspot=None, csuite=None, run_mode=None, budget_left=None):
 
         before = csuite.write_budget.used if getattr(
             csuite, "write_budget", None) else 0
-        _write(out, entry, data, plan, profile_id, csuite, employee,
-               form_id, hold, displays)
+        results = _write(out, entry, data, plan, profile_id, csuite,
+                         employee, form_id, hold, displays, lists)
         used = (csuite.write_budget.used - before) if getattr(
             csuite, "write_budget", None) else needed
         remaining -= used
         out["budget_allowed"] += used
+        refused = str((results or {}).get("task_failed") or "")
+        if NOT_A_VALID_EMPLOYEE in refused:
+            # This submission is held/reported as any failed task is. The
+            # rest of tonight gets no writes (see the top of the loop).
+            out["stopped"] = {"submission_id": sid, "employee": employee,
+                              "error": refused[:200]}
+            logger.error("nightly endowment step stopped: CSuite refused "
+                         "employee %s as not a valid employee", employee)
+    out["assignee"] = assignee_seen(employee, lists)
     return out
 
 
+def assignee_seen(employee, lists) -> dict:
+    """Who follow-up tasks go to, from the task/list rows the night has
+    ALREADY read (no read of its own): {"id", "name", "read"}. `read` is
+    False when tonight read no task list at all, so nothing can be said
+    about the id either way."""
+    read, name = False, None
+    for cache in lists:
+        found, error = cache.get("tasks") or (None, "not read")
+        if error:
+            continue
+        read = True
+        for tasks in found.values():
+            for task in tasks:
+                if employee and str(task.get("employee_id") or "") == \
+                        str(employee) and task.get("employee_name"):
+                    name = name or task["employee_name"]
+    return {"id": employee, "name": name, "read": read}
+
+
 def _write(out, entry, data, plan, profile_id, csuite, employee, form_id,
-           hold, displays=None):
+           hold, displays=None, lists=None):
     """The writes for one submission, then where it goes in the report."""
     from intents import endowment_inquiry as ei
 
@@ -401,21 +453,21 @@ def _write(out, entry, data, plan, profile_id, csuite, employee, form_id,
         status = ei.run_endowment_writes(data, state, results, csuite,
                                          employee, meta,
                                          new_org=plan == "new",
-                                         displays=displays)
+                                         displays=displays, lists=lists)
         if status == "profile_failed":
             hold("csuite_error")
-            return
+            return results
         if status == "deferred":
             # The write-time open-task recheck could not be read. Nothing
             # was sent; the next night tries again.
             hold("task_check_failed")
-            return
+            return results
     except Exception as e:
         logger.error("endowment submission %s: write raised %s", sid,
                      type(e).__name__)
         if not state.get("profile_id"):
             hold("csuite_error")
-            return
+            return results
         results["task_failed"] = results.get("task_failed") or (
             f"the write stopped ({type(e).__name__})")
 
@@ -434,7 +486,7 @@ def _write(out, entry, data, plan, profile_id, csuite, employee, form_id,
                 entry, existing_profile=pid, open_task=existing,
                 recorded=existing.get("recorded"),
                 note_id=results.get("note_id")))
-        return
+        return results
 
     problems = list(results.get("errors") or [])
     if results.get("note_failed"):
@@ -452,7 +504,7 @@ def _write(out, entry, data, plan, profile_id, csuite, employee, form_id,
              problem="; ".join(problems) or "unknown")
         if out["held"]:
             out["held"][-1]["note_id"] = results.get("note_id")
-        return
+        return results
 
     entry.update(profile_id=pid, profile_created=bool(
                      results.get("profile_created")),
@@ -474,6 +526,7 @@ def _write(out, entry, data, plan, profile_id, csuite, employee, form_id,
         logger.info("endowment submission %s added: profile %s, task %s",
                     sid, pid, results.get("task_id"))
     out["added"].append(entry)
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +538,30 @@ def _person_lines(index, entry) -> list:
 
     return [f"{index}. {entry['organization']} — contact {entry['name']}, "
             f"{entry['email']} (submitted {_when(entry.get('submitted_at'))})"]
+
+
+def assignee_line(seen, preview) -> str:
+    """Who follow-up tasks go to, from what the night already read."""
+    go = "would go" if preview else "go"
+    seen = seen or {}
+    employee = seen.get("id")
+    if not employee:
+        from intents.endowment_inquiry import assignee_not_an_id
+
+        why = assignee_not_an_id() or "isn't set"
+        return (f"Follow-up tasks {go} to nobody yet: "
+                f"CSUITE_ENDOWMENT_ASSIGNEE {why}.")
+    if seen.get("name"):
+        return (f"Follow-up tasks {go} to {seen['name']} "
+                f"(employee {employee}).")
+    if seen.get("read"):
+        return (f"Follow-up tasks {go} to employee {employee}. No open "
+                f"CSuite task is assigned to employee {employee}, so Jidhr "
+                "can't show the name or confirm the id is valid.")
+    return (f"Follow-up tasks {go} to employee {employee}. Tonight's run "
+            "didn't read CSuite's task list (no submission matched an "
+            "organization already in CSuite), so Jidhr can't show the name "
+            "or confirm the id is valid.")
 
 
 def section_text(section, mark_preview=False) -> list:
@@ -500,6 +577,7 @@ def section_text(section, mark_preview=False) -> list:
         return []
     lines = ["ENDOWMENT INQUIRIES"
              + (" (PREVIEW)" if preview and mark_preview else ""), ""]
+    lines += [assignee_line(section.get("assignee"), preview), ""]
     new = [e for e in clean if e.get("plan") != "returning"]
     matched = [e for e in clean if e.get("plan") == "returning"]
     groups = [(new, "Would be added" if preview else "Added to CSuite"),

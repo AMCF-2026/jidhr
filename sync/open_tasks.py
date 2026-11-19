@@ -56,6 +56,7 @@ def load_open_tasks(csuite, with_employee=False) -> tuple:
                 "created": str(row.get("created_date") or "")[:10] or None}
         if with_employee:
             task["employee_id"] = row.get("employee_name_link_id")
+            task["employee_name"] = row.get("employee_name")
         found.setdefault(profile_id, []).append(task)
     for tasks in found.values():
         tasks.sort(key=lambda t: int(t["task_id"] or 0))
