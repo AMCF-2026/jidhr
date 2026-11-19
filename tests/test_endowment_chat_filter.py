@@ -285,3 +285,86 @@ def test_endowment_chat_another_assignees_daf_follow_up_does_not_cover(
     assert displayed(client) == []
     assert not [r for r in world["records"]
                 if "existing_open_task" in r["endpoint"]]
+
+
+# --- an assignee that isn't a whole-number employee id is named as such -----------
+
+def _set(monkeypatch, name, value):
+    """On every Config the modules hold: another test may reload config."""
+    import config
+    from intents import endowment_inquiry
+    from sync import daf_sync, endowment_sync
+    for holder in {config.Config, endowment_inquiry.Config,
+                   endowment_sync.Config, daf_sync.Config}:
+        monkeypatch.setattr(holder, name, value, raising=False)
+
+
+UNSET_REFUSAL = ("CSUITE_ENDOWMENT_ASSIGNEE is not set. It waits on Carl "
+                 "confirming in the CSuite UI who employee 1002 is; no id is "
+                 "guessed. Nothing was written.")
+
+
+@pytest.mark.parametrize("raw", ["Ola", "1002.0", "Mohamed, Ola", "0"])
+def test_a_value_that_is_not_an_id_is_named_in_every_message(world,
+                                                              monkeypatch,
+                                                              raw):
+    from config import Config
+    from intents import endowment_inquiry as ei
+    from sync import endowment_sync
+    from sync.daf_sync import Refused
+
+    _set(monkeypatch, "CSUITE_ENDOWMENT_ASSIGNEE", None)
+    _set(monkeypatch, "CSUITE_ENDOWMENT_ASSIGNEE_RAW", raw)
+    words = f"is set to {raw!r}, which isn't a whole-number employee id"
+
+    review, reply, _state, client = offer_and_create()
+    assert words in review and "is not set" not in review
+    assert words in reply and UNSET_REFUSAL not in reply
+    assert writes(client) == []
+
+    from clients import audit
+    monkeypatch.setattr(audit, "held_submissions", lambda form_id: {})
+    _set(monkeypatch, "JIDHR_ENDOWMENT_SINCE", "2030-01-01")
+    _set(monkeypatch, "CSUITE_WRITE_BUDGET", 10)
+    _set(monkeypatch, "CSUITE_WRITE_BUDGET_RAW", "10")
+    with pytest.raises(Refused) as caught:
+        endowment_sync.run(hubspot=Hub(), csuite=Client(), run_mode="live")
+    assert words in str(caught.value)
+
+    _existing_org(world)
+    out = endowment_sync.run(hubspot=Hub(), csuite=Client(),
+                             run_mode="preview")
+    block = "\n".join(endowment_sync.section_text(out))
+    assert f"Open-task check skipped: CSUITE_ENDOWMENT_ASSIGNEE {words}" \
+        in block
+    assert ei.assignee() is None          # text only: still no assignee
+
+
+def test_unset_keeps_every_message_as_it_was(world, monkeypatch):
+    from config import Config
+    from sync import endowment_sync
+    from sync.daf_sync import Refused
+
+    _set(monkeypatch, "CSUITE_ENDOWMENT_ASSIGNEE", None)
+    _set(monkeypatch, "CSUITE_ENDOWMENT_ASSIGNEE_RAW", "")
+    review, reply, _state, _client = offer_and_create()
+    assert ("Assignee not confirmed: CSUITE_ENDOWMENT_ASSIGNEE is not set, "
+            "so create will refuse.") in review
+    assert UNSET_REFUSAL in reply
+
+    from clients import audit
+    monkeypatch.setattr(audit, "held_submissions", lambda form_id: {})
+    _set(monkeypatch, "JIDHR_ENDOWMENT_SINCE", "2030-01-01")
+    _set(monkeypatch, "CSUITE_WRITE_BUDGET", 10)
+    _set(monkeypatch, "CSUITE_WRITE_BUDGET_RAW", "10")
+    with pytest.raises(Refused) as caught:
+        endowment_sync.run(hubspot=Hub(), csuite=Client(), run_mode="live")
+    assert str(caught.value) == (
+        "JIDHR_ENDOWMENT_MODE is live but CSUITE_ENDOWMENT_ASSIGNEE is not "
+        "set on this service, so the nightly endowment step wrote nothing.")
+    _existing_org(world)
+    out = endowment_sync.run(hubspot=Hub(), csuite=Client(),
+                             run_mode="preview")
+    assert ("Open-task check skipped: CSUITE_ENDOWMENT_ASSIGNEE isn't set, "
+            "so whose open tasks count can't be told. Live would check "
+            "first.") in "\n".join(endowment_sync.section_text(out))

@@ -113,6 +113,22 @@ def _row():
     return inquiry_form(ROW_KEY)
 
 
+def assignee_not_an_id():
+    """When CSUITE_ENDOWMENT_ASSIGNEE is SET but is not a whole-number
+    employee id, the words for it ("is set to 'Ola', which isn't a
+    whole-number employee id"); None when it is unset or an id. Text only:
+    either way assignee() is None and everything refuses as before."""
+    if assignee():
+        return None
+    raw = str(getattr(Config, "CSUITE_ENDOWMENT_ASSIGNEE_RAW", "") or "")
+    raw = raw.strip()
+    if not raw:
+        return None
+    shown = raw if len(raw) <= 20 else raw[:20] + "…"
+    return (f"is set to {shown!r}, which isn't a whole-number employee id "
+            "(e.g. 1002)")
+
+
 def assignee():
     """The confirmed assignee's employee id, or None."""
     row = _row() or {}
@@ -287,7 +303,8 @@ def render_review(parsed: dict, hubspot, note: str = None) -> str:
     lines += other_handled_lines(found, warnings)
     if not assignee():
         lines.append("• 🛑 Assignee not confirmed: CSUITE_ENDOWMENT_ASSIGNEE "
-                     "is not set, so create will refuse.")
+                     f"{assignee_not_an_id() or 'is not set'}, so create "
+                     "will refuse.")
     lines += [
         "",
         "---",
@@ -492,6 +509,11 @@ def _refuse_unassigned(state):
 
     state.pop(PLAN_KEY, None)
     _reset_state(state)
+    wrong = assignee_not_an_id()
+    if wrong:
+        return ("🛑 **Endowment create refused: assignee not confirmed.**"
+                f"\n\nCSUITE_ENDOWMENT_ASSIGNEE {wrong}. No id is guessed. "
+                "Nothing was written.")
     return ("🛑 **Endowment create refused: assignee not confirmed.**\n\n"
             "CSUITE_ENDOWMENT_ASSIGNEE is not set. It waits on Carl "
             "confirming in the CSuite UI who employee 1002 is; no id is "
