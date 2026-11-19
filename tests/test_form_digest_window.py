@@ -69,6 +69,7 @@ class Mail:
     def __init__(self):
         self.delivered = []          # (night, recipient, body)
         self.refuse = set()
+        self.partial = set()     # refused one by one; the rest delivered
         self.night = None
 
     def factory(self):
@@ -97,8 +98,13 @@ class Mail:
                 if mail.refuse & set(to + cc):
                     raise OSError("550 mailbox unavailable")
                 body = message.get_content()
+                refused = {}
                 for address in to + cc:
-                    mail.delivered.append((mail.night, address, body))
+                    if address in mail.partial:
+                        refused[address] = (550, b"mailbox unavailable")
+                    else:
+                        mail.delivered.append((mail.night, address, body))
+                return refused
 
         return SMTP
 
@@ -290,3 +296,75 @@ def test_a_result_stored_as_json_text_is_read(monkeypatch):
                         lambda sql, params=None, fetch=True:
                         rows["max" if "max(" in sql else "recent"])
     assert last_success("investment", recent_runs(2, DAY2), DAY2) == DAY1
+
+
+# --- a server that refuses SOME recipients ----------------------------------------
+#
+# smtplib does not raise when a server accepts a message for some recipients
+# and refuses others; it returns the refused ones. Pinned against 2b4a8f4,
+# where that counted as delivered: no alert, no repeat.
+
+def test_a_partial_refusal_with_cc_alerts_once_and_repeats(world):
+    world["monkeypatch"].setenv("JIDHR_FORMS_LIVE_CC", "ops@example.invalid")
+    mail = world["mail"]
+    mail.partial = {"nora@example.invalid"}
+    first = night(world, 1, DAY1, [A], "investment")
+    assert first["digests"] == {"investment": {"sent": 0, "failed": 3}}
+    assert len(world["alerts"]) == 1
+    assert world["alerts"][0][1]["form"] == "investment"
+
+    mail.partial = set()
+    night(world, 2, DAY2, [A, B], "investment")
+    assert len(world["alerts"]) == 1
+    # Nora gets A once, on the repeat. Kods and ops had it on night 1 and
+    # get it again: the known cost of repeating a partial delivery.
+    assert mail.got("nora@example.invalid", A["conversionId"]) == 1
+    assert [n for n, a, body in mail.delivered
+            if a == "nora@example.invalid"
+            and "(submission subA0001)" in body] == [2]
+    for address in ("kods@example.invalid", "ops@example.invalid"):
+        assert mail.got(address, A["conversionId"]) == 2
+    for address in ("kods@example.invalid", "nora@example.invalid",
+                    "ops@example.invalid"):
+        assert mail.got(address, B["conversionId"]) == 1
+
+
+def test_full_acceptance_with_cc_neither_alerts_nor_repeats(world):
+    world["monkeypatch"].setenv("JIDHR_FORMS_LIVE_CC", "ops@example.invalid")
+    mail = world["mail"]
+    first = night(world, 1, DAY1, [A], "investment")
+    assert first["digests"] == {"investment": {"sent": 3, "failed": 0}}
+    night(world, 2, DAY2, [A, B], "investment")
+    assert world["alerts"] == []
+    for address in ("kods@example.invalid", "nora@example.invalid",
+                    "ops@example.invalid"):
+        assert mail.got(address, A["conversionId"]) == 1
+        assert mail.got(address, B["conversionId"]) == 1
+
+
+def test_send_email_is_false_when_any_recipient_is_refused(monkeypatch):
+    import smtplib
+
+    import clients.notify as notify
+
+    class SMTP:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def starttls(self):
+            pass
+
+        def send_message(self, message):
+            return {"b@example.invalid": (550, b"no")}
+
+    monkeypatch.setattr(smtplib, "SMTP", SMTP)
+    monkeypatch.setenv("NOTIFY_SMTP_HOST", "smtp.example.invalid")
+    monkeypatch.delenv("NOTIFY_SMTP_PORT", raising=False)
+    assert notify._send_email(["a@example.invalid", "b@example.invalid"],
+                              "S", "T") is False

@@ -236,6 +236,11 @@ def _send_email(to_address, subject, text, cc=()) -> bool:
     `to_address` is one address, or a list that all go on one message's To
     line (send_report with a CC, for JIDHR_FORMS_LIVE_CC). `cc` adds a Cc
     line; empty, the message is exactly what it was before.
+
+    A server that refuses SOME recipients still accepts the message and
+    smtplib does not raise; it returns the refused ones. That is a failed
+    send here (False), so a partial delivery is never counted as a whole
+    one. Only the count is logged, not the addresses.
     """
     import os
     import smtplib
@@ -269,7 +274,11 @@ def _send_email(to_address, subject, text, cc=()) -> bool:
                 smtp.starttls()
             if user and password:
                 smtp.login(user, password)
-            smtp.send_message(message)
+            refused = smtp.send_message(message)
+        if refused:
+            logger.warning("notify: email send failed: the server refused "
+                           "%d recipient(s)", len(refused))
+            return False
         return True
     except Exception as e:
         logger.warning("notify: email send failed: %s: %s",
