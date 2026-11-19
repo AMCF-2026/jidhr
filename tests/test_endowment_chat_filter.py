@@ -1,0 +1,193 @@
+"""Chat "new endowment" counts only the endowment step's OWN open tasks
+(intents/endowment_inquiry.own_open_tasks), as the nightly step does, and
+writes nothing when that check cannot be completed. The DAF chat is
+unchanged, pinned against b0be280.
+
+Test doubles only (tests/test_endowment_org.py, tests/test_daf_sync.py);
+no network, no database.
+"""
+
+import json
+
+import pytest
+
+from intents import daf_workflow
+from tests.test_endowment_org import (WRITES, Client, Hub, _existing_org,
+                                      offer_and_create, open_task, world)
+# noqa above: `world` is the endowment chat fixture.
+
+PIN = "b0be280"
+
+
+def writes(client):
+    return [e for e in client.endpoints() if e in WRITES]
+
+
+def displayed(client):
+    return [s["body"]["task_id"] for s in client.sent
+            if s["endpoint"] == "task/display"]
+
+
+# --- a check that can't be completed writes nothing -------------------------------
+
+def test_a_failed_display_read_at_the_plan_stops_and_writes_nothing(world):
+    _existing_org(world)
+    client = Client()
+    client.task_rows = (open_task("2030-03-16"),)
+    client.task_types = {1067: "fail"}
+    _review, reply, state, client = offer_and_create(client=client)
+    assert "couldn't be checked" in reply and "Nothing was written" in reply
+    assert writes(client) == []
+    assert state.get("step") == "done"
+    assert world["records"] == []
+
+
+def test_a_failed_display_read_at_the_write_writes_nothing(world):
+    """Not even the EIN or the note: the check runs before any write."""
+    _existing_org(world)
+    client = Client()                 # profile 18075 has no EIN: EIN_SET
+    hub = Hub()
+    state = daf_workflow.default_workflow_state()
+    daf_workflow._initiate_workflow("new endowment", state, hub)
+    plan = daf_workflow._handle_active_workflow("yes", state, hub, client)
+    assert "`task/create`" in plan and "profile/edit" in plan
+    client.task_rows = (open_task("2030-03-16"),)    # appears, unreadable
+    client.task_types = {1067: "fail"}
+    reply = daf_workflow._handle_active_workflow("yes", state, hub, client)
+    assert "couldn't be checked" in reply and "Nothing was written" in reply
+    assert writes(client) == []
+    assert world["records"] == []
+
+
+def test_an_unreadable_task_list_also_writes_nothing(world):
+    """The same rule as the nightly: any incomplete check stops it."""
+    _existing_org(world)
+
+    class NoList(Client):
+        def _request(self, endpoint, data=None, **kwargs):
+            if endpoint == "task/list":
+                return {"success": False, "error": "HTTP 503"}
+            return super()._request(endpoint, data, **kwargs)
+
+    _review, reply, _state, client = offer_and_create(client=NoList())
+    assert "couldn't be checked" in reply
+    assert writes(client) == []
+
+
+# --- whose open tasks count ----------------------------------------------------
+
+def test_the_assignees_endowment_task_still_covers(world):
+    _existing_org(world)
+    client = Client()
+    client.task_rows = (open_task("2030-03-16"),)
+    _review, reply, _state, client = offer_and_create(client=client)
+    assert "task/create" not in client.endpoints()
+    assert "open task 1067" in reply
+    assert displayed(client) == [1067, 1067]   # the plan, then the write
+
+
+def test_another_assignees_task_is_never_displayed_and_never_counts(world):
+    _existing_org(world)
+    client = Client()
+    client.task_rows = (open_task("2030-03-16", 1068, employee=1012),)
+    _review, _reply, _state, client = offer_and_create(client=client)
+    assert "task/create" in client.endpoints()
+    assert displayed(client) == []
+
+
+def test_the_assignees_task_of_another_type_does_not_count(world):
+    _existing_org(world)
+    client = Client()
+    client.task_rows = (open_task("2030-03-16", 1069),)
+    client.task_types = {1069: 1000}
+    _review, _reply, _state, client = offer_and_create(client=client)
+    assert "task/create" in client.endpoints()
+
+
+# --- the DAF chat is unchanged (pinned against b0be280) ----------------------------
+
+def test_the_daf_chat_modules_are_byte_identical_to_the_pin():
+    import subprocess
+
+    found = subprocess.run(
+        ["git", "diff", "--stat", PIN, "--", "intents/daf_workflow.py",
+         "sync/open_tasks.py"], capture_output=True, text=True)
+    assert found.returncode == 0, found.stderr
+    assert found.stdout.strip() == "", found.stdout
+
+
+@pytest.mark.parametrize("spec", [
+    [("2027-01-10", 1099, 1002)],
+    [("2026-09-01", 1099, 1007), ("2027-01-10", 1100, 1012)],
+    [("2026-08-01", 1099, 1002), ("2026-10-02", 1100, 1012)]])
+def test_the_daf_chat_write_sequence_matches_the_pin(spec, monkeypatch):
+    """run_daf_writes (what the DAF chat runs after its yes) with open tasks
+    on a returning donor: the same results through b0be280's modules."""
+    from tests import test_daf_sync as t
+    from tests.test_open_task_rules import old_module, use_modules
+
+    def once():
+        from intents import daf_workflow as wf
+
+        state = {"processed": {}, "held": {}, "holds": [], "audit": []}
+        rows = tuple(dict(t.open_task(created, task_id),
+                          employee_name_link_id=employee)
+                     for created, task_id, employee in spec)
+        client = t.Client(existing={t.BACK_EMAIL: [21999]}, task_rows=rows)
+        row = wf.inquiry_form("daf")
+        data = wf._parse_submission(t.BACK, row["field_map"])
+        wf_state = {"active": True, "workflow_type": "daf", "type": "daf",
+                    "step": "confirm", "form_id": row["form_id"],
+                    "submission_data": data, "profile_id": None,
+                    "funit_id": None, "ticket_id": None}
+        results = wf.run_daf_writes(wf_state, t.Hub([t.BACK]), client,
+                                    allow_contact_create=False)
+        return {"results": json.loads(json.dumps(results, default=str)),
+                "sent": [s["endpoint"] for s in client.sent]}
+
+    with monkeypatch.context() as m:
+        _daf_world(m)
+        now = once()
+    old = {"sync.open_tasks": old_module("sync.open_tasks",
+                                         "sync/open_tasks.py", PIN),
+           "intents.daf_workflow": old_module("intents.daf_workflow",
+                                              "intents/daf_workflow.py",
+                                              PIN)}
+    with monkeypatch.context() as m:
+        _daf_world(m)
+        for module in old.values():
+            if hasattr(module, "Config"):
+                module.Config = t.Config
+        use_modules(m, old)
+        then = once()
+    assert now == then
+    # Not two empty answers: the open task was found and judged.
+    assert now["results"].get("task_existing"), now["results"]
+    assert "task/list" in now["sent"]
+
+
+def _daf_world(m):
+    """The DAF test settings and audit doubles, on a monkeypatch context."""
+    import uuid
+
+    import clients.csuite as mod
+    import sync.filter_trust as trust
+    from clients import audit
+    from tests import test_daf_sync as t
+
+    for name, value in (("CSUITE_ENV", "live"), ("CSUITE_WRITE_BUDGET", 10),
+                        ("CSUITE_DAF_CREATE_ENABLED", True),
+                        ("CSUITE_DAF_TASK_CREATE_ENABLED", True),
+                        ("CSUITE_DAF_FUND_CREATE_ENABLED", False),
+                        ("CSUITE_HUBSPOT_BACKFILL_ENABLED", False),
+                        ("CSUITE_TICKET_CLOSE_ENABLED", False),
+                        ("CSUITE_TASK_EMPLOYEE_ID_DAF_INQUIRY", 1012),
+                        ("CSUITE_TASK_TYPE_ID", 1065)):
+        m.setattr(t.Config, name, value)
+    m.setattr(mod, "reserve_write", lambda *a, **k: {"id": 1})
+    m.setattr(mod, "complete_write", lambda *a, **k: None)
+    m.setattr(audit, "record_write", lambda *a, **k: True)
+    m.setattr(audit, "processed_submissions", lambda form_id, **k: {})
+    m.setattr(audit, "held_submissions", lambda form_id: {})
+    m.setattr("sync.daf_reconcile.link_rows_allowed", lambda: True)
+    m.setattr(trust.uuid, "uuid4", lambda: uuid.UUID(int=0x5EED))
