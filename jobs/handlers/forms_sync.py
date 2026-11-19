@@ -57,9 +57,13 @@ def handle(job) -> dict:
 
     now = datetime.now(timezone.utc)
     switches = {f["key"]: f["switches"] for f in out["forms"]}
-    start = form_digests.window_start(
-        now, form_digests.last_success((job or {}).get("id")))
-    digests = form_digests.build_all(raw, switches, now, start)
+    # Per form: a form whose digest failed, and any form on a night that
+    # stood down, keeps its window (sync/form_digests.last_success).
+    runs = form_digests.recent_runs((job or {}).get("id"), now)
+    starts = {key: form_digests.window_start(
+                  now, form_digests.last_success(key, runs, now))
+              for key in switches}
+    digests = form_digests.build_all(raw, switches, now, starts)
     sent = form_digests.send(digests, switches, os.environ)
     del raw
     logger.info("nightly forms report: %d form(s), %d new in 24h, %d "

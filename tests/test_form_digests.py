@@ -211,7 +211,11 @@ def test_the_raw_submissions_never_reach_the_job_row(monkeypatch):
            "_raw": {"investment": [sub("a0000001-x", NOW,
                                        firstname="Privatename")]}}
     monkeypatch.setattr(forms_sync, "run", lambda: out)
-    monkeypatch.setattr(fd, "last_success", lambda job_id: None)
+    # No earlier runs. Patched at the database, not at last_success, whose
+    # signature changed when the window became per form.
+    import clients.database as database
+    monkeypatch.setattr(database, "execute_query",
+                        lambda sql, params=None, fetch=True: [])
     result = handler.handle({"id": 9})
     assert "Privatename" not in repr(result)
     assert "_raw" not in result and "digests" in result

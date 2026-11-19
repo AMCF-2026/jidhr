@@ -4,9 +4,10 @@ Daily digests for the "a person acts" (D) forms (V5.96)
 Run inside the nightly forms_sync job, from the submissions it has already
 read. For each D form switched on (JIDHR_FORM_<KEY>_ON=true) with a
 since-date (JIDHR_FORM_<KEY>_SINCE), one plain email listing the
-submissions that arrived since the last successful forms_sync run (at most
-7 days back; 24 hours if there is no earlier run), never before the
-since-date. No email when there are none.
+submissions that arrived since the last forms_sync run that delivered that
+form's digest in full (per form; at most 7 days back; 24 hours if there is
+no earlier run), never before the since-date. No email when there are none.
+A failed digest is repeated the next night.
 
     preview (default)  to JIDHR_FORMS_REPORT_TO only, marked [Preview]
     live               to the form's owners: JIDHR_OWNER_EMAIL_<OWNER>
@@ -41,25 +42,85 @@ logger = logging.getLogger(__name__)
 MAX_LOOKBACK = timedelta(days=7)
 DEFAULT_LOOKBACK = timedelta(hours=24)
 
-_LAST_SUCCESS_SQL = """
+# The window is PER FORM. A form's digest starts at the last complete
+# forms_sync run that covered it: one whose stored result has a `digests`
+# map with no failure for that form. A form with no entry in that map had
+# nothing to send (or was off), so the run covered it. A run with no
+# `digests` map at all (stood down on a bad setting, or disabled) covers no
+# form, so it moves no window. The 7-day cap still applies (window_start).
+_EVER_RUN_SQL = """
     SELECT max(finished_at) AS finished_at FROM jobs
      WHERE job_type = 'forms_sync' AND status = 'complete' AND id <> %s
 """
+_RECENT_RUNS_SQL = """
+    SELECT finished_at, result FROM jobs
+     WHERE job_type = 'forms_sync' AND status = 'complete' AND id <> %s
+       AND finished_at >= %s
+     ORDER BY finished_at DESC
+"""
 
 
-def last_success(job_id):
-    """When the previous forms_sync run completed, or None. Read only."""
+def recent_runs(job_id, now):
+    """The complete forms_sync runs inside the 7-day cap, newest first, and
+    whether any complete run exists at all. One read for every form. None
+    when the database cannot answer (every form then covers 24 hours)."""
     try:
         from clients import database
 
-        rows = database.execute_query(_LAST_SUCCESS_SQL, (job_id or 0,),
+        ever = database.execute_query(_EVER_RUN_SQL, (job_id or 0,),
                                       fetch=True) or []
+        rows = database.execute_query(
+            _RECENT_RUNS_SQL, (job_id or 0, now - MAX_LOOKBACK),
+            fetch=True) or []
     except Exception as e:
-        logger.warning("previous forms_sync run unknown (%s); digests cover "
+        logger.warning("previous forms_sync runs unknown (%s); digests cover "
                        "24 hours", type(e).__name__)
         return None
-    value = (rows[0] or {}).get("finished_at") if rows else None
-    return value if isinstance(value, datetime) else None
+    last = (ever[0] or {}).get("finished_at") if ever else None
+    runs = [(r.get("finished_at"), _result(r.get("result"))) for r in rows
+            if isinstance(r.get("finished_at"), datetime)]
+    runs.sort(key=lambda run: run[0], reverse=True)
+    return {"ever": isinstance(last, datetime), "runs": runs}
+
+
+def _result(value) -> dict:
+    if isinstance(value, str):
+        import json
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def covered(result, key) -> bool:
+    """Did this run's stored result cover the form? See the note above."""
+    digests = (result or {}).get("digests")
+    if not isinstance(digests, dict):
+        return False
+    entry = digests.get(key)
+    if entry is None:
+        return True
+    try:
+        return int((entry or {}).get("failed") or 0) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def last_success(key, runs, now):
+    """When the form's window starts from, or None (no run ever: 24 hours).
+
+    The newest recent run that covered the form. None of the recent runs
+    did, but a run has completed before: the 7-day cap, so a failed or
+    stood-down night is retried as far back as the cap allows."""
+    if not runs:
+        return None
+    for finished, result in runs["runs"]:
+        if covered(result, key):
+            return finished
+    if runs["ever"] or runs["runs"]:
+        return now - MAX_LOOKBACK
+    return None
 
 
 def window_start(now, previous) -> datetime:
@@ -235,13 +296,18 @@ def build(form, subs, switches, start, now) -> dict | None:
 
 
 def build_all(raw_by_key, switches, now, start) -> list:
+    """`start` is {form key: window start} (per form), or one datetime for
+    every form."""
     out = []
     for form in registry.FORMS:
         s = switches.get(form["key"]) or {}
         if not (form["digest"] and form.get("counted", True) and s.get("on")
                 and s.get("since") and not form.get("observe_only")):
             continue
-        digest = build(form, raw_by_key.get(form["key"]) or [], s, start, now)
+        form_start = (start.get(form["key"], now - DEFAULT_LOOKBACK)
+                      if isinstance(start, dict) else start)
+        digest = build(form, raw_by_key.get(form["key"]) or [], s,
+                       form_start, now)
         if digest:
             out.append(digest)
     return out
@@ -280,8 +346,9 @@ def _alert_failed(form, digest, failed, attempted):
     """One [Jidhr ALERT] for a digest that did not fully go out, live or
     preview. Form name and counts only: no submitter, no addresses.
 
-    The job still completes, so the next digest starts after this run and
-    these submissions are NOT in it. The alert says so.
+    The run records the failure in its result, so this form's window does
+    not move: the next night's digest repeats these submissions (within the
+    7-day cap). The alert says so.
     """
     from clients.notify import KIND_ALERT, safe_notify
 
@@ -295,8 +362,8 @@ def _alert_failed(form, digest, failed, attempted):
     safe_notify(
         f"{form['name']} digest not delivered",
         f"The {digest['mode']} digest for {form['name']} ({what}) {why}. "
-        "Tomorrow's digest will not repeat these submissions; read them in "
-        "HubSpot: "
+        "The next digest repeats them (up to 7 days back); meanwhile they "
+        "are in HubSpot: "
         + Config.HUBSPOT_FORM_SUBMISSIONS_URL.format(form_id=form["form_id"]),
         kind=KIND_ALERT, form=form["key"], mode=digest["mode"],
         submissions=n, failed_recipients=failed)
