@@ -320,6 +320,20 @@ class Config:
         a.strip() for a in os.environ.get('JIDHR_DAF_REPORT_TO', '').split(',')
         if a.strip())
 
+    # The nightly ENDOWMENT step (sync/endowment_sync.py), run by the same
+    # daf_sync job after DAF, reported as a block in the DAF email (to
+    # JIDHR_DAF_REPORT_TO). Its own mode and date, as DAF has:
+    #   preview (default)  reads only; reports what it WOULD add and hold
+    #   live               writes; also needs CSUITE_ENDOWMENT_CREATE_ENABLED
+    #                      and CSUITE_ENDOWMENT_ASSIGNEE
+    # Only the word "live" writes. JIDHR_ENDOWMENT_SINCE unset = the step does
+    # nothing at all (no read, no alert).
+    JIDHR_ENDOWMENT_MODE = (
+        'live' if (os.environ.get('JIDHR_ENDOWMENT_MODE', 'preview')
+                   .strip().lower() == 'live') else 'preview')
+    JIDHR_ENDOWMENT_SINCE = os.environ.get('JIDHR_ENDOWMENT_SINCE',
+                                           '').strip()
+
     # Nightly forms report (V5.94), OBSERVE mode: reads every registered form
     # (sync/form_registry.py) and writes nothing. Only the exact word "true"
     # turns it on; it also needs SCHEDULED_SYNC_ENABLED like the rest.

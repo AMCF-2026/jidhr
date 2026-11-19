@@ -13,6 +13,11 @@ One email, to JIDHR_DAF_REPORT_TO, and only when at least one submission
 was added, held or deferred. A step that cannot run at all (no JIDHR_DAF_SINCE, a
 live run without the DAF switches, an unreadable history) sends an
 [Jidhr ALERT] instead and fails the job; the next night runs again.
+
+Then the nightly ENDOWMENT step (sync/endowment_sync.py), whatever DAF did,
+with what DAF left of CSUITE_WRITE_BUDGET. Its block goes in the same email.
+JIDHR_ENDOWMENT_SINCE unset: it does nothing. A refusal or a wrong setting
+sends its own [Jidhr ALERT] and never fails the job or stops the DAF email.
 """
 
 import logging
@@ -32,6 +37,7 @@ def handle(job) -> dict:
                     "not 'true') — nothing read, nothing written, no email")
         return {"enabled": False}
 
+    out = stood = refused = None
     try:
         out = daf_sync.run()
     except daf_sync.BadSetting as bad:
@@ -42,17 +48,29 @@ def handle(job) -> dict:
         safe_notify("nightly DAF step: a setting needs fixing", str(bad),
                     kind=KIND_ALERT, mode=daf_sync.mode())
         logger.error("nightly DAF step stood down: a setting needs fixing")
-        return {"enabled": True, "refused": str(bad), "stood_down": True}
-    except daf_sync.Refused as refused:
+        stood = {"enabled": True, "refused": str(bad), "stood_down": True}
+    except daf_sync.Refused as error:
         from clients.notify import KIND_ALERT, safe_notify
 
-        safe_notify("nightly DAF step did not run", str(refused),
+        safe_notify("nightly DAF step did not run", str(error),
                     kind=KIND_ALERT, mode=daf_sync.mode())
-        raise JobFailed(f"daf_sync refused: {refused}",
-                        result={"enabled": True, "refused": str(refused)})
+        refused = error
+
+    endowment = _endowment(out)
+    extra = {"endowment": _endowment_ids(endowment)} if endowment else {}
+
+    if out is None:
+        if endowment:
+            delivery = daf_sync.send_email([endowment])
+            extra["endowment"]["emailed"] = delivery.get("sent") or []
+        if refused is not None:
+            raise JobFailed(f"daf_sync refused: {refused}",
+                            result={"enabled": True,
+                                    "refused": str(refused)} | extra)
+        return stood | extra
 
     out["enabled"] = True
-    delivery = daf_sync.send_email([out])
+    delivery = daf_sync.send_email([out] + ([endowment] if endowment else []))
     out["emailed"] = delivery.get("sent") or []
     out["email_failed"] = delivery.get("failed") or []
     out["email_skipped"] = delivery.get("skipped")
@@ -69,4 +87,64 @@ def handle(job) -> dict:
         "added_ids": [e["submission_id"] for e in out["added"]],
         "held_ids": {e["submission_id"]: e["reason"] for e in out["held"]},
         "deferred_ids": {e["submission_id"]: e["reason"]
-                         for e in out.get("deferred") or []}}
+                         for e in out.get("deferred") or []}} | extra
+
+
+def _endowment(daf_out):
+    """The endowment section, or None (off, refused, or crashed: alerted)."""
+    from config import Config
+    from sync import endowment_sync
+
+    budget_left = None
+    if daf_out:
+        total = int(getattr(Config, "CSUITE_WRITE_BUDGET", 0) or 0)
+        budget_left = total - int(daf_out.get("budget_allowed") or 0)
+    try:
+        section = endowment_sync.run(budget_left=budget_left)
+    except daf_sync.BadSetting as bad:
+        from clients.notify import KIND_ALERT, safe_notify
+
+        safe_notify("nightly endowment step: a setting needs fixing",
+                    str(bad), kind=KIND_ALERT, mode=endowment_sync.mode())
+        logger.error("nightly endowment step stood down: a setting needs "
+                     "fixing")
+        return None
+    except daf_sync.Refused as error:
+        from clients.notify import KIND_ALERT, safe_notify
+
+        safe_notify("nightly endowment step did not run", str(error),
+                    kind=KIND_ALERT, mode=endowment_sync.mode())
+        logger.error("nightly endowment step refused")
+        return None
+    except Exception as e:
+        from clients.notify import KIND_ALERT, safe_notify
+
+        safe_notify("nightly endowment step failed",
+                    f"It stopped with {type(e).__name__}. The DAF report "
+                    "still went out.", kind=KIND_ALERT)
+        logger.error("nightly endowment step raised %s", type(e).__name__)
+        return None
+    if section is not None:
+        logger.info("nightly endowment step (%s): %d candidate(s), %d "
+                    "added, %d held, %d deferred, %d already handled, %d "
+                    "already held", section["mode"], section["candidates"],
+                    len(section["added"]), len(section["held"]),
+                    len(section["deferred"]), section["skipped_handled"],
+                    section["skipped_held"])
+    return section
+
+
+def _endowment_ids(section) -> dict:
+    """Ids and counts only, for the job row."""
+    return {"mode": section["mode"], "candidates": section["candidates"],
+            "added_ids": [e["submission_id"] for e in section["added"]],
+            "held_ids": {e["submission_id"]: e["reason"]
+                         for e in section["held"]},
+            "deferred_ids": {e["submission_id"]: e["reason"]
+                             for e in section["deferred"]},
+            "existing_task_ids": {
+                e["submission_id"]: (e.get("open_task") or {}).get("task_id")
+                for e in section["existing_task"]},
+            "skipped_handled": section["skipped_handled"],
+            "skipped_held": section["skipped_held"],
+            "budget_allowed": section["budget_allowed"]}

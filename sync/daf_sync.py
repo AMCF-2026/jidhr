@@ -635,7 +635,27 @@ def subject(sections, when=None) -> str:
     when = when or datetime.now(timezone.utc)
     local = when.astimezone(ZoneInfo("America/New_York"))
     day = f"{local:%a %b} {local.day}"
+    live = [s for s in sections if s.get("mode") != MODE_PREVIEW]
+    shown = [s for s in sections if s.get("mode") == MODE_PREVIEW]
+    if live and shown:
+        # DAF and endowment in different modes: the subject counts what was
+        # really done, and says how much more is only a preview.
+        tail = _subject_parts(live, preview=False)
+        extra = sum(len(s.get(k) or []) for s in shown
+                    for k in ("added", "held", "deferred", "existing_task"))
+        if extra:
+            tail.append(f"{extra} more in preview")
+        tail = f" ({', '.join(tail)})" if tail else ""
+        return f"New donor inquiries added to CSuite — {day}{tail}"
     preview = any(s.get("mode") == MODE_PREVIEW for s in sections)
+    parts = _subject_parts(sections, preview)
+    tail = f" ({', '.join(parts)})" if parts else ""
+    if preview:
+        return f"[Preview] New donor inquiries for CSuite — {day}{tail}"
+    return f"New donor inquiries added to CSuite — {day}{tail}"
+
+
+def _subject_parts(sections, preview) -> list:
     _added, needs = counts(sections)
     new = len(_clean(sections, returning=False))
     followups = len(_clean(sections, returning=True))
@@ -654,10 +674,7 @@ def subject(sections, when=None) -> str:
     deferred = deferred_count(sections)
     if deferred:
         parts.append(f"{deferred} deferred")
-    tail = f" ({', '.join(parts)})" if parts else ""
-    if preview:
-        return f"[Preview] New donor inquiries for CSuite — {day}{tail}"
-    return f"New donor inquiries added to CSuite — {day}{tail}"
+    return parts
 
 
 def _when(value) -> str:
@@ -685,12 +702,18 @@ def _short_id(entry) -> str:
 def carl_footer(sections) -> list:
     """The chat commands, for Carl only, after the signature. Staff read
     the body; nothing in it asks them to type anything into Jidhr."""
+    endowment = [s for s in sections if s.get("form") == "endowment"]
+    sections = [s for s in sections if s.get("form") != "endowment"]
     held = [e for s in sections for e in s.get("held") or []]
     # Only an open-task row whose "handled" could not be recorded needs Carl:
     # the rest are recorded and will not come back (V5.95.1).
     open_task = [e for s in sections for e in s.get("existing_task") or []
                  if s.get("mode") != MODE_PREVIEW and not e.get("recorded")]
-    if not (held or open_task):
+    e_held = [e for s in endowment for e in s.get("held") or []
+              if s.get("mode") != MODE_PREVIEW]
+    e_open = [e for s in endowment for e in s.get("existing_task") or []
+              if s.get("mode") != MODE_PREVIEW and not e.get("recorded")]
+    if not (held or open_task or e_held or e_open):
         return []
     lines = ["", "-----", "(for Carl)"]
     if held:
@@ -705,6 +728,17 @@ def carl_footer(sections) -> list:
                      'back:')
         lines += [f"  {e.get('name') or '(no name given)'}: {_short_id(e)}"
                   for e in open_task]
+    if e_held:
+        lines.append('Held endowment inquiries, in Jidhr chat: "new '
+                     'endowment" to add one, or "mark inquiry handled '
+                     'endowment <id>" if it was dealt with already.')
+        lines += [f"  {e.get('organization') or '(no name given)'}: "
+                  f"{_short_id(e)}" for e in e_held]
+    if e_open:
+        lines.append('Endowment open task found but "handled" not recorded '
+                     '— "mark inquiry handled endowment <id>":')
+        lines += [f"  {e.get('organization') or '(no name given)'}: "
+                  f"{_short_id(e)}" for e in e_open]
     return lines
 
 
@@ -729,8 +763,13 @@ def _extra_lines(entry) -> list:
     return lines
 
 
-def section_text(section) -> list:
-    """One form's part of the email. Endowment can add its own later."""
+def section_text(section, mark_preview=False) -> list:
+    """One form's part of the email. Endowment has its own
+    (sync/endowment_sync.section_text). `mark_preview` labels a preview
+    section when the email mixes preview and live."""
+    if section.get("form") == "endowment":
+        from sync import endowment_sync
+        return endowment_sync.section_text(section, mark_preview)
     preview = section.get("mode") == MODE_PREVIEW
     label = section.get("label", "DAF")
     clean = [e for e in section.get("added") or [] if not e.get("problems")]
@@ -740,7 +779,8 @@ def section_text(section) -> list:
     open_task = section.get("existing_task") or []
     if not (clean or rough or held or deferred or open_task):
         return []
-    lines = [f"{label} INQUIRIES", ""]
+    lines = [f"{label} INQUIRIES"
+             + (" (PREVIEW)" if preview and mark_preview else ""), ""]
     new = [e for e in clean if e.get("plan") != "returning"]
     returning = [e for e in clean if e.get("plan") == "returning"]
     groups = [(new, "Would be added" if preview else "Added to CSuite"),
@@ -823,15 +863,22 @@ def section_text(section) -> list:
 
 
 def email_text(sections) -> str:
-    preview = any(s.get("mode") == MODE_PREVIEW for s in sections)
+    modes = {s.get("mode") == MODE_PREVIEW for s in sections}
+    mixed = modes == {True, False}
+    preview = not mixed and any(s.get("mode") == MODE_PREVIEW
+                                for s in sections)
     lines = ["Good morning,", "",
              "Jidhr checked the website's donor inquiry forms overnight."]
     if preview:
         lines += ["", "This is a PREVIEW: nothing was added to CSuite. It "
                       "shows what Jidhr would have done."]
+    elif mixed:
+        lines += ["", "Part of this is a PREVIEW: a section marked "
+                      "(PREVIEW) shows what Jidhr would have done, and "
+                      "nothing in it was added to CSuite."]
     lines.append("")
     for section in sections:
-        lines += section_text(section)
+        lines += section_text(section, mark_preview=mixed)
     lines += ["Nothing was sent to any donor.", "", "— Jidhr"]
     lines += carl_footer(sections)
     return "\n".join(lines)

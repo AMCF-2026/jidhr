@@ -795,44 +795,7 @@ def _write(data, state, results, duplicate, csuite, employee) -> str:
         if (results.get("ein") or {}).get("action") == EIN_SET:
             _set_ein(data, state, results, csuite)
     else:
-        try:
-            response = csuite.create_org_profile(
-                organization=data.get("organization"),
-                email=data.get("email"),
-                phone=data.get("phone"),
-                address_line=data.get("org_address_street"),
-                city=data.get("org_address_city"),
-                state=data.get("org_address_state"),
-                zipcode=data.get("org_address_zip"),
-                audit_meta=meta,
-                **({"website": data["website"]}
-                   if data.get("website") else {}),
-                **({"fedid": data["ein"].strip()}
-                   if _ein_digits(data.get("ein")) else {}))
-        except Exception as e:
-            response = {"success": False, "error": str(e)}
-        if response.get("success") and isinstance(response.get("data"), dict):
-            state["profile_id"] = response["data"].get("profile_id")
-            results["profile_created"] = True
-            for key in ("phone_warning", "address_warning", "verify_warning"):
-                if response.get(key):
-                    results["warnings"].append(response[key])
-            if response.get("nothing_stored"):
-                results["errors"].append(
-                    f"CSuite reported success on {state['profile_id']} but "
-                    "stored NOTHING. Treat this profile as empty.")
-            elif response.get("fields_dropped"):
-                results["errors"].append(
-                    f"Profile {state['profile_id']} created but CSuite did "
-                    f"not store: {', '.join(sorted(response['fields_dropped']))}")
-            logger.info("CSuite org profile %s created for endowment "
-                        "submission %s", state["profile_id"],
-                        data.get("submission_id"))
-        else:
-            results["errors"].append(
-                f"Profile creation: {response.get('error') or 'Unknown error'}")
-            logger.error("CSuite org profile NOT created for endowment "
-                         "submission %s", data.get("submission_id"))
+        create_org(data, state, results, csuite, meta)
 
     if state.get("profile_id"):
         _create_note(data, state, results, csuite, meta)
@@ -843,6 +806,66 @@ def _write(data, state, results, duplicate, csuite, employee) -> str:
 
     state["step"] = "done"
     return format_confirmation(data, state, results)
+
+
+def run_endowment_writes(data, state, results, csuite, employee, meta,
+                         new_org) -> bool:
+    """The nightly step's write sequence (sync/endowment_sync.py), built
+    from the chat's own pieces: for a NEW organisation create_org first,
+    then the note and the task on state["profile_id"]. Never profile/edit.
+    False when a new organisation's profile was not created (nothing else
+    is then sent)."""
+    if new_org and not create_org(data, state, results, csuite, meta):
+        return False
+    _create_note(data, state, results, csuite, meta)
+    _create_task(data, state, results, csuite, employee, meta)
+    return True
+
+
+def create_org(data, state, results, csuite, meta):
+    """ONE profile/create/org for a NEW organisation. Sets
+    state["profile_id"] and results["profile_created"] on success; an error
+    goes to results["errors"]. Used by the chat (_write) and the nightly
+    step (sync/endowment_sync.py)."""
+    try:
+        response = csuite.create_org_profile(
+            organization=data.get("organization"),
+            email=data.get("email"),
+            phone=data.get("phone"),
+            address_line=data.get("org_address_street"),
+            city=data.get("org_address_city"),
+            state=data.get("org_address_state"),
+            zipcode=data.get("org_address_zip"),
+            audit_meta=meta,
+            **({"website": data["website"]}
+               if data.get("website") else {}),
+            **({"fedid": data["ein"].strip()}
+               if _ein_digits(data.get("ein")) else {}))
+    except Exception as e:
+        response = {"success": False, "error": str(e)}
+    if response.get("success") and isinstance(response.get("data"), dict):
+        state["profile_id"] = response["data"].get("profile_id")
+        results["profile_created"] = True
+        for key in ("phone_warning", "address_warning", "verify_warning"):
+            if response.get(key):
+                results["warnings"].append(response[key])
+        if response.get("nothing_stored"):
+            results["errors"].append(
+                f"CSuite reported success on {state['profile_id']} but "
+                "stored NOTHING. Treat this profile as empty.")
+        elif response.get("fields_dropped"):
+            results["errors"].append(
+                f"Profile {state['profile_id']} created but CSuite did "
+                f"not store: {', '.join(sorted(response['fields_dropped']))}")
+        logger.info("CSuite org profile %s created for endowment "
+                    "submission %s", state["profile_id"],
+                    data.get("submission_id"))
+    else:
+        results["errors"].append(
+            f"Profile creation: {response.get('error') or 'Unknown error'}")
+        logger.error("CSuite org profile NOT created for endowment "
+                     "submission %s", data.get("submission_id"))
+    return bool(results.get("profile_created"))
 
 
 def _set_ein(data, state, results, csuite):
