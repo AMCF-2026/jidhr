@@ -191,3 +191,97 @@ def _daf_world(m):
     m.setattr(audit, "held_submissions", lambda form_id: {})
     m.setattr("sync.daf_reconcile.link_rows_allowed", lambda: True)
     m.setattr(trust.uuid, "uuid4", lambda: uuid.UUID(int=0x5EED))
+
+
+# --- several open tasks, both chats -----------------------------------------------
+
+def _daf_chat(monkeypatch, rows):
+    """The DAF chat's write sequence for a returning donor with `rows`."""
+    from intents import daf_workflow as wf
+    from tests import test_daf_sync as t
+
+    recorded = []
+    with monkeypatch.context() as m:
+        _daf_world(m)
+        from clients import audit
+        m.setattr(audit, "record_write",
+                  lambda system, method, endpoint, **k:
+                  recorded.append(endpoint) or True)
+        client = t.Client(existing={t.BACK_EMAIL: [21999]}, task_rows=rows)
+        row = wf.inquiry_form("daf")
+        data = wf._parse_submission(t.BACK, row["field_map"])
+        state = {"active": True, "workflow_type": "daf", "type": "daf",
+                 "step": "confirm", "form_id": row["form_id"],
+                 "submission_data": data, "profile_id": None,
+                 "funit_id": None, "ticket_id": None}
+        results = wf.run_daf_writes(state, t.Hub([t.BACK]), client,
+                                    allow_contact_create=False)
+    return results, client, recorded
+
+
+def test_daf_chat_a_recent_task_beside_an_old_one_covers(monkeypatch):
+    from tests.test_daf_sync import open_task as daf_task
+
+    results, client, recorded = _daf_chat(
+        monkeypatch, (daf_task("2026-09-01", 1099),
+                      daf_task("2027-01-10", 1100)))
+    found = results["task_existing"]
+    assert found["task_id"] == 1100 and found["verdict"] == "within"
+    assert "task/create" not in client.writes()
+    assert recorded == ["submission/link/existing_open_task"]
+
+
+def test_daf_chat_all_tasks_old_is_held_naming_the_newest(monkeypatch):
+    from tests.test_daf_sync import open_task as daf_task
+
+    results, client, recorded = _daf_chat(
+        monkeypatch, (daf_task("2026-08-01", 1099),
+                      daf_task("2026-11-20", 1100),
+                      daf_task("2026-10-02", 1101)))
+    found = results["task_existing"]
+    assert found["verdict"] == "stale" and found["task_id"] == 1100
+    assert found["text"].startswith("The newest of the profile's 3 open "
+                                    "tasks is open task 1100")
+    assert "task/create" not in client.writes()
+    assert recorded == ["submission/held/stale_open_task"]
+
+
+def test_endowment_chat_a_recent_task_beside_an_old_one_covers(world):
+    _existing_org(world)
+    client = Client()
+    client.task_rows = (open_task("2029-06-01", 1066),
+                        open_task("2030-03-16", 1067))
+    _review, reply, _state, client = offer_and_create(client=client)
+    assert "task/create" not in client.endpoints()
+    assert "open task 1067" in reply and "recorded as handled" in reply
+    assert "1066" not in reply
+
+
+def test_endowment_chat_all_tasks_old_is_held_naming_the_newest(world):
+    _existing_org(world)
+    client = Client()
+    client.task_rows = (open_task("2029-06-01", 1066),
+                        open_task("2029-09-01", 1067))
+    _review, reply, _state, client = offer_and_create(client=client)
+    assert "task/create" not in client.endpoints()
+    assert "The newest of the profile's 2 open tasks is open task 1067" \
+        in reply
+    assert [r["endpoint"] for r in world["records"]] == \
+        ["submission/held/stale_open_task"]
+
+
+def test_endowment_chat_another_assignees_daf_follow_up_does_not_cover(
+        world):
+    """Munira's recent DAF follow-up (type 1065, the type DAF also uses):
+    not the endowment assignee's, so it covers nothing and Ola gets the
+    task."""
+    _existing_org(world)
+    client = Client()
+    client.task_rows = (open_task("2030-03-16", 1070, employee=1012),)
+    _review, reply, _state, client = offer_and_create(client=client)
+    assert "task/create" in client.endpoints()
+    task = client.body("task/create")
+    assert task["employee_id"] == 1002 and task["id"] == 18075
+    assert displayed(client) == []
+    assert not [r for r in world["records"]
+                if "existing_open_task" in r["endpoint"]]
