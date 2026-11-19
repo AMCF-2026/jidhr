@@ -612,8 +612,11 @@ def step_create(state: dict, hubspot, csuite) -> str:
         # V5.95: shown now so the plan is honest; checked again at the write.
         from sync.open_tasks import open_tasks_on_profile
 
+        from sync.open_tasks import decide
+
         found, problem = open_tasks_on_profile(csuite, _existing_id(duplicate))
-        results["open_task"] = found[0] if found else None
+        decided = decide(found, data.get("submitted_at"))
+        results["open_task"] = decided["task"] if decided else None
         results["open_task_problem"] = problem
 
     # Ids and the outcome only: this lives in the session cookie.
@@ -957,13 +960,15 @@ def _create_task(data, state, results, csuite, employee, meta):
             # V5.95.1: within 30 days, recorded as handled; older, held.
             from sync import open_tasks as ot
 
-            task = found[0]
-            verdict, days = ot.judge(task, data.get("submitted_at"))
+            decided = ot.decide(found, data.get("submitted_at"))
+            task, verdict, days = (decided["task"], decided["verdict"],
+                                   decided["days"])
             recorded = ot.record(verdict, meta["hubspot_form_id"],
                                  data.get("submission_id"),
                                  state["profile_id"], task)
             text = ot.outcome_text(verdict, task, data.get("submitted_at"),
-                                   recorded=recorded)
+                                   recorded=recorded,
+                                   count=decided["count"])
             results["task_existing"] = dict(task, verdict=verdict, days=days,
                                             recorded=recorded, text=text)
             results["task_skipped"] = text

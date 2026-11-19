@@ -294,6 +294,33 @@ def test_a_matched_org_with_a_recent_open_task_gets_nothing(world):
     assert found["open_task"]["task_id"] == 777 and found["recorded"]
 
 
+def test_a_recent_open_task_covers_even_beside_an_old_one(world):
+    """Every open task is judged (sync/open_tasks.decide), as for DAF."""
+    world["mirror"].append(EXACT)
+    client = NClient()
+    client.task_rows = ({"task_id": 700, "o": "profile", "id": 18075,
+                         "created_date": "2029-01-01"},
+                        {"task_id": 777, "o": "profile", "id": 18075,
+                         "created_date": "2030-03-16"})
+    out = run(client=client)
+    assert client.writes() == [] and out["held"] == []
+    assert out["existing_task"][0]["open_task"]["task_id"] == 777
+
+
+def test_all_old_open_tasks_hold_naming_the_newest(world):
+    world["mirror"].append(EXACT)
+    client = NClient()
+    client.task_rows = ({"task_id": 700, "o": "profile", "id": 18075,
+                         "created_date": "2029-01-01"},
+                        {"task_id": 701, "o": "profile", "id": 18075,
+                         "created_date": "2029-06-01"})
+    out = run(client=client)
+    [held] = out["held"]
+    assert held["reason"] == "stale_open_task"
+    assert held["why"].startswith("The newest of the profile's 2 open "
+                                  "tasks is open task 701")
+
+
 @pytest.mark.parametrize("left,plan_mirror,added", [
     (2, False, False),      # new org needs 3
     (2, True, True),        # matched org needs 2

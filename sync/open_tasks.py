@@ -130,6 +130,38 @@ def judge(task, submitted_at) -> tuple:
     return (WITHIN if days <= STALE_AFTER_DAYS else STALE), days
 
 
+def decide(tasks, submitted_at):
+    """Judge EVERY open task on a profile. None when there are none, else
+    {"verdict", "task", "days", "count"}.
+
+    Any task created within STALE_AFTER_DAYS of the inquiry, or after it,
+    covers it: the verdict is WITHIN and the task is the NEWEST such task
+    (the one recorded as handling it). Only when every task is older is the
+    verdict STALE, naming the newest of them. A task whose date cannot be
+    read is STALE (judge), so it never covers an inquiry. With one task this
+    is exactly judge() on it."""
+    tasks = list(tasks or ())
+    if not tasks:
+        return None
+    judged = [(task,) + judge(task, submitted_at) for task in tasks]
+    within = [row for row in judged if row[1] == WITHIN]
+    pool = within or judged
+
+    def newest(row):
+        from datetime import date
+
+        created = _day(row[0].get("created")) or date.min
+        try:
+            number = int(row[0].get("task_id") or 0)
+        except (TypeError, ValueError):
+            number = 0
+        return created, number
+
+    task, verdict, days = max(pool, key=newest)
+    return {"verdict": verdict, "task": task, "days": days,
+            "count": len(tasks)}
+
+
 def reason(task) -> str:
     """'existing open task 1099 (2026-10-23)' — the recorded reason."""
     return f"existing open task {task.get('task_id')} ({task.get('created')})"
@@ -166,7 +198,7 @@ def record(verdict, form_id, submission_id, profile_id, task) -> bool:
 
 
 def outcome_text(verdict, task, submitted_at, recorded=True,
-                 preview=False) -> str:
+                 preview=False, count=1) -> str:
     """The one sentence chat and the email both use."""
     def pretty(value):
         d = _day(value)
@@ -185,6 +217,11 @@ def outcome_text(verdict, task, submitted_at, recorded=True,
                    "again." if recorded else
                    "no new task, but recording it as handled FAILED, so it "
                    "will be shown again."))
+    if (count or 1) > 1:
+        return (f"The newest of the profile's {count} open tasks is "
+                f"{task_part} — more than {STALE_AFTER_DAYS} days before "
+                f"{inquiry}, like all of them. An old task isn't follow-up "
+                "on this inquiry, so nothing was added; held for Carl.")
     return (f"The profile's only open task is {task_part} — more than "
             f"{STALE_AFTER_DAYS} days before {inquiry}. An old task isn't "
             "follow-up on this inquiry, so nothing was added; held for Carl.")

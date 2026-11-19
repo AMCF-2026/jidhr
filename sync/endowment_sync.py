@@ -321,12 +321,14 @@ def run(hubspot=None, csuite=None, run_mode=None, budget_left=None):
                 hold("task_check_failed")
                 continue
             if found:
-                task = found[0]
-                verdict, days = ot.judge(task, data.get("submitted_at"))
+                decided = ot.decide(found, data.get("submitted_at"))
+                task, verdict, days = (decided["task"], decided["verdict"],
+                                       decided["days"])
                 if verdict == ot.STALE:
                     hold("stale_open_task",
                          text=ot.outcome_text(verdict, task,
-                                              data.get("submitted_at")))
+                                              data.get("submitted_at"),
+                                              count=decided["count"]))
                     continue
                 recorded = (ot.record(verdict, form_id, sid, profile_id,
                                       task)
