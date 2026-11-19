@@ -113,6 +113,22 @@ def _row():
     return inquiry_form(ROW_KEY)
 
 
+def assignee_not_an_id():
+    """When CSUITE_ENDOWMENT_ASSIGNEE is SET but is not a whole-number
+    employee id, the words for it ("is set to 'Ola', which isn't a
+    whole-number employee id"); None when it is unset or an id. Text only:
+    either way assignee() is None and everything refuses as before."""
+    if assignee():
+        return None
+    raw = str(getattr(Config, "CSUITE_ENDOWMENT_ASSIGNEE_RAW", "") or "")
+    raw = raw.strip()
+    if not raw:
+        return None
+    shown = raw if len(raw) <= 20 else raw[:20] + "…"
+    return (f"is set to {shown!r}, which isn't a whole-number employee id "
+            "(e.g. 1002)")
+
+
 def assignee():
     """The confirmed assignee's employee id, or None."""
     row = _row() or {}
@@ -287,7 +303,8 @@ def render_review(parsed: dict, hubspot, note: str = None) -> str:
     lines += other_handled_lines(found, warnings)
     if not assignee():
         lines.append("• 🛑 Assignee not confirmed: CSUITE_ENDOWMENT_ASSIGNEE "
-                     "is not set, so create will refuse.")
+                     f"{assignee_not_an_id() or 'is not set'}, so create "
+                     "will refuse.")
     lines += [
         "",
         "---",
@@ -492,6 +509,11 @@ def _refuse_unassigned(state):
 
     state.pop(PLAN_KEY, None)
     _reset_state(state)
+    wrong = assignee_not_an_id()
+    if wrong:
+        return ("🛑 **Endowment create refused: assignee not confirmed.**"
+                f"\n\nCSUITE_ENDOWMENT_ASSIGNEE {wrong}. No id is guessed. "
+                "Nothing was written.")
     return ("🛑 **Endowment create refused: assignee not confirmed.**\n\n"
             "CSUITE_ENDOWMENT_ASSIGNEE is not set. It waits on Carl "
             "confirming in the CSuite UI who employee 1002 is; no id is "
@@ -610,14 +632,18 @@ def step_create(state: dict, hubspot, csuite) -> str:
 
     if duplicate["outcome"] == EXISTING:
         # V5.95: shown now so the plan is honest; checked again at the write.
-        from sync.open_tasks import open_tasks_on_profile
-
+        # Only the endowment assignee's open tasks of the endowment type
+        # count (own_open_tasks), as in the nightly step.
         from sync.open_tasks import decide
 
-        found, problem = open_tasks_on_profile(csuite, _existing_id(duplicate))
+        profile_id = _existing_id(duplicate)
+        found, problem = own_open_tasks(csuite, profile_id)
+        if problem:
+            state.pop(PLAN_KEY, None)
+            state["step"] = "done"
+            return _unchecked_reply(profile_id, problem)
         decided = decide(found, data.get("submitted_at"))
         results["open_task"] = decided["task"] if decided else None
-        results["open_task_problem"] = problem
 
     # Ids and the outcome only: this lives in the session cookie.
     state[PLAN_KEY] = {"submission_id": data.get("submission_id"),
@@ -706,11 +732,6 @@ def render_plan(data: dict, results: dict, duplicate: dict) -> str:
                   f"Assigned to employee {assignee()}, task type "
                   f"{form_task_type(_row())}, due "
                   f"{task_due_date(data.get('submitted_at'))}."]
-        if existing and results.get("open_task_problem"):
-            lines.append(f"   ⚠️ CSuite couldn't be checked for an open task "
-                         f"on this profile ({results['open_task_problem']}). "
-                         "It is checked again before writing; if it still "
-                         "can't be, no task is created.")
         lines.append("")
     lines += [
               "The submission itself stays in HubSpot: "
@@ -793,8 +814,16 @@ def _write(data, state, results, duplicate, csuite, employee) -> str:
     meta = {"hubspot_form_id": row["form_id"],
             "hubspot_submission_id": data.get("submission_id")}
 
+    found = None
     if duplicate["outcome"] == EXISTING:
         state["profile_id"] = _existing_id(duplicate)
+        # Before ANY write: an open-task check that cannot be completed
+        # writes nothing (no EIN, no note, no task).
+        found, problem = own_open_tasks(csuite, state["profile_id"])
+        if problem:
+            results["task_check_failed"] = problem
+            state["step"] = "done"
+            return _unchecked_reply(state["profile_id"], problem)
         if (results.get("ein") or {}).get("action") == EIN_SET:
             _set_ein(data, state, results, csuite)
     else:
@@ -802,7 +831,8 @@ def _write(data, state, results, duplicate, csuite, employee) -> str:
 
     if state.get("profile_id"):
         _create_note(data, state, results, csuite, meta)
-        _create_task(data, state, results, csuite, employee, meta)
+        _create_task(data, state, results, csuite, employee, meta,
+                     found=found)
     else:
         results["note_skipped"] = True
         results["task_skipped"] = "no CSuite profile to attach it to"
@@ -1015,8 +1045,16 @@ def _create_note(data, state, results, csuite, meta):
         logger.error("CSuite note NOT added to profile %s", profile_id)
 
 
+def _unchecked_reply(profile_id, problem) -> str:
+    """The chat's reply when the open-task check could not be completed."""
+    return ("🛑 **Nothing was written — CSuite's open tasks on profile "
+            f"{mark_id(profile_id)} couldn't be checked** ({problem}).\n\n"
+            "Without that check a second follow-up task could be created. "
+            'Say *"new endowment"* to try again.')
+
+
 def _create_task(data, state, results, csuite, employee, meta,
-                 check_open_tasks=True):
+                 check_open_tasks=True, found=None):
     from intents.daf_workflow import form_task_type, task_due_date
 
     row = _row()
@@ -1029,9 +1067,11 @@ def _create_task(data, state, results, csuite, employee, meta,
     if check_open_tasks and not results.get("profile_created"):
         # V5.95: an existing organisation may already have an open task.
         # (The nightly step checks before its note instead: False there.)
-        from sync.open_tasks import open_tasks_on_profile
-
-        found, problem = open_tasks_on_profile(csuite, state["profile_id"])
+        # Only the endowment step's own open tasks count (own_open_tasks);
+        # `found` is that check, already made by _write before any write.
+        problem = None
+        if found is None:
+            found, problem = own_open_tasks(csuite, state["profile_id"])
         if problem:
             results["task_check_failed"] = problem
             results["task_skipped"] = (

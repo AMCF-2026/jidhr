@@ -142,9 +142,11 @@ def _live_refusal():
                 "CSUITE_ENDOWMENT_CREATE_ENABLED is off on this service, so "
                 "the nightly endowment step wrote nothing.")
     if not assignee():
+        from intents.endowment_inquiry import assignee_not_an_id
+
         return ("JIDHR_ENDOWMENT_MODE is live but CSUITE_ENDOWMENT_ASSIGNEE "
-                "is not set on this service, so the nightly endowment step "
-                "wrote nothing.")
+                f"{assignee_not_an_id() or 'is not set'} on this service, so "
+                "the nightly endowment step wrote nothing.")
     try:
         if not link_rows_allowed():
             return ("write_audit cannot hold a hold row yet (migration 007), "
@@ -529,8 +531,11 @@ def section_text(section, mark_preview=False) -> list:
             if e.get("ein"):
                 lines.append(f"   {e['ein']}")
             if e.get("open_task_check_skipped"):
+                from intents.endowment_inquiry import assignee_not_an_id
+
+                why = assignee_not_an_id() or "isn't set"
                 lines.append("   Open-task check skipped: "
-                             "CSUITE_ENDOWMENT_ASSIGNEE isn't set, so whose "
+                             f"CSUITE_ENDOWMENT_ASSIGNEE {why}, so whose "
                              "open tasks count can't be told. Live would "
                              "check first.")
             lines.append(f"   HubSpot: {e['hubspot_link']}")

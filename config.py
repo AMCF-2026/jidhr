@@ -532,6 +532,10 @@ class Config:
     # one is the deliberate act that says "the id is confirmed".
     CSUITE_ENDOWMENT_ASSIGNEE = _int_or_zero(
         os.environ.get('CSUITE_ENDOWMENT_ASSIGNEE', '0')) or None
+    # The text as set, only so a value that is not a whole-number employee
+    # id can be NAMED in a message rather than reported as "not set".
+    CSUITE_ENDOWMENT_ASSIGNEE_RAW = os.environ.get(
+        'CSUITE_ENDOWMENT_ASSIGNEE', '').strip()
 
     # CSuite UI base URL (for deep-linking to profiles, funds, etc.)
     CSUITE_UI_BASE_URL = "https://amuslimcf.fcsuite.com/erp"

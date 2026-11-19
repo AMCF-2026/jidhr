@@ -92,6 +92,9 @@ class Client(CSuiteClient):
         self.notes = []
         self.note_reply = {"note_id": 303200, "success": 0}
         self.task_rows = ()
+        # task/display: task_id -> task type, or "fail". Any task not listed
+        # is the endowment type (1065), the type the endowment step writes.
+        self.task_types = {}
         unreadable = {str(u) for u in unreadable}
 
         class Session:
@@ -134,6 +137,13 @@ class Client(CSuiteClient):
                     rows = [dict(r) for r in outer.task_rows]
                     payload = {"success": 1, "data": {
                         "count": len(rows), "results": rows}}
+                elif endpoint == "task/display":
+                    kind = outer.task_types.get(body.get("task_id"), 1065)
+                    payload = ({"success": 0, "errors": ["server error"]}
+                               if kind == "fail" else
+                               {"success": 1, "data": {
+                                   "task_id": body.get("task_id"),
+                                   "task_type_id": kind}})
                 elif endpoint == "note/create":
                     # CSuite's real reply for a note it DID create (sandbox,
                     # 2026-10-15): a note_id, and success 0.
@@ -1087,9 +1097,12 @@ def test_angle_brackets_are_removed_from_every_field():
 # --- V5.95/V5.95.1: an existing organisation that already has an open task ---
 # The submission is 2030-03-17; 30 days before is 2030-02-15.
 
-def open_task(created):
-    return {"task_id": 1067, "o": "profile", "id": 18075,
-            "created_date": f"{created} 09:00:00", "complete_date": None}
+def open_task(created, task_id=1067, employee=1002):
+    """An open task on profile 18075, assigned to the endowment assignee
+    (1002) unless said otherwise."""
+    return {"task_id": task_id, "o": "profile", "id": 18075,
+            "created_date": f"{created} 09:00:00", "complete_date": None,
+            "employee_name_link_id": employee}
 
 
 def _existing_org(world):
