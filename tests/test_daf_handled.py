@@ -733,3 +733,9 @@ def test_the_only_automated_daf_create_is_the_nightly_step():
         ["grep", "-rln", "--include=*.py", "-e", "run_daf_writes(",
          "jobs/", "sync/"], capture_output=True, text=True)
     assert via.stdout.split() == ["sync/daf_sync.py"]
+    # The nightly endowment step: the same rule, through the endowment
+    # chat's own sequence (intents/endowment_inquiry.run_endowment_writes).
+    via = subprocess.run(
+        ["grep", "-rln", "--include=*.py", "-e", "run_endowment_writes(",
+         "jobs/", "sync/"], capture_output=True, text=True)
+    assert via.stdout.split() == ["sync/endowment_sync.py"]
