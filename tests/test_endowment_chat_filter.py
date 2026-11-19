@@ -107,11 +107,15 @@ def test_the_assignees_task_of_another_type_does_not_count(world):
 # --- the DAF chat is unchanged (pinned against b0be280) ----------------------------
 
 def test_the_daf_chat_modules_are_byte_identical_to_the_pin():
+    """intents/daf_workflow.py byte for byte. sync/open_tasks.py left this
+    list when the endowment step began naming its assignee (V5.104): it
+    gained a field that only the endowment step asks for, and DAF's use of
+    it is pinned by behaviour instead (tests/test_endowment_assignee.py)."""
     import subprocess
 
     found = subprocess.run(
-        ["git", "diff", "--stat", PIN, "--", "intents/daf_workflow.py",
-         "sync/open_tasks.py"], capture_output=True, text=True)
+        ["git", "diff", "--stat", PIN, "--", "intents/daf_workflow.py"],
+        capture_output=True, text=True)
     assert found.returncode == 0, found.stderr
     assert found.stdout.strip() == "", found.stdout
 
